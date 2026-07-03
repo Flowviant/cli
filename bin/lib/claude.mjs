@@ -127,7 +127,13 @@ export function runTurn({ prompt, resume, system, cwd, mcpConfig, label, onSpawn
     const args = [];
     if (resume) args.push('--continue');
     args.push('-p', prompt, '--mcp-config', mcpConfig, '--append-system-prompt', system, ...PERM);
-    const child = spawn('claude', args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+    // Force the user's Claude Code subscription — never the API. A key exported in
+    // the shell would otherwise silently bill every poll-mode turn as raw API
+    // usage (same invariant live mode enforces on its SDK session env).
+    const env = { ...process.env };
+    delete env.ANTHROPIC_API_KEY;
+    delete env.ANTHROPIC_AUTH_TOKEN;
+    const child = spawn('claude', args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
     onSpawn?.(child);
     let out = '';
     const pfx = label ? `${label} ` : '';

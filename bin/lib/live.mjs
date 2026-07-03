@@ -51,7 +51,21 @@ async function registerLiveTarget(intentId, kind, url) {
   }
 }
 
-const SAFE_TOOLS = ['Edit', 'Write', 'Read', 'Grep', 'Glob', 'Bash', 'mcp__flowviant'];
+// Safe mode's curated toolset. Bash is scoped to the specific CLIs the agent
+// needs (git/gh/npm/bun) — NOT bare `Bash`, which would auto-approve arbitrary
+// shell (rm -rf, curl|sh, reading ~/.ssh) and defeat the point of safe mode.
+const SAFE_TOOLS = [
+  'Edit',
+  'Write',
+  'Read',
+  'Grep',
+  'Glob',
+  'Bash(git:*)',
+  'Bash(gh:*)',
+  'Bash(npm:*)',
+  'Bash(bun:*)',
+  'mcp__flowviant',
+];
 
 // Appended to Claude Code's preset. The reliable copy of the contract also
 // rides in the seed message below, so this degrades gracefully if the preset
@@ -99,6 +113,9 @@ async function mcpCall(mcpUrl, token, name, args) {
       Authorization: `Bearer ${token}`,
       'Content-Type': 'application/json',
       Accept: 'application/json',
+      // Required: Node's default UA trips Cloudflare Bot Fight Mode (403) —
+      // without this every live MCP call fails against api.flowviant.com.
+      'User-Agent': USER_AGENT,
     },
     body: JSON.stringify({
       jsonrpc: '2.0',
@@ -241,7 +258,11 @@ export async function runLiveTask({ mcpUrl, token, cwd, baseRef, isAlive }) {
       ...(SAFE ? { allowedTools: SAFE_TOOLS } : {}),
       systemPrompt: { type: 'preset', preset: 'claude_code', append: SYSTEM_LIVE },
       mcpServers: {
-        flowviant: { type: 'http', url: mcpUrl, headers: { Authorization: `Bearer ${token}` } },
+        flowviant: {
+          type: 'http',
+          url: mcpUrl,
+          headers: { Authorization: `Bearer ${token}`, 'User-Agent': USER_AGENT },
+        },
       },
     },
   });
