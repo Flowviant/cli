@@ -128,8 +128,11 @@ async function runFleetWorker({ agentId, label, cwd, baseRef, getToken, getHasWo
     // don't fake a blocker or a completion.
     enter('reconnect', warn, `${c.yellow('no result')}${c.dim(' — refreshing token, retrying')}`);
     onTokenSuspect?.(agentId);
-    resuming = false;
-    needsReset = true;
+    // A no-sentinel turn while RESUMING a blocked task is a transient MCP/token
+    // failure, not completion — retry in place and KEEP the worktree. Resetting
+    // here would wipe the blocked task's uncommitted changes. Only a fresh-task
+    // turn (not resuming) warrants a clean slate next time.
+    if (!resuming) needsReset = true;
     await sleep(IDLE_SECONDS);
   }
   info(`${label} stopped`);

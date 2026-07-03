@@ -216,22 +216,26 @@ async function waitForMessage(mcpUrl, token, runId, afterId, isAlive) {
 
 // One task: claim → seed → stream/mirror/inject/park → complete. Returns
 // { outcome: 'nothing' | 'done' | 'blocked' | 'stalled' | 'error' }.
-export async function runLiveTask({ mcpUrl, token, cwd, baseRef, isAlive }) {
+export async function runLiveTask({ mcpUrl, token, cwd, baseRef, isAlive, resumeIntentId, onChild }) {
   const claim = await mcpCall(mcpUrl, token, 'claim_next_intent', {}).catch(() => null);
   if (!claim || claim.claimed !== true) return { outcome: 'nothing' };
   const { runId, intentId } = claim;
   const brief = claim.brief ?? {};
   const title = brief.title ?? 'a task';
+  // Re-claiming the SAME intent this worker was just working (parked on a blocker,
+  // now resuming) — its worktree holds hours of uncommitted work. Do NOT reset.
+  const resuming = !!resumeIntentId && intentId === resumeIntentId;
 
-  // Revision resumes its PR branch; otherwise a clean base checkout.
+  // Revision resumes its PR branch; a genuinely fresh task gets a clean base
+  // checkout; a resume keeps its dirty worktree untouched.
   if (brief.branch) {
     try {
       git(['fetch', 'origin', '--quiet'], cwd);
       git(['checkout', brief.branch], cwd);
     } catch {
-      resetWorktree(cwd, baseRef);
+      if (!resuming) resetWorktree(cwd, baseRef);
     }
-  } else {
+  } else if (!resuming) {
     resetWorktree(cwd, baseRef);
   }
 
@@ -264,6 +268,25 @@ export async function runLiveTask({ mcpUrl, token, cwd, baseRef, isAlive }) {
           headers: { Authorization: `Bearer ${token}`, 'User-Agent': USER_AGENT },
         },
       },
+    },
+  });
+
+  // Mark this worker BUSY for the daemon's reconcile loop: buildHave keeps the
+  // worker's token while a session is live (never rotate a credential out from
+  // under it), and teardown/agent-removal can interrupt the SDK session via this
+  // marker's kill(). Cleared in finally. Mirrors poll mode's onChild(child).
+  onChild?.({
+    kill: () => {
+      try {
+        session.interrupt?.();
+      } catch {
+        /* already ending */
+      }
+      try {
+        session.return?.();
+      } catch {
+        /* already closed */
+      }
     },
   });
 
@@ -380,6 +403,7 @@ export async function runLiveTask({ mcpUrl, token, cwd, baseRef, isAlive }) {
   } catch (e) {
     return { outcome: 'error', error: e?.message ?? String(e), title, intentId };
   } finally {
+    onChild?.(null); // no longer busy — token may rotate between tasks
     input.close();
     try {
       await session.interrupt?.();
@@ -406,7 +430,12 @@ export async function runLiveWorker({
   getMcpUrl,
   isAlive,
   onTokenSuspect,
+  onChild,
 }) {
+  // The intent this worker is holding across iterations. When a task parks on a
+  // blocker its worktree keeps uncommitted work; on the resume claim we must NOT
+  // reset it. Cleared once the task finishes or the worker goes idle.
+  let lastIntentId = null;
   let phase = '';
   const enter = (p, fn, msg) => {
     if (phase !== p) {
@@ -462,13 +491,28 @@ export async function runLiveWorker({
     }
     let res;
     try {
-      res = await runLiveTask({ mcpUrl: getMcpUrl() ?? MCP_URL, token, cwd, baseRef, isAlive });
+      res = await runLiveTask({
+        mcpUrl: getMcpUrl() ?? MCP_URL,
+        token,
+        cwd,
+        baseRef,
+        isAlive,
+        resumeIntentId: lastIntentId,
+        onChild,
+      });
     } catch (e) {
       enter('error', warn, `${c.yellow('error')} ${c.dim(`— ${e?.message ?? e}`)}`);
       await sleep(IDLE_SECONDS);
       continue;
     }
     if (!isAlive()) break;
+    // Keep the held intent only while a task is genuinely in flight (parked /
+    // stalled / errored → same worktree resumes). Finishing or finding no work
+    // clears it so the next fresh task starts from a clean base.
+    lastIntentId =
+      res.outcome === 'parked' || res.outcome === 'stalled' || res.outcome === 'error'
+        ? res.intentId
+        : null;
     if (res.outcome === 'nothing') {
       enter('idle', info, 'idle — no work assigned');
       await sleep(IDLE_SECONDS);

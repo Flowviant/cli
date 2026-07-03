@@ -137,14 +137,36 @@ export async function startPreview({ worktree, kind, cmd, port, log, timeoutMs =
   const cf = await ensureCloudflared(log);
   if (!cf) return null; // fall back to captured evidence
   return new Promise((resolve) => {
-    const server = spawn(cmd, { cwd: worktree, shell: true, stdio: ['ignore', 'ignore', 'ignore'] });
+    // detached so each gets its own process group — `bun run dev` via a shell
+    // spawns a grandchild dev server that would otherwise SURVIVE a kill of the
+    // shell, keep port bound, and get silently re-fronted by the NEXT task's
+    // tunnel (reviewer sees the wrong branch). We kill the whole group instead.
+    const server = spawn(cmd, {
+      cwd: worktree,
+      shell: true,
+      detached: true,
+      stdio: ['ignore', 'ignore', 'ignore'],
+    });
     const tunnel = spawn(cf, ['tunnel', '--url', `http://localhost:${port}`], {
+      detached: true,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let settled = false;
+    const killGroup = (child) => {
+      if (!child.pid) return;
+      try {
+        process.kill(-child.pid, 'SIGKILL'); // negative pid = the whole group
+      } catch {
+        try {
+          child.kill('SIGKILL');
+        } catch {
+          /* gone */
+        }
+      }
+    };
     const stop = () => {
-      try { server.kill('SIGKILL'); } catch { /* gone */ }
-      try { tunnel.kill('SIGKILL'); } catch { /* gone */ }
+      killGroup(server);
+      killGroup(tunnel);
     };
     const finish = (val) => {
       if (settled) return;
