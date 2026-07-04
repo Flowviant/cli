@@ -189,17 +189,19 @@ export async function runFleetDaemon() {
   // Merge jobs (Flowvy-commanded): approved PRs to squash-merge to main on the
   // user's own gh. `merging` guards against re-processing a job mid-flight.
   const MERGE_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/merge-done');
+  const MERGE_FAILED_URL = FLEET_URL.replace(/\/agents\/?$/, '/merge-failed');
   const merging = new Set();
-  const reportMerged = async (intentId) => {
+  const mergeAttempts = new Map(); // job.id -> transient-failure count
+  const reportMergeOutcome = async (url, body) => {
     try {
-      await fetch(MERGE_DONE_URL, {
+      await fetch(url, {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${FLEET_TOKEN}`,
           'User-Agent': USER_AGENT,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ intentId }),
+        body: JSON.stringify(body),
       });
     } catch {
       /* best-effort — the job reappears next poll if this failed */
@@ -213,6 +215,7 @@ export async function runFleetDaemon() {
         try {
           note(`${c.cyan('merge')} ${c.dim(`— ${job.title}`)}`);
           let merged = false;
+          let failedReason = null; // permanent — tell the thread, clear the flag
           try {
             execFileSync('gh', ['pr', 'merge', job.prUrl, '--squash', '--delete-branch'], {
               cwd: repoRoot,
@@ -221,14 +224,33 @@ export async function runFleetDaemon() {
             merged = true;
           } catch (e) {
             const err = e.stderr?.toString?.() || e.message || '';
+            const line = err.split('\n')[0] || 'gh pr merge failed';
             if (/already merged|not open|closed/i.test(err)) merged = true;
-            else if (/conflict|not mergeable|CONFLICTING/i.test(err))
-              warn(`"${job.title}" has a merge conflict — rebase the branch, then it'll merge.`);
-            else warn(`merge failed for "${job.title}": ${err.split('\n')[0]} — will retry`);
+            else if (/conflict|not mergeable|CONFLICTING/i.test(err)) {
+              // Permanent until a human/agent acts — don't spin on it.
+              failedReason = `merge conflict with ${baseRef} — the branch needs a rebase`;
+            } else {
+              // Transient (auth hiccup, network, CI requirement): retry a few
+              // polls, then surface it instead of silently looping forever.
+              const n = (mergeAttempts.get(job.id) ?? 0) + 1;
+              mergeAttempts.set(job.id, n);
+              if (n >= 3) failedReason = line;
+              else warn(`merge failed for "${job.title}": ${line} — will retry`);
+            }
           }
           if (merged) {
-            await reportMerged(job.id);
+            mergeAttempts.delete(job.id);
+            await reportMergeOutcome(MERGE_DONE_URL, { intentId: job.id });
             ok(`${c.cyan('merged')} ${c.dim(`— ${job.title} → ${baseRef}`)}`);
+          } else if (failedReason) {
+            // Report into the thread (server narrates + re-arms the merge
+            // button + notifies) — the job disappears from the roster.
+            mergeAttempts.delete(job.id);
+            await reportMergeOutcome(MERGE_FAILED_URL, {
+              intentId: job.id,
+              message: failedReason,
+            });
+            warn(`merge failed for "${job.title}": ${failedReason} — reported to the thread`);
           }
         } finally {
           merging.delete(job.id);
