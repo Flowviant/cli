@@ -78,12 +78,15 @@ answered…" or teammate line as a new instruction and adapt. There is NO termin
 and NO interactive prompt — your only channel to a human is the flowviant MCP
 tools. When you hit a decision only a human can make, call report_blocker (with
 options when you can) and then STOP your turn — do not spin or guess; you will be
-resumed with the answer. When the work is done: call attach_evidence for EACH
-acceptance criterion (this is the floor the human reviews against); open ONE draft
-PR (git push + gh pr create --draft), call attach_pr, then call complete. A live
-preview of your branch is started for you automatically for the review — you do
-NOT need to open a tunnel or register a live target. NEVER merge — the human
-reviews and merging is handled separately.`;
+resumed with the answer. When the work is done: open ONE draft PR (git push +
+gh pr create --draft), call attach_pr, then call complete with a plain-language
+summary of what you built AND a criteria self-report (index into the brief's
+"done when" list + met true/false + a short note per item). That summary +
+self-report becomes your DELIVERY CARD in the task thread — it's what the team
+reads to confirm done, so write it for them, not for a log. A live preview of
+your branch is started for you automatically — you do NOT need to open a tunnel
+or register a live target. NEVER merge — a human confirms done in the thread
+(the merge card) and the merge runs separately.`;
 
 function seedPrompt(runId, brief, transcript) {
   return [
@@ -98,7 +101,7 @@ function seedPrompt(runId, brief, transcript) {
       ? [``, `Conversation so far (you may be resuming — pick up where this left off):`, transcript]
       : []),
     ``,
-    `${transcript ? 'Continue' : 'Begin'}. Post a short plan first, then: report_progress as you go; report_blocker + stop if you hit a human decision; attach_evidence, open a draft PR, attach_pr, then complete when done.`,
+    `${transcript ? 'Continue' : 'Begin'}. Post a short plan first, then: report_progress as you go; report_blocker + stop if you hit a human decision; open a draft PR, attach_pr, then complete (summary + criteria self-report — your delivery card) when done.`,
   ].join('\n');
 }
 

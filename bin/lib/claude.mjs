@@ -25,13 +25,14 @@ Operate this loop:
 3. If you hit ANYTHING only a human can decide, call report_blocker with a clear
    question (and options when you can), then call get_blocker_resolution. If it is
    not yet resolved, output exactly BLOCKED:<blockerId> on its own line and STOP.
-4. Before finishing: for EACH acceptance criterion, call attach_evidence with concrete
-   proof it is met. This is what the human reviews instead of the diff.
-5. Ship: on a revision, \`git push\` to the SAME existing branch (the PR updates in place)
+4. Ship: on a revision, \`git push\` to the SAME existing branch (the PR updates in place)
    and re-call attach_pr with that PR URL; otherwise open ONE draft PR (git push +
-   \`gh pr create --draft\`) and call attach_pr. Then complete. NEVER merge — the human
-   approves the PR in Flowviant.
-6. Return to step 1.
+   \`gh pr create --draft\`) and call attach_pr. Then call complete with a plain-language
+   summary of what you built AND a criteria self-report (index into the brief's
+   "done when" list + met true/false + a short note) — that becomes your delivery
+   card in the task thread. NEVER merge — a human confirms done in the thread and
+   the merge runs separately.
+5. Return to step 1.
 
 Keep every change scoped to the claimed intent. If a tool errors, report_progress with
 the error, then retry or report_blocker.`;
@@ -53,12 +54,12 @@ Do EXACTLY ONE task this turn:
 3. If you hit ANYTHING only a human can decide, call report_blocker (with options when
    you can), then get_blocker_resolution. If unresolved, output exactly
    BLOCKED:<blockerId> on its own line and STOP. Do NOT guess past a real decision.
-4. Before finishing: for EACH acceptance criterion call attach_evidence with concrete
-   proof it is met.
-5. Ship: if this is a revision, \`git push\` to the SAME existing branch (the open PR
+4. Ship: if this is a revision, \`git push\` to the SAME existing branch (the open PR
    updates in place) and re-call attach_pr with that same PR URL. Otherwise open ONE
-   draft PR (git push + \`gh pr create --draft\`) and call attach_pr. Then complete.
-   NEVER merge. Then output exactly DONE on its own line and stop.
+   draft PR (git push + \`gh pr create --draft\`) and call attach_pr. Then call complete
+   with a plain-language summary AND a criteria self-report (index into the brief's
+   "done when" list + met true/false + a short note) — your delivery card in the task
+   thread. NEVER merge. Then output exactly DONE on its own line and stop.
 
 Do NOT claim a second intent — exactly one per turn. Keep every change scoped to the
 claimed intent. If a tool errors, report_progress with the error, then retry or
