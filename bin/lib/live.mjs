@@ -302,14 +302,26 @@ export async function runLiveTask({ mcpUrl, token, cwd, baseRef, isAlive, resume
   let nudges = 0;
   let held = false; // asked to stop — park for direction, don't nudge
 
+  // Liveness heartbeat: stream_turn refreshes the lease, but a long stretch of
+  // silent tool work streams no text — the app would read "stalled" while the
+  // agent is grinding. Beat at most once a minute on ANY session activity.
+  let lastBeat = Date.now();
+  const beat = () => {
+    if (Date.now() - lastBeat < 60_000) return;
+    lastBeat = Date.now();
+    void mcpCall(mcpUrl, token, 'heartbeat', { runId }).catch(() => {});
+  };
+
   const flush = async () => {
-    if (turnId && turnText.trim())
+    if (turnId && turnText.trim()) {
+      lastBeat = Date.now(); // stream_turn refreshes the lease itself
       await mcpCall(mcpUrl, token, 'stream_turn', {
         runId,
         turnId,
         text: turnText.trim(),
         createdAt: turnAt,
       }).catch(() => {});
+    }
   };
   const inject = (msgs) => {
     afterId = msgs[msgs.length - 1].id;
@@ -319,6 +331,7 @@ export async function runLiveTask({ mcpUrl, token, cwd, baseRef, isAlive, resume
   try {
     for await (const m of session) {
       if (!isAlive()) return { outcome: 'blocked', title, intentId };
+      beat(); // any session traffic = alive (throttled to 1/min)
 
       if (m.type === 'assistant') {
         if (!turnId) {
@@ -471,7 +484,16 @@ export async function runLiveWorker({
     const cfg = loadPreviewConfig(cwd);
     const kind = cfg?.ui ? 'ui' : cfg?.api ? 'api' : null;
     const entry = kind ? cfg[kind] : null;
-    if (!entry || !intentId) return; // no preview config → captured evidence only
+    if (!entry || !intentId) {
+      // Say WHY there's no preview instead of skipping silently — this was a
+      // real "where's my preview?" support case.
+      info(
+        `${label} ${c.dim(
+          'no live preview: add .flowviant/preview.json ({"ui":{"cmd":"npm run dev","port":5173}}) — the framework could not be inferred from package.json.'
+        )}`
+      );
+      return;
+    }
     info(`${label} ${c.dim('starting a live preview of the branch for review…')}`);
     preview = await startPreview({
       worktree: cwd,
