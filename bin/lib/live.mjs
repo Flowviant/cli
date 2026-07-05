@@ -368,6 +368,11 @@ export async function runLiveTask({ mcpUrl, token, cwd, baseRef, isAlive, resume
           runId,
           ...(afterId ? { afterId } : {}),
         }).catch(() => null);
+        // Torn down out from under us (restart / reassign in Flowviant): the
+        // server killed this run — abandon the session, don't keep building.
+        if (poll && poll.ok === false && poll.reason === 'run_not_active') {
+          return { outcome: 'torn_down', title, intentId };
+        }
         const fresh = (poll?.messages ?? []).filter((x) => x.role === 'user');
 
         if (fresh.some((f) => STOP_RE.test(f.content))) {
@@ -525,6 +530,13 @@ export async function runLiveWorker({
       ok(`${label} ${c.dim(`finished "${res.title}" — PR opened for your review`)}`);
       phase = '';
       await startReviewPreview(res.intentId);
+      continue;
+    }
+    if (res.outcome === 'torn_down') {
+      // The human restarted/reassigned the task in Flowviant. Drop everything —
+      // the next fresh claim resets the worktree to base.
+      info(`${label} ${c.dim(`"${res.title}" was restarted/reassigned — abandoned this attempt`)}`);
+      phase = '';
       continue;
     }
     if (res.outcome === 'parked') {

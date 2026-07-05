@@ -259,6 +259,56 @@ export async function runFleetDaemon() {
     }
   };
 
+  // Cleanup jobs (task restarts): close the abandoned PR + delete its remote
+  // branch on the user's own gh, so a restart doesn't litter the repo.
+  const CLEANUP_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/cleanup-done');
+  const cleaning = new Set();
+  const processCleanupJobs = (jobs) => {
+    for (const job of jobs ?? []) {
+      if (cleaning.has(job.id)) continue;
+      cleaning.add(job.id);
+      (async () => {
+        try {
+          note(`${c.cyan('cleanup')} ${c.dim(`— ${job.title} (restarted)`)}`);
+          if (job.prUrl) {
+            try {
+              execFileSync(
+                'gh',
+                [
+                  'pr',
+                  'close',
+                  job.prUrl,
+                  '--comment',
+                  'Task restarted in Flowviant — this attempt was discarded.',
+                  '--delete-branch',
+                ],
+                { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] }
+              );
+            } catch (e) {
+              // Already closed/merged/missing = fine; anything else we still
+              // report done — a restart must never wedge on stale remotes.
+              const err = e.stderr?.toString?.() || e.message || '';
+              warn(`cleanup for "${job.title}": ${err.split('\n')[0] || 'gh pr close failed'}`);
+            }
+          } else if (job.branch) {
+            try {
+              execFileSync('git', ['push', 'origin', '--delete', job.branch], {
+                cwd: repoRoot,
+                stdio: ['ignore', 'pipe', 'pipe'],
+              });
+            } catch {
+              /* branch already gone — fine */
+            }
+          }
+          await reportMergeOutcome(CLEANUP_DONE_URL, { intentId: job.id });
+          ok(`${c.cyan('cleaned')} ${c.dim(`— ${job.title}`)}`);
+        } finally {
+          cleaning.delete(job.id);
+        }
+      })();
+    }
+  };
+
   let connected = false; // log the first successful poll once
   let rosterSig = null; // last roster membership, to log changes only
   let idleBeatAt = 0; // throttle the "still alive" idle heartbeat
@@ -298,6 +348,7 @@ export async function runFleetDaemon() {
     if (roster.mcpUrl) mcpUrl = roster.mcpUrl;
     if (roster.leaseTtlSeconds) leaseTtlSeconds = roster.leaseTtlSeconds;
     processMergeJobs(roster.mergeJobs);
+    processCleanupJobs(roster.cleanupJobs);
     const rosterIds = new Set(roster.agents.map((a) => a.agentId));
 
     // Announce roster size only when it changes (not every poll).
