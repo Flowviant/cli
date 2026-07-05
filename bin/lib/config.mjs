@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 
-export const VERSION = '0.7.2';
+export const VERSION = '0.8.0';
 
 // Credential stored by `flowviant login` (device auth) — the no-token,
 // no-env-var path. An explicit --fleet flag or FLOWVIANT_FLEET env still wins.
@@ -35,10 +35,12 @@ export const RECONCILE_SECONDS = Number(process.env.RECONCILE_SECONDS || 10);
 // so a long-lived daemon never silently 401s on an expired token.
 export const REFRESH_BEFORE_SECONDS = Number(process.env.REFRESH_BEFORE_SECONDS || 3600);
 export const SAFE = process.env.FLOWVIANT_SAFE === '1';
-// Opt-in phase-2 live mode: persistent Agent-SDK session per task (streams into
-// the task channel, injectable, blocker-parks in place) instead of one-shot
-// `claude -p` turns. Off = the proven poll/sentinel path, untouched.
-export const LIVE = process.env.FLOWVIANT_LIVE === '1';
+// Live mode (DEFAULT since 0.8.0): persistent Agent-SDK session per task —
+// streams into the task channel, injectable mid-task, blocker-parks in place,
+// delivery card on complete, branch preview tunnels. The legacy poll/sentinel
+// path (one-shot `claude -p` turns) survives behind FLOWVIANT_POLL=1 as the
+// escape hatch; FLOWVIANT_LIVE=1 is still honored for old scripts.
+export const LIVE = process.env.FLOWVIANT_POLL !== '1';
 // Sent on the daemon's own HTTP calls so Cloudflare Bot Fight Mode doesn't 403
 // them (Node's default UA is treated as a bot). Claude Code sends its own UA.
 export const USER_AGENT = `flowviant/${VERSION}`;

@@ -38,13 +38,15 @@ Prefer an explicit token? Create a fleet credential in the app and pass it direc
 FLOWVIANT_FLEET=fva_… npx flowviant
 ```
 
-## Live mode (opt-in)
+## Live mode (the default)
+
+Each task runs a **persistent** Claude session you can talk to mid-task from the app: the agent streams its work into the task's conversation, you `@`-mention it to steer or answer questions, and it resumes in place. Blockers park the session at zero cost until you answer. When it finishes, it posts a delivery card (summary + checklist self-report) in the thread — a human confirms done by merging there.
+
+Prefer the legacy one-shot poll mode (no streaming, no previews)? Escape hatch:
 
 ```bash
-FLOWVIANT_LIVE=1 npx flowviant
+FLOWVIANT_POLL=1 npx flowviant
 ```
-
-Each task runs a **persistent** Claude session you can talk to mid-task from the app: the agent streams its work into the task's conversation, you `@`-mention it to steer or answer questions, and it resumes in place. Blockers park the session at zero cost until you answer.
 
 ### Live previews
 

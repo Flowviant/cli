@@ -1,5 +1,5 @@
 /**
- * Live mode (phase 2, opt-in via FLOWVIANT_LIVE=1). Instead of one-shot
+ * Live mode (the DEFAULT since 0.8.0; FLOWVIANT_POLL=1 = legacy path). Instead of one-shot
  * `claude -p` turns + sentinels, each task runs a PERSISTENT Agent-SDK session:
  * the daemon claims, seeds the session with the brief, mirrors the model's
  * streamed reply into the task channel (stream_turn), injects human @-messages
