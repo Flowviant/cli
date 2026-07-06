@@ -16,6 +16,8 @@
  * live fleet + repo to shake out. Old (poll/sentinel) mode is untouched.
  */
 
+import { readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import {
   MCP_URL,
@@ -88,12 +90,14 @@ your branch is started for you automatically — you do NOT need to open a tunne
 or register a live target. NEVER merge — a human confirms done in the thread
 (the merge card) and the merge runs separately.`;
 
-function seedPrompt(runId, brief, transcript) {
+function seedPrompt(runId, brief, transcript, resumedInPlace) {
   return [
     `Your run id is ${runId}. Use it for every flowviant MCP tool call.`,
-    brief?.branch
-      ? `This is a REVISION — your prior branch "${brief.branch}" is checked out; address the review feedback and push to the SAME branch (the PR updates in place).`
-      : `Start from the clean base checkout and open a fresh draft PR when done.`,
+    resumedInPlace
+      ? `You are RESUMING after a daemon restart: your worktree still contains your own uncommitted work from before the interruption. Run \`git status\` and \`git diff\` first, take stock, and CONTINUE from there — do not start over.`
+      : brief?.branch
+        ? `This is a REVISION — your prior branch "${brief.branch}" is checked out; address the review feedback and push to the SAME branch (the PR updates in place).`
+        : `Start from the clean base checkout and open a fresh draft PR when done.`,
     ``,
     `Task brief:`,
     JSON.stringify(brief ?? {}, null, 2),
@@ -180,6 +184,29 @@ function makeInput(seedText) {
   };
 }
 
+// Task marker — WHICH intent this worktree was building, stored in the
+// worktree's own git dir (never the working tree, so the agent can't commit
+// it and `git clean` can't delete it). It's what lets a claim after a daemon
+// restart recognize its own half-built worktree and resume IN PLACE instead
+// of resetting away hours of uncommitted work.
+function markerPath(cwd) {
+  return join(git(['rev-parse', '--absolute-git-dir'], cwd), 'flowviant-task');
+}
+function readTaskMarker(cwd) {
+  try {
+    return readFileSync(markerPath(cwd), 'utf8').trim() || null;
+  } catch {
+    return null;
+  }
+}
+function writeTaskMarker(cwd, intentId) {
+  try {
+    writeFileSync(markerPath(cwd), `${intentId}\n`);
+  } catch {
+    /* best-effort — worst case the next restart resets to base */
+  }
+}
+
 // A stop word from any teammate halts the agent (interrupt at the next boundary,
 // then hold for direction) — the "stop, you're going the wrong way" valve.
 const STOP_RE = /(^|\W)stop(\W|$)/i;
@@ -225,21 +252,35 @@ export async function runLiveTask({ mcpUrl, token, cwd, baseRef, isAlive, resume
   const { runId, intentId } = claim;
   const brief = claim.brief ?? {};
   const title = brief.title ?? 'a task';
-  // Re-claiming the SAME intent this worker was just working (parked on a blocker,
-  // now resuming) — its worktree holds hours of uncommitted work. Do NOT reset.
+  // Re-claiming the SAME intent this worker was just working — either this
+  // daemon's own memory (parked on a blocker, now resuming) or the persistent
+  // task marker (the daemon restarted mid-task). Its worktree holds hours of
+  // uncommitted work. Do NOT reset.
   const resuming = !!resumeIntentId && intentId === resumeIntentId;
+  const resumedInPlace = !resuming && readTaskMarker(cwd) === intentId;
 
   // Revision resumes its PR branch; a genuinely fresh task gets a clean base
-  // checkout; a resume keeps its dirty worktree untouched.
+  // checkout; a resume (in-memory or marker) keeps its dirty worktree untouched.
   if (brief.branch) {
     try {
       git(['fetch', 'origin', '--quiet'], cwd);
       git(['checkout', brief.branch], cwd);
     } catch {
-      if (!resuming) resetWorktree(cwd, baseRef);
+      if (!resuming && !resumedInPlace) resetWorktree(cwd, baseRef);
     }
-  } else if (!resuming) {
+  } else if (!resuming && !resumedInPlace) {
     resetWorktree(cwd, baseRef);
+  }
+  writeTaskMarker(cwd, intentId);
+
+  if (resumedInPlace) {
+    // Thread honesty: the team must see this is a genuine continuation with
+    // files intact — deterministic, not left to the model's self-narration.
+    await mcpCall(mcpUrl, token, 'stream_turn', {
+      runId,
+      turnId: `resume:${runId}`,
+      text: '⟲ Resumed after a daemon restart — local work survived; continuing in place.',
+    }).catch(() => {});
   }
 
   const env = { ...process.env };
@@ -255,7 +296,7 @@ export async function runLiveTask({ mcpUrl, token, cwd, baseRef, isAlive, resume
     .join('\n');
   let afterId = priorMsgs.length ? priorMsgs[priorMsgs.length - 1].id : null;
 
-  const input = makeInput(seedPrompt(runId, brief, transcript));
+  const input = makeInput(seedPrompt(runId, brief, transcript, resumedInPlace));
   const session = query({
     prompt: input.stream(),
     options: {

@@ -44,6 +44,33 @@ if (process.argv[2] === 'login') {
   process.exit(0);
 }
 
+// `flowviant clean` — reclaim the persistent worktrees (~/.flowviant/worktrees).
+// They're kept across runs so in-flight work survives Ctrl+C; this is the drain.
+// Repos self-heal: the daemon runs `git worktree prune` if a stale registration
+// blocks re-adding a path.
+if (process.argv[2] === 'clean') {
+  const { rmSync, existsSync } = await import('node:fs');
+  const { join } = await import('node:path');
+  const { homedir } = await import('node:os');
+  const { execFileSync } = await import('node:child_process');
+  const dir = join(homedir(), '.flowviant', 'worktrees');
+  if (!existsSync(dir)) {
+    console.log('nothing to clean — no worktrees at ~/.flowviant/worktrees.');
+    process.exit(0);
+  }
+  let size = '';
+  try {
+    const kb = Number(execFileSync('du', ['-sk', dir], { encoding: 'utf8' }).split('\t')[0]);
+    size = ` (${(kb / 1024).toFixed(0)} MB reclaimed)`;
+  } catch {
+    /* du unavailable — skip the size */
+  }
+  console.log('note: stop any running flowviant daemon first — in-flight local work is discarded.');
+  rmSync(dir, { recursive: true, force: true });
+  console.log(`cleaned ~/.flowviant/worktrees${size}.`);
+  process.exit(0);
+}
+
 if (!FLEET_TOKEN && tokens.length === 0) {
   console.error(
     'error: no credential found. Easiest:\n' +

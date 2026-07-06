@@ -5,10 +5,11 @@
  * MCP token, and only spawns Claude when the server says an agent has work.
  */
 
-import { mkdtempSync, rmSync, existsSync } from 'node:fs';
+import { mkdirSync, existsSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { createHash } from 'node:crypto';
+import { homedir } from 'node:os';
+import { join, basename } from 'node:path';
 import {
   VERSION,
   FLEET_URL,
@@ -151,7 +152,21 @@ export async function runFleetDaemon() {
   console.log('');
   preflight({ needGit: true });
 
-  const baseDir = mkdtempSync(join(tmpdir(), 'flowviant-fleet-'));
+  // Persistent worktree home (0.9.0) — survives daemon restarts AND reboots,
+  // so Ctrl+C mid-task never loses local work. Keyed per repo path; each
+  // agent's worktree carries a task marker so a resumed claim keeps its files.
+  const repoKey = `${basename(repoRoot)}-${createHash('sha256').update(repoRoot).digest('hex').slice(0, 8)}`;
+  const baseDir = join(homedir(), '.flowviant', 'worktrees', repoKey);
+  mkdirSync(baseDir, { recursive: true });
+  try {
+    const kb = Number(execFileSync('du', ['-sk', baseDir], { encoding: 'utf8' }).split('\t')[0]);
+    if (kb > 1024)
+      info(
+        `disk   · worktrees ${(kb / 1024 / 1024).toFixed(1)} GB at ~/.flowviant/worktrees — \`flowviant clean\` reclaims`
+      );
+  } catch {
+    /* du unavailable (Windows) — skip the disk line */
+  }
   const tokenByAgent = new Map(); // agentId -> latest worker token
   const mintedAt = new Map(); // agentId -> ms when we last got a fresh token
   const hasWorkByAgent = new Map(); // agentId -> server says it has claimable work
@@ -159,6 +174,10 @@ export async function runFleetDaemon() {
   let mcpUrl = MCP_URL;
   const workers = new Map(); // agentId -> { state, promise, wt, label }
 
+  // Shutdown KEEPS the worktrees: in-flight local work survives Ctrl+C and
+  // resumes in place on the next run (the task marker matches). Worktrees are
+  // only removed when an agent is deleted from the roster, or by
+  // `flowviant clean`.
   const teardown = () => {
     for (const [, w] of workers) {
       w.state.alive = false;
@@ -167,21 +186,11 @@ export async function runFleetDaemon() {
       } catch {
         /* best-effort */
       }
-      try {
-        git(['worktree', 'remove', '--force', w.wt], repoRoot);
-      } catch {
-        /* best-effort */
-      }
-    }
-    try {
-      rmSync(baseDir, { recursive: true, force: true });
-    } catch {
-      /* best-effort */
     }
   };
   process.on('SIGINT', () => {
     console.log('');
-    note('shutting down — stopping workers and freeing worktrees…');
+    note('shutting down — stopping workers. Worktrees are kept: in-flight work resumes next run.');
     teardown();
     process.exit(130);
   });
@@ -377,7 +386,16 @@ export async function runFleetDaemon() {
       if (!workers.has(a.agentId)) {
         const wt = join(baseDir, `agent-${a.agentId}`);
         try {
-          if (!existsSync(wt)) git(['worktree', 'add', '--detach', wt, baseRef], repoRoot);
+          if (!existsSync(wt)) {
+            try {
+              git(['worktree', 'add', '--detach', wt, baseRef], repoRoot);
+            } catch {
+              // A stale registration (e.g. after `flowviant clean` rm'd the
+              // dir) blocks re-adding the same path — prune and retry once.
+              git(['worktree', 'prune'], repoRoot);
+              git(['worktree', 'add', '--detach', wt, baseRef], repoRoot);
+            }
+          }
         } catch (e) {
           fail(`could not create worktree for "${a.name}": ${e.message}`);
           continue;
