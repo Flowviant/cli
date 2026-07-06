@@ -16,7 +16,7 @@
  * live fleet + repo to shake out. Old (poll/sentinel) mode is untouched.
  */
 
-import { readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import {
@@ -31,7 +31,7 @@ import {
 } from './config.mjs';
 import { c, info, ok, warn } from './ui.mjs';
 import { sleep } from './claude.mjs';
-import { git, resetWorktree } from './git.mjs';
+import { git, resetWorktree, isValidBranch } from './git.mjs';
 import { loadPreviewConfig, startPreview } from './preview.mjs';
 
 // Register a branch preview's tunnel URL with Flowviant (fleet-authed). The
@@ -46,6 +46,7 @@ async function registerLiveTarget(intentId, kind, url) {
         'User-Agent': USER_AGENT,
         'Content-Type': 'application/json',
       },
+      signal: AbortSignal.timeout(30_000),
       body: JSON.stringify({ intentId, kind, url }),
     });
   } catch {
@@ -124,6 +125,7 @@ async function mcpCall(mcpUrl, token, name, args) {
       // without this every live MCP call fails against api.flowviant.com.
       'User-Agent': USER_AGENT,
     },
+    signal: AbortSignal.timeout(30_000),
     body: JSON.stringify({
       jsonrpc: '2.0',
       id: ++rpcId,
@@ -206,6 +208,13 @@ function writeTaskMarker(cwd, intentId) {
     /* best-effort — worst case the next restart resets to base */
   }
 }
+function clearTaskMarker(cwd) {
+  try {
+    rmSync(markerPath(cwd), { force: true });
+  } catch {
+    /* best-effort */
+  }
+}
 
 // A stop word from any teammate halts the agent (interrupt at the next boundary,
 // then hold for direction) — the "stop, you're going the wrong way" valve.
@@ -261,7 +270,10 @@ export async function runLiveTask({ mcpUrl, token, cwd, baseRef, isAlive, resume
 
   // Revision resumes its PR branch; a genuinely fresh task gets a clean base
   // checkout; a resume (in-memory or marker) keeps its dirty worktree untouched.
-  if (brief.branch) {
+  // The branch is server-supplied — validate it's a well-formed non-base ref
+  // (not a leading-'-' git option) before checkout; on a bad value fall back to
+  // a clean base rather than executing it.
+  if (brief.branch && isValidBranch(brief.branch, cwd, baseRef)) {
     try {
       git(['fetch', 'origin', '--quiet'], cwd);
       git(['checkout', brief.branch], cwd);
@@ -284,7 +296,13 @@ export async function runLiveTask({ mcpUrl, token, cwd, baseRef, isAlive, resume
   }
 
   const env = { ...process.env };
-  delete env.ANTHROPIC_API_KEY; // force the user's Claude Code subscription
+  // Force the user's Claude Code subscription — strip EVERY var that could
+  // divert to API billing or a proxy (poll mode strips these too; live mode
+  // was only clearing API_KEY, so an exported AUTH_TOKEN/BASE_URL silently
+  // billed the API on the default path).
+  delete env.ANTHROPIC_API_KEY;
+  delete env.ANTHROPIC_AUTH_TOKEN;
+  delete env.ANTHROPIC_BASE_URL;
 
   // Prior channel transcript — present when resuming a parked/re-claimed task;
   // seed it so a fresh session picks up where the conversation left off. afterId
@@ -401,7 +419,14 @@ export async function runLiveTask({ mcpUrl, token, cwd, baseRef, isAlive, resume
         await flush();
         turnId = null;
 
-        if (completed) return { outcome: 'done', title, intentId };
+        // Task finished — clear the marker so this worktree is NOT treated as a
+        // resume of this intent later (esp. if the task is restarted from
+        // scratch, which discards it: a stale marker would resume the discarded
+        // attempt's dirty files).
+        if (completed) {
+          clearTaskMarker(cwd);
+          return { outcome: 'done', title, intentId };
+        }
 
         if (sawBlocker) {
           const res = await waitForResolution(mcpUrl, token, blockerId, isAlive);
@@ -425,6 +450,11 @@ export async function runLiveTask({ mcpUrl, token, cwd, baseRef, isAlive, resume
         // Torn down out from under us (restart / reassign in Flowviant): the
         // server killed this run — abandon the session, don't keep building.
         if (poll && poll.ok === false && poll.reason === 'run_not_active') {
+          // Discarded (restart/reassign): clear the marker AND reset the
+          // worktree so the next fresh claim starts from clean base, never
+          // resuming the abandoned attempt.
+          clearTaskMarker(cwd);
+          resetWorktree(cwd, baseRef);
           return { outcome: 'torn_down', title, intentId };
         }
         const fresh = (poll?.messages ?? []).filter((x) => x.role === 'user');
@@ -493,6 +523,7 @@ export async function runLiveWorker({
   isAlive,
   onTokenSuspect,
   onChild,
+  onPreview,
 }) {
   // The intent this worker is holding across iterations. When a task parks on a
   // blocker its worktree keeps uncommitted work; on the resume claim we must NOT
@@ -519,6 +550,10 @@ export async function runLiveWorker({
       }
       preview = null;
     }
+    // Detached preview children (dev server + tunnel) survive process exit, so
+    // the daemon's SIGINT teardown needs a handle to stop them — clear it here
+    // once they're down.
+    onPreview?.(null);
   };
   const startReviewPreview = async (intentId) => {
     stopPreview();
@@ -544,6 +579,7 @@ export async function runLiveWorker({
       log: (m) => info(`${label} ${c.dim(m)}`),
     });
     if (preview) {
+      onPreview?.(stopPreview); // hand the daemon a stop handle for shutdown
       await registerLiveTarget(intentId, kind, preview.url);
       ok(`${label} ${c.dim('live preview ready — open the node to drive it in your review')}`);
     }

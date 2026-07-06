@@ -5,7 +5,7 @@
  * MCP token, and only spawns Claude when the server says an agent has work.
  */
 
-import { mkdirSync, existsSync } from 'node:fs';
+import { mkdirSync, existsSync, rmSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
@@ -23,6 +23,16 @@ import {
   REFRESH_BEFORE_SECONDS,
   LIVE,
 } from './config.mjs';
+import {
+  git,
+  resetWorktree,
+  repoRootOrDie,
+  detectBaseRef,
+  originSlug,
+  isValidPrUrl,
+  isValidBranch,
+  isSafePathSegment,
+} from './git.mjs';
 import { c, LABEL_COLORS, info, note, ok, warn, fail } from './ui.mjs';
 import {
   sleep,
@@ -34,7 +44,6 @@ import {
   SINGLE_KICKOFF,
   SINGLE_RESUME,
 } from './claude.mjs';
-import { git, repoRootOrDie, detectBaseRef, resetWorktree } from './git.mjs';
 import { runLiveWorker } from './live.mjs';
 import { preflight } from './preflight.mjs';
 
@@ -45,6 +54,7 @@ async function fetchRoster(haveIds) {
   // Cloudflare Bot Fight Mode (403). A descriptive product UA passes.
   const res = await fetch(url, {
     headers: { Authorization: `Bearer ${FLEET_TOKEN}`, 'User-Agent': USER_AGENT },
+    signal: AbortSignal.timeout(30_000), // a black-holed poll must not stall the loop
   });
   if (res.status === 401 || res.status === 403) {
     // Fleet credential revoked/expired — retrying can't recover; signal exit.
@@ -54,7 +64,20 @@ async function fetchRoster(haveIds) {
   }
   if (!res.ok) throw new Error(`fleet poll failed (${res.status})`);
   const body = await res.json();
-  return body.data; // { mcpUrl, leaseTtlSeconds, agents: [{agentId,name,token,reviewGate,hasWork}] }
+  // Validate the shape here so a malformed 200 (deploy hiccup, error envelope)
+  // throws a NORMAL retryable error inside the loop's try/catch, instead of a
+  // `roster.agents.map` TypeError escaping to top-level and killing the daemon.
+  const data = body?.data;
+  if (!data || !Array.isArray(data.agents)) {
+    throw new Error('fleet poll returned an unexpected shape');
+  }
+  // Drop roster agents with an unsafe id BEFORE they're used as a path segment.
+  data.agents = data.agents.filter((a) => {
+    if (isSafePathSegment(a?.agentId)) return true;
+    warn(`ignoring roster agent with an invalid id: ${JSON.stringify(a?.agentId)}`);
+    return false;
+  });
+  return data; // { mcpUrl, leaseTtlSeconds, agents: [{agentId,name,token,reviewGate,hasWork}] }
 }
 
 // One roster agent's loop: persistent worktree, one intent per turn, reset to
@@ -186,6 +209,14 @@ export async function runFleetDaemon() {
       } catch {
         /* best-effort */
       }
+      // Stop the detached preview (dev server + cloudflared tunnel) — it's its
+      // own process group and survives our exit, otherwise leaking a port-bound
+      // server + a live tunnel serving a stale branch until reboot.
+      try {
+        w.state.stopPreview?.();
+      } catch {
+        /* best-effort */
+      }
     }
   };
   process.on('SIGINT', () => {
@@ -210,6 +241,7 @@ export async function runFleetDaemon() {
           'User-Agent': USER_AGENT,
           'Content-Type': 'application/json',
         },
+        signal: AbortSignal.timeout(30_000),
         body: JSON.stringify(body),
       });
     } catch {
@@ -225,6 +257,18 @@ export async function runFleetDaemon() {
           note(`${c.cyan('merge')} ${c.dim(`— ${job.title}`)}`);
           let merged = false;
           let failedReason = null; // permanent — tell the thread, clear the flag
+          // Refuse a PR URL that isn't an https github.com PR in THIS repo — a
+          // bad/hostile server must not merge a PR in another repo the user's
+          // gh can write to (and a leading '-' would be a gh flag).
+          if (!isValidPrUrl(job.prUrl, originSlug(repoRoot))) {
+            mergeAttempts.delete(job.id);
+            await reportMergeOutcome(MERGE_FAILED_URL, {
+              intentId: job.id,
+              message: 'refused: PR URL is not a pull request in this repository',
+            });
+            warn(`merge REFUSED for "${job.title}": untrusted PR URL ${String(job.prUrl)}`);
+            return;
+          }
           try {
             execFileSync('gh', ['pr', 'merge', job.prUrl, '--squash', '--delete-branch'], {
               cwd: repoRoot,
@@ -234,8 +278,13 @@ export async function runFleetDaemon() {
           } catch (e) {
             const err = e.stderr?.toString?.() || e.message || '';
             const line = err.split('\n')[0] || 'gh pr merge failed';
-            if (/already merged|not open|closed/i.test(err)) merged = true;
-            else if (/conflict|not mergeable|CONFLICTING/i.test(err)) {
+            // Only "already merged" is a real success; a CLOSED-without-merge PR
+            // also matches "not open"/"closed" but nothing landed on main —
+            // report it as a failure so the thread learns the truth.
+            if (/already merged/i.test(err)) merged = true;
+            else if (/not open|closed/i.test(err)) {
+              failedReason = 'the PR was closed without merging';
+            } else if (/conflict|not mergeable|CONFLICTING/i.test(err)) {
               // Permanent until a human/agent acts — don't spin on it.
               failedReason = `merge conflict with ${baseRef} — the branch needs a rebase`;
             } else {
@@ -279,7 +328,10 @@ export async function runFleetDaemon() {
       (async () => {
         try {
           note(`${c.cyan('cleanup')} ${c.dim(`— ${job.title} (restarted)`)}`);
-          if (job.prUrl) {
+          // Same guards as merge: only close a PR in THIS repo, only delete a
+          // well-formed non-base branch. A bad server must not close a stranger's
+          // PR or delete `main` (`--delete` with `main`) via a cleanup job.
+          if (job.prUrl && isValidPrUrl(job.prUrl, originSlug(repoRoot))) {
             try {
               execFileSync(
                 'gh',
@@ -299,15 +351,18 @@ export async function runFleetDaemon() {
               const err = e.stderr?.toString?.() || e.message || '';
               warn(`cleanup for "${job.title}": ${err.split('\n')[0] || 'gh pr close failed'}`);
             }
-          } else if (job.branch) {
+          } else if (job.branch && isValidBranch(job.branch, repoRoot, baseRef)) {
             try {
-              execFileSync('git', ['push', 'origin', '--delete', job.branch], {
+              // Explicit refspec form so a leading '-' can't be a git flag.
+              execFileSync('git', ['push', 'origin', `:refs/heads/${job.branch}`], {
                 cwd: repoRoot,
                 stdio: ['ignore', 'pipe', 'pipe'],
               });
             } catch {
               /* branch already gone — fine */
             }
+          } else if (job.prUrl || job.branch) {
+            warn(`cleanup REFUSED for "${job.title}": untrusted PR/branch value`);
           }
           await reportMergeOutcome(CLEANUP_DONE_URL, { intentId: job.id });
           ok(`${c.cyan('cleaned')} ${c.dim(`— ${job.title}`)}`);
@@ -417,6 +472,11 @@ export async function runFleetDaemon() {
           onChild: (ch) => {
             state.child = ch;
           },
+          // Hold the preview's stop fn so teardown/removal can kill the detached
+          // dev-server + tunnel (they survive our exit otherwise).
+          onPreview: (stop) => {
+            state.stopPreview = stop;
+          },
           // A turn that couldn't reach the MCP server: forget the cached token so
           // the next reconcile poll re-mints a fresh one (self-heals a token that
           // was rotated/expired out from under a running session).
@@ -442,6 +502,11 @@ export async function runFleetDaemon() {
           /* best-effort */
         }
         try {
+          w.state.stopPreview?.();
+        } catch {
+          /* best-effort */
+        }
+        try {
           git(['worktree', 'remove', '--force', w.wt], repoRoot);
         } catch {
           /* best-effort */
@@ -449,6 +514,7 @@ export async function runFleetDaemon() {
         workers.delete(id);
         tokenByAgent.delete(id);
         hasWorkByAgent.delete(id);
+        mintedAt.delete(id); // was leaked on removal (finding 14)
       }
     }
 

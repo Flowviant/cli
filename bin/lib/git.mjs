@@ -15,6 +15,50 @@ export function repoRootOrDie() {
   }
 }
 
+// ── Server-value validation ────────────────────────────────────────────────
+// prUrl / branch / agentId arrive from the fleet server. execFileSync blocks
+// SHELL injection but NOT git/gh option injection (a leading '-' becomes a
+// flag) or cross-repo/cross-path abuse. These guards make a malicious or buggy
+// server unable to touch a repo/branch/path outside the expected scope.
+
+/** The `owner/repo` the daemon is running inside, from origin's URL. Null if
+ *  origin isn't a github remote. */
+export function originSlug(repoRoot) {
+  try {
+    const url = git(['remote', 'get-url', 'origin'], repoRoot);
+    const m = url.match(/github\.com[:/]([^/]+)\/(.+?)(?:\.git)?$/i);
+    return m ? `${m[1]}/${m[2]}` : null;
+  } catch {
+    return null;
+  }
+}
+
+/** A PR URL is accepted only if it's an https github.com PR in THIS repo. */
+export function isValidPrUrl(prUrl, slug) {
+  if (typeof prUrl !== 'string' || !slug) return false;
+  const m = prUrl.match(/^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/\d+$/);
+  return !!m && m[1].toLowerCase() === slug.toLowerCase();
+}
+
+/** A branch name is accepted only if git considers it a well-formed ref, it's
+ *  not the base branch, and it doesn't start with '-' (option injection). */
+export function isValidBranch(branch, repoRoot, baseRef) {
+  if (typeof branch !== 'string' || !branch || branch.startsWith('-')) return false;
+  if (baseRef && (branch === baseRef || `origin/${branch}` === baseRef)) return false;
+  try {
+    git(['check-ref-format', '--branch', branch], repoRoot);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** A roster agent id used as a filesystem path segment — strict allowlist so
+ *  it can't traverse (`..`, `/`) out of the worktrees dir. */
+export function isSafePathSegment(id) {
+  return typeof id === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(id);
+}
+
 export function detectBaseRef(repoRoot) {
   try {
     return git(['rev-parse', '--abbrev-ref', 'origin/HEAD'], repoRoot); // e.g. origin/main
