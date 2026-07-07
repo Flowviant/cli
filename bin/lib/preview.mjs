@@ -64,6 +64,14 @@ function pkgManager(dir) {
   return 'npm';
 }
 
+// An explicit port baked into the dev script (PORT=3005 …, -p 3005, --port 3005,
+// --port=3005) overrides the framework default — otherwise the tunnel would
+// target the wrong port and never connect.
+function portFromScript(s) {
+  const m = String(s).match(/(?:PORT=|(?:^|\s)-p[=\s]+|--port[=\s]+)(\d{2,5})\b/);
+  return m ? Number(m[1]) : null;
+}
+
 // Infer {script, port} from one directory's package.json, or null if it has no
 // dev/start script or no framework we can map to a port.
 function inferFromDir(absDir) {
@@ -82,7 +90,7 @@ function inferFromDir(absDir) {
   const hay = `${scripts[script]} ${Object.keys(deps).join(' ')}`.toLowerCase();
   const fw = FRAMEWORK_PORTS.find((f) => f.re.test(hay));
   if (!fw) return null; // can't safely guess the port
-  return { script, port: fw.port };
+  return { script, port: portFromScript(scripts[script]) ?? fw.port };
 }
 
 // The ordered dirs to probe: root, then the common frontend names, then every
@@ -188,20 +196,38 @@ const TUNNEL_RE = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/i;
  * once the tunnel URL is captured, or null if it can't come up. stop() kills
  * both the server and the tunnel.
  */
-export async function startPreview({ worktree, kind, cmd, port, log, timeoutMs = 90_000 }) {
+export async function startPreview({ worktree, kind, cmd, port, log, timeoutMs = 180_000 }) {
   const cf = await ensureCloudflared(log);
   if (!cf) return null; // fall back to captured evidence
   return new Promise((resolve) => {
+    // We SIGKILL the dev server's whole group on teardown, which skips a tool's
+    // graceful cleanup — some dev servers (e.g. vinext) leave a singleton
+    // dev-lock behind and then REFUSE to start next time. Disable known locks so
+    // a reused/uncleaned worktree still previews. Harmless to tools that ignore
+    // these vars; BROWSER=none stops any auto-open.
+    const env = { ...process.env, VINEXT_NO_DEV_LOCK: '1', BROWSER: 'none' };
     // detached so each gets its own process group — `bun run dev` via a shell
     // spawns a grandchild dev server that would otherwise SURVIVE a kill of the
     // shell, keep port bound, and get silently re-fronted by the NEXT task's
     // tunnel (reviewer sees the wrong branch). We kill the whole group instead.
+    // stdout/stderr are piped (not ignored) so we can show WHY a preview didn't
+    // come up — a swallowed "another dev server is already running" was a real
+    // dead-end.
     const server = spawn(cmd, {
       cwd: worktree,
       shell: true,
       detached: true,
-      stdio: ['ignore', 'ignore', 'ignore'],
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env,
     });
+    // Ring buffer of the dev server's recent output, surfaced on failure.
+    let out = '';
+    const capture = (d) => {
+      out = (out + d.toString()).slice(-4000);
+    };
+    server.stdout.on('data', capture);
+    server.stderr.on('data', capture);
+    const tail = () => out.trim().split('\n').slice(-15).join('\n');
     const tunnel = spawn(cf, ['tunnel', '--url', `http://localhost:${port}`], {
       detached: true,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -238,8 +264,24 @@ export async function startPreview({ worktree, kind, cmd, port, log, timeoutMs =
     tunnel.stderr.on('data', onData);
     tunnel.on('error', () => finish(null));
     tunnel.on('close', () => finish(null));
+    // The dev server exiting BEFORE the tunnel came up is the loud failure mode
+    // (crash on boot, or a singleton lock refusing to start) — surface its
+    // output instead of a silent timeout.
+    server.on('exit', (code) => {
+      if (settled) return;
+      log?.(
+        `preview dev server exited (code ${code}) before it was reachable — no preview.${
+          tail() ? `\n  dev server said:\n${tail()}` : ''
+        }`,
+      );
+      finish(null);
+    });
     const timer = setTimeout(() => {
-      log?.('preview tunnel did not come up in time — skipping (captured evidence still applies).');
+      log?.(
+        `preview tunnel did not come up in ${Math.round(timeoutMs / 1000)}s — skipping.${
+          tail() ? `\n  last dev-server output:\n${tail()}` : ''
+        }`,
+      );
       finish(null);
     }, timeoutMs);
   });
