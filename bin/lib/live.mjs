@@ -78,6 +78,23 @@ function clearLiveTarget(intentId, kind) {
   }).catch(() => {});
 }
 
+// Report WHY a preview didn't come up into the task thread, so the reason is
+// visible in the app (not just the daemon console). The card grace-window shows
+// "starting…"; this is the honest terminal state when it can't.
+const PREVIEW_NOTE_URL = FLEET_URL.replace(/\/agents\/?$/, '/preview-note');
+function postPreviewNote(intentId, text) {
+  return fetch(PREVIEW_NOTE_URL, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${FLEET_TOKEN}`,
+      'User-Agent': USER_AGENT,
+      'Content-Type': 'application/json',
+    },
+    signal: AbortSignal.timeout(10_000),
+    body: JSON.stringify({ intentId, text }),
+  }).catch(() => {});
+}
+
 // Safe mode's curated toolset. Bash is scoped to the specific CLIs the agent
 // needs (git/gh/npm/bun) — NOT bare `Bash`, which would auto-approve arbitrary
 // shell (rm -rf, curl|sh, reading ~/.ssh) and defeat the point of safe mode.
@@ -693,6 +710,12 @@ export async function runLiveWorker({
           'no live preview: no runnable web frontend found (searched the repo root, web/frontend/client/…, and apps/* + packages/*). If your app is elsewhere or not vite/next/astro/etc., add .flowviant/preview.json: {"ui":{"cmd":"cd <dir> && npm install && npm run dev","port":5173}}.'
         )}`
       );
+      if (intentId) {
+        await postPreviewNote(
+          intentId,
+          'No live preview: no runnable web frontend found (searched the repo root, common frontend dirs, and apps/* + packages/*). If this task has a web app, add a `.flowviant/preview.json` pointing at it.',
+        );
+      }
       return;
     }
     // Zero-config win: when we found the app in a subdir, say where, so it's
@@ -704,6 +727,7 @@ export async function runLiveWorker({
     // worktree is missing) so DB/auth-backed paths like sign-in don't 500.
     copyLocalEnvFiles(repoRoot, cwd, (m) => info(`${label} ${c.dim(m)}`));
     info(`${label} ${c.dim('starting a live preview of the branch for review…')}`);
+    let lastPreviewLog = ''; // captured so a failure's reason reaches the app
     preview = await startPreview({
       worktree: cwd,
       kind,
@@ -711,8 +735,21 @@ export async function runLiveWorker({
       port: entry.port,
       env: entry.env, // optional: extra env from .flowviant/preview.json
       hostHeader: entry.hostHeader, // optional: override/disable the Host rewrite
-      log: (m) => info(`${label} ${c.dim(m)}`),
+      auth: entry.auth === true, // optional: password-gate the public tunnel
+      log: (m) => {
+        lastPreviewLog = m;
+        info(`${label} ${c.dim(m)}`);
+      },
     });
+    if (!preview) {
+      // Dev server crashed on boot / tunnel never came up — surface the reason
+      // (the last log line is the specific failure) in the thread, not just the
+      // console, so the reviewer isn't left guessing.
+      await postPreviewNote(
+        intentId,
+        `Live preview didn't start — ${lastPreviewLog || 'the dev server did not come up'}. (Full output is in the daemon console.)`,
+      );
+    }
     if (preview) {
       onPreview?.(stopPreview); // hand the daemon a stop handle for shutdown
       await registerLiveTarget(intentId, kind, preview.url);
@@ -724,6 +761,14 @@ export async function runLiveWorker({
         if (previewTarget) void registerLiveTarget(previewTarget.intentId, previewTarget.kind, previewTarget.url);
       }, PREVIEW_HEARTBEAT_MS);
       previewHeartbeat.unref?.();
+      // Auth on: post the password into the thread so the reviewer can enter it
+      // at the browser prompt (the tunnel is otherwise a capability URL).
+      if (preview.auth && intentId) {
+        await postPreviewNote(
+          intentId,
+          `🔒 This live preview is password-protected. At the browser prompt, sign in with user \`${preview.auth.user}\` and password \`${preview.auth.password}\`.`,
+        );
+      }
       ok(`${label} ${c.dim('live preview ready — open the node to drive it in your review')}`);
     }
   };

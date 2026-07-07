@@ -17,9 +17,12 @@
  *       "cmd": "<start dev server>",   // required
  *       "port": 5173,                  // required
  *       "env": { "FOO": "bar" },       // optional — extra env for the dev server
- *       "hostHeader": "localhost"      // optional — Host sent to the origin;
+ *       "hostHeader": "localhost",     // optional — Host sent to the origin;
  *                                      //   false disables the rewrite (for apps
  *                                      //   that need their real public Host)
+ *       "auth": true                   // optional — gate the public tunnel
+ *                                      //   behind a generated password (shown
+ *                                      //   in the app); off by default
  *     },
  *     "api": { "cmd": "<start api>", "port": 8787 } }
  */
@@ -28,6 +31,7 @@ import { spawn, execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync, existsSync, mkdirSync, chmodSync, readdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir, platform, arch } from 'node:os';
+import { startAuthProxy } from './authproxy.mjs';
 
 // ── Config: explicit file, else infer from package.json ────────────────────
 
@@ -297,6 +301,7 @@ export async function startPreview({
   port,
   env: extraEnv,
   hostHeader,
+  auth,
   log,
   timeoutMs = 180_000,
 }) {
@@ -339,6 +344,7 @@ export async function startPreview({
     let settled = false;
     let tunnel = null;
     let tunnelStarted = false;
+    let authProxy = null; // opt-in basic-auth proxy in front of the dev server
     let out = '';
     const tail = () => out.trim().split('\n').slice(-15).join('\n');
     const killGroup = (child) => {
@@ -356,6 +362,11 @@ export async function startPreview({
     const stop = () => {
       forgetPreviewPid(server.pid);
       forgetPreviewPid(tunnel?.pid);
+      try {
+        authProxy?.stop();
+      } catch {
+        /* already closed */
+      }
       killGroup(server);
       killGroup(tunnel);
     };
@@ -370,22 +381,40 @@ export async function startPreview({
       resolve(val);
     };
 
-    // Open the tunnel once we know the real port (detected or fallback).
-    const openTunnel = (p) => {
+    // Open the tunnel once we know the real port (detected or fallback). When
+    // auth is opted in, put the password proxy in front and tunnel to THAT.
+    const openTunnel = async (p) => {
       if (tunnelStarted || settled) return;
       tunnelStarted = true;
       clearTimeout(bindTimer);
+      let tunnelPort = p;
+      if (auth) {
+        authProxy = await startAuthProxy({ targetPort: p, log });
+        if (settled) {
+          authProxy?.stop(); // torn down while the proxy was coming up — don't leak it
+          return;
+        }
+        if (authProxy) tunnelPort = authProxy.port;
+        else log?.('auth proxy failed to start — tunneling WITHOUT a password.');
+      }
       log?.(`preview: dev server on :${p} — opening the tunnel…`);
       // --http-host-header: send the origin the Host it expects (default
       // localhost — see hostRewrite above). Passes Vite/webpack/Next host checks
       // with zero repo config; skipped when preview.json sets hostHeader:false.
-      const args = ['tunnel', '--url', `http://localhost:${p}`];
+      const args = ['tunnel', '--url', `http://localhost:${tunnelPort}`];
       if (hostRewrite) args.push('--http-host-header', hostRewrite);
       tunnel = spawn(cf, args, { detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
       recordPreviewPid(tunnel.pid, 'cloudflared'); // signature for orphan reaping
       const onTunnel = (d) => {
         const m = TUNNEL_RE.exec(d.toString());
-        if (m) finish({ url: m[0], kind, stop });
+        if (m) {
+          finish({
+            url: m[0],
+            kind,
+            stop,
+            auth: authProxy ? { user: authProxy.user, password: authProxy.password } : undefined,
+          });
+        }
       };
       tunnel.stdout.on('data', onTunnel);
       tunnel.stderr.on('data', onTunnel);
@@ -398,7 +427,7 @@ export async function startPreview({
       out = (out + s).slice(-4000);
       if (!tunnelStarted) {
         const m = BIND_RE.exec(s);
-        if (m) openTunnel(Number(m[1]));
+        if (m) void openTunnel(Number(m[1]));
       }
     };
     server.stdout.on('data', onServer);
@@ -417,7 +446,7 @@ export async function startPreview({
 
     // If the server never prints a URL we recognize (quiet server), tunnel to the
     // configured port as a last resort.
-    bindTimer = setTimeout(() => openTunnel(port), 30_000);
+    bindTimer = setTimeout(() => void openTunnel(port), 30_000);
     timer = setTimeout(() => {
       log?.(
         `preview tunnel did not come up in ${Math.round(timeoutMs / 1000)}s — skipping.${

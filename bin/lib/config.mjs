@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 
-export const VERSION = '0.17.0';
+export const VERSION = '0.18.0';
 
 // Credential stored by `flowviant login` (device auth) — the no-token,
 // no-env-var path. An explicit --fleet flag or FLOWVIANT_FLEET env still wins.
