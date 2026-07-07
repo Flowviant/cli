@@ -47,6 +47,7 @@ import {
   SINGLE_RESUME,
 } from './claude.mjs';
 import { runLiveWorker } from './live.mjs';
+import { reapOrphanPreviews } from './preview.mjs';
 import { preflight } from './preflight.mjs';
 
 async function fetchRoster(haveIds) {
@@ -176,6 +177,9 @@ export async function runFleetDaemon() {
   info(`server · ${FLEET_URL}`);
   console.log('');
   await preflight({ needGit: true });
+  // Kill any preview dev-server/tunnel groups a previously-crashed daemon left
+  // running (detached children survive an ungraceful exit) before we start fresh.
+  reapOrphanPreviews((m) => info(m));
 
   // Persistent worktree home (0.9.0) — survives daemon restarts AND reboots,
   // so Ctrl+C mid-task never loses local work. Keyed per repo path; each

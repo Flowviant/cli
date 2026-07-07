@@ -80,6 +80,9 @@ if (process.argv[2] === 'clean') {
   const { join } = await import('node:path');
   const { homedir } = await import('node:os');
   const { execFileSync } = await import('node:child_process');
+  // Also reap any preview dev-server/tunnel groups a crashed daemon left running.
+  const { reapOrphanPreviews } = await import('./lib/preview.mjs');
+  reapOrphanPreviews((m) => console.log(m));
   const dir = join(homedir(), '.flowviant', 'worktrees');
   if (!existsSync(dir)) {
     console.log('nothing to clean — no worktrees at ~/.flowviant/worktrees.');

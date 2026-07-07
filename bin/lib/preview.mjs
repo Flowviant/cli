@@ -212,6 +212,74 @@ const TUNNEL_RE = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/i;
 // Where a dev server announces it bound — "Local: http://localhost:3001/".
 const BIND_RE = /https?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0):(\d+)/i;
 
+// ── Orphan reaping ─────────────────────────────────────────────────────────
+// Preview children (dev server + tunnel) are detached so we can kill the whole
+// group — but that also means they SURVIVE an ungraceful daemon death (SIGKILL,
+// crash, box sleep), leaking ports/memory. We record each spawned group's pid +
+// a signature; on the next daemon start we reap any that are still ours.
+const PREVIEW_REGISTRY = join(homedir(), '.flowviant', 'previews.json');
+function readRegistry() {
+  try {
+    const v = JSON.parse(readFileSync(PREVIEW_REGISTRY, 'utf8'));
+    return Array.isArray(v) ? v : [];
+  } catch {
+    return [];
+  }
+}
+function writeRegistry(list) {
+  try {
+    mkdirSync(join(homedir(), '.flowviant'), { recursive: true });
+    writeFileSync(PREVIEW_REGISTRY, JSON.stringify(list));
+  } catch {
+    /* best-effort */
+  }
+}
+function recordPreviewPid(pid, sig) {
+  if (!pid) return;
+  writeRegistry([...readRegistry(), { pid, sig }]);
+}
+function forgetPreviewPid(pid) {
+  if (!pid) return;
+  writeRegistry(readRegistry().filter((e) => e.pid !== pid));
+}
+// Only kill a pid we can VERIFY is still one of ours — its /proc cmdline must
+// still contain the signature we stored. A reused pid (belonging to something
+// unrelated) won't match, so we never kill a stranger. Linux-only (that's where
+// /proc + process groups work); elsewhere we just clear the registry.
+function stillOurs(pid, sig) {
+  if (platform() !== 'linux') return false;
+  try {
+    const cmd = readFileSync(`/proc/${pid}/cmdline`, 'utf8').replace(/\0/g, ' ');
+    return typeof sig === 'string' && sig.length > 0 && cmd.includes(sig);
+  } catch {
+    return false; // process gone / unreadable
+  }
+}
+
+/** Reap preview process groups left behind by a previously-crashed daemon.
+ *  Call once at daemon startup, before spawning workers. */
+export function reapOrphanPreviews(log) {
+  const list = readRegistry();
+  if (list.length === 0) return;
+  let killed = 0;
+  for (const { pid, sig } of list) {
+    if (!stillOurs(pid, sig)) continue;
+    try {
+      process.kill(-pid, 'SIGKILL'); // whole group
+      killed++;
+    } catch {
+      try {
+        process.kill(pid, 'SIGKILL');
+        killed++;
+      } catch {
+        /* already gone */
+      }
+    }
+  }
+  writeRegistry([]);
+  if (killed) log?.(`reaped ${killed} orphaned preview process${killed === 1 ? '' : 'es'} from a previous run.`);
+}
+
 /**
  * Start the dev server + tunnel for one worktree. Resolves { url, kind, stop }
  * once the tunnel URL is captured, or null if it can't come up. stop() kills
@@ -264,6 +332,9 @@ export async function startPreview({
       stdio: ['ignore', 'pipe', 'pipe'],
       env,
     });
+    // Track for orphan reaping: the shell's cmdline stays `sh -c <cmd>`, so `cmd`
+    // is a safe signature to re-verify against later.
+    recordPreviewPid(server.pid, cmd);
 
     let settled = false;
     let tunnel = null;
@@ -283,6 +354,8 @@ export async function startPreview({
       }
     };
     const stop = () => {
+      forgetPreviewPid(server.pid);
+      forgetPreviewPid(tunnel?.pid);
       killGroup(server);
       killGroup(tunnel);
     };
@@ -309,6 +382,7 @@ export async function startPreview({
       const args = ['tunnel', '--url', `http://localhost:${p}`];
       if (hostRewrite) args.push('--http-host-header', hostRewrite);
       tunnel = spawn(cf, args, { detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+      recordPreviewPid(tunnel.pid, 'cloudflared'); // signature for orphan reaping
       const onTunnel = (d) => {
         const m = TUNNEL_RE.exec(d.toString());
         if (m) finish({ url: m[0], kind, stop });

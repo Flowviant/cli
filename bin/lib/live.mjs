@@ -37,6 +37,13 @@ import { loadPreviewConfig, startPreview } from './preview.mjs';
 // Register a branch preview's tunnel URL with Flowviant (fleet-authed). The
 // reviewer then drives it via "Open live preview" in the node.
 const LIVE_TARGET_URL = FLEET_URL.replace(/\/agents\/?$/, '/live-target');
+// Short TTL + a heartbeat that re-asserts while the tunnel is alive. So a live
+// preview stays linked indefinitely (survives long reviews), but one whose
+// daemon DIED ungracefully (no more heartbeats) drops off the card within the
+// TTL instead of showing a dead URL for 2 hours. TTL comfortably covers a few
+// missed heartbeats.
+const PREVIEW_TTL_MINUTES = 6;
+const PREVIEW_HEARTBEAT_MS = 90_000;
 async function registerLiveTarget(intentId, kind, url) {
   try {
     await fetch(LIVE_TARGET_URL, {
@@ -47,7 +54,7 @@ async function registerLiveTarget(intentId, kind, url) {
         'Content-Type': 'application/json',
       },
       signal: AbortSignal.timeout(30_000),
-      body: JSON.stringify({ intentId, kind, url }),
+      body: JSON.stringify({ intentId, kind, url, ttlMinutes: PREVIEW_TTL_MINUTES }),
     });
   } catch {
     /* best-effort — the tunnel still works; it just isn't linked in the app */
@@ -615,8 +622,16 @@ export async function runLiveWorker({
   // kept up while it's in review (a gated agent parks, so it lives until review
   // resolves). Replaced when the next task finishes; torn down on shutdown.
   let preview = null;
-  let previewTarget = null; // { intentId, kind } of the currently-registered link
+  let previewTarget = null; // { intentId, kind, url } of the currently-registered link
+  let previewHeartbeat = null;
+  const stopHeartbeat = () => {
+    if (previewHeartbeat) {
+      clearInterval(previewHeartbeat);
+      previewHeartbeat = null;
+    }
+  };
   const stopPreview = () => {
+    stopHeartbeat();
     if (preview) {
       try {
         preview.stop();
@@ -670,7 +685,14 @@ export async function runLiveWorker({
     if (preview) {
       onPreview?.(stopPreview); // hand the daemon a stop handle for shutdown
       await registerLiveTarget(intentId, kind, preview.url);
-      previewTarget = { intentId, kind }; // so teardown can drop the link
+      previewTarget = { intentId, kind, url: preview.url }; // teardown drops it; heartbeat re-asserts it
+      // Re-assert the link while the tunnel is alive so it survives long reviews
+      // (and a dead daemon stops re-asserting → the record expires by itself).
+      stopHeartbeat();
+      previewHeartbeat = setInterval(() => {
+        if (previewTarget) void registerLiveTarget(previewTarget.intentId, previewTarget.kind, previewTarget.url);
+      }, PREVIEW_HEARTBEAT_MS);
+      previewHeartbeat.unref?.();
       ok(`${label} ${c.dim('live preview ready — open the node to drive it in your review')}`);
     }
   };
