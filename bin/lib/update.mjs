@@ -110,8 +110,28 @@ export function handleVersionSignal({ latest, min, autoUpdate, safeToUpdate, tea
       }
       return false;
     }
+    // Loop guard: the server can announce a version before it's published. npm is
+    // the source of truth — only install if npm ACTUALLY has something newer than
+    // us, else `npm i -g @latest` reinstalls our own version and we'd re-exec
+    // forever.
+    let published = null;
     try {
-      note(`flowviant ${cur} → ${target}: self-updating…`);
+      published = execFileSync('npm', ['view', 'flowviant', 'version'], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim();
+    } catch {
+      /* offline / npm hiccup — treat as "can't confirm", skip this poll */
+    }
+    if (!published || cmpVersion(published, cur) <= 0) {
+      if (naggedFor !== target) {
+        naggedFor = target;
+        note(`update ${target} announced but npm still serves ${published ?? '?'} — waiting for the publish.`);
+      }
+      return false;
+    }
+    try {
+      note(`flowviant ${cur} → ${published}: self-updating…`);
       installLatest();
       ok('updated — restarting into the new version.');
       reexec(teardown);

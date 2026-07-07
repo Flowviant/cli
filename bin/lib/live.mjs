@@ -54,6 +54,23 @@ async function registerLiveTarget(intentId, kind, url) {
   }
 }
 
+// The preview's tunnel is going down (replaced by another task's, or the daemon
+// is stopping/restarting) — tell Flowviant to drop the link so it doesn't keep
+// offering a dead URL that 530s. Best-effort + short timeout so teardown is snappy.
+const LIVE_TARGET_CLEAR_URL = FLEET_URL.replace(/\/agents\/?$/, '/live-target-clear');
+function clearLiveTarget(intentId, kind) {
+  return fetch(LIVE_TARGET_CLEAR_URL, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${FLEET_TOKEN}`,
+      'User-Agent': USER_AGENT,
+      'Content-Type': 'application/json',
+    },
+    signal: AbortSignal.timeout(5_000),
+    body: JSON.stringify({ intentId, kind }),
+  }).catch(() => {});
+}
+
 // Safe mode's curated toolset. Bash is scoped to the specific CLIs the agent
 // needs (git/gh/npm/bun) — NOT bare `Bash`, which would auto-approve arbitrary
 // shell (rm -rf, curl|sh, reading ~/.ssh) and defeat the point of safe mode.
@@ -598,6 +615,7 @@ export async function runLiveWorker({
   // kept up while it's in review (a gated agent parks, so it lives until review
   // resolves). Replaced when the next task finishes; torn down on shutdown.
   let preview = null;
+  let previewTarget = null; // { intentId, kind } of the currently-registered link
   const stopPreview = () => {
     if (preview) {
       try {
@@ -606,6 +624,11 @@ export async function runLiveWorker({
         /* already gone */
       }
       preview = null;
+    }
+    // Drop the app-side link so it stops offering a now-dead tunnel (530).
+    if (previewTarget) {
+      void clearLiveTarget(previewTarget.intentId, previewTarget.kind);
+      previewTarget = null;
     }
     // Detached preview children (dev server + tunnel) survive process exit, so
     // the daemon's SIGINT teardown needs a handle to stop them — clear it here
@@ -645,6 +668,7 @@ export async function runLiveWorker({
     if (preview) {
       onPreview?.(stopPreview); // hand the daemon a stop handle for shutdown
       await registerLiveTarget(intentId, kind, preview.url);
+      previewTarget = { intentId, kind }; // so teardown can drop the link
       ok(`${label} ${c.dim('live preview ready — open the node to drive it in your review')}`);
     }
   };
