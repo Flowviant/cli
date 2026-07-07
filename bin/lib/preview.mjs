@@ -17,7 +17,7 @@
  */
 
 import { spawn, execFileSync } from 'node:child_process';
-import { readFileSync, writeFileSync, existsSync, mkdirSync, chmodSync, readdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, chmodSync, readdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir, platform, arch } from 'node:os';
 
@@ -164,27 +164,38 @@ async function ensureCloudflared(log) {
   const dir = join(homedir(), '.flowviant', 'bin');
   const bin = join(dir, os === 'win32' ? 'cloudflared.exe' : 'cloudflared');
   if (existsSync(bin)) return bin;
-  // Raw single-file binaries exist for linux + windows; macOS ships a tarball,
-  // so point mac users at brew instead of unpacking here.
-  if (os === 'darwin') {
-    log?.('cloudflared not found — install it (`brew install cloudflared`) to enable live previews.');
-    return null;
-  }
-  const osName = os === 'win32' ? 'windows' : 'linux';
   const a = arch() === 'arm64' ? 'arm64' : 'amd64';
-  const url = `https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-${osName}-${a}${
-    os === 'win32' ? '.exe' : ''
-  }`;
-  log?.(`fetching cloudflared (${osName}-${a}) to enable live previews…`);
   try {
+    mkdirSync(dir, { recursive: true });
+    if (os === 'darwin') {
+      // macOS ships a .tgz (not a raw binary) — download it and extract the
+      // single `cloudflared` executable with the system tar (always on macOS).
+      const url = `https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-${a}.tgz`;
+      log?.(`fetching cloudflared (darwin-${a}) to enable live previews…`);
+      const res = await fetch(url, { redirect: 'follow' });
+      if (!res.ok) throw new Error(`http ${res.status}`);
+      const tgz = join(dir, 'cloudflared.tgz');
+      writeFileSync(tgz, Buffer.from(await res.arrayBuffer()));
+      execFileSync('tar', ['-xzf', tgz, '-C', dir], { stdio: 'ignore' });
+      rmSync(tgz, { force: true });
+      if (!existsSync(bin)) throw new Error('archive did not contain cloudflared');
+      chmodSync(bin, 0o755);
+      return bin;
+    }
+    // linux + windows ship a raw single-file binary.
+    const osName = os === 'win32' ? 'windows' : 'linux';
+    const url = `https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-${osName}-${a}${
+      os === 'win32' ? '.exe' : ''
+    }`;
+    log?.(`fetching cloudflared (${osName}-${a}) to enable live previews…`);
     const res = await fetch(url, { redirect: 'follow' });
     if (!res.ok) throw new Error(`http ${res.status}`);
-    mkdirSync(dir, { recursive: true });
     writeFileSync(bin, Buffer.from(await res.arrayBuffer()));
     if (os !== 'win32') chmodSync(bin, 0o755);
     return bin;
   } catch (e) {
-    log?.(`could not fetch cloudflared (${e.message}) — install it manually to enable live previews.`);
+    const hint = os === 'darwin' ? ' (or `brew install cloudflared`)' : '';
+    log?.(`could not fetch cloudflared (${e.message}) — install it manually${hint} to enable live previews.`);
     return null;
   }
 }
