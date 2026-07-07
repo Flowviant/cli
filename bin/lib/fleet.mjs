@@ -175,7 +175,7 @@ export async function runFleetDaemon() {
   info(`base   · ${baseRef}`);
   info(`server · ${FLEET_URL}`);
   console.log('');
-  preflight({ needGit: true });
+  await preflight({ needGit: true });
 
   // Persistent worktree home (0.9.0) — survives daemon restarts AND reboots,
   // so Ctrl+C mid-task never loses local work. Keyed per repo path; each

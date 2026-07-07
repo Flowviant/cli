@@ -57,6 +57,20 @@ if (process.argv[2] === 'update') {
   process.exit(0);
 }
 
+// `flowviant gh-auth` — sign in the gh CLI (incl. a copy we bundled into
+// ~/.flowviant/bin), so the isolated install doesn't need gh on your global PATH.
+if (process.argv[2] === 'gh-auth') {
+  const { addLocalBinToPath } = await import('./lib/install.mjs');
+  const { execFileSync } = await import('node:child_process');
+  addLocalBinToPath();
+  try {
+    execFileSync('gh', ['auth', 'login'], { stdio: 'inherit' });
+  } catch {
+    console.error('gh not found — run `flowviant` once to install it, or see https://cli.github.com');
+  }
+  process.exit(0);
+}
+
 // `flowviant clean` — reclaim the persistent worktrees (~/.flowviant/worktrees).
 // They're kept across runs so in-flight work survives Ctrl+C; this is the drain.
 // Repos self-heal: the daemon runs `git worktree prune` if a stale registration
@@ -106,7 +120,7 @@ async function main() {
       ? '» safe mode: restricted toolset (unset FLOWVIANT_SAFE for full autonomy).'
       : '» unattended mode: permission prompts skipped so the agent runs hands-off.'
   );
-  preflight({ needGit: tokens.length > 1 });
+  await preflight({ needGit: tokens.length > 1 });
   if (tokens.length === 1) {
     console.log(`» flowviant → ${MCP_URL}  (1 worker · token fva_…${tokens[0].slice(-4)})`);
     await runWorker({ token: tokens[0], cwd: process.cwd(), label: '' });
