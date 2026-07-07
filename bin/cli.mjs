@@ -4,9 +4,14 @@
  *
  * Three modes, picked by which env var is set:
  *
- *   FLOWVIANT_TOKEN=fva_…   npx flowviant        # 1 worker, current checkout
- *   FLOWVIANT_TOKENS=a,b,c  npx flowviant        # static fleet, 1 worktree each
- *   FLOWVIANT_FLEET=fft_…   npx flowviant        # FLEET DAEMON (recommended)
+ *   FLOWVIANT_TOKEN=fva_…   npx flowviant@latest  # 1 worker, current checkout
+ *   FLOWVIANT_TOKENS=a,b,c  npx flowviant@latest  # static fleet, 1 worktree each
+ *   FLOWVIANT_FLEET=fft_…   npx flowviant@latest  # FLEET DAEMON (recommended)
+ *
+ * Launch with `@latest` so each start pulls the newest published version (bare
+ * `npx flowviant` can reuse a stale cache). A running daemon also self-updates
+ * on its own — at startup and when idle — so it stays current without restarts
+ * (FLOWVIANT_NO_UPDATE=1 makes it nag-only; `flowviant update` updates now).
  *
  * Fleet daemon: install ONCE with a fleet credential, then manage everything
  * from Flowviant. The daemon polls GET /api/v2/fleet/agents, reconciles one
@@ -41,6 +46,14 @@ import { preflight } from './lib/preflight.mjs';
 // app, the credential is stored locally, then plain `flowviant` just runs.
 if (process.argv[2] === 'login') {
   await runLogin();
+  process.exit(0);
+}
+
+// `flowviant update` — install the latest published version now. The daemon also
+// self-updates on its own (at startup + when idle); this is the manual path.
+if (process.argv[2] === 'update') {
+  const { runUpdateCommand } = await import('./lib/update.mjs');
+  runUpdateCommand();
   process.exit(0);
 }
 

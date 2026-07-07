@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 
-export const VERSION = '0.10.0';
+export const VERSION = '0.11.0';
 
 // Credential stored by `flowviant login` (device auth) — the no-token,
 // no-env-var path. An explicit --fleet flag or FLOWVIANT_FLEET env still wins.
@@ -35,6 +35,11 @@ export const RECONCILE_SECONDS = Number(process.env.RECONCILE_SECONDS || 10);
 // so a long-lived daemon never silently 401s on an expired token.
 export const REFRESH_BEFORE_SECONDS = Number(process.env.REFRESH_BEFORE_SECONDS || 3600);
 export const SAFE = process.env.FLOWVIANT_SAFE === '1';
+// Self-update: a running daemon updates itself to the latest published version
+// (at startup + when idle) and re-execs. On by default; FLOWVIANT_NO_UPDATE=1
+// keeps it nag-only (it still tells you to update, never installs). Below the
+// server's MIN version it updates regardless, since live mode won't work.
+export const AUTO_UPDATE = process.env.FLOWVIANT_NO_UPDATE !== '1';
 // Live mode (DEFAULT since 0.8.0): persistent Agent-SDK session per task —
 // streams into the task channel, injectable mid-task, blocker-parks in place,
 // delivery card on complete, branch preview tunnels. The legacy poll/sentinel

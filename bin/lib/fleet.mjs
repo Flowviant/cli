@@ -22,7 +22,9 @@ import {
   RECONCILE_SECONDS,
   REFRESH_BEFORE_SECONDS,
   LIVE,
+  AUTO_UPDATE,
 } from './config.mjs';
+import { handleVersionSignal } from './update.mjs';
 import {
   git,
   resetWorktree,
@@ -411,6 +413,20 @@ export async function runFleetDaemon() {
     }
     if (roster.mcpUrl) mcpUrl = roster.mcpUrl;
     if (roster.leaseTtlSeconds) leaseTtlSeconds = roster.leaseTtlSeconds;
+    // Keep the daemon current. Safe = no worker mid-task (true at startup, since
+    // no workers are spawned yet). If it self-updates it re-execs into the new
+    // version and this process becomes a proxy — stop the loop.
+    if (roster.daemon) {
+      const safeToUpdate = [...workers.values()].every((w) => w.state.child == null);
+      const updating = handleVersionSignal({
+        latest: roster.daemon.latest,
+        min: roster.daemon.min,
+        autoUpdate: AUTO_UPDATE,
+        safeToUpdate,
+        teardown,
+      });
+      if (updating) return;
+    }
     processMergeJobs(roster.mergeJobs);
     processCleanupJobs(roster.cleanupJobs);
     const rosterIds = new Set(roster.agents.map((a) => a.agentId));
