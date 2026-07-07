@@ -255,6 +255,52 @@ async function waitForMessage(mcpUrl, token, runId, afterId, isAlive) {
 
 // One task: claim → seed → stream/mirror/inject/park → complete. Returns
 // { outcome: 'nothing' | 'done' | 'blocked' | 'stalled' | 'error' }.
+// Distinguish "YOUR OWN Claude account is out of quota" (the user must wait or
+// hand off — a park) from a transient Anthropic-side hiccup (retry soon — a
+// plain error). Only the former parks. resetAt is lifted from the limit
+// response's retry headers when present, so the thread can say when it's back.
+export function classifyRateLimit(e) {
+  const status = e?.status ?? e?.statusCode ?? e?.response?.status;
+  const msg = String(e?.message ?? e ?? '').toLowerCase();
+  const overloaded = status === 529 || msg.includes('overloaded');
+  const isRateLimit =
+    !overloaded &&
+    (status === 429 ||
+      /rate.?limit|usage limit|quota|too many requests|exceeded your|reached your|limit reached/.test(
+        msg,
+      ));
+  if (!isRateLimit) return { isRateLimit: false };
+  let resetAt;
+  const hdrs = e?.headers ?? e?.response?.headers;
+  const get = (k) => hdrs?.get?.(k) ?? hdrs?.[k];
+  const retryAfter = Number(get?.('retry-after'));
+  const resetHdr = get?.('anthropic-ratelimit-unified-reset');
+  if (Number.isFinite(retryAfter) && retryAfter > 0) {
+    resetAt = new Date(Date.now() + retryAfter * 1000).toISOString();
+  } else if (resetHdr != null) {
+    const epoch = Number(resetHdr);
+    if (Number.isFinite(epoch) && epoch > 0) resetAt = new Date(epoch * 1000).toISOString();
+    else if (!Number.isNaN(Date.parse(resetHdr))) resetAt = new Date(resetHdr).toISOString();
+  }
+  return { isRateLimit: true, resetAt };
+}
+
+// Wait out a Claude-account limit, heartbeating so the 30-min lease stays warm
+// and the task isn't reclaimed while paused. Caps the wait so an unknown or very
+// distant reset still retries eventually (and re-parks if still limited).
+async function parkUntilReset(resetAt, { mcpUrl, getToken, runId, isAlive }) {
+  const MAX_PARK_MS = 60 * 60 * 1000; // never sit longer than an hour before retrying
+  const DEFAULT_PARK_MS = 15 * 60 * 1000; // no reset given → try again in 15 min
+  const now = Date.now();
+  const target = resetAt ? Date.parse(resetAt) : now + DEFAULT_PARK_MS;
+  const until = Math.min(Number.isFinite(target) ? target : now + DEFAULT_PARK_MS, now + MAX_PARK_MS);
+  while (isAlive() && Date.now() < until) {
+    const token = getToken();
+    if (token) await mcpCall(mcpUrl, token, 'heartbeat', { runId }).catch(() => {});
+    await sleep(IDLE_SECONDS);
+  }
+}
+
 export async function runLiveTask({ mcpUrl, token, cwd, baseRef, isAlive, resumeIntentId, onChild }) {
   const claim = await mcpCall(mcpUrl, token, 'claim_next_intent', {}).catch(() => null);
   if (!claim || claim.claimed !== true) return { outcome: 'nothing' };
@@ -493,6 +539,14 @@ export async function runLiveTask({ mcpUrl, token, cwd, baseRef, isAlive, resume
     }
     return { outcome: completed ? 'done' : 'stalled', title, intentId };
   } catch (e) {
+    const rl = classifyRateLimit(e);
+    if (rl.isRateLimit) {
+      // The user's OWN Claude account is tapped. Park the run so the thread shows
+      // it as their plan's limit (not a Flowviant error) and the lease stays warm
+      // for a resume in place — never reset this worktree's work.
+      await mcpCall(mcpUrl, token, 'report_paused', { runId, resetAt: rl.resetAt }).catch(() => {});
+      return { outcome: 'rate_limited', resetAt: rl.resetAt, runId, title, intentId };
+    }
     return { outcome: 'error', error: e?.message ?? String(e), title, intentId };
   } finally {
     onChild?.(null); // no longer busy — token may rotate between tasks
@@ -617,7 +671,10 @@ export async function runLiveWorker({
     // stalled / errored → same worktree resumes). Finishing or finding no work
     // clears it so the next fresh task starts from a clean base.
     lastIntentId =
-      res.outcome === 'parked' || res.outcome === 'stalled' || res.outcome === 'error'
+      res.outcome === 'parked' ||
+      res.outcome === 'stalled' ||
+      res.outcome === 'error' ||
+      res.outcome === 'rate_limited'
         ? res.intentId
         : null;
     if (res.outcome === 'nothing') {
@@ -650,6 +707,25 @@ export async function runLiveWorker({
       // Only reached on shutdown mid-park; the intent stays claimed and resumes
       // on reconnect. Nothing to do but stop cleanly.
       break;
+    }
+    if (res.outcome === 'rate_limited') {
+      // The agent's OWN Claude account hit its limit — not a Flowviant failure.
+      // Hold the worktree + lease and wait it out (heartbeating so it isn't
+      // reclaimed), then resume the SAME task in place. Never reset the worktree.
+      const when = res.resetAt ? ` until ~${new Date(res.resetAt).toLocaleTimeString()}` : '';
+      enter(
+        'paused',
+        warn,
+        `${c.yellow('paused')} ${c.dim(`— your Claude account hit its usage limit; holding your work${when}`)}`,
+      );
+      await parkUntilReset(res.resetAt, {
+        mcpUrl: getMcpUrl() ?? MCP_URL,
+        getToken: () => getToken(agentId),
+        runId: res.runId,
+        isAlive,
+      });
+      phase = '';
+      continue;
     }
     // stalled / error — usually a stale token or a stuck turn. Refresh + retry.
     enter('reconnect', warn, `${c.yellow(res.outcome)} ${c.dim('— refreshing token, retrying')}`);
