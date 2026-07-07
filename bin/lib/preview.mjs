@@ -274,10 +274,16 @@ export async function startPreview({ worktree, kind, cmd, port, log, timeoutMs =
       tunnelStarted = true;
       clearTimeout(bindTimer);
       log?.(`preview: dev server on :${p} — opening the tunnel…`);
-      tunnel = spawn(cf, ['tunnel', '--url', `http://localhost:${p}`], {
-        detached: true,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
+      // --http-host-header localhost: send the origin the Host it expects. Vite
+      // (5+) rejects any Host it doesn't recognize (server.allowedHosts), and the
+      // tunnel's public hostname isn't in that list → "Blocked request". Rewriting
+      // the Host to localhost — what a local browser sends anyway — passes the
+      // check with zero repo config, and is harmless to servers that don't check.
+      tunnel = spawn(
+        cf,
+        ['tunnel', '--url', `http://localhost:${p}`, '--http-host-header', 'localhost'],
+        { detached: true, stdio: ['ignore', 'pipe', 'pipe'] },
+      );
       const onTunnel = (d) => {
         const m = TUNNEL_RE.exec(d.toString());
         if (m) finish({ url: m[0], kind, stop });
