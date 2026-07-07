@@ -485,6 +485,8 @@ export async function runFleetDaemon() {
           label,
           cwd: wt,
           baseRef,
+          repoRoot, // for copying the repo's local env into the preview worktree
+
           getToken: (id) => tokenByAgent.get(id),
           getHasWork: (id) => hasWorkByAgent.get(id) ?? false,
           getMcpUrl: () => mcpUrl,

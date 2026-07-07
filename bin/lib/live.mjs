@@ -16,7 +16,7 @@
  * live fleet + repo to shake out. Old (poll/sentinel) mode is untouched.
  */
 
-import { readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { readFileSync, writeFileSync, rmSync, existsSync, copyFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import {
@@ -593,11 +593,39 @@ export async function runLiveTask({ mcpUrl, token, cwd, baseRef, isAlive, resume
 
 // Per-agent loop — same signature/scaffolding as runFleetWorker, but each task
 // is a persistent SDK session instead of a one-shot claude turn.
+// A preview runs in the agent's WORKTREE — a fresh checkout that lacks the repo's
+// gitignored env files (.env.local etc.), so the app's DB/auth secrets are absent
+// and anything that hits them (sign-in!) 500s. Copy the files the checkout is
+// missing from the real repo into the worktree so the preview runs like local
+// dev. We only copy files ABSENT from the worktree — i.e. the gitignored ones —
+// so nothing tracked is overwritten and (being gitignored) nothing gets committed.
+const PREVIEW_ENV_FILES = ['.env', '.env.local', '.env.development', '.env.development.local'];
+function copyLocalEnvFiles(repoRoot, worktree, log) {
+  if (!repoRoot || repoRoot === worktree) return;
+  let copied = 0;
+  for (const f of PREVIEW_ENV_FILES) {
+    const src = join(repoRoot, f);
+    const dst = join(worktree, f);
+    if (existsSync(src) && !existsSync(dst)) {
+      try {
+        copyFileSync(src, dst);
+        copied++;
+      } catch {
+        /* best-effort */
+      }
+    }
+  }
+  if (copied) {
+    log?.(`preview: brought ${copied} local env file(s) into the worktree so the app has its secrets.`);
+  }
+}
+
 export async function runLiveWorker({
   agentId,
   label,
   cwd,
   baseRef,
+  repoRoot,
   getToken,
   getHasWork,
   getMcpUrl,
@@ -672,6 +700,9 @@ export async function runLiveWorker({
     if (cfg.dir && cfg.dir !== '.') {
       info(`${label} ${c.dim(`live preview: detected a frontend at ${cfg.dir}/ (port ${entry.port})`)}`);
     }
+    // Give the dev server the repo's local env (gitignored secrets the fresh
+    // worktree is missing) so DB/auth-backed paths like sign-in don't 500.
+    copyLocalEnvFiles(repoRoot, cwd, (m) => info(`${label} ${c.dim(m)}`));
     info(`${label} ${c.dim('starting a live preview of the branch for review…')}`);
     preview = await startPreview({
       worktree: cwd,
