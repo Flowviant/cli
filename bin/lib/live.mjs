@@ -619,13 +619,20 @@ export async function runLiveWorker({
     const entry = kind ? cfg[kind] : null;
     if (!entry || !intentId) {
       // Say WHY there's no preview instead of skipping silently — this was a
-      // real "where's my preview?" support case.
+      // real "where's my preview?" support case. We search the root, common
+      // frontend dirs, and apps/* + packages/*, so if nothing matched either
+      // there's no runnable web app or it needs an explicit config.
       info(
         `${label} ${c.dim(
-          'no live preview: add .flowviant/preview.json ({"ui":{"cmd":"npm run dev","port":5173}}) — the framework could not be inferred from package.json.'
+          'no live preview: no runnable web frontend found (searched the repo root, web/frontend/client/…, and apps/* + packages/*). If your app is elsewhere or not vite/next/astro/etc., add .flowviant/preview.json: {"ui":{"cmd":"cd <dir> && npm install && npm run dev","port":5173}}.'
         )}`
       );
       return;
+    }
+    // Zero-config win: when we found the app in a subdir, say where, so it's
+    // clear what's being served (and how to pin it if the guess is wrong).
+    if (cfg.dir && cfg.dir !== '.') {
+      info(`${label} ${c.dim(`live preview: detected a frontend at ${cfg.dir}/ (port ${entry.port})`)}`);
     }
     info(`${label} ${c.dim('starting a live preview of the branch for review…')}`);
     preview = await startPreview({

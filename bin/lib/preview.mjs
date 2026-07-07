@@ -17,7 +17,7 @@
  */
 
 import { spawn, execFileSync } from 'node:child_process';
-import { readFileSync, writeFileSync, existsSync, mkdirSync, chmodSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, chmodSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir, platform, arch } from 'node:os';
 
@@ -45,17 +45,29 @@ const FRAMEWORK_PORTS = [
   { re: /\bsvelte/, port: 5173 },
   { re: /\bgatsby\b/, port: 8000 },
   { re: /\bexpo\b/, port: 8081 },
+  { re: /@angular\/|\bng serve\b/, port: 4200 },
+  { re: /vue-cli-service/, port: 8080 },
 ];
 
-function pkgManager(repoRoot) {
-  if (existsSync(join(repoRoot, 'bun.lock')) || existsSync(join(repoRoot, 'bun.lockb'))) return 'bun';
-  if (existsSync(join(repoRoot, 'pnpm-lock.yaml'))) return 'pnpm';
-  if (existsSync(join(repoRoot, 'yarn.lock'))) return 'yarn';
+// A repo whose ROOT is a library/monorepo often keeps its web app in a subdir,
+// so the root package.json has no dev server at all. Search these (plus every
+// child of apps/ and packages/) so a nested frontend previews with ZERO config.
+const SUBDIR_CANDIDATES = [
+  'web', 'webapp', 'frontend', 'client', 'ui', 'site', 'www', 'app', 'dashboard',
+];
+const SUBDIR_PARENTS = ['apps', 'packages'];
+
+function pkgManager(dir) {
+  if (existsSync(join(dir, 'bun.lock')) || existsSync(join(dir, 'bun.lockb'))) return 'bun';
+  if (existsSync(join(dir, 'pnpm-lock.yaml'))) return 'pnpm';
+  if (existsSync(join(dir, 'yarn.lock'))) return 'yarn';
   return 'npm';
 }
 
-function inferPreviewConfig(repoRoot) {
-  const pkgPath = join(repoRoot, 'package.json');
+// Infer {script, port} from one directory's package.json, or null if it has no
+// dev/start script or no framework we can map to a port.
+function inferFromDir(absDir) {
+  const pkgPath = join(absDir, 'package.json');
   if (!existsSync(pkgPath)) return null;
   let pkg;
   try {
@@ -70,15 +82,58 @@ function inferPreviewConfig(repoRoot) {
   const hay = `${scripts[script]} ${Object.keys(deps).join(' ')}`.toLowerCase();
   const fw = FRAMEWORK_PORTS.find((f) => f.re.test(hay));
   if (!fw) return null; // can't safely guess the port
-  const pm = pkgManager(repoRoot);
-  const install = pm === 'npm' ? 'npm install' : `${pm} install`;
-  const run = pm === 'yarn' ? `yarn ${script}` : `${pm} run ${script}`;
-  return { ui: { cmd: `${install} && ${run}`, port: fw.port } };
+  return { script, port: fw.port };
 }
 
-/** The preview config for a repo — explicit file wins, else inferred. */
+// The ordered dirs to probe: root, then the common frontend names, then every
+// child of apps/ and packages/. Relative to repoRoot ('' = root).
+function candidateDirs(repoRoot) {
+  const dirs = ['', ...SUBDIR_CANDIDATES];
+  for (const parent of SUBDIR_PARENTS) {
+    const p = join(repoRoot, parent);
+    try {
+      for (const e of readdirSync(p, { withFileTypes: true })) {
+        if (e.isDirectory()) dirs.push(`${parent}/${e.name}`);
+      }
+    } catch {
+      /* no such parent dir */
+    }
+  }
+  return dirs;
+}
+
+function buildConfig(repoRoot, rel, hit) {
+  // Prefer the app dir's own package manager if it has a lockfile, else the repo
+  // root's (monorepos install from the root).
+  const abs = rel ? join(repoRoot, rel) : repoRoot;
+  const hasOwnLock = ['bun.lock', 'bun.lockb', 'pnpm-lock.yaml', 'yarn.lock', 'package-lock.json'].some(
+    (f) => existsSync(join(abs, f)),
+  );
+  const pm = pkgManager(hasOwnLock ? abs : repoRoot);
+  const install = pm === 'npm' ? 'npm install' : `${pm} install`;
+  const run = pm === 'yarn' ? `yarn ${hit.script}` : `${pm} run ${hit.script}`;
+  const inner = `${install} && ${run}`;
+  // Subdir apps run from their own folder (shell:true honors the cd prefix).
+  const cmd = rel ? `cd ${rel} && ${inner}` : inner;
+  return { ui: { cmd, port: hit.port }, dir: rel || '.' };
+}
+
+// Infer a preview config by probing the root and likely frontend subdirs.
+function inferPreviewConfig(repoRoot) {
+  for (const rel of candidateDirs(repoRoot)) {
+    const hit = inferFromDir(rel ? join(repoRoot, rel) : repoRoot);
+    if (hit) return buildConfig(repoRoot, rel, hit);
+  }
+  return null;
+}
+
+/** The preview config for a repo — explicit file wins, else inferred from the
+ *  root or a nested frontend. Carries `dir` (relative) so callers can say where
+ *  it found the app. */
 export function loadPreviewConfig(repoRoot) {
-  return readPreviewConfig(repoRoot) ?? inferPreviewConfig(repoRoot);
+  const explicit = readPreviewConfig(repoRoot);
+  if (explicit) return explicit;
+  return inferPreviewConfig(repoRoot);
 }
 
 // ── cloudflared: use if installed, else auto-fetch ─────────────────────────
