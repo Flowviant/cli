@@ -11,9 +11,17 @@
  * cloudflared / no inferable config → no live preview, and review falls back to
  * the captured evidence the agent attached (never a hard failure).
  *
- * Config shape:
- *   { "ui": { "cmd": "<start dev server>", "port": 5173 },
- *     "api": { "cmd": "<start api>",        "port": 8787 } }
+ * Config shape (the escape hatch for any setup the defaults don't handle — the
+ * repo declares its own recipe, so the daemon never needs per-framework code):
+ *   { "ui": {
+ *       "cmd": "<start dev server>",   // required
+ *       "port": 5173,                  // required
+ *       "env": { "FOO": "bar" },       // optional — extra env for the dev server
+ *       "hostHeader": "localhost"      // optional — Host sent to the origin;
+ *                                      //   false disables the rewrite (for apps
+ *                                      //   that need their real public Host)
+ *     },
+ *     "api": { "cmd": "<start api>", "port": 8787 } }
  */
 
 import { spawn, execFileSync } from 'node:child_process';
@@ -214,16 +222,37 @@ const BIND_RE = /https?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0):(\d+)/i;
  * theirs is taken, and tunneling to the guess then 502s. We fall back to the
  * configured port only if the server never announces one.
  */
-export async function startPreview({ worktree, kind, cmd, port, log, timeoutMs = 180_000 }) {
+export async function startPreview({
+  worktree,
+  kind,
+  cmd,
+  port,
+  env: extraEnv,
+  hostHeader,
+  log,
+  timeoutMs = 180_000,
+}) {
   const cf = await ensureCloudflared(log);
   if (!cf) return null; // fall back to captured evidence
+  // Host the origin sees. Default 'localhost' (what a local browser sends) so
+  // dev servers that validate Host — Vite server.allowedHosts, webpack, Next's
+  // allowedDevOrigins — accept the tunnel. `hostHeader: false` in preview.json
+  // disables the rewrite for apps that route on their real public Host.
+  const hostRewrite =
+    hostHeader === false ? null : typeof hostHeader === 'string' && hostHeader ? hostHeader : 'localhost';
   return new Promise((resolve) => {
     // We SIGKILL the dev server's whole group on teardown, which skips a tool's
     // graceful cleanup — some dev servers (e.g. vinext) leave a singleton
     // dev-lock behind and then REFUSE to start next time. Disable known locks so
     // a reused/uncleaned worktree still previews. Harmless to tools that ignore
-    // these vars; BROWSER=none stops any auto-open.
-    const env = { ...process.env, VINEXT_NO_DEV_LOCK: '1', BROWSER: 'none' };
+    // these vars; BROWSER=none stops any auto-open. A repo's preview.json `env`
+    // is layered last, so it can override any of these.
+    const env = {
+      ...process.env,
+      VINEXT_NO_DEV_LOCK: '1',
+      BROWSER: 'none',
+      ...(extraEnv && typeof extraEnv === 'object' ? extraEnv : {}),
+    };
     // detached so each gets its own process group — `bun run dev` via a shell
     // spawns a grandchild dev server that would otherwise SURVIVE a kill of the
     // shell. We kill the whole group instead. stdout/stderr piped so we can read
@@ -274,16 +303,12 @@ export async function startPreview({ worktree, kind, cmd, port, log, timeoutMs =
       tunnelStarted = true;
       clearTimeout(bindTimer);
       log?.(`preview: dev server on :${p} — opening the tunnel…`);
-      // --http-host-header localhost: send the origin the Host it expects. Vite
-      // (5+) rejects any Host it doesn't recognize (server.allowedHosts), and the
-      // tunnel's public hostname isn't in that list → "Blocked request". Rewriting
-      // the Host to localhost — what a local browser sends anyway — passes the
-      // check with zero repo config, and is harmless to servers that don't check.
-      tunnel = spawn(
-        cf,
-        ['tunnel', '--url', `http://localhost:${p}`, '--http-host-header', 'localhost'],
-        { detached: true, stdio: ['ignore', 'pipe', 'pipe'] },
-      );
+      // --http-host-header: send the origin the Host it expects (default
+      // localhost — see hostRewrite above). Passes Vite/webpack/Next host checks
+      // with zero repo config; skipped when preview.json sets hostHeader:false.
+      const args = ['tunnel', '--url', `http://localhost:${p}`];
+      if (hostRewrite) args.push('--http-host-header', hostRewrite);
+      tunnel = spawn(cf, args, { detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
       const onTunnel = (d) => {
         const m = TUNNEL_RE.exec(d.toString());
         if (m) finish({ url: m[0], kind, stop });

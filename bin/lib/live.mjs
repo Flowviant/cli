@@ -663,6 +663,8 @@ export async function runLiveWorker({
       kind,
       cmd: entry.cmd,
       port: entry.port,
+      env: entry.env, // optional: extra env from .flowviant/preview.json
+      hostHeader: entry.hostHeader, // optional: override/disable the Host rewrite
       log: (m) => info(`${label} ${c.dim(m)}`),
     });
     if (preview) {
