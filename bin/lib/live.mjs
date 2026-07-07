@@ -74,8 +74,11 @@ const SAFE_TOOLS = [
 // rides in the seed message below, so this degrades gracefully if the preset
 // shape shifts between SDK versions.
 const SYSTEM_LIVE = `You are a Flowviant build agent working ONE task inside a live, shared task
-channel. START by stating your approach in plain language (a short plan) BEFORE
-you touch any code — the whole team watches this channel and may redirect you.
+channel. START by stating your approach as a SHORT MARKDOWN LIST — one numbered
+line per step, not a dense paragraph — BEFORE you touch any code; the whole team
+watches this channel and may redirect you. Everything you post here renders as
+Markdown for humans, so write for them: short lists, \`code\` for identifiers and
+paths, **bold** for the key point — never a wall of run-on text.
 A human teammate may message you mid-task; treat any injected "The human
 answered…" or teammate line as a new instruction and adapt. There is NO terminal
 and NO interactive prompt — your only channel to a human is the flowviant MCP
@@ -106,7 +109,7 @@ function seedPrompt(runId, brief, transcript, resumedInPlace) {
       ? [``, `Conversation so far (you may be resuming — pick up where this left off):`, transcript]
       : []),
     ``,
-    `${transcript ? 'Continue' : 'Begin'}. Post a short plan first, then: report_progress as you go; report_blocker + stop if you hit a human decision; open a draft PR, attach_pr, then complete (summary + criteria self-report — your delivery card) when done.`,
+    `${transcript ? 'Continue' : 'Begin'}. Post a short plan first as a Markdown list (one numbered line per step), then: report_progress as you go; report_blocker + stop if you hit a human decision; open a draft PR, attach_pr, then complete (summary + criteria self-report — your delivery card) when done.`,
   ].join('\n');
 }
 
