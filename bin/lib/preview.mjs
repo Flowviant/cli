@@ -201,11 +201,18 @@ async function ensureCloudflared(log) {
 }
 
 const TUNNEL_RE = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/i;
+// Where a dev server announces it bound — "Local: http://localhost:3001/".
+const BIND_RE = /https?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0):(\d+)/i;
 
 /**
  * Start the dev server + tunnel for one worktree. Resolves { url, kind, stop }
  * once the tunnel URL is captured, or null if it can't come up. stop() kills
  * both the server and the tunnel.
+ *
+ * The tunnel target is the port the server ACTUALLY bound (read from its
+ * output), not the guessed one — vite/vinext/next hop to the next free port when
+ * theirs is taken, and tunneling to the guess then 502s. We fall back to the
+ * configured port only if the server never announces one.
  */
 export async function startPreview({ worktree, kind, cmd, port, log, timeoutMs = 180_000 }) {
   const cf = await ensureCloudflared(log);
@@ -219,11 +226,8 @@ export async function startPreview({ worktree, kind, cmd, port, log, timeoutMs =
     const env = { ...process.env, VINEXT_NO_DEV_LOCK: '1', BROWSER: 'none' };
     // detached so each gets its own process group — `bun run dev` via a shell
     // spawns a grandchild dev server that would otherwise SURVIVE a kill of the
-    // shell, keep port bound, and get silently re-fronted by the NEXT task's
-    // tunnel (reviewer sees the wrong branch). We kill the whole group instead.
-    // stdout/stderr are piped (not ignored) so we can show WHY a preview didn't
-    // come up — a swallowed "another dev server is already running" was a real
-    // dead-end.
+    // shell. We kill the whole group instead. stdout/stderr piped so we can read
+    // the bound port and surface failures.
     const server = spawn(cmd, {
       cwd: worktree,
       shell: true,
@@ -231,21 +235,14 @@ export async function startPreview({ worktree, kind, cmd, port, log, timeoutMs =
       stdio: ['ignore', 'pipe', 'pipe'],
       env,
     });
-    // Ring buffer of the dev server's recent output, surfaced on failure.
-    let out = '';
-    const capture = (d) => {
-      out = (out + d.toString()).slice(-4000);
-    };
-    server.stdout.on('data', capture);
-    server.stderr.on('data', capture);
-    const tail = () => out.trim().split('\n').slice(-15).join('\n');
-    const tunnel = spawn(cf, ['tunnel', '--url', `http://localhost:${port}`], {
-      detached: true,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
+
     let settled = false;
+    let tunnel = null;
+    let tunnelStarted = false;
+    let out = '';
+    const tail = () => out.trim().split('\n').slice(-15).join('\n');
     const killGroup = (child) => {
-      if (!child.pid) return;
+      if (!child?.pid) return;
       try {
         process.kill(-child.pid, 'SIGKILL'); // negative pid = the whole group
       } catch {
@@ -260,24 +257,49 @@ export async function startPreview({ worktree, kind, cmd, port, log, timeoutMs =
       killGroup(server);
       killGroup(tunnel);
     };
+    let bindTimer;
+    let timer;
     const finish = (val) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      clearTimeout(bindTimer);
       if (!val) stop();
       resolve(val);
     };
-    const onData = (d) => {
-      const m = TUNNEL_RE.exec(d.toString());
-      if (m) finish({ url: m[0], kind, stop });
+
+    // Open the tunnel once we know the real port (detected or fallback).
+    const openTunnel = (p) => {
+      if (tunnelStarted || settled) return;
+      tunnelStarted = true;
+      clearTimeout(bindTimer);
+      log?.(`preview: dev server on :${p} — opening the tunnel…`);
+      tunnel = spawn(cf, ['tunnel', '--url', `http://localhost:${p}`], {
+        detached: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      const onTunnel = (d) => {
+        const m = TUNNEL_RE.exec(d.toString());
+        if (m) finish({ url: m[0], kind, stop });
+      };
+      tunnel.stdout.on('data', onTunnel);
+      tunnel.stderr.on('data', onTunnel);
+      tunnel.on('error', () => finish(null));
+      tunnel.on('close', () => finish(null));
     };
-    tunnel.stdout.on('data', onData);
-    tunnel.stderr.on('data', onData);
-    tunnel.on('error', () => finish(null));
-    tunnel.on('close', () => finish(null));
-    // The dev server exiting BEFORE the tunnel came up is the loud failure mode
-    // (crash on boot, or a singleton lock refusing to start) — surface its
-    // output instead of a silent timeout.
+
+    const onServer = (d) => {
+      const s = d.toString();
+      out = (out + s).slice(-4000);
+      if (!tunnelStarted) {
+        const m = BIND_RE.exec(s);
+        if (m) openTunnel(Number(m[1]));
+      }
+    };
+    server.stdout.on('data', onServer);
+    server.stderr.on('data', onServer);
+    // A dev server that exits before it's reachable (crash on boot, a singleton
+    // lock refusing to start) is the loud failure mode — surface its output.
     server.on('exit', (code) => {
       if (settled) return;
       log?.(
@@ -287,7 +309,11 @@ export async function startPreview({ worktree, kind, cmd, port, log, timeoutMs =
       );
       finish(null);
     });
-    const timer = setTimeout(() => {
+
+    // If the server never prints a URL we recognize (quiet server), tunnel to the
+    // configured port as a last resort.
+    bindTimer = setTimeout(() => openTunnel(port), 30_000);
+    timer = setTimeout(() => {
       log?.(
         `preview tunnel did not come up in ${Math.round(timeoutMs / 1000)}s — skipping.${
           tail() ? `\n  last dev-server output:\n${tail()}` : ''
