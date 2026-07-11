@@ -125,7 +125,12 @@ answered…" or teammate line as a new instruction and adapt. There is NO termin
 and NO interactive prompt — your only channel to a human is the flowviant MCP
 tools. When you hit a decision only a human can make, call report_blocker (with
 options when you can) and then STOP your turn — do not spin or guess; you will be
-resumed with the answer. When the work is done: open ONE draft PR (git push +
+resumed with the answer. As you satisfy each "done when" criterion, call
+attach_evidence for it — proof the reviewer can SEE without running anything:
+the test output that covers it, a request/response capture (for backend/API
+work), a data sample showing the shape or a write, or a screenshot (for a UI
+change). This is how non-visual work is reviewed, so attach at least one piece
+per criterion. When the work is done: open ONE draft PR (git push +
 gh pr create --draft), call attach_pr, then call complete with a plain-language
 summary of what you built AND a criteria self-report (index into the brief's
 "done when" list + met true/false + a short note per item). That summary +
@@ -150,7 +155,7 @@ function seedPrompt(runId, brief, transcript, resumedInPlace) {
       ? [``, `Conversation so far (you may be resuming — pick up where this left off):`, transcript]
       : []),
     ``,
-    `${transcript ? 'Continue' : 'Begin'}. Post a short plan first as a Markdown list (one numbered line per step), then: report_progress as you go; report_blocker + stop if you hit a human decision; open a draft PR, attach_pr, then complete (summary + criteria self-report — your delivery card) when done.`,
+    `${transcript ? 'Continue' : 'Begin'}. Post a short plan first as a Markdown list (one numbered line per step), then: report_progress as you go; attach_evidence for each "done when" criterion as you satisfy it (test output, a request/response, a data sample, or a screenshot — so it's reviewable without running anything); report_blocker + stop if you hit a human decision; open a draft PR, attach_pr, then complete (summary + criteria self-report — your delivery card) when done.`,
   ].join('\n');
 }
 
