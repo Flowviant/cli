@@ -45,6 +45,10 @@ import {
   SYSTEM_SINGLE,
   SINGLE_KICKOFF,
   SINGLE_RESUME,
+  SYSTEM_WIKI,
+  WIKI_KICKOFF,
+  SYSTEM_REGROUND,
+  REGROUND_KICKOFF,
 } from './claude.mjs';
 import { runLiveWorker } from './live.mjs';
 import { reapOrphanPreviews } from './preview.mjs';
@@ -306,6 +310,12 @@ export async function runFleetDaemon() {
             mergeAttempts.delete(job.id);
             await reportMergeOutcome(MERGE_DONE_URL, { intentId: job.id });
             ok(`${c.cyan('merged')} ${c.dim(`— ${job.title} → ${baseRef}`)}`);
+            // The code just landed — re-ground the living wiki for what shipped
+            // (touched nodes re-read + a persistent feature-history node).
+            // Direct enqueue = immediacy; the server's durable regroundJobs list
+            // (created by merge-done above, cleared by our reground-done report)
+            // is the restart-safe backstop — dedup'd here by groundedIntents.
+            enqueueReground(job.id, job.prUrl, job.title);
           } else if (failedReason) {
             // Report into the thread (server narrates + re-arms the merge
             // button + notifies) — the job disappears from the roster.
@@ -378,6 +388,143 @@ export async function runFleetDaemon() {
       })();
     }
   };
+
+  // Living-wiki work runs ONE turn at a time in a dedicated worktree (off the
+  // agents' checkouts), via the emit_wiki_node MCP tool — never code edits. Two
+  // triggers enqueue: a Regenerate click (full SWEEP) and a successful merge
+  // (incremental RE-GROUND → feature-history). One queue + runner serializes
+  // them so they never collide on the worktree. Each turn runs under its own
+  // wiki-scoped credential (minted per task below) — the server allows ONLY the
+  // wiki tools on it, and build agents' worker tokens can't touch the map. Also
+  // means wiki work needs no agent online.
+  const wikiWt = join(baseDir, 'wiki');
+  const REGROUND_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/reground-done');
+  const WIKI_TOKEN_URL = FLEET_URL.replace(/\/agents\/?$/, '/wiki-token');
+  const wikiQueue = [];
+  let wikiBusy = false;
+  let lastSweepAt = null; // dedup: run each Regenerate request once
+  const groundedIntents = new Set(); // dedup: re-ground each delivery once
+
+  const mintWikiToken = async () => {
+    try {
+      const res = await fetch(WIKI_TOKEN_URL, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${FLEET_TOKEN}`, 'User-Agent': USER_AGENT },
+        signal: AbortSignal.timeout(30_000),
+      });
+      if (!res.ok) return null;
+      return (await res.json())?.data?.token ?? null;
+    } catch {
+      return null;
+    }
+  };
+
+  const enqueueSweep = (job) => {
+    if (!job || job.requestedAt === lastSweepAt) return;
+    lastSweepAt = job.requestedAt;
+    wikiQueue.push({ type: 'sweep' });
+    void drainWiki();
+  };
+  const enqueueReground = (intentId, prUrl, title) => {
+    if (!intentId || groundedIntents.has(intentId)) return;
+    groundedIntents.add(intentId);
+    wikiQueue.push({ type: 'reground', intentId, prUrl, title: title || 'a delivered task' });
+    void drainWiki();
+  };
+
+  // Changed files of a (merged) PR, for the re-ground prompt. Capped so a huge
+  // PR can't blow up the prompt. prUrl was already validated before the merge.
+  const changedFilesForPr = (prUrl) => {
+    try {
+      const out = execFileSync('gh', ['pr', 'view', prUrl, '--json', 'files'], {
+        cwd: repoRoot,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      return (JSON.parse(out).files ?? []).map((f) => f.path).filter(Boolean).slice(0, 60);
+    } catch {
+      return [];
+    }
+  };
+
+  async function drainWiki() {
+    if (wikiBusy || wikiQueue.length === 0) return;
+    wikiBusy = true;
+    try {
+      while (wikiQueue.length) {
+        // Fresh wiki-scoped credential per task — dedicated, so no roster
+        // re-mint can rotate it out from under a long sweep.
+        const token = await mintWikiToken();
+        if (!token) {
+          warn('wiki: could not mint the cartographer token — retrying on a later poll');
+          break; // queue intact — the reconcile loop re-drains
+        }
+        const task = wikiQueue.shift();
+        const { dir, path: mcpConfig } = mcpConfigFor(token, mcpUrl);
+        try {
+          if (!existsSync(wikiWt)) {
+            try {
+              git(['worktree', 'add', '--detach', wikiWt, baseRef], repoRoot);
+            } catch {
+              git(['worktree', 'prune'], repoRoot);
+              git(['worktree', 'add', '--detach', wikiWt, baseRef], repoRoot);
+            }
+          }
+          resetWorktree(wikiWt, baseRef);
+          let sha = '';
+          try {
+            sha = git(['rev-parse', 'HEAD'], wikiWt);
+          } catch {
+            /* detached/no HEAD — still writes the map, just ungrounded */
+          }
+          if (task.type === 'sweep') {
+            note(`${c.cyan('wiki')} ${c.dim('— regenerating: your Claude is reading the repo…')}`);
+            const out = await runTurn({
+              prompt: WIKI_KICKOFF(sha),
+              resume: false,
+              system: SYSTEM_WIKI,
+              cwd: wikiWt,
+              mcpConfig,
+              label: c.cyan('[wiki]'),
+            });
+            if (sawSentinel(out, 'WIKI_DONE'))
+              ok(`${c.cyan('wiki')} ${c.dim('— regenerated from your code.')}`);
+            else
+              warn('code-wiki regeneration ended without WIKI_DONE — retry from the app if incomplete.');
+          } else {
+            const files = changedFilesForPr(task.prUrl);
+            if (files.length === 0) {
+              note(`${c.cyan('wiki')} ${c.dim(`— "${task.title}": no changed files to re-ground`)}`);
+            } else {
+              note(`${c.cyan('wiki')} ${c.dim(`— re-grounding after "${task.title}"…`)}`);
+              const out = await runTurn({
+                prompt: REGROUND_KICKOFF({ sha, title: task.title, files }),
+                resume: false,
+                system: SYSTEM_REGROUND,
+                cwd: wikiWt,
+                mcpConfig,
+                label: c.cyan('[wiki]'),
+              });
+              if (sawSentinel(out, 'REGROUND_DONE'))
+                ok(`${c.cyan('wiki')} ${c.dim(`— wiki updated for "${task.title}".`)}`);
+              else warn(`wiki re-ground for "${task.title}" ended without REGROUND_DONE.`);
+            }
+            // Consume the durable job: attempted = done (success or not — emits
+            // are idempotent and a failed turn heals on the next full sweep), so
+            // a failing re-ground can't loop-burn quota. Only a crash BEFORE
+            // this line leaves the job listed for a retry after restart.
+            await reportMergeOutcome(REGROUND_DONE_URL, { intentId: task.intentId });
+          }
+        } catch (e) {
+          warn(`wiki ${task.type} failed: ${e.message}`);
+        } finally {
+          rmSync(dir, { recursive: true, force: true });
+        }
+      }
+    } finally {
+      wikiBusy = false;
+    }
+  }
 
   let connected = false; // log the first successful poll once
   let rosterSig = null; // last roster membership, to log changes only
@@ -510,6 +657,15 @@ export async function runFleetDaemon() {
         workers.set(a.agentId, { state, promise, wt, label });
       }
     }
+
+    // Living-wiki work (runs under its own minted wiki token — no agent
+    // needed). enqueueSweep queues a Regenerate; regroundJobs re-offers merged
+    // deliveries whose re-ground never ran (e.g. we restarted between merge and
+    // turn) until we report reground-done; the bare drain flushes anything
+    // whose earlier mint failed.
+    enqueueSweep(roster.codeMapJob);
+    for (const j of roster.regroundJobs ?? []) enqueueReground(j.intentId, j.prUrl, j.title);
+    void drainWiki();
 
     // Stop workers whose agent left the roster (removed in the app).
     for (const [id, w] of [...workers]) {
