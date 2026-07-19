@@ -199,13 +199,88 @@ export function mcpConfigFor(token, mcpUrl) {
   return { dir, path: p };
 }
 
+// Shorten an absolute tool path to a repo-relative one for legible output.
+const shortPath = (p, cwd) => {
+  if (typeof p !== 'string') return '';
+  let s = p;
+  if (cwd && s.startsWith(cwd)) s = s.slice(cwd.length).replace(/^\/+/, '');
+  return s;
+};
+
+// Turn one Claude tool_use into a compact activity {kind, label}, or null for
+// tools not worth surfacing. `kind:'read'` is what the file counter counts;
+// an emit_wiki_node flips the phase to "writing". Used by wiki turns to stream
+// exactly which files Claude is touching (daemon console + app cover).
+export function humanizeToolUse(name, input = {}, cwd = '') {
+  switch (name) {
+    case 'Read':
+      return { kind: 'read', label: `read ${shortPath(input.file_path, cwd)}` };
+    case 'Grep':
+      return {
+        kind: 'search',
+        label: `grep ${JSON.stringify(input.pattern ?? '')}${input.path ? ` in ${shortPath(input.path, cwd)}` : ''}`,
+      };
+    case 'Glob':
+      return { kind: 'glob', label: `glob ${input.pattern ?? ''}` };
+    case 'LS':
+      return { kind: 'list', label: `ls ${shortPath(input.path ?? '.', cwd)}` };
+    case 'Bash':
+      return { kind: 'bash', label: `$ ${String(input.command ?? '').replace(/\s+/g, ' ').slice(0, 60)}` };
+    default:
+      if (typeof name !== 'string') return null;
+      if (name.includes('emit_wiki_node')) return { kind: 'write', label: `+ node ${input.id ?? ''}` };
+      if (name.includes('finish_wiki_generation')) return { kind: 'write', label: 'finalize wiki' };
+      if (name.includes('list_wiki_nodes')) return { kind: 'mcp', label: 'list wiki nodes' };
+      return null; // other tools: silent
+  }
+}
+
+// Parse ONE line of `--output-format stream-json` NDJSON. Pulls assistant text
+// into `out` (so sentinel detection still works) and turns each tool_use into a
+// streamed activity line. A line that isn't JSON (a stray warning) is treated as
+// raw text so nothing is lost.
+function handleStreamLine(line, { cwd, emit, onActivity, appendText }) {
+  let ev;
+  try {
+    ev = JSON.parse(line);
+  } catch {
+    appendText(line + '\n');
+    emit(line + '\n');
+    return;
+  }
+  if (ev.type === 'assistant' && Array.isArray(ev.message?.content)) {
+    for (const b of ev.message.content) {
+      if (b.type === 'text' && b.text) appendText(b.text + '\n');
+      else if (b.type === 'tool_use') {
+        const a = humanizeToolUse(b.name, b.input || {}, cwd);
+        if (a) {
+          emit(a.label + '\n');
+          onActivity?.(a);
+        }
+      }
+    }
+  } else if (ev.type === 'result' && typeof ev.result === 'string') {
+    // The final assistant text (carries WIKI_DONE / REGROUND_DONE).
+    appendText(ev.result + '\n');
+  }
+}
+
 // One Claude Code turn. Output is captured (for sentinel detection) and streamed
 // through, line-prefixed with the worker label so a fleet stays legible.
-export function runTurn({ prompt, resume, system, cwd, mcpConfig, label, onSpawn }) {
+//
+// `streamJson` switches to `--output-format stream-json` and parses the event
+// stream: only the humanized tool activity reaches the console (a legible
+// stream of `read …`, `grep …`, `+ node …`), assistant text is folded into the
+// returned string for sentinel detection, and each activity is handed to
+// `onActivity` so the caller can forward progress. Build-agent turns leave it
+// off and keep the raw text passthrough + line sentinels.
+export function runTurn({ prompt, resume, system, cwd, mcpConfig, label, onSpawn, streamJson, onActivity }) {
   return new Promise((resolve) => {
     const args = [];
     if (resume) args.push('--continue');
-    args.push('-p', prompt, '--mcp-config', mcpConfig, '--append-system-prompt', system, ...PERM);
+    args.push('-p', prompt, '--mcp-config', mcpConfig, '--append-system-prompt', system);
+    if (streamJson) args.push('--output-format', 'stream-json', '--verbose');
+    args.push(...PERM);
     // Force the user's Claude Code subscription — never the API. A key exported in
     // the shell would otherwise silently bill every poll-mode turn as raw API
     // usage (same invariant live mode enforces on its SDK session env).
@@ -216,10 +291,47 @@ export function runTurn({ prompt, resume, system, cwd, mcpConfig, label, onSpawn
     onSpawn?.(child);
     let out = '';
     const pfx = label ? `${label} ` : '';
+    const emit = (s) => process.stdout.write(pfx ? s.replace(/\n/g, `\n${pfx}`) : s);
+
+    if (streamJson) {
+      let buf = '';
+      const appendText = (t) => {
+        out += t;
+      };
+      child.stdout.on('data', (d) => {
+        buf += d.toString();
+        let nl;
+        while ((nl = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, nl);
+          buf = buf.slice(nl + 1);
+          if (line.trim()) handleStreamLine(line, { cwd, emit, onActivity, appendText });
+        }
+      });
+      // stderr is not JSON (warnings/errors) — pass through and keep for sentinels.
+      child.stderr.on('data', (d) => {
+        const s = d.toString();
+        out += s;
+        emit(s);
+      });
+      child.on('error', (e) => {
+        if (e.code === 'ENOENT') {
+          console.error("\nerror: 'claude' CLI not found on PATH. Install Claude Code first.");
+          process.exit(1);
+        }
+        console.error(e);
+        resolve(out);
+      });
+      child.on('close', () => {
+        if (buf.trim()) handleStreamLine(buf, { cwd, emit, onActivity, appendText });
+        resolve(out);
+      });
+      return;
+    }
+
     const onChunk = (d) => {
       const s = d.toString();
       out += s;
-      process.stdout.write(pfx ? s.replace(/\n/g, `\n${pfx}`) : s);
+      emit(s);
     };
     child.stdout.on('data', onChunk);
     child.stderr.on('data', onChunk);

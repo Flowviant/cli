@@ -400,6 +400,7 @@ export async function runFleetDaemon() {
   const wikiWt = join(baseDir, 'wiki');
   const REGROUND_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/reground-done');
   const WIKI_TOKEN_URL = FLEET_URL.replace(/\/agents\/?$/, '/wiki-token');
+  const WIKI_PROGRESS_URL = FLEET_URL.replace(/\/agents\/?$/, '/wiki-progress');
   const wikiQueue = [];
   let wikiBusy = false;
   let lastSweepAt = null; // dedup: run each Regenerate request once
@@ -416,6 +417,30 @@ export async function runFleetDaemon() {
       return (await res.json())?.data?.token ?? null;
     } catch {
       return null;
+    }
+  };
+
+  // Stream what the wiki turn is doing to the app (the canvas renders the read
+  // phase). Throttled to ~1/s — the FIRST activity of a run and the terminal
+  // `done` frame force-send so the cover appears fast and clears cleanly.
+  let lastProgressAt = 0;
+  const postWikiProgress = async (body, force = false) => {
+    const now = Date.now();
+    if (!force && now - lastProgressAt < 1000) return;
+    lastProgressAt = now;
+    try {
+      await fetch(WIKI_PROGRESS_URL, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${FLEET_TOKEN}`,
+          'User-Agent': USER_AGENT,
+          'Content-Type': 'application/json',
+        },
+        signal: AbortSignal.timeout(15_000),
+        body: JSON.stringify(body),
+      });
+    } catch {
+      /* best-effort — a dropped frame is harmless, the next one supersedes it */
     }
   };
 
@@ -461,6 +486,24 @@ export async function runFleetDaemon() {
         }
         const task = wikiQueue.shift();
         const { dir, path: mcpConfig } = mcpConfigFor(token, mcpUrl);
+        // Live progress for this turn: count the files Claude reads, flip to the
+        // "writing" phase once it starts emitting nodes, and stream each action
+        // to the app (throttled). elapsedSec is on the daemon's own clock.
+        const mode = task.type === 'sweep' ? 'sweep' : 'reground';
+        const startedAt = Date.now();
+        let filesRead = 0;
+        let phase = 'reading';
+        const onActivity = (a) => {
+          if (a.kind === 'read') filesRead++;
+          if (a.kind === 'write') phase = 'writing';
+          void postWikiProgress({
+            mode,
+            phase,
+            activity: a.label,
+            filesRead,
+            elapsedSec: Math.round((Date.now() - startedAt) / 1000),
+          });
+        };
         try {
           if (!existsSync(wikiWt)) {
             try {
@@ -486,6 +529,8 @@ export async function runFleetDaemon() {
               cwd: wikiWt,
               mcpConfig,
               label: c.cyan('[wiki]'),
+              streamJson: true,
+              onActivity,
             });
             if (sawSentinel(out, 'WIKI_DONE'))
               ok(`${c.cyan('wiki')} ${c.dim('— regenerated from your code.')}`);
@@ -504,6 +549,8 @@ export async function runFleetDaemon() {
                 cwd: wikiWt,
                 mcpConfig,
                 label: c.cyan('[wiki]'),
+                streamJson: true,
+                onActivity,
               });
               if (sawSentinel(out, 'REGROUND_DONE'))
                 ok(`${c.cyan('wiki')} ${c.dim(`— wiki updated for "${task.title}".`)}`);
@@ -518,6 +565,19 @@ export async function runFleetDaemon() {
         } catch (e) {
           warn(`wiki ${task.type} failed: ${e.message}`);
         } finally {
+          // Terminal frame so the app cover clears promptly (don't wait for the
+          // freshness window to lapse). force-sent past the throttle.
+          await postWikiProgress(
+            {
+              mode,
+              phase,
+              activity: '',
+              filesRead,
+              elapsedSec: Math.round((Date.now() - startedAt) / 1000),
+              done: true,
+            },
+            true
+          );
           rmSync(dir, { recursive: true, force: true });
         }
       }
