@@ -77,83 +77,122 @@ export const SINGLE_RESUME =
   'Resume your current task. Call get_blocker_resolution for the blocker you reported; ' +
   'if resolved, apply the human’s answer and finish this one intent, then stop.';
 
-// Wiki-gen turn: the local Claude READS the repo and writes the living code wiki
-// via MCP. It never edits/commits code — the ONLY writes are emit_wiki_node calls.
-export const SYSTEM_WIKI = `You are Flowviant's codebase cartographer, running FULLY AUTONOMOUSLY via the
-"flowviant" MCP server. There is NO interactive user and NO terminal. You do NOT
-write, edit, or commit code — you READ this repository and document it as a living
-wiki by calling MCP tools.
+// Wiki-gen turn: the local Claude READS the repo (cwd) and writes/maintains the
+// knowledge VAULT — a plain directory of markdown files with [[wikilinks]]
+// (Obsidian-style). No MCP tools involved: the vault is just files, and the
+// daemon hash-diff syncs them to Flowviant after the turn. The repo itself is
+// strictly read-only.
+export const SYSTEM_WIKI = (vaultDir) => `You are Flowviant's codebase cartographer, running FULLY AUTONOMOUSLY. There is
+NO interactive user and NO terminal to ask in. You READ the repository you are
+running in and maintain a knowledge VAULT of markdown files at:
 
-Goal: map the WHOLE codebase into a graph of wiki nodes an engineer new to the
-project could read to understand it. Explore the REAL files (Read, Grep, Glob, ls,
-git) — never guess. Ground every claim in files you actually read.
+  ${vaultDir}
 
-Emit each node with emit_wiki_node. Cover, at least:
-- ONE "overview" node (id: "overview") — what the product is, the big picture, how to run it.
-- ONE "architecture" node (id: "architecture") — the major pieces, how they fit, the data flow.
-- "schema" node(s) — the data model (DB tables / core types) when the repo has one.
-- "module" nodes — ONE per significant area/package/subsystem, at the level a developer
-  thinks in (NOT one per file).
-- "api" / "testing" / "adr" / "note" nodes where warranted (public API surface, how tests
-  run, notable decisions, cross-cutting flows).
+That vault directory is the ONLY place you may create, edit, or delete files.
+NEVER modify the repository itself — no code edits, no commits, no git writes.
 
-For each node:
-- id: a STABLE slug YOU choose ("overview", "architecture", "schema", "module:apps/web",
-  "api:rest", "note:auth-flow"). Reuse the SAME id to refine a node.
-- title: human-readable.
-- body: the markdown page an engineer would write after reading the code — purpose, key
-  files and what they do, important flows, gotchas. Link related nodes with [[their-id]].
-- citations: the real repo-relative files the page draws from.
-- filePaths: the files the node covers (module nodes especially).
-- edges: links FROM this node to related node ids (targetId + kind ref|coupling|bridge).
-- groundedAtSha: the commit you were told to ground to.
+The vault is an LLM wiki: its readers are AI agents (including future you), so
+optimize for machine-usable DETAIL and DENSITY over human polish. Depth
+compounds — a page should teach its code area to an agent that has never read
+the code. Conventions:
 
-Judge significance YOURSELF: a big/important area gets its own node; trivial things fold
-into a parent node's body. Do NOT emit a node per file.
+- One markdown file per topic: each significant module/subsystem, core concept,
+  data model, key flow, notable decision. Organize with folders as you see fit
+  (e.g. modules/, concepts/, decisions/). More pages is fine — granular beats
+  monolithic.
+- Link related pages inline with [[wikilinks]] — link LIBERALLY; the link graph
+  IS the map. A [[link]] to a page you haven't written yet marks it as worth
+  writing.
+- index.md — the entry point: a categorized catalog of every page with a
+  one-line summary each. Keep it current.
+- log.md — append-only history: one "## [<sha7>] <what happened>" entry per
+  pass. When log.md grows past ~150KB, compact its OLDEST entries into a short
+  summary section at the top (never let it exceed the 256KB sync cap).
+- Every page STARTS with YAML frontmatter listing the REAL repo files it
+  documents, then a "# Title" heading, then the body:
 
-When the whole codebase is mapped, call finish_wiki_generation ONCE with keepNodeIds =
-EVERY id you emitted, then output exactly WIKI_DONE on its own line and stop.
+  ---
+  files:
+    - apps/web/src/example.ts
+  ---
+  # Page Title
 
-Be efficient — this spends the user's Claude quota. Read broadly and sample enough to
-document each area accurately; you needn't read every file. If a tool errors, retry a
-couple of times, then move on — never stall waiting on a human.`;
+  Body: purpose, how it works, key functions/types/tables, invariants, gotchas,
+  cross-references to [[related-pages]].
 
-export const WIKI_KICKOFF = (sha) =>
-  `Map this repository into the living code wiki now. Ground everything to commit ${sha}. ` +
-  `Read the real files, emit a node per significant area with emit_wiki_node, then call ` +
-  `finish_wiki_generation with all your node ids and output WIKI_DONE.`;
+Ground EVERY claim in files you actually read (Read, Grep, Glob, ls, git in the
+repo) — never guess.
 
-// Delivery re-ground turn: a feature just MERGED. Update only the touched wiki
-// nodes + record a persistent feature-history node. INCREMENTAL — never a full
-// rewrite, never finish_wiki_generation (that prunes; this only adds/updates).
-export const SYSTEM_REGROUND = `You are Flowviant's codebase cartographer, running FULLY AUTONOMOUSLY via the
-"flowviant" MCP server. There is NO interactive user and NO terminal. You do NOT
-write, edit, or commit code — a feature just MERGED and you update the living code
-wiki to reflect it, by calling MCP tools.
+THE HUMAN DOCS — docs/ inside the vault. After the vault pages are current,
+COMPILE human documentation FROM them (distill your own vault pages — don't
+re-read the whole repo; spot-check a cited file only when something looks off).
+Docs are for humans: clear prose, short sections, a reading order. Fixed spine:
+- docs/00-start-here.md — "Start Here": what this codebase is, how to run it,
+  the handful of files that matter most, where to go next.
+- docs/01-architecture.md — the big picture: major pieces, how they fit, data
+  flow, and a map of the chapters below.
+- docs/1N-<chapter>.md — ONE chapter per major subsystem (10, 11, 12 …), YOUR
+  choice of chapters, derived from the vault's hub pages.
+- docs/90-decisions.md — notable design decisions and their why.
+- docs/91-glossary.md — the project's terms of art.
+Docs pages use the same frontmatter files: lists and [[wikilinks]] (they may
+link to vault pages); numeric prefixes are the reading order.
+
+Full-sweep protocol:
+1. If the vault already has pages, read index.md + log.md FIRST — update and
+   extend rather than rewrite; delete vault pages whose code no longer exists.
+2. Explore the repo broadly, then write/refresh pages area by area.
+3. Compile/refresh the docs/ chapters from the finished vault pages.
+4. Refresh index.md, append a log.md entry, then output exactly WIKI_DONE on
+   its own line and stop.
+
+Be efficient — this spends the user's Claude quota. Read broadly and sample
+enough to document each area accurately; you needn't read every file. If a tool
+errors, retry a couple of times, then move on — never stall waiting on a human.`;
+
+export const WIKI_KICKOFF = (sha, vaultDir) =>
+  `Map this repository into the knowledge vault now (vault: ${vaultDir}). Ground ` +
+  `everything to commit ${sha}. Read the real files, write/refresh the vault pages, ` +
+  `compile the docs/ chapters from them, update index.md and log.md, then output WIKI_DONE.`;
+
+// Delivery re-ground turn: a feature just MERGED. Update only the vault pages
+// the change touched + append the durable feature-history log entry.
+// INCREMENTAL — never a full rewrite.
+export const SYSTEM_REGROUND = (vaultDir) => `You are Flowviant's codebase cartographer, running FULLY AUTONOMOUSLY. There is
+NO interactive user and NO terminal. A feature just MERGED and you update the
+knowledge VAULT of markdown files at:
+
+  ${vaultDir}
+
+That vault directory is the ONLY place you may create, edit, or delete files.
+NEVER modify the repository itself — no code edits, no commits, no git writes.
 
 Steps:
-1. Call list_wiki_nodes to see the current wiki (node ids + the files each covers).
-2. For each existing node whose files OVERLAP the changed files, RE-READ that area's
-   real code and re-emit the node with emit_wiki_node using the SAME id (updating it
-   in place). Touch ONLY nodes the change actually affected — this is incremental.
-   If the change adds a genuinely new area with no node, emit a new one.
-3. Emit ONE feature-history node recording what shipped: id "feature:<short-slug>",
-   kind "note", state "built", title = the feature, body = what it added and why
-   (a durable record), citations = the changed files, edges linking to the code
-   nodes it touched. state "built" makes it permanent — a future full sweep keeps it.
-4. Do NOT call finish_wiki_generation — that is only for a full sweep and would
-   prune. Just emit, then output exactly REGROUND_DONE on its own line and stop.
+1. Read the vault's index.md (and log.md tail) to see the current pages and the
+   repo files each documents (their frontmatter "files:" lists).
+2. For each existing page whose files OVERLAP the changed files, RE-READ that
+   area's real code and update the page in place. Touch ONLY pages the change
+   actually affected — this is incremental. If the change adds a genuinely new
+   area, write a new page (with frontmatter + [[links]]) and add it to index.md.
+3. If any docs/ chapter cites or covers the updated vault pages, refresh THAT
+   chapter (docs are compiled from the vault — keep them consistent; touch only
+   affected chapters).
+4. Append ONE feature-history entry to log.md:
+   "## [<sha7>] shipped: <feature title>" followed by a short durable record of
+   what it added and why, citing the changed files and [[touched-pages]].
+5. Output exactly REGROUND_DONE on its own line and stop.
 
 Ground every claim in files you actually read. Be efficient — look only at the
 changed area, not the whole repo; spend little quota.`;
 
-export const REGROUND_KICKOFF = ({ sha, title, files }) =>
-  `A feature just merged. Re-ground the living wiki for it.\n\n` +
+export const REGROUND_KICKOFF = ({ sha, title, files, vaultDir }) =>
+  `A feature just merged. Re-ground the knowledge vault (${vaultDir}) for it.\n\n` +
   `Feature: ${title}\n` +
   `Grounded commit: ${sha}\n` +
   `Changed files:\n${files.map((f) => `- ${f}`).join('\n')}\n\n` +
-  `Follow your instructions: list_wiki_nodes, re-emit the touched nodes (same ids), ` +
-  `emit the feature-history node (state "built"), then output REGROUND_DONE.`;
+  `Follow your instructions: update the touched vault pages (and any docs/\n` +
+  `chapter that covers them), append the feature-history entry to log.md,\n` +
+  `then output REGROUND_DONE.`;
 
 // Unattended (default) skips prompts so the agent never stalls with no terminal;
 // FLOWVIANT_SAFE=1 restricts to a curated toolset instead.
@@ -172,6 +211,36 @@ const PERM = SAFE
       'Bash(bun:*)',
     ]
   : ['--dangerously-skip-permissions'];
+
+// Wiki turns are read-the-repo + write-the-vault ONLY — always curated, never
+// --dangerously-skip-permissions: no gh, no push-capable git, no package
+// managers, and nothing that can EXECUTE arbitrary commands — no `find`
+// (-exec/-delete) and no `git grep` (-O<pager> runs a shell; the Grep tool
+// covers search). Command execution is the line: it enables network exfil,
+// which plain file writes never do. `rm` IS allowed: pruning a stale vault
+// page requires a real file deletion (that's how the sync protocol learns of
+// it), and the blast radius is bounded — the daemon resets the repo worktree
+// after every wiki turn, and the vault has its own git history.
+// (Write/Edit can't be path-scoped here; the worktree reset is the backstop.)
+const WIKI_PERM = [
+  '--allowedTools',
+  'Read',
+  'Grep',
+  'Glob',
+  'Edit',
+  'Write',
+  'Bash(ls:*)',
+  'Bash(wc:*)',
+  'Bash(head:*)',
+  'Bash(cat:*)',
+  'Bash(mkdir:*)',
+  'Bash(rm:*)',
+  'Bash(git status:*)',
+  'Bash(git log:*)',
+  'Bash(git show:*)',
+  'Bash(git diff:*)',
+  'Bash(git rev-parse:*)',
+];
 
 export const sleep = (s) => new Promise((r) => setTimeout(r, s * 1000));
 
@@ -215,6 +284,15 @@ export function humanizeToolUse(name, input = {}, cwd = '') {
   switch (name) {
     case 'Read':
       return { kind: 'read', label: `read ${shortPath(input.file_path, cwd)}` };
+    // Vault authoring: Write/Edit of a markdown page is the "writing" signal
+    // (the wiki turn's only legal writes are vault files). Label with the last
+    // two path segments — the vault lives outside cwd, so shortPath can't trim.
+    case 'Write':
+    case 'Edit': {
+      const p = String(input.file_path ?? '');
+      const tail = p.split('/').slice(-2).join('/');
+      return { kind: 'write', label: `${name === 'Write' ? '+ page' : '~ page'} ${tail}` };
+    }
     case 'Grep':
       return {
         kind: 'search',
@@ -286,16 +364,18 @@ function handleStreamLine(line, { cwd, emit, onActivity, appendText }) {
 // returned string for sentinel detection, and each activity is handed to
 // `onActivity` so the caller can forward progress. Build-agent turns leave it
 // off and keep the raw text passthrough + line sentinels.
-export function runTurn({ prompt, resume, system, cwd, mcpConfig, label, onSpawn, streamJson, onActivity }) {
+export function runTurn({ prompt, resume, system, cwd, mcpConfig, label, onSpawn, streamJson, onActivity, wikiPerm }) {
   return new Promise((resolve) => {
     const args = [];
     if (resume) args.push('--continue');
-    args.push('-p', prompt, '--mcp-config', mcpConfig, '--append-system-prompt', system);
+    args.push('-p', prompt, '--append-system-prompt', system);
+    // Wiki-vault turns are pure file work — no MCP server at all.
+    if (mcpConfig) args.push('--mcp-config', mcpConfig);
     // Pin the model — never inherit the user's global default (which may be a
     // 1M/long-context tier their subscription can't bill autonomous work on).
     args.push('--model', MODEL);
     if (streamJson) args.push('--output-format', 'stream-json', '--verbose');
-    args.push(...PERM);
+    args.push(...(wikiPerm ? WIKI_PERM : PERM));
     // Force the user's Claude Code subscription — never the API. A key exported in
     // the shell would otherwise silently bill every poll-mode turn as raw API
     // usage (same invariant live mode enforces on its SDK session env).

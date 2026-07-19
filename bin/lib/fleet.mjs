@@ -54,6 +54,7 @@ import { runLiveWorker } from './live.mjs';
 import { reapOrphanPreviews } from './preview.mjs';
 import { preflight } from './preflight.mjs';
 import { connectStream } from './stream.mjs';
+import { ensureVault, syncVault } from './vault.mjs';
 
 async function fetchRoster(haveIds) {
   const url = new URL(FLEET_URL);
@@ -218,6 +219,14 @@ export async function runFleetDaemon() {
     daemonAlive = false;
     try {
       stream?.close();
+    } catch {
+      /* best-effort */
+    }
+    // A mid-sweep wiki Claude must die with the daemon — orphaning it leaves it
+    // burning quota, and a restarted daemon would start a SECOND sweep racing
+    // it on the same vault dir + sync state.
+    try {
+      wikiChild?.kill('SIGKILL');
     } catch {
       /* best-effort */
     }
@@ -398,36 +407,31 @@ export async function runFleetDaemon() {
     }
   };
 
-  // Living-wiki work runs ONE turn at a time in a dedicated worktree (off the
-  // agents' checkouts), via the emit_wiki_node MCP tool — never code edits. Two
-  // triggers enqueue: a Regenerate click (full SWEEP) and a successful merge
-  // (incremental RE-GROUND → feature-history). One queue + runner serializes
-  // them so they never collide on the worktree. Each turn runs under its own
-  // wiki-scoped credential (minted per task below) — the server allows ONLY the
-  // wiki tools on it, and build agents' worker tokens can't touch the map. Also
-  // means wiki work needs no agent online.
+  // Living-wiki work runs ONE turn at a time in a dedicated repo worktree (off
+  // the agents' checkouts). Claude READS the repo there and writes the markdown
+  // VAULT (~/.flowviant/vaults/<projectId>) — plain files, no MCP tools; the
+  // daemon hash-diff syncs the vault to the server after each turn. Two
+  // triggers enqueue: a Regenerate click (full SWEEP, finalize-prunes) and a
+  // successful merge (incremental RE-GROUND). One queue + runner serializes
+  // them so they never collide on the worktree or the vault. Wiki work needs no
+  // agent online.
   const wikiWt = join(baseDir, 'wiki');
   const REGROUND_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/reground-done');
-  const WIKI_TOKEN_URL = FLEET_URL.replace(/\/agents\/?$/, '/wiki-token');
+  const WIKI_VAULT_URL = FLEET_URL.replace(/\/agents\/?$/, '/wiki-vault');
   const WIKI_PROGRESS_URL = FLEET_URL.replace(/\/agents\/?$/, '/wiki-progress');
   const wikiQueue = [];
   let wikiBusy = false;
+  let wikiChild = null; // the wiki turn's Claude process — tracked so teardown can kill it
   let lastSweepAt = null; // dedup: run each Regenerate request once
   const groundedIntents = new Set(); // dedup: re-ground each delivery once
-
-  const mintWikiToken = async () => {
-    try {
-      const res = await fetch(WIKI_TOKEN_URL, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${FLEET_TOKEN}`, 'User-Agent': USER_AGENT },
-        signal: AbortSignal.timeout(30_000),
-      });
-      if (!res.ok) return null;
-      return (await res.json())?.data?.token ?? null;
-    } catch {
-      return null;
-    }
-  };
+  // The vault is keyed by the server project this fleet credential serves
+  // (learned from the roster); until the first poll names it, fall back to a
+  // repo-keyed dir so a stale-server daemon still works.
+  let wikiProjectId = null;
+  const vaultDirFor = () =>
+    wikiProjectId && isSafePathSegment(wikiProjectId)
+      ? join(homedir(), '.flowviant', 'vaults', wikiProjectId)
+      : join(homedir(), '.flowviant', 'vaults', repoKey);
 
   // Stream what the wiki turn is doing to the app (the canvas renders the read
   // phase). Throttled to ~1/s — the FIRST activity of a run and the terminal
@@ -456,6 +460,11 @@ export async function runFleetDaemon() {
   const enqueueSweep = (job) => {
     if (!job || job.requestedAt === lastSweepAt) return;
     lastSweepAt = job.requestedAt;
+    // A full sweep is expensive — never stack two. One queued sweep already
+    // covers any newer Regenerate click (it reads the repo fresh when it runs).
+    // A failed/partial sweep stays recoverable: re-clicking Regenerate always
+    // refreshes requestedAt server-side, beating this dedup.
+    if (wikiQueue.some((t) => t.type === 'sweep')) return;
     wikiQueue.push({ type: 'sweep' });
     void drainWiki();
   };
@@ -468,6 +477,9 @@ export async function runFleetDaemon() {
 
   // Changed files of a (merged) PR, for the re-ground prompt. Capped so a huge
   // PR can't blow up the prompt. prUrl was already validated before the merge.
+  // Returns null on a gh FAILURE (network/auth) — distinct from a PR that
+  // genuinely changed nothing — so the caller can retry instead of silently
+  // consuming the durable job with no re-ground run.
   const changedFilesForPr = (prUrl) => {
     try {
       const out = execFileSync('gh', ['pr', 'view', prUrl, '--json', 'files'], {
@@ -477,24 +489,22 @@ export async function runFleetDaemon() {
       });
       return (JSON.parse(out).files ?? []).map((f) => f.path).filter(Boolean).slice(0, 60);
     } catch {
-      return [];
+      return null;
     }
   };
+  const regroundAttempts = new Map(); // intentId -> gh-failure count
 
   async function drainWiki() {
     if (wikiBusy || wikiQueue.length === 0) return;
     wikiBusy = true;
     try {
       while (wikiQueue.length) {
-        // Fresh wiki-scoped credential per task — dedicated, so no roster
-        // re-mint can rotate it out from under a long sweep.
-        const token = await mintWikiToken();
-        if (!token) {
-          warn('wiki: could not mint the cartographer token — retrying on a later poll');
-          break; // queue intact — the reconcile loop re-drains
-        }
         const task = wikiQueue.shift();
-        const { dir, path: mcpConfig } = mcpConfigFor(token, mcpUrl);
+        // The vault is plain files — the turn needs no MCP server and no
+        // cartographer token; the daemon itself syncs afterwards on the fleet
+        // credential.
+        const vaultDir = vaultDirFor();
+        ensureVault(vaultDir);
         // Live progress for this turn: a rolling FEED of everything Claude does
         // (thinking, narration, reads, node writes), the file count, and the
         // phase — streamed to the app (throttled; each frame carries the whole
@@ -550,56 +560,113 @@ export async function runFleetDaemon() {
           } catch {
             /* detached/no HEAD — still writes the map, just ungrounded */
           }
+          // Sync the vault after the turn regardless of the sentinel: a died
+          // sweep's partial pages still persist (merge, no prune) — only a
+          // COMPLETED sweep finalizes, so an interrupted one can't erase pages.
+          const runSync = async (finalize) => {
+            try {
+              const r = await syncVault({
+                dir: vaultDir,
+                url: WIKI_VAULT_URL,
+                token: FLEET_TOKEN,
+                userAgent: USER_AGENT,
+                finalize,
+                groundedAtSha: sha || undefined,
+                // Powers the GitHub blob links behind every cited file path.
+                repoFullName: originSlug(repoRoot) || undefined,
+                warn,
+              });
+              if (r.skipped) note(`${c.cyan('wiki')} ${c.dim('— vault unchanged, nothing to sync')}`);
+              else
+                ok(
+                  `${c.cyan('wiki')} ${c.dim(
+                    `— synced ${r.uploaded} page${r.uploaded === 1 ? '' : 's'} (${r.pages} total${r.deleted ? `, ${r.deleted} removed` : ''})`
+                  )}`
+                );
+            } catch (e) {
+              warn(`wiki vault sync failed: ${e.message} — pages stay local; next turn retries`);
+            }
+          };
           if (task.type === 'sweep') {
             note(`${c.cyan('wiki')} ${c.dim('— regenerating: your Claude is reading the repo…')}`);
             const out = await runTurn({
-              prompt: WIKI_KICKOFF(sha),
+              prompt: WIKI_KICKOFF(sha, vaultDir),
               resume: false,
-              system: SYSTEM_WIKI,
+              system: SYSTEM_WIKI(vaultDir),
               cwd: wikiWt,
-              mcpConfig,
+              wikiPerm: true,
               label: c.cyan('[wiki]'),
               streamJson: true,
               onActivity,
+              onSpawn: (ch) => {
+                wikiChild = ch;
+              },
             });
-            if (sawSentinel(out, 'WIKI_DONE'))
-              ok(`${c.cyan('wiki')} ${c.dim('— regenerated from your code.')}`);
+            const complete = sawSentinel(out, 'WIKI_DONE');
+            if (complete) ok(`${c.cyan('wiki')} ${c.dim('— vault regenerated from your code.')}`);
             else
-              warn('code-wiki regeneration ended without WIKI_DONE — retry from the app if incomplete.');
+              warn('wiki sweep ended without WIKI_DONE — partial pages synced; retry from the app.');
+            await runSync(complete);
           } else {
             const files = changedFilesForPr(task.prUrl);
-            if (files.length === 0) {
+            if (files === null) {
+              // gh failed (network/auth) — retry via the durable job a couple
+              // of times before consuming it, so a transient outage doesn't
+              // silently drop the re-ground.
+              const n = (regroundAttempts.get(task.intentId) ?? 0) + 1;
+              regroundAttempts.set(task.intentId, n);
+              if (n < 3) {
+                warn(`wiki re-ground for "${task.title}": gh failed — will retry (${n}/3)`);
+                groundedIntents.delete(task.intentId); // let the roster re-offer it
+                continue;
+              }
+              warn(`wiki re-ground for "${task.title}": gh failed ${n} times — giving up (heals on the next full sweep)`);
+            } else if (files.length === 0) {
               note(`${c.cyan('wiki')} ${c.dim(`— "${task.title}": no changed files to re-ground`)}`);
             } else {
               note(`${c.cyan('wiki')} ${c.dim(`— re-grounding after "${task.title}"…`)}`);
               const out = await runTurn({
-                prompt: REGROUND_KICKOFF({ sha, title: task.title, files }),
+                prompt: REGROUND_KICKOFF({ sha, title: task.title, files, vaultDir }),
                 resume: false,
-                system: SYSTEM_REGROUND,
+                system: SYSTEM_REGROUND(vaultDir),
                 cwd: wikiWt,
-                mcpConfig,
+                wikiPerm: true,
                 label: c.cyan('[wiki]'),
                 streamJson: true,
                 onActivity,
+                onSpawn: (ch) => {
+                  wikiChild = ch;
+                },
               });
               if (sawSentinel(out, 'REGROUND_DONE'))
-                ok(`${c.cyan('wiki')} ${c.dim(`— wiki updated for "${task.title}".`)}`);
+                ok(`${c.cyan('wiki')} ${c.dim(`— vault updated for "${task.title}".`)}`);
               else warn(`wiki re-ground for "${task.title}" ended without REGROUND_DONE.`);
+              await runSync(false);
             }
-            // Consume the durable job: attempted = done (success or not — emits
-            // are idempotent and a failed turn heals on the next full sweep), so
-            // a failing re-ground can't loop-burn quota. Only a crash BEFORE
-            // this line leaves the job listed for a retry after restart.
+            // Consume the durable job: attempted = done (success or not — the
+            // sync is idempotent and a failed turn heals on the next full
+            // sweep), so a failing re-ground can't loop-burn quota. Only a
+            // crash BEFORE this line leaves the job listed for a retry.
+            regroundAttempts.delete(task.intentId);
             await reportMergeOutcome(REGROUND_DONE_URL, { intentId: task.intentId });
           }
         } catch (e) {
           warn(`wiki ${task.type} failed: ${e.message}`);
         } finally {
+          wikiChild = null;
           if (heartbeat) clearInterval(heartbeat);
           // Terminal frame so the app cover clears promptly (don't wait for the
           // freshness window to lapse). force-sent past the throttle.
           await postWikiProgress(frame({ done: true }), true);
-          rmSync(dir, { recursive: true, force: true });
+          // Safety net: the wiki turn is read-only on the repo by CONTRACT, but
+          // permission enforcement is a curated tool list, not a path jail —
+          // discard anything a confused turn wrote to the worktree so it can
+          // never leak into a later turn or a push.
+          try {
+            resetWorktree(wikiWt, baseRef);
+          } catch {
+            /* best-effort */
+          }
         }
       }
     } finally {
@@ -684,12 +751,17 @@ export async function runFleetDaemon() {
       }
     }
     if (roster.mcpUrl) mcpUrl = roster.mcpUrl;
+    if (roster.project?.id) wikiProjectId = roster.project.id; // keys the vault dir
     if (roster.leaseTtlSeconds) leaseTtlSeconds = roster.leaseTtlSeconds;
     // Keep the daemon current. Safe = no worker mid-task (true at startup, since
     // no workers are spawned yet). If it self-updates it re-execs into the new
     // version and this process becomes a proxy — stop the loop.
     if (roster.daemon) {
-      const safeToUpdate = [...workers.values()].every((w) => w.state.child == null);
+      // "No worker mid-task" must include the wiki runner: updating mid-sweep
+      // re-execs the daemon, orphans the wiki Claude, and the fresh process
+      // starts a second sweep racing it on the same vault.
+      const safeToUpdate =
+        !wikiBusy && [...workers.values()].every((w) => w.state.child == null);
       const updating = handleVersionSignal({
         latest: roster.daemon.latest,
         min: roster.daemon.min,
