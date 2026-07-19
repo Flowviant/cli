@@ -515,11 +515,17 @@ export async function runFleetDaemon() {
           }
           void postWikiProgress(frame());
         };
+        // Heartbeat: re-send the current frame every 5s even with no new stream
+        // event, so the app's freshness window never lapses during a long
+        // thinking block or slow tool (which emit nothing until they finish) —
+        // otherwise the cover would flap back to the empty state mid-sweep.
+        let heartbeat = null;
         try {
           // Immediate frame so the cover shows the daemon feed right away (the
           // "reading your code" phase), not a static message, while Claude warms up.
           feed.push('starting…');
           await postWikiProgress(frame(), true);
+          heartbeat = setInterval(() => void postWikiProgress(frame(), true), 5000);
           if (!existsSync(wikiWt)) {
             try {
               git(['worktree', 'add', '--detach', wikiWt, baseRef], repoRoot);
@@ -580,6 +586,7 @@ export async function runFleetDaemon() {
         } catch (e) {
           warn(`wiki ${task.type} failed: ${e.message}`);
         } finally {
+          if (heartbeat) clearInterval(heartbeat);
           // Terminal frame so the app cover clears promptly (don't wait for the
           // freshness window to lapse). force-sent past the throttle.
           await postWikiProgress(frame({ done: true }), true);
@@ -626,6 +633,14 @@ export async function runFleetDaemon() {
     if (!connected) {
       connected = true;
       ok('Connected to Flowviant — watching your roster.');
+      // Name the scoped project so a mismatch (this daemon serves project A, but
+      // you're viewing project B's wiki) is obvious instead of a silent no-op.
+      if (roster.project) {
+        note(
+          `${c.cyan('project')} · ${c.bold(roster.project.name)} ${c.dim(`(${roster.project.id})`)}`
+        );
+        note(c.dim('  wiki + agents stream to THIS project — view its Code canvas in Flowviant.'));
+      }
     }
     if (roster.mcpUrl) mcpUrl = roster.mcpUrl;
     if (roster.leaseTtlSeconds) leaseTtlSeconds = roster.leaseTtlSeconds;

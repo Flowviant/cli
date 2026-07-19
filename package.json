@@ -1,6 +1,6 @@
 {
   "name": "flowviant",
-  "version": "0.22.0",
+  "version": "0.23.0",
   "description": "Run your own Claude Code as headless build agents for Flowviant — on your own credentials. Claims dispatched work, opens PRs, captures review evidence, and routes questions back to you.",
   "type": "module",
   "bin": {
