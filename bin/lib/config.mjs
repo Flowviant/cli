@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 
-export const VERSION = '0.23.0';
+export const VERSION = '0.24.0';
 
 // Credential stored by `flowviant login` (device auth) — the no-token,
 // no-env-var path. An explicit --fleet flag or FLOWVIANT_FLEET env still wins.
@@ -25,6 +25,12 @@ function argFlag(name) {
 const API_BASE = process.env.FLOWVIANT_API_URL || 'https://api.flowviant.com/api/v2';
 export const MCP_URL = process.env.FLOWVIANT_MCP_URL || `${API_BASE}/mcp`;
 export const FLEET_URL = process.env.FLOWVIANT_FLEET_URL || `${API_BASE}/fleet/agents`;
+// Push channel: the daemon holds this WebSocket open and the server nudges it
+// the instant a job lands, so dispatch is ~a round-trip instead of a full poll.
+// Derived from FLEET_URL (…/fleet/agents → …/fleet/stream, http→ws) unless set.
+export const STREAM_URL =
+  process.env.FLOWVIANT_STREAM_URL ||
+  FLEET_URL.replace(/\/agents(\/?)$/, '/stream$1').replace(/^http/, 'ws');
 export const POLL_SECONDS = Number(process.env.POLL_SECONDS || 20);
 export const IDLE_SECONDS = Number(process.env.IDLE_SECONDS || 30);
 // Live mode: after this long idle-parked on a blocker, tear the session down to

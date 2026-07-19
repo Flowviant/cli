@@ -53,6 +53,7 @@ import {
 import { runLiveWorker } from './live.mjs';
 import { reapOrphanPreviews } from './preview.mjs';
 import { preflight } from './preflight.mjs';
+import { connectStream } from './stream.mjs';
 
 async function fetchRoster(haveIds) {
   const url = new URL(FLEET_URL);
@@ -206,12 +207,20 @@ export async function runFleetDaemon() {
   let leaseTtlSeconds = 24 * 60 * 60; // updated from each roster response
   let mcpUrl = MCP_URL;
   const workers = new Map(); // agentId -> { state, promise, wt, label }
+  let daemonAlive = true; // flipped false on shutdown so the stream stops reconnecting
+  let stream = null; // push channel handle (set once the loop is set up)
 
   // Shutdown KEEPS the worktrees: in-flight local work survives Ctrl+C and
   // resumes in place on the next run (the task marker matches). Worktrees are
   // only removed when an agent is deleted from the roster, or by
   // `flowviant clean`.
   const teardown = () => {
+    daemonAlive = false;
+    try {
+      stream?.close();
+    } catch {
+      /* best-effort */
+    }
     for (const [, w] of workers) {
       w.state.alive = false;
       try {
@@ -603,6 +612,38 @@ export async function runFleetDaemon() {
   let idleBeatAt = 0; // throttle the "still alive" idle heartbeat
   let joinCount = 0; // for stable per-agent label colours
 
+  // ── Push channel: a server wake short-circuits the reconcile sleep so a job is
+  // picked up in ~a round trip instead of on the next poll. The socket only
+  // nudges — we still fetch the roster below — so it's pure latency, and the
+  // poll stays the fallback whenever the socket is down. `waitReconcile()`
+  // resolves on either a wake or the RECONCILE_SECONDS timeout, whichever first.
+  let wakeSignal = null; // { resolve, timer } while the loop is idling
+  let pendingWake = false; // a wake that landed mid-reconcile — honored next wait
+  const fireWake = () => {
+    if (wakeSignal) {
+      clearTimeout(wakeSignal.timer);
+      const { resolve } = wakeSignal;
+      wakeSignal = null;
+      resolve();
+    } else {
+      pendingWake = true; // not idling right now; don't lose the wake
+    }
+  };
+  const waitReconcile = () => {
+    if (pendingWake) {
+      pendingWake = false;
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        wakeSignal = null;
+        resolve();
+      }, RECONCILE_SECONDS * 1000);
+      wakeSignal = { resolve, timer };
+    });
+  };
+  stream = connectStream({ onWake: () => fireWake(), isAlive: () => daemonAlive });
+
   // Which agents to tell the server we already hold a good token for. We keep
   // our token (omit a re-mint) UNLESS it's near expiry AND the worker is idle
   // (no child mid-turn) — then we drop it from `have` to force a fresh token,
@@ -776,6 +817,7 @@ export async function runFleetDaemon() {
       }
     }
 
-    await sleep(RECONCILE_SECONDS);
+    // Idle until the next poll deadline OR a push wake — whichever comes first.
+    await waitReconcile();
   }
 }
