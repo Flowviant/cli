@@ -4,7 +4,15 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 
-export const VERSION = '0.24.0';
+export const VERSION = '0.25.0';
+
+// The model EVERY daemon Claude turn runs on — pinned so autonomous work never
+// inherits your interactive `~/.claude/settings.json` default. That matters: a
+// default of `opus[1m]` puts big prompts (wiki-gen over a whole repo, >200K
+// tokens) onto the 1M long-context premium tier, which a Max plan does NOT cover
+// — the turn dies with "usage credits required for this model". Standard `opus`
+// is fully covered. Override with FLOWVIANT_MODEL (e.g. `sonnet` for cheaper/faster).
+export const MODEL = process.env.FLOWVIANT_MODEL || 'opus';
 
 // Credential stored by `flowviant login` (device auth) — the no-token,
 // no-env-var path. An explicit --fleet flag or FLOWVIANT_FLEET env still wins.

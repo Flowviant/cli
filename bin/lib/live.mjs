@@ -22,6 +22,7 @@ import { query } from '@anthropic-ai/claude-agent-sdk';
 import {
   MCP_URL,
   SAFE,
+  MODEL,
   POLL_SECONDS,
   IDLE_SECONDS,
   PARK_TIMEOUT_SECONDS,
@@ -419,6 +420,9 @@ export async function runLiveTask({ mcpUrl, token, cwd, baseRef, isAlive, resume
     options: {
       cwd,
       env,
+      // Pin the model — never inherit the user's global default (which may be a
+      // 1M/long-context tier their subscription can't bill autonomous work on).
+      model: MODEL,
       permissionMode: SAFE ? 'default' : 'bypassPermissions',
       ...(SAFE ? { allowedTools: SAFE_TOOLS } : {}),
       systemPrompt: { type: 'preset', preset: 'claude_code', append: SYSTEM_LIVE },

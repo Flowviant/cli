@@ -8,7 +8,7 @@ import { spawn } from 'node:child_process';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { SAFE } from './config.mjs';
+import { SAFE, MODEL } from './config.mjs';
 
 // Multi-task loop (TOKEN / TOKENS modes): drain the whole queue in one session.
 export const SYSTEM_MULTI = `You are a Flowviant build agent running FULLY AUTONOMOUSLY via the "flowviant" MCP
@@ -291,6 +291,9 @@ export function runTurn({ prompt, resume, system, cwd, mcpConfig, label, onSpawn
     const args = [];
     if (resume) args.push('--continue');
     args.push('-p', prompt, '--mcp-config', mcpConfig, '--append-system-prompt', system);
+    // Pin the model — never inherit the user's global default (which may be a
+    // 1M/long-context tier their subscription can't bill autonomous work on).
+    args.push('--model', MODEL);
     if (streamJson) args.push('--output-format', 'stream-json', '--verbose');
     args.push(...PERM);
     // Force the user's Claude Code subscription — never the API. A key exported in
