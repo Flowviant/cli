@@ -235,10 +235,15 @@ export function humanizeToolUse(name, input = {}, cwd = '') {
   }
 }
 
-// Parse ONE line of `--output-format stream-json` NDJSON. Pulls assistant text
-// into `out` (so sentinel detection still works) and turns each tool_use into a
-// streamed activity line. A line that isn't JSON (a stray warning) is treated as
-// raw text so nothing is lost.
+// Collapse whitespace + clip so a narration/thinking snippet is one tidy feed line.
+const oneLine = (s, n = 160) => String(s).replace(/\s+/g, ' ').trim().slice(0, n);
+
+// Parse ONE line of `--output-format stream-json` NDJSON into feed activities.
+// Surfaces the WHOLE turn — thinking, narration, AND every tool — so neither the
+// daemon console nor the app cover goes dark while Claude reasons (Opus thinks in
+// bursts before/between tools; emitting only tools left long silent gaps).
+// Assistant text is also folded into `out` so the WIKI_DONE/REGROUND_DONE
+// sentinels still match. A non-JSON line (a stray warning) is kept as raw text.
 function handleStreamLine(line, { cwd, emit, onActivity, appendText }) {
   let ev;
   try {
@@ -248,15 +253,22 @@ function handleStreamLine(line, { cwd, emit, onActivity, appendText }) {
     emit(line + '\n');
     return;
   }
+  const push = (a) => {
+    if (!a || !a.label) return;
+    emit(a.label + '\n');
+    onActivity?.(a);
+  };
   if (ev.type === 'assistant' && Array.isArray(ev.message?.content)) {
     for (const b of ev.message.content) {
-      if (b.type === 'text' && b.text) appendText(b.text + '\n');
-      else if (b.type === 'tool_use') {
-        const a = humanizeToolUse(b.name, b.input || {}, cwd);
-        if (a) {
-          emit(a.label + '\n');
-          onActivity?.(a);
-        }
+      if (b.type === 'thinking' || b.type === 'redacted_thinking') {
+        // The `thinking` text is usually redacted (signature only), so emit a
+        // marker — enough to show Claude is actively reasoning, not hung.
+        push({ kind: 'think', label: b.thinking ? `thinking: ${oneLine(b.thinking)}` : 'thinking…' });
+      } else if (b.type === 'text' && b.text?.trim()) {
+        appendText(b.text + '\n');
+        push({ kind: 'say', label: oneLine(b.text) });
+      } else if (b.type === 'tool_use') {
+        push(humanizeToolUse(b.name, b.input || {}, cwd));
       }
     }
   } else if (ev.type === 'result' && typeof ev.result === 'string') {

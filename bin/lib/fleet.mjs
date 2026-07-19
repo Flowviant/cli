@@ -426,7 +426,7 @@ export async function runFleetDaemon() {
   let lastProgressAt = 0;
   const postWikiProgress = async (body, force = false) => {
     const now = Date.now();
-    if (!force && now - lastProgressAt < 1000) return;
+    if (!force && now - lastProgressAt < 600) return;
     lastProgressAt = now;
     try {
       await fetch(WIKI_PROGRESS_URL, {
@@ -486,25 +486,40 @@ export async function runFleetDaemon() {
         }
         const task = wikiQueue.shift();
         const { dir, path: mcpConfig } = mcpConfigFor(token, mcpUrl);
-        // Live progress for this turn: count the files Claude reads, flip to the
-        // "writing" phase once it starts emitting nodes, and stream each action
-        // to the app (throttled). elapsedSec is on the daemon's own clock.
+        // Live progress for this turn: a rolling FEED of everything Claude does
+        // (thinking, narration, reads, node writes), the file count, and the
+        // phase — streamed to the app (throttled; each frame carries the whole
+        // recent tail so a dropped POST loses nothing). elapsedSec is the
+        // daemon's own clock.
         const mode = task.type === 'sweep' ? 'sweep' : 'reground';
         const startedAt = Date.now();
         let filesRead = 0;
         let phase = 'reading';
+        const feed = [];
+        const frame = (extra) => ({
+          mode,
+          phase,
+          activity: feed[feed.length - 1] ?? '',
+          recent: feed.slice(-24),
+          filesRead,
+          elapsedSec: Math.round((Date.now() - startedAt) / 1000),
+          ...extra,
+        });
         const onActivity = (a) => {
           if (a.kind === 'read') filesRead++;
           if (a.kind === 'write') phase = 'writing';
-          void postWikiProgress({
-            mode,
-            phase,
-            activity: a.label,
-            filesRead,
-            elapsedSec: Math.round((Date.now() - startedAt) / 1000),
-          });
+          // Collapse runs of bare "thinking…" so the feed doesn't fill with it.
+          if (!(a.label === 'thinking…' && feed[feed.length - 1] === 'thinking…')) {
+            feed.push(a.label);
+            if (feed.length > 48) feed.shift();
+          }
+          void postWikiProgress(frame());
         };
         try {
+          // Immediate frame so the cover shows the daemon feed right away (the
+          // "reading your code" phase), not a static message, while Claude warms up.
+          feed.push('starting…');
+          await postWikiProgress(frame(), true);
           if (!existsSync(wikiWt)) {
             try {
               git(['worktree', 'add', '--detach', wikiWt, baseRef], repoRoot);
@@ -567,17 +582,7 @@ export async function runFleetDaemon() {
         } finally {
           // Terminal frame so the app cover clears promptly (don't wait for the
           // freshness window to lapse). force-sent past the throttle.
-          await postWikiProgress(
-            {
-              mode,
-              phase,
-              activity: '',
-              filesRead,
-              elapsedSec: Math.round((Date.now() - startedAt) / 1000),
-              done: true,
-            },
-            true
-          );
+          await postWikiProgress(frame({ done: true }), true);
           rmSync(dir, { recursive: true, force: true });
         }
       }
