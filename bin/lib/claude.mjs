@@ -130,25 +130,62 @@ Ground EVERY claim in files you actually read (Read, Grep, Glob, ls, git in the
 repo) — never guess.
 
 THE HUMAN DOCS — docs/ inside the vault. After the vault pages are current,
-COMPILE human documentation FROM them (distill your own vault pages — don't
-re-read the whole repo; spot-check a cited file only when something looks off).
-Docs are for humans: clear prose, short sections, a reading order. Fixed spine:
-- docs/00-start-here.md — "Start Here": what this codebase is, how to run it,
-  the handful of files that matter most, where to go next.
-- docs/01-architecture.md — the big picture: major pieces, how they fit, data
-  flow, and a map of the chapters below.
-- docs/1N-<chapter>.md — ONE chapter per major subsystem (10, 11, 12 …), YOUR
-  choice of chapters, derived from the vault's hub pages.
-- docs/90-decisions.md — notable design decisions and their why.
-- docs/91-glossary.md — the project's terms of art.
-Docs pages use the same frontmatter files: lists and [[wikilinks]] (they may
-link to vault pages); numeric prefixes are the reading order.
+COMPILE professional developer documentation FROM them (distill your own vault
+pages; spot-check a cited file only when something looks off — don't re-read the
+whole repo). These are what a new engineer onboards from and a working engineer
+keeps open: hold them to the standard of Stripe / Google / Microsoft developer
+docs — comprehensive, precisely structured, richly cross-linked. Detailed and
+thorough beats short: a reader should be able to work in a subsystem after
+reading its chapter.
+
+Fixed spine (numeric prefix = reading order):
+- docs/00-start-here.md — the landing page + MASTER TABLE OF CONTENTS: what the
+  product is (2-3 sentences); how to run it locally (prerequisites, install,
+  required env, dev server, tests); then a linked table of contents of EVERY
+  chapter, each with a one-line description; then 2-3 role-based reading paths
+  (e.g. "New to the backend: read 01, then 12, then 14").
+- docs/01-architecture.md — the system at a glance: a Mermaid diagram (a fenced
+  code block whose language is mermaid) of the major components and how they
+  connect, a component-responsibility table, the primary request/data flows, and
+  a link into the chapter for each component.
+- docs/1N-<chapter>.md — ONE chapter per major subsystem (10, 11, 12 …), your
+  choice of chapters, derived from the vault's hub pages. Cover every significant
+  subsystem.
+- docs/90-decisions.md — notable design decisions, each as context, decision,
+  why, and consequences.
+- docs/91-glossary.md — the project's terms of art, alphabetized, each linking to
+  the chapter or vault page that defines it.
+
+EVERY chapter follows this exact anatomy, in order:
+  1. YAML frontmatter listing the real repo files the chapter draws on.
+  2. A "# Title" heading.
+  3. One or two sentences: what the chapter covers and who should read it.
+  4. A "## Contents" section — an in-page table of contents: a bulleted list
+     linking each of the chapter's own "## " sections by anchor. An anchor is the
+     heading text lowercased, spaces turned to hyphens, punctuation removed — so
+     a section "## How dispatch works" is linked "- [How dispatch works](#how-dispatch-works)".
+  5. The body sections ("## " / "### "), including as relevant: an overview and
+     where the subsystem sits in the system; how it works walked step by step
+     with REAL code excerpts (fenced and language-tagged) and file citations; a
+     Mermaid diagram for any non-trivial flow or sequence; and REFERENCE TABLES
+     for the concrete surface — HTTP endpoints (method, path, auth, purpose), key
+     functions/types, env/config keys, DB tables/columns — as markdown tables.
+  6. A "## Gotchas" section: the traps, edge cases, invariants, and non-obvious
+     constraints.
+  7. A "## See also" section: [[wikilinks]] to the deeper vault pages, plus
+     relative links to sibling chapters (e.g. "[Architecture](01-architecture.md)").
+
+Cross-link liberally: [[wikilinks]] point to vault pages; relative "NN-name.md"
+links point to sibling chapters; both are clickable in the reader. Keep every
+claim grounded in code you actually read.
 
 Full-sweep protocol:
 1. If the vault already has pages, read index.md + log.md FIRST — update and
    extend rather than rewrite; delete vault pages whose code no longer exists.
 2. Explore the repo broadly, then write/refresh pages area by area.
-3. Compile/refresh the docs/ chapters from the finished vault pages.
+3. Compile/refresh the docs/ chapters from the finished vault pages, following
+   the docs spine + per-chapter anatomy above (Contents TOC, reference tables,
+   Mermaid diagrams, Gotchas, See also).
 4. Refresh index.md, append a log.md entry, then output exactly WIKI_DONE on
    its own line and stop.
 
