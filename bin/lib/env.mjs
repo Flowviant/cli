@@ -64,18 +64,27 @@ export async function sodiumReady() {
 /** 6-emoji key fingerprint — algorithm MUST match the web's pubkeyEmoji
  *  (EnvironmentSettings.tsx) so the human can compare terminal ↔ approve card. */
 // MUST stay byte-identical to the web's pubkeyEmoji (EnvironmentSettings.tsx) —
-// the human compares the two. 32 glyphs × 8 positions ≈ 40 bits; each position
-// mixes the whole key so no byte is mute (a compromised-server pubkey swap must
-// grind a full collision, not just the tail).
-const FP_EMOJI = ['🦊','🐙','🦕','🐝','🦉','🐬','🦁','🐸','🦄','🐢','🦋','🐺','🦜','🐳','🦔','🐌','🦩','🐿️','🦥','🐨','🦦','🐇','🦡','🐝','🦨','🐜','🦢','🐋','🦭','🐞','🦚','🐊'];
+// the human compares the two strings. 32 glyphs × 8 positions, effective ~40
+// bits. Two FNV-1a rolling hashes over the whole key + a murmur3 finalizer per
+// glyph (a plain additive sum collapsed the space to ~10 bits — grindable).
+const FP_EMOJI = ['🦊','🐙','🦕','🐝','🦉','🐬','🦁','🐸','🦄','🐢','🦋','🐺','🦜','🐳','🦔','🐌','🦩','🐿️','🦥','🐨','🦦','🐇','🦡','🦂','🦨','🐜','🦢','🐋','🦭','🐞','🦚','🐊'];
 export function pubkeyEmoji(pubkeyB64) {
+  let h1 = 0x811c9dc5 >>> 0;
+  let h2 = 0xc2b2ae35 >>> 0;
+  for (let i = 0; i < pubkeyB64.length; i++) {
+    const ch = pubkeyB64.charCodeAt(i);
+    h1 = Math.imul(h1 ^ ch, 0x01000193) >>> 0;
+    h2 = Math.imul(h2 ^ ch, 0x85ebca6b) >>> 0;
+  }
   let out = '';
   for (let i = 0; i < 8; i++) {
-    let acc = i + 1;
-    for (let j = 0; j < pubkeyB64.length; j++) {
-      acc = (acc * 31 + pubkeyB64.charCodeAt(j) * (i + 2)) % 1_000_003;
-    }
-    out += FP_EMOJI[acc % FP_EMOJI.length];
+    let x = (((i < 4 ? h1 : h2) + i * 0x9e3779b1) >>> 0);
+    x ^= x >>> 16;
+    x = Math.imul(x, 0x7feb352d) >>> 0;
+    x ^= x >>> 15;
+    x = Math.imul(x, 0x846ca68b) >>> 0;
+    x ^= x >>> 16;
+    out += FP_EMOJI[x & 31];
   }
   return out;
 }
@@ -186,13 +195,15 @@ function readCache(projectId) {
   }
 }
 
-/** Offline start: materialize from the encrypted cache before the first poll. */
+/** Offline start: materialize from the encrypted cache before the first poll.
+ *  Also seeds knownTargetFiles so stale-file cleanup survives a restart. */
 export async function loadCachedEnv(projectId) {
   await ensureKeypair();
   const cached = readCache(projectId);
   if (!cached) return false;
   values = cached.values ?? [];
   bundleVersion = cached.bundleVersion ?? -1;
+  knownTargetFiles = new Set(cached.knownFiles ?? values.map((v) => v.targetFile));
   cachedProjectId = projectId;
   return values.length > 0;
 }
@@ -253,9 +264,16 @@ function isTrackedInGit(wt, relPath) {
   }
 }
 
-// Per-worktree: the target files we last materialized, so a file that lost all
-// its keys (or a key that moved files) gets its stale copy removed.
+// Per-worktree: the target files we last materialized THIS SESSION.
 const lastFilesByWorktree = new Map();
+// Project-global union of every target file we've ever materialized — PERSISTED
+// in the cache and seeded on load, so a file whose key was deleted while the
+// daemon was down still gets its stale plaintext copy cleaned on the next
+// materialize (lastFilesByWorktree alone is empty after a restart, and
+// `git clean -fd` never removes an info/exclude'd file).
+let knownTargetFiles = new Set();
+
+const MATERIALIZE_HEADER = '# Materialized by flowviant env sync';
 
 /** Render KEY=value with values that contain newlines/= safely quoted so one
  *  value can't fabricate another key line. */
@@ -266,7 +284,21 @@ function renderEnvFile(list) {
     const esc = v.value.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n').replace(/\r/g, '');
     return `${v.name}="${esc}"`;
   });
-  return `# Materialized by flowviant env sync — DO NOT COMMIT.\n${lines.join('\n')}\n`;
+  return `${MATERIALIZE_HEADER} — DO NOT COMMIT.\n${lines.join('\n')}\n`;
+}
+
+/** Delete a materialized file from a worktree, but ONLY if it's ours (carries
+ *  our header) and not git-tracked — never touch a file we didn't write. */
+function removeStaleEnvFile(wt, rel) {
+  if (isTrackedInGit(wt, rel)) return;
+  const abs = join(wt, rel);
+  try {
+    if (existsSync(abs) && readFileSync(abs, 'utf8').startsWith(MATERIALIZE_HEADER)) {
+      rmSync(abs, { force: true });
+    }
+  } catch {
+    /* best-effort */
+  }
 }
 
 /** Write the decrypted env into ONE worktree. Never call on the wiki worktree. */
@@ -305,18 +337,15 @@ export function materializeInto(wt) {
     }
   }
 
-  // Remove files we materialized last time that have no keys now (all deleted,
-  // or every key moved elsewhere) — a stale secret file must not linger.
-  const prevFiles = lastFilesByWorktree.get(wt) ?? [];
-  for (const stale of prevFiles) {
-    if (!written.includes(stale) && !isTrackedInGit(wt, stale)) {
-      try {
-        rmSync(join(wt, stale), { force: true });
-      } catch {
-        /* best-effort */
-      }
-    }
+  // Remove any file we ever materialized (this session OR a prior one, via the
+  // persisted knownTargetFiles) that has no keys now — a deleted secret's
+  // plaintext file must not linger, even across a daemon restart.
+  const writtenSet = new Set(written);
+  const candidates = new Set([...(lastFilesByWorktree.get(wt) ?? []), ...knownTargetFiles]);
+  for (const stale of candidates) {
+    if (!writtenSet.has(stale)) removeStaleEnvFile(wt, stale);
   }
+  for (const f of written) knownTargetFiles.add(f);
   lastFilesByWorktree.set(wt, written);
   if (written.length) excludeInWorktree(wt, written);
 }
@@ -359,7 +388,18 @@ export async function handleRosterEnv(env, { projectId } = {}) {
     // wedge registration until restart.
     if (env.status === 'none' && !registeredOnce) {
       const label = hostname() || 'daemon';
-      await post('register', { pubkey: myPubB64(), label });
+      try {
+        await post('register', { pubkey: myPubB64(), label });
+      } catch (e) {
+        // A 429 = the project is at its machine cap; retrying every poll would
+        // just hammer it. Stop for this session (a restart re-tries).
+        if (/\(429/.test(e.message)) {
+          registeredOnce = true;
+          warn('env: this project is at its machine limit — env access not requested. Ask an admin to remove an old machine.');
+          return { changed: false };
+        }
+        throw e; // transient — retry next poll (registeredOnce still false)
+      }
       registeredOnce = true;
       const fp = pubkeyEmoji(myPubB64());
       info(`${c.cyan('env')}    · this machine requested env access as ${c.bold(label)}`);
@@ -443,7 +483,10 @@ export async function handleRosterEnv(env, { projectId } = {}) {
     if (needSync) {
       values = opened;
       bundleVersion = bundle.bundleVersion;
-      if (cachedProjectId) writeCache(cachedProjectId, { values, bundleVersion });
+      // Fold the current target files into the persisted known set so stale
+      // cleanup survives a restart (a key deleted while down still gets swept).
+      for (const v of values) knownTargetFiles.add(v.targetFile);
+      if (cachedProjectId) writeCache(cachedProjectId, { values, bundleVersion, knownFiles: [...knownTargetFiles] });
       ok(`${c.cyan('env')} ${c.dim(`— synced ${values.length} secret${values.length === 1 ? '' : 's'} (env v${bundleVersion})`)}`);
       return { changed: true };
     }
