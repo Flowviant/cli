@@ -60,14 +60,19 @@ export async function reportDeployConfig(repoRoot) {
   const targets = readDeployConfig(repoRoot);
   const json = JSON.stringify(targets);
   if (json === lastConfigJson) return;
-  // Strip commands/secrets before the server sees the config (metadata only).
+  // Scrub command strings before the server sees them — a command line can embed
+  // an internal host or a synced secret. Only redacted metadata leaves the box.
+  const scrubCmds = (o) =>
+    o && typeof o === 'object'
+      ? Object.fromEntries(Object.entries(o).map(([k, v]) => [k, scrub(String(v ?? ''))]))
+      : o;
   const meta = targets.map((t) => ({
     id: t.id,
     label: t.label,
     provider: t.provider || 'cloudflare',
-    command: t.command,
-    build: t.build,
-    commands: t.commands,
+    command: scrub(String(t.command ?? '')),
+    build: t.build ? scrub(String(t.build)) : t.build,
+    commands: scrubCmds(t.commands),
     healthcheck: t.healthcheck,
     healthStatus: t.healthStatus,
     pushSecrets: t.pushSecrets,
@@ -100,6 +105,11 @@ function run(command, { cwd, env, input }) {
         /* already gone */
       }
     }, 30 * 60_000);
+    // A broken pipe (child exits before draining stdin — e.g. a fast-failing
+    // `wrangler secret put`) surfaces as an ASYNC 'error' on the stdin stream,
+    // which the try/catch below can't catch. Without a listener it's an uncaught
+    // exception that kills the whole daemon. Swallow it.
+    child.stdin.on('error', () => {});
     if (input != null) {
       try {
         child.stdin.write(input);
@@ -148,6 +158,10 @@ const claiming = new Set(); // in-flight guard (single-flight per daemon process
 export function processDeployJobs(jobs, ctx) {
   if (!Array.isArray(jobs) || !jobs.length) return;
   for (const job of jobs) {
+    // Defend against a malformed roster element — `job.id` on a null would throw
+    // synchronously here (outside the per-job try below) and wedge the whole
+    // reconcile loop, since this runs unguarded from the fleet tick.
+    if (!job || typeof job.id !== 'string') continue;
     if (claiming.has(job.id)) continue;
     claiming.add(job.id);
     void (async () => {
