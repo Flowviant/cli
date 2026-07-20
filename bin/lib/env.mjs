@@ -301,11 +301,30 @@ function removeStaleEnvFile(wt, rel) {
   }
 }
 
-/** Write the decrypted env into ONE worktree. Never call on the wiki worktree. */
+/** Deploy-scope credentials (e.g. CLOUDFLARE_API_TOKEN) as a NAME→value map —
+ *  injected into the deploy command's process env, NEVER written to a file. */
+export function deployCreds() {
+  const out = {};
+  for (const v of values) if (v.scope === 'deploy' && v.value) out[v.name] = v.value;
+  return out;
+}
+
+/** app-scope secrets for one environment as a NAME→value map — for pushing to
+ *  the provider's secret store on a prod deploy (`wrangler secret put`). */
+export function appSecretsFor(env) {
+  const out = {};
+  for (const v of values) if (v.scope === 'app' && v.env === env && v.value) out[v.name] = v.value;
+  return out;
+}
+
+/** Write the decrypted env into ONE worktree. Never call on the wiki worktree.
+ *  v1 materializes the 'dev' app env (agent test runs + local preview); prod
+ *  app secrets go to the provider at deploy, deploy creds are injected only. */
 export function materializeInto(wt) {
   if (!wt || !existsSync(wt)) return;
   const byFile = new Map();
   for (const v of values) {
+    if (v.scope !== 'app' || v.env !== 'dev') continue; // only local dev secrets hit a worktree file
     if (!isSafeTarget(v.targetFile)) continue;
     const list = byFile.get(v.targetFile) ?? [];
     list.push(v);
@@ -445,7 +464,7 @@ export async function handleRosterEnv(env, { projectId } = {}) {
     for (const k of bundle.keys) {
       try {
         const plain = openSealed(k.ciphertext, projectPub, projectPriv);
-        opened.push({ name: k.name, env: k.env, targetFile: k.targetFile, value: sodium.to_string(plain), version: k.version });
+        opened.push({ name: k.name, env: k.env, scope: k.scope ?? 'app', targetFile: k.targetFile, value: sodium.to_string(plain), version: k.version });
       } catch {
         allOpened = false;
         warn(`env: could not open ${k.name} (epoch ${k.keyEpoch}) — skipping; a rotation should heal it`);

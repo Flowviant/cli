@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 
-export const VERSION = '0.27.1';
+export const VERSION = '0.28.0';
 
 // The model EVERY daemon Claude turn runs on — pinned so autonomous work never
 // inherits your interactive `~/.claude/settings.json` default. That matters: a

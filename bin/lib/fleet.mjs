@@ -59,8 +59,10 @@ import {
   envQueryParams,
   handleRosterEnv,
   materializeInto,
+  myPubB64,
   scrub as envScrub,
 } from './env.mjs';
+import { processDeployJobs, reportDeployConfig } from './deploy.mjs';
 
 async function fetchRoster(haveIds) {
   const url = new URL(FLEET_URL);
@@ -904,6 +906,14 @@ export async function runFleetDaemon() {
         }
       }
     });
+
+    // Deploy: a deploy-authorized daemon reports its .flowviant/deploy.json and
+    // runs queued deploy jobs (the server only sends deployJobs to authorized
+    // machines). Config report is cheap + dedup'd; jobs are single-flight.
+    if (roster.env?.deployAuthorized) {
+      void reportDeployConfig(repoRoot);
+      processDeployJobs(roster.deployJobs, { repoRoot, baseRef, myPubB64 });
+    }
 
     // Stop workers whose agent left the roster (removed in the app).
     for (const [id, w] of [...workers]) {
