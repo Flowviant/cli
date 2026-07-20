@@ -270,6 +270,14 @@ export async function runFleetDaemon() {
     teardown();
     process.exit(130);
   });
+  // Keep the daemon alive on a stray rejection. Many loops here are fire-and-
+  // forget (`void drainWiki()`, dispatch, sync) and rely on their callees never
+  // rejecting; Node ≥15 terminates the process on an unhandled rejection, which
+  // would kill every in-flight agent worker over one transient error. Log and
+  // survive instead — a wedged sub-task self-heals on the next poll.
+  process.on('unhandledRejection', (reason) => {
+    warn(`unhandled rejection (daemon kept alive): ${reason?.stack || reason}`);
+  });
 
   // Merge jobs (Flowvy-commanded): approved PRs to squash-merge to main on the
   // user's own gh. `merging` guards against re-processing a job mid-flight.
@@ -530,8 +538,19 @@ export async function runFleetDaemon() {
         // The vault is plain files — the turn needs no MCP server and no
         // cartographer token; the daemon itself syncs afterwards on the fleet
         // credential.
-        const vaultDir = vaultDirFor();
-        ensureVault(vaultDir);
+        // Guard the mkdir: this runs OUTSIDE the per-task try below, so an
+        // ENOSPC/EACCES here (disk full is an anticipated prod condition —
+        // worktrees + vault history grow) would escape drainWiki as an unhandled
+        // rejection and take down the whole daemon mid-work. Skip this sweep on
+        // failure instead.
+        let vaultDir;
+        try {
+          vaultDir = vaultDirFor();
+          ensureVault(vaultDir);
+        } catch (e) {
+          warn(`wiki sweep skipped — vault dir unavailable: ${e?.message || e}`);
+          continue;
+        }
         // Live progress for this turn: a rolling FEED of everything Claude does
         // (thinking, narration, reads, node writes), the file count, and the
         // phase — streamed to the app (throttled; each frame carries the whole
