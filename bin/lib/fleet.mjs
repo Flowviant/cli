@@ -55,10 +55,24 @@ import { reapOrphanPreviews } from './preview.mjs';
 import { preflight } from './preflight.mjs';
 import { connectStream } from './stream.mjs';
 import { ensureVault, syncVault } from './vault.mjs';
+import {
+  envQueryParams,
+  handleRosterEnv,
+  materializeInto,
+  scrub as envScrub,
+} from './env.mjs';
 
 async function fetchRoster(haveIds) {
   const url = new URL(FLEET_URL);
   if (haveIds.length) url.searchParams.set('have', haveIds.join(','));
+  // Env-sync identity + materialized version (the Settings "env vN" chip).
+  try {
+    for (const [k, v] of Object.entries(await envQueryParams())) {
+      if (v) url.searchParams.set(k, v);
+    }
+  } catch {
+    /* env identity is best-effort — the poll must never fail on it */
+  }
   // An explicit User-Agent is required: Node's default ("node"/empty) trips
   // Cloudflare Bot Fight Mode (403). A descriptive product UA passes.
   const res = await fetch(url, {
@@ -117,6 +131,7 @@ async function runFleetWorker({ agentId, label, cwd, baseRef, getToken, getHasWo
     }
     if (!resuming && needsReset) {
       resetWorktree(cwd, baseRef); // clean slate for a new task
+      materializeInto(cwd); // reset wiped the env files (git clean -fd) — rewrite
       needsReset = false;
     }
     const { dir, path: mcpConfig } = mcpConfigFor(token, getMcpUrl());
@@ -441,6 +456,14 @@ export async function runFleetDaemon() {
     const now = Date.now();
     if (!force && now - lastProgressAt < 600) return;
     lastProgressAt = now;
+    // Uplink scrub: narration/labels can quote repo content, and repo content
+    // can contain a synced secret — redact known values before anything leaves
+    // this machine.
+    const safe = {
+      ...body,
+      ...(typeof body.activity === 'string' ? { activity: envScrub(body.activity) } : {}),
+      ...(Array.isArray(body.recent) ? { recent: body.recent.map((s) => envScrub(s)) } : {}),
+    };
     try {
       await fetch(WIKI_PROGRESS_URL, {
         method: 'POST',
@@ -450,7 +473,7 @@ export async function runFleetDaemon() {
           'Content-Type': 'application/json',
         },
         signal: AbortSignal.timeout(15_000),
-        body: JSON.stringify(body),
+        body: JSON.stringify(safe),
       });
     } catch {
       /* best-effort — a dropped frame is harmless, the next one supersedes it */
@@ -575,6 +598,8 @@ export async function runFleetDaemon() {
                 // Powers the GitHub blob links behind every cited file path.
                 repoFullName: originSlug(repoRoot) || undefined,
                 warn,
+                // Redact synced secrets a page may have quoted from the repo.
+                scrub: envScrub,
               });
               if (r.skipped) note(`${c.cyan('wiki')} ${c.dim('— vault unchanged, nothing to sync')}`);
               else
@@ -815,6 +840,11 @@ export async function runFleetDaemon() {
           fail(`could not create worktree for "${a.name}": ${e.message}`);
           continue;
         }
+        try {
+          materializeInto(wt); // synced env into the fresh worktree
+        } catch {
+          /* best-effort */
+        }
         const colorFn = LABEL_COLORS[joinCount++ % LABEL_COLORS.length];
         const label = colorFn(`[${a.name}]`);
         const state = { alive: true, child: null };
@@ -859,6 +889,21 @@ export async function runFleetDaemon() {
     enqueueSweep(roster.codeMapJob);
     for (const j of roster.regroundJobs ?? []) enqueueReground(j.intentId, j.prUrl, j.title);
     void drainWiki();
+
+    // Env sync tick: register/bootstrap/wrap/rotate/sync as the roster block
+    // dictates (self-guarded — one operation at a time, errors retry next
+    // poll). A fresh bundle rematerializes every AGENT worktree; the wiki
+    // worktree NEVER gets env (the cartographer doesn't need secrets).
+    void handleRosterEnv(roster.env, { projectId: roster.project?.id }).then(({ changed }) => {
+      if (!changed) return;
+      for (const [, w] of workers) {
+        try {
+          materializeInto(w.wt);
+        } catch {
+          /* best-effort */
+        }
+      }
+    });
 
     // Stop workers whose agent left the roster (removed in the app).
     for (const [id, w] of [...workers]) {

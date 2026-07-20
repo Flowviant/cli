@@ -101,6 +101,15 @@ if (process.argv[2] === 'clean') {
   process.exit(0);
 }
 
+// `flowviant env <import|set|show>` — the CLI half of team env sync. Values
+// are sealed to the project pubkey ON THIS MACHINE (same write-only crypto as
+// the browser); `show` decrypts locally — it only works on an ENROLLED machine.
+if (process.argv[2] === 'env') {
+  const { runEnvCommand } = await import('./lib/env-cli.mjs');
+  await runEnvCommand(process.argv.slice(3));
+  process.exit(0);
+}
+
 if (!FLEET_TOKEN && tokens.length === 0) {
   console.error(
     'error: no credential found. Easiest:\n' +

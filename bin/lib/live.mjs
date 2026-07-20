@@ -34,6 +34,7 @@ import { c, info, ok, warn } from './ui.mjs';
 import { sleep } from './claude.mjs';
 import { git, resetWorktree, isValidBranch } from './git.mjs';
 import { loadPreviewConfig, startPreview } from './preview.mjs';
+import { materializeInto, scrub as envScrub } from './env.mjs';
 
 // Register a branch preview's tunnel URL with Flowviant (fleet-authed). The
 // reviewer then drives it via "Open live preview" in the node.
@@ -92,7 +93,9 @@ function postPreviewNote(intentId, text) {
       'Content-Type': 'application/json',
     },
     signal: AbortSignal.timeout(10_000),
-    body: JSON.stringify({ intentId, text }),
+    // Scrub: preview failure reasons can quote dev-server output, which can
+    // echo env values.
+    body: JSON.stringify({ intentId, text: envScrub(text) }),
   }).catch(() => {});
 }
 
@@ -143,7 +146,12 @@ self-report becomes your DELIVERY CARD in the task thread — it's what the team
 reads to confirm done, so write it for them, not for a log. A live preview of
 your branch is started for you automatically — you do NOT need to open a tunnel
 or register a live target. NEVER merge — a human confirms done in the thread
-(the merge card) and the merge runs separately.`;
+(the merge card) and the merge runs separately.
+SECRETS: env files (.env, .dev.vars, …) in your worktree hold the team's synced
+secrets. Their VALUES must NEVER appear in evidence, progress reports, blocker
+questions, delivery summaries, commits, or PRs — reference keys by NAME only
+(e.g. "set STRIPE_KEY"). Never screenshot a terminal or page that displays a
+credential, and never commit an env file.`;
 
 function seedPrompt(runId, brief, transcript, resumedInPlace) {
   return [
@@ -383,6 +391,7 @@ export async function runLiveTask({ mcpUrl, token, cwd, baseRef, isAlive, resume
   } else if (!resuming && !resumedInPlace) {
     resetWorktree(cwd, baseRef);
   }
+  materializeInto(cwd); // resets wipe the synced env files — rewrite them
   writeTaskMarker(cwd, intentId);
 
   if (resumedInPlace) {
@@ -480,7 +489,9 @@ export async function runLiveTask({ mcpUrl, token, cwd, baseRef, isAlive, resume
       await mcpCall(mcpUrl, token, 'stream_turn', {
         runId,
         turnId,
-        text: turnText.trim(),
+        // Uplink scrub: the model's narration can quote file contents, and a
+        // file can contain a synced secret — redact before it leaves the box.
+        text: envScrub(turnText.trim()),
         createdAt: turnAt,
       }).catch(() => {});
     }

@@ -35,7 +35,10 @@ Operate this loop:
 5. Return to step 1.
 
 Keep every change scoped to the claimed intent. If a tool errors, report_progress with
-the error, then retry or report_blocker.`;
+the error, then retry or report_blocker.
+SECRETS: env files (.env, .dev.vars, …) hold the team's synced secrets. Their VALUES
+must NEVER appear in evidence, progress, summaries, commits, or PRs — reference keys
+by NAME only. Never commit an env file.`;
 
 // Single-task turn (FLEET mode): claim EXACTLY ONE intent, then stop. The daemon
 // owns the loop so it can reset the worktree + start a fresh conversation per task.
@@ -63,7 +66,10 @@ Do EXACTLY ONE task this turn:
 
 Do NOT claim a second intent — exactly one per turn. Keep every change scoped to the
 claimed intent. If a tool errors, report_progress with the error, then retry or
-report_blocker.`;
+report_blocker.
+SECRETS: env files (.env, .dev.vars, …) hold the team's synced secrets. Their VALUES
+must NEVER appear in evidence, progress, summaries, commits, or PRs — reference keys
+by NAME only. Never commit an env file.`;
 
 export const KICKOFF =
   'Begin the loop: claim and complete all dispatched Flowviant intents per your instructions.';

@@ -108,7 +108,7 @@ function commitVault(dir, message) {
  * upload (the sync state is only advanced after EVERY request lands, so a
  * partial failure re-uploads next time — server upserts are idempotent).
  */
-export async function syncVault({ dir, url, token, userAgent, finalize, groundedAtSha, repoFullName, warn = () => {} }) {
+export async function syncVault({ dir, url, token, userAgent, finalize, groundedAtSha, repoFullName, warn = () => {}, scrub = (t) => t }) {
   const walkErrors = { count: 0 };
   const found = walkMd(dir, dir, [], walkErrors).sort();
   if (walkErrors.count > 0 && found.length === 0) {
@@ -155,6 +155,10 @@ export async function syncVault({ dir, url, token, userAgent, finalize, grounded
       carry(p, 'unreadable');
       continue;
     }
+    // Uplink scrub: the cartographer quotes real repo files, and a repo file
+    // can contain a synced secret — redact known values before upload. The
+    // hash is computed on the SCRUBBED text so the diff state stays coherent.
+    text = scrub(text);
     if (Buffer.byteLength(text) > MAX_FILE_BYTES) {
       carry(p, 'exceeds 256KB');
       continue;
