@@ -320,9 +320,9 @@ const shortPath = (p, cwd) => {
 };
 
 // Turn one Claude tool_use into a compact activity {kind, label}, or null for
-// tools not worth surfacing. `kind:'read'` is what the file counter counts;
-// an emit_wiki_node flips the phase to "writing". Used by wiki turns to stream
-// exactly which files Claude is touching (daemon console + app cover).
+// tools not worth surfacing. `kind:'read'` is what the file counter counts; a
+// Write/Edit of a vault page is the "writing" signal. Used by wiki turns to
+// stream exactly which files Claude is touching (daemon console + app cover).
 export function humanizeToolUse(name, input = {}, cwd = '') {
   switch (name) {
     case 'Read':
@@ -348,10 +348,6 @@ export function humanizeToolUse(name, input = {}, cwd = '') {
     case 'Bash':
       return { kind: 'bash', label: `$ ${String(input.command ?? '').replace(/\s+/g, ' ').slice(0, 60)}` };
     default:
-      if (typeof name !== 'string') return null;
-      if (name.includes('emit_wiki_node')) return { kind: 'write', label: `+ node ${input.id ?? ''}` };
-      if (name.includes('finish_wiki_generation')) return { kind: 'write', label: 'finalize wiki' };
-      if (name.includes('list_wiki_nodes')) return { kind: 'mcp', label: 'list wiki nodes' };
       return null; // other tools: silent
   }
 }
