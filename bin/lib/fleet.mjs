@@ -295,6 +295,7 @@ export async function runFleetDaemon() {
   };
   const processMergeJobs = (jobs) => {
     for (const job of jobs ?? []) {
+      if (!job || typeof job.id !== 'string') continue; // a null element would wedge the loop
       if (merging.has(job.id)) continue;
       merging.add(job.id);
       (async () => {
@@ -374,6 +375,7 @@ export async function runFleetDaemon() {
   const cleaning = new Set();
   const processCleanupJobs = (jobs) => {
     for (const job of jobs ?? []) {
+      if (!job || typeof job.id !== 'string') continue; // a null element would wedge the loop
       if (cleaning.has(job.id)) continue;
       cleaning.add(job.id);
       (async () => {
@@ -889,7 +891,10 @@ export async function runFleetDaemon() {
     // turn) until we report reground-done; the bare drain flushes anything
     // whose earlier mint failed.
     enqueueSweep(roster.codeMapJob);
-    for (const j of roster.regroundJobs ?? []) enqueueReground(j.intentId, j.prUrl, j.title);
+    for (const j of roster.regroundJobs ?? []) {
+      if (!j || typeof j.intentId !== 'string') continue; // a null element would throw + wedge the loop
+      enqueueReground(j.intentId, j.prUrl, j.title);
+    }
     void drainWiki();
 
     // Env sync tick: register/bootstrap/wrap/rotate/sync as the roster block

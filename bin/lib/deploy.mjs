@@ -139,7 +139,7 @@ async function verifyHealth(url, status) {
   for (let i = 0; i < 4; i++) {
     try {
       const res = await fetch(url, { signal: AbortSignal.timeout(10_000), redirect: 'manual' });
-      if (res.status === status) return true;
+      if (res.status === Number(status)) return true; // coerce — a string "200" in deploy.json must still match
     } catch {
       /* not up yet */
     }
@@ -199,6 +199,7 @@ export function processDeployJobs(jobs, ctx) {
 
 async function runDeploy(job, target, ctx) {
   const env = { ...process.env, ...deployCreds() }; // inject infra creds; never a file
+  delete env.FLEET_TOKEN; // the deploy command has no business reading it; keep it out of a command that might echo its env
   const logs = [];
   // Rollback is a single wrangler command; deploy is build → secrets → deploy.
   if (job.kind === 'rollback') {
