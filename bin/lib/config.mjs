@@ -1,10 +1,23 @@
 /** Parsed configuration: env vars, CLI flags, and the chosen credentials. */
 
 import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 
-export const VERSION = '0.28.0';
+// Read the daemon's version from its OWN package.json (always shipped in the npm
+// tarball) — never hardcode it. The hardcoded constant drifted: it sat at
+// '0.28.0' across every release through 0.28.6, so the startup banner, the
+// User-Agent the server version-gates on, and the self-update check all reported
+// a stale version (and the "update available" nag never cleared).
+export const VERSION = (() => {
+  try {
+    const pkgPath = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'package.json');
+    return JSON.parse(readFileSync(pkgPath, 'utf8')).version || '0.0.0';
+  } catch {
+    return '0.0.0';
+  }
+})();
 
 // The model EVERY daemon Claude turn runs on — pinned so autonomous work never
 // inherits your interactive `~/.claude/settings.json` default. That matters: a
