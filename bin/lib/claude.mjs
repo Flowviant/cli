@@ -147,32 +147,44 @@ its frontmatter and title are part of the chapter and must comply):
 Open every existing docs/ chapter and FIX any that violate these two rules on
 EVERY run. The sidebar grouping + clean titles depend on it; it is not skippable.
 
-Every chapter declares its sidebar GROUP with a "category:" line in its
-frontmatter — the bold group header it sits under, exactly like the grouped left
-nav in Stripe / HuggingFace docs. Group RELATED chapters under a shared category
-(aim for 2-5 categories total that mirror the codebase's real divisions — e.g.
-"Getting started", "Core runtime", "Workspaces", "Reference"; a category holding a
-single chapter is a smell — merge or regroup). Number the chapters so same-category
-chapters are CONTIGUOUS and the categories flow in reading order. The "# Title" is
-a clean human name — NO number prefix (ordering comes from the filename prefix).
+Every page declares its sidebar GROUP with a "category:" line in its frontmatter
+— the group header it sits under, like the grouped left nav in HuggingFace docs.
+The category may be TWO levels, "Top group / Sub-group", to add HuggingFace's
+second nav tier: use the sub-level to break a LARGE top group into coherent
+sub-groups (e.g. "Workspaces / Fundraising", "Workspaces / Finance & budget"); a
+single level ("Reference") is fine for small groups. Aim for 3-6 top groups that
+mirror the codebase's real divisions; a group OR sub-group holding a single page
+is a smell — merge or regroup. Keep same-group pages CONTIGUOUS by filename number
+so reading order also orders the nav. The "# Title" is a clean human name — NO
+number prefix (ordering comes from the filename prefix).
+
+Prefer MANY FOCUSED pages over a few giant chapters — HuggingFace granularity:
+ONE page per coherent topic, not one page per whole subsystem. If a subsystem is
+large, SPLIT it into several pages (its overview, its data model, its API, its
+key flows), each its own docs/NN-page.md with its own category, so the left nav
+is a fine-grained tree of pages and each page is focused enough to read in one
+sitting. The in-page "## " sections are the right-hand on-this-page rail — the
+left nav is pages, so when a chapter grows more than a handful of "## " sections,
+that is the signal to split it into separate pages.
 
 Fixed spine (flat docs/ files; numeric prefix = reading order):
 - docs/00-start-here.md  (category: "Getting started") — the landing page + MASTER
   TABLE OF CONTENTS: what the product is (2-3 sentences); how to run it locally
   (prerequisites, install, required env, dev server, tests); then a linked table
-  of contents of EVERY chapter GROUPED BY CATEGORY, each with a one-line
-  description; then 2-3 role-based reading paths (e.g. "New to the backend: read
-  Architecture, then Agent fleet, then Data model").
+  of contents of EVERY page GROUPED BY CATEGORY, each with a one-line description;
+  then 2-3 role-based reading paths (e.g. "New to the backend: read Architecture,
+  then Agent fleet, then Data model").
 - docs/01-architecture.md  (category: "Getting started") — the system at a glance:
   a Mermaid diagram (a fenced code block whose language is mermaid) of the major
   components and how they connect, a component-responsibility table, the primary
-  request/data flows, and a link into the chapter for each component.
-- docs/1N-<chapter>.md — ONE chapter per major subsystem, EACH with its own
-  "category:" grouping it with its siblings. Cover every significant subsystem.
+  request/data flows, and a link into the page for each component.
+- docs/NN-<page>.md — the subsystem PAGES: many focused pages (split large
+  subsystems into several), EACH with its own 1- or 2-level "category:" placing it
+  in the nav. Cover every significant part of the system.
 - docs/90-decisions.md  (category: "Reference") — notable design decisions, each as
   context, decision, why, and consequences.
 - docs/91-glossary.md  (category: "Reference") — the project's terms of art,
-  alphabetized, each linking to the chapter or vault page that defines it.
+  alphabetized, each linking to the page that defines it.
 
 EVERY chapter follows this exact anatomy, in order:
   1. YAML frontmatter: a "category:" group header (see the spine) AND a "files:"
