@@ -138,36 +138,37 @@ docs — comprehensive, precisely structured, richly cross-linked. Detailed and
 thorough beats short: a reader should be able to work in a subsystem after
 reading its chapter.
 
-Organize the chapters into CATEGORY FOLDERS: docs/<NN>-<category>/<MM>-<chapter>.md.
-The folder name (minus its numeric prefix, hyphens → spaces) becomes the sidebar's
-bold GROUP HEADER — exactly like the grouped left nav in Stripe / HuggingFace docs.
-Numeric prefixes on BOTH the folder and the file set reading order.
+Every chapter declares its sidebar GROUP with a "category:" line in its
+frontmatter — the bold group header it sits under, exactly like the grouped left
+nav in Stripe / HuggingFace docs. Group RELATED chapters under a shared category
+(aim for 2-5 categories total that mirror the codebase's real divisions — e.g.
+"Getting started", "Core runtime", "Workspaces", "Reference"; a category holding a
+single chapter is a smell — merge or regroup). Number the chapters so same-category
+chapters are CONTIGUOUS and the categories flow in reading order. The "# Title" is
+a clean human name — NO number prefix (ordering comes from the filename prefix).
 
-Fixed spine:
-- docs/00-overview/00-start-here.md — the landing page + MASTER TABLE OF CONTENTS:
-  what the product is (2-3 sentences); how to run it locally (prerequisites,
-  install, required env, dev server, tests); then a linked table of contents of
-  EVERY chapter GROUPED BY CATEGORY, each with a one-line description; then 2-3
-  role-based reading paths (e.g. "New to the backend: read Architecture, then
-  Agent fleet, then Data model").
-- docs/00-overview/01-architecture.md — the system at a glance: a Mermaid diagram
-  (a fenced code block whose language is mermaid) of the major components and how
-  they connect, a component-responsibility table, the primary request/data flows,
-  and a link into the chapter for each component.
-- docs/<NN>-<category>/<MM>-<chapter>.md — the subsystem chapters, sorted into a
-  FEW meaningful categories (aim for 2-5 folders) that mirror the codebase's real
-  divisions — e.g. docs/10-core-runtime/, docs/20-api-and-data/, docs/30-frontend/.
-  Each folder groups the RELATED chapters (a category holding a single chapter is a
-  smell — merge or regroup). One chapter per major subsystem; cover every
-  significant one.
-- docs/90-reference/00-decisions.md — notable design decisions, each as context,
-  decision, why, and consequences.
-- docs/90-reference/01-glossary.md — the project's terms of art, alphabetized, each
-  linking to the chapter or vault page that defines it.
+Fixed spine (flat docs/ files; numeric prefix = reading order):
+- docs/00-start-here.md  (category: "Getting started") — the landing page + MASTER
+  TABLE OF CONTENTS: what the product is (2-3 sentences); how to run it locally
+  (prerequisites, install, required env, dev server, tests); then a linked table
+  of contents of EVERY chapter GROUPED BY CATEGORY, each with a one-line
+  description; then 2-3 role-based reading paths (e.g. "New to the backend: read
+  Architecture, then Agent fleet, then Data model").
+- docs/01-architecture.md  (category: "Getting started") — the system at a glance:
+  a Mermaid diagram (a fenced code block whose language is mermaid) of the major
+  components and how they connect, a component-responsibility table, the primary
+  request/data flows, and a link into the chapter for each component.
+- docs/1N-<chapter>.md — ONE chapter per major subsystem, EACH with its own
+  "category:" grouping it with its siblings. Cover every significant subsystem.
+- docs/90-decisions.md  (category: "Reference") — notable design decisions, each as
+  context, decision, why, and consequences.
+- docs/91-glossary.md  (category: "Reference") — the project's terms of art,
+  alphabetized, each linking to the chapter or vault page that defines it.
 
 EVERY chapter follows this exact anatomy, in order:
-  1. YAML frontmatter listing the real repo files the chapter draws on.
-  2. A "# Title" heading.
+  1. YAML frontmatter: a "category:" group header (see the spine) AND a "files:"
+     list of the real repo files the chapter draws on.
+  2. A "# Title" heading (a clean name — no leading number).
   3. One or two sentences: what the chapter covers and who should read it.
   4. A "## Contents" section — an in-page table of contents: a bulleted list
      linking each of the chapter's own "## " sections by anchor. An anchor is the
@@ -181,12 +182,11 @@ EVERY chapter follows this exact anatomy, in order:
      functions/types, env/config keys, DB tables/columns — as markdown tables.
   6. A "## Gotchas" section: the traps, edge cases, invariants, and non-obvious
      constraints.
-  7. A "## See also" section: [[wikilinks]] to the deeper vault pages, plus links
-     to sibling chapters by BASENAME (e.g. "[Architecture](01-architecture.md)").
+  7. A "## See also" section: [[wikilinks]] to the deeper vault pages, plus
+     relative links to sibling chapters (e.g. "[Architecture](01-architecture.md)").
 
-Cross-link liberally: [[wikilinks]] point to vault pages; sibling-chapter links by
-BASENAME ("MM-name.md") resolve no matter which category folder the target sits in
-— you needn't spell the folder path. Both are clickable in the reader. Keep every
+Cross-link liberally: [[wikilinks]] point to vault pages; relative "NN-name.md"
+links point to sibling chapters; both are clickable in the reader. Keep every
 claim grounded in code you actually read.
 
 Full-sweep protocol:
