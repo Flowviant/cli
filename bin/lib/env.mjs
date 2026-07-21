@@ -39,7 +39,10 @@ import {
 import { execFileSync } from 'node:child_process';
 import { homedir, hostname } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
-import sodium from 'libsodium-wrappers';
+// The SUMO build: the standard `libsodium-wrappers` omits Argon2 (crypto_pwhash),
+// which bootstrapProject() needs to derive the recovery-code key — without it
+// crypto_pwhash_SALTBYTES is undefined and bootstrap throws every poll.
+import sodium from 'libsodium-wrappers-sumo';
 import { FLEET_URL, FLEET_TOKEN, USER_AGENT } from './config.mjs';
 import { c, info, note, ok, warn } from './ui.mjs';
 

@@ -20,7 +20,7 @@
 import { readFileSync } from 'node:fs';
 import { basename } from 'node:path';
 import { createInterface } from 'node:readline';
-import sodium from 'libsodium-wrappers';
+import sodium from 'libsodium-wrappers-sumo'; // sumo: Argon2 for the recovery KDF (see env.mjs)
 import { FLEET_URL, FLEET_TOKEN, USER_AGENT } from './config.mjs';
 import { ensureKeypair, myPubB64, fetchBundle } from './env.mjs';
 

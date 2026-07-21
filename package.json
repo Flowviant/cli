@@ -1,6 +1,6 @@
 {
   "name": "flowviant",
-  "version": "0.28.4",
+  "version": "0.28.5",
   "description": "Run your own Claude Code as headless build agents for Flowviant — on your own credentials. Claims dispatched work, opens PRs, captures review evidence, and routes questions back to you.",
   "type": "module",
   "bin": {
@@ -16,7 +16,7 @@
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.0",
-    "libsodium-wrappers": "^0.8.4",
+    "libsodium-wrappers-sumo": "^0.8.4",
     "ws": "^8.18.0"
   },
   "keywords": [
