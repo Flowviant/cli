@@ -101,6 +101,16 @@ if (process.argv[2] === 'clean') {
   process.exit(0);
 }
 
+// `flowviant shot <url>` — capture a headless-browser screenshot of a running
+// page. Build agents shell out to this to attach REAL visual evidence to the
+// delivery card. Self-contained + graceful (no browser → exit 1, agent falls
+// back to text evidence); needs no credential, so it runs before the auth gate.
+if (process.argv[2] === 'shot') {
+  const { runShot } = await import('./lib/shot.mjs');
+  await runShot(process.argv.slice(3));
+  process.exit(0);
+}
+
 // `flowviant env <import|set|show>` — the CLI half of team env sync. Values
 // are sealed to the project pubkey ON THIS MACHINE (same write-only crypto as
 // the browser); `show` decrypts locally — it only works on an ENROLLED machine.

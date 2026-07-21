@@ -112,6 +112,7 @@ const SAFE_TOOLS = [
   'Bash(gh:*)',
   'Bash(npm:*)',
   'Bash(bun:*)',
+  'Bash(flowviant:*)', // `flowviant shot` — capture screenshot evidence
   'mcp__flowviant',
 ];
 
@@ -131,14 +132,21 @@ tools. When you hit a decision only a human can make, call report_blocker (with
 options when you can) and then STOP your turn — do not spin or guess; you will be
 resumed with the answer. As you satisfy each "done when" criterion, call
 attach_evidence for it — proof the reviewer can SEE without running anything.
-Match the evidence to what you built: backend/API work → a request/response
-capture or a data sample showing the write; a single screen → a screenshot.
-CRITICAL for a multi-step FLOW (login, signup, checkout): a screenshot of one
-page does NOT prove the flow works — you MUST prove the whole path end to end.
-Best: write an e2e/integration test that DRIVES the flow (fill form → submit →
-assert the post-login/success state) and attach its test_output; if you have a
-browser tool (e.g. Playwright), also attach a screen recording of it running.
-Never let a static screenshot stand in for a flow. When the work is done: open ONE draft PR (git push +
+This IS your handover, so make it tangible; match the evidence to what you built:
+• UI / any visible screen → attach a real SCREENSHOT. Start the app's dev server
+  in your worktree, then capture it headlessly with
+  \`flowviant shot http://localhost:<PORT>/<route> --out shot.png\` (it finds a
+  browser for you and never needs a display), and attach_evidence with kind
+  "screenshot" and the file's base64 (\`base64 -w0 shot.png\`). Shoot EVERY key
+  screen you changed. If \`flowviant shot\` reports that no browser is available,
+  do NOT block — fall back to the text evidence below.
+• backend / API work → a request/response capture or a data sample showing the
+  write (kind "request_response" or "sample").
+• a multi-step FLOW (login, signup, checkout): one screenshot does NOT prove it
+  works — write an e2e/integration test that DRIVES the flow (fill form → submit
+  → assert the post-success state), attach its test_output, AND screenshot the
+  end state. Never let a single static screenshot stand in for a flow.
+When the work is done: open ONE draft PR (git push +
 gh pr create --draft), call attach_pr, then call complete with a plain-language
 summary of what you built AND a criteria self-report (index into the brief's
 "done when" list + met true/false + a short note per item). That summary +
@@ -168,7 +176,7 @@ function seedPrompt(runId, brief, transcript, resumedInPlace) {
       ? [``, `Conversation so far (you may be resuming — pick up where this left off):`, transcript]
       : []),
     ``,
-    `${transcript ? 'Continue' : 'Begin'}. Post a short plan first as a Markdown list (one numbered line per step), then: report_progress as you go; attach_evidence for each "done when" criterion as you satisfy it (test output, a request/response, a data sample, or a screenshot — so it's reviewable without running anything); report_blocker + stop if you hit a human decision; open a draft PR, attach_pr, then complete (summary + criteria self-report — your delivery card) when done.`,
+    `${transcript ? 'Continue' : 'Begin'}. Post a short plan first as a Markdown list (one numbered line per step), then: report_progress as you go; attach_evidence for each "done when" criterion as you satisfy it — a real screenshot for UI (run the dev server, then \`flowviant shot <url> --out shot.png\`), or test output / a request-response / a data sample for backend, so it's reviewable without running anything; report_blocker + stop if you hit a human decision; open a draft PR, attach_pr, then complete (summary + criteria self-report — your delivery card) when done.`,
   ].join('\n');
 }
 
