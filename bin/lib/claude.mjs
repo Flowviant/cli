@@ -138,6 +138,15 @@ docs — comprehensive, precisely structured, richly cross-linked. Detailed and
 thorough beats short: a reader should be able to work in a subsystem after
 reading its chapter.
 
+⚠ MANDATORY every compile — normalize BOTH new AND EXISTING chapters (do NOT
+leave an existing chapter untouched just because its prose is already current;
+its frontmatter and title are part of the chapter and must comply):
+  • Frontmatter MUST contain a "category:" line. If a chapter lacks one, ADD it now.
+  • The "# Title" MUST be a clean name with NO leading number — "Architecture",
+    never "01 — Architecture". If a title carries a number, REWRITE it clean now.
+Open every existing docs/ chapter and FIX any that violate these two rules on
+EVERY run. The sidebar grouping + clean titles depend on it; it is not skippable.
+
 Every chapter declares its sidebar GROUP with a "category:" line in its
 frontmatter — the bold group header it sits under, exactly like the grouped left
 nav in Stripe / HuggingFace docs. Group RELATED chapters under a shared category
