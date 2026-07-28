@@ -43,6 +43,11 @@ function argFlag(name) {
   return i >= 0 ? process.argv[i + 1] : undefined;
 }
 
+/** A bare boolean flag (no value follows it). */
+function hasFlag(name) {
+  return process.argv.includes(name);
+}
+
 const API_BASE = process.env.FLOWVIANT_API_URL || 'https://api.flowviant.com/api/v2';
 export const MCP_URL = process.env.FLOWVIANT_MCP_URL || `${API_BASE}/mcp`;
 export const FLEET_URL = process.env.FLOWVIANT_FLEET_URL || `${API_BASE}/fleet/agents`;
@@ -73,6 +78,22 @@ export const AUTO_UPDATE = process.env.FLOWVIANT_NO_UPDATE !== '1';
 // path (one-shot `claude -p` turns) survives behind FLOWVIANT_POLL=1 as the
 // escape hatch; FLOWVIANT_LIVE=1 is still honored for old scripts.
 export const LIVE = process.env.FLOWVIANT_POLL !== '1';
+/**
+ * Does this machine accept PATCHES — commits cherry-picked straight into your
+ * working checkout, with no PR and no review?
+ *
+ * Patch placement is chosen by a model, and any teammate who @mentions one of
+ * your agents can trigger it, so whether it happens at all belongs to whoever
+ * owns the checkout. Turning it off does not lose the work: the task falls back
+ * to branch placement and arrives as a PR like anything else.
+ *
+ * On by default — the guard that actually protects you (never touching a file
+ * you have uncommitted edits in) is enforced at apply time, and the whole point
+ * of patches is to spare you a review cycle for a nine-character diff.
+ * `--no-patches` or FLOWVIANT_PATCHES=0 to refuse them.
+ */
+export const ALLOW_PATCHES =
+  !hasFlag('--no-patches') && process.env.FLOWVIANT_PATCHES !== '0';
 // Sent on the daemon's own HTTP calls so Cloudflare Bot Fight Mode doesn't 403
 // them (Node's default UA is treated as a bot). Claude Code sends its own UA.
 export const USER_AGENT = `flowviant/${VERSION}`;

@@ -29,10 +29,12 @@ import {
   FLEET_URL,
   FLEET_TOKEN,
   USER_AGENT,
+  ALLOW_PATCHES,
 } from './config.mjs';
 import { c, info, ok, warn } from './ui.mjs';
 import { sleep } from './claude.mjs';
 import { git, resetWorktree, isValidBranch } from './git.mjs';
+import { applyPatch, fileDiffs, ownerCurrentBranch, withPatchLock } from './patch.mjs';
 import { loadPreviewConfig, startPreview } from './preview.mjs';
 import { materializeInto, scrub as envScrub } from './env.mjs';
 
@@ -146,8 +148,17 @@ This IS your handover, so make it tangible; match the evidence to what you built
   works — write an e2e/integration test that DRIVES the flow (fill form → submit
   → assert the post-success state), attach its test_output, AND screenshot the
   end state. Never let a single static screenshot stand in for a flow.
-When the work is done: open ONE draft PR (git push +
-gh pr create --draft), call attach_pr, then call complete with a plain-language
+When the work is done, check the brief's "placement" FIRST.
+If placement is "patch": do NOT create a branch, do NOT push, do NOT open a PR.
+Commit your change in this worktree with a one-line message and stop there — the
+daemon carries it into the owner's own checkout and they keep or revert it. Then
+call complete with the summary + criteria self-report as normal.
+Otherwise (placement "branch", the default): create the branch named in the
+brief's "branchName" (git checkout -b <branchName> — use that exact name, do not
+invent one), open ONE draft PR (git push +
+gh pr create --draft; if the brief has a "baseBranch", target it with
+--base <baseBranch> so the stack stays reviewable), call attach_pr, then call
+complete with a plain-language
 summary of what you built AND a criteria self-report (index into the brief's
 "done when" list + met true/false + a short note per item). That summary +
 self-report becomes your DELIVERY CARD in the task thread — it's what the team
@@ -161,6 +172,12 @@ questions, delivery summaries, commits, or PRs — reference keys by NAME only
 (e.g. "set STRIPE_KEY"). Never screenshot a terminal or page that displays a
 credential, and never commit an env file.`;
 
+/** The brief minus the conversation — that is rendered as prose, not JSON. */
+function briefWithoutThread(brief) {
+  const { thread: _thread, lastMessageId: _lastMessageId, ...rest } = brief ?? {};
+  return rest;
+}
+
 function seedPrompt(runId, brief, transcript, resumedInPlace) {
   return [
     `Your run id is ${runId}. Use it for every flowviant MCP tool call.`,
@@ -168,15 +185,24 @@ function seedPrompt(runId, brief, transcript, resumedInPlace) {
       ? `You are RESUMING after a daemon restart: your worktree still contains your own uncommitted work from before the interruption. Run \`git status\` and \`git diff\` first, take stock, and CONTINUE from there — do not start over.`
       : brief?.branch
         ? `This is a REVISION — your prior branch "${brief.branch}" is checked out; address the review feedback and push to the SAME branch (the PR updates in place).`
-        : `Start from the clean base checkout and open a fresh draft PR when done.`,
+        : brief?.placement === 'patch'
+          ? `This is a PATCH: commit your change in this worktree and STOP — no branch, no push, no PR. The daemon lands it in the owner's checkout.`
+          : `Start from the clean base checkout. Create the branch named in the brief ("${brief?.branchName ?? 'flowviant/…'}") and open a fresh draft PR when done.`,
     ``,
     `Task brief:`,
-    JSON.stringify(brief ?? {}, null, 2),
+    // The conversation is rendered below as readable turns, not dumped twice as
+    // JSON — it is the longest thing in the brief and the least useful as data.
+    JSON.stringify(briefWithoutThread(brief), null, 2),
     ...(transcript
-      ? [``, `Conversation so far (you may be resuming — pick up where this left off):`, transcript]
+      ? [
+          ``,
+          `The task conversation — what the team actually said, oldest first. The`,
+          `newest human message is usually why you were brought in:`,
+          transcript,
+        ]
       : []),
     ``,
-    `${transcript ? 'Continue' : 'Begin'}. Post a short plan first as a Markdown list (one numbered line per step), then: report_progress as you go; attach_evidence for each "done when" criterion as you satisfy it — a real screenshot for UI (run the dev server, then \`flowviant shot <url> --out shot.png\`), or test output / a request-response / a data sample for backend, so it's reviewable without running anything; report_blocker + stop if you hit a human decision; open a draft PR, attach_pr, then complete (summary + criteria self-report — your delivery card) when done.`,
+    `${transcript ? 'Continue' : 'Begin'}. Post a short plan first as a Markdown list (one numbered line per step), then: report_progress as you go; attach_evidence for each "done when" criterion as you satisfy it — a real screenshot for UI (run the dev server, then \`flowviant shot <url> --out shot.png\`), or test output / a request-response / a data sample for backend, so it's reviewable without running anything; report_blocker + stop if you hit a human decision; then finish per the brief's "placement" (patch: commit only, no PR; branch: draft PR + attach_pr) and call complete (summary + criteria self-report — your delivery card).`,
   ].join('\n');
 }
 
@@ -371,18 +397,161 @@ async function parkUntilReset(resetAt, { mcpUrl, getToken, runId, isAlive }) {
   }
 }
 
-export async function runLiveTask({ mcpUrl, token, cwd, baseRef, isAlive, resumeIntentId, onChild }) {
+/**
+ * Carry a completed patch into the owner's checkout, then narrate what happened
+ * in the thread.
+ *
+ * Serialised through withPatchLock so two agents can never write the tree at
+ * once, and refused outright when the owner is editing the same files — a
+ * collision becomes a blocker for a human, never a silent overwrite. Failure to
+ * land is reported honestly rather than being folded into a successful-looking
+ * delivery: the human must know the change is NOT in their tree.
+ */
+/** Where the patch base is remembered — inside the worktree's git dir, so
+ *  `git clean` can't take it (same reasoning as the task marker). */
+function patchBaseFile(cwd) {
+  return join(git(['rev-parse', '--absolute-git-dir'], cwd), 'flowviant-patch-base');
+}
+function writePatchBase(cwd, branch) {
+  try {
+    writeFileSync(patchBaseFile(cwd), branch ?? '', 'utf8');
+  } catch {
+    /* best effort */
+  }
+}
+function readPatchBase(cwd) {
+  try {
+    const v = readFileSync(patchBaseFile(cwd), 'utf8').trim();
+    return v || null;
+  } catch {
+    return null;
+  }
+}
+
+async function landPatch({ mcpUrl, token, runId, intentId, repoRoot, cwd, patchBase, baseRef }) {
+  // Everything here runs AFTER the agent called `complete`, which finalizes the
+  // run server-side. stream_turn and report_blocker are active-run gated, so
+  // they would be silently rejected — report_patch is deliberately not, and the
+  // server does the narrating.
+  const report = (body) =>
+    mcpCall(mcpUrl, token, 'report_patch', { runId, ...body }).catch(() => {});
+
+  if (!repoRoot) {
+    await report({ shas: [], ok: false, reason: 'this daemon has no main checkout to land it in' });
+    return;
+  }
+
+  // Computed from the AGENT's worktree, so it is the same set of hunks whether
+  // or not the cherry-pick lands. A declined patch still deserves to show what
+  // it would have done — that's what the human needs to unblock it.
+  // Where the agent's commits start. Normally the owner's branch we mirrored;
+  // when we could NOT mirror it (they were in a detached HEAD, or the fetch
+  // failed) the worktree was reset to base instead, so that is the honest
+  // starting point. Diffing against 'HEAD' here silently produced an empty range
+  // and a "the agent committed nothing" refusal over real work.
+  const commitsFrom = patchBase ?? baseRef ?? 'HEAD';
+  let diffs = [];
+  try {
+    diffs = fileDiffs(cwd, commitsFrom);
+  } catch {
+    /* evidence is best-effort; never block landing on it */
+  }
+
+  const res = await withPatchLock(() =>
+    Promise.resolve(applyPatch({ repoRoot, cwd, basedOnBranch: patchBase, commitsFrom }))
+  );
+
+  if (res.ok) {
+    await report({ shas: res.shas, files: res.files, diffs, ok: true });
+    ok(`${c.cyan('patch')} ${c.dim(`— applied ${res.files.length} file(s) in your checkout`)}`);
+    return;
+  }
+
+  const reason =
+    res.reason === 'conflict'
+      ? `you have uncommitted edits in ${res.paths.join(', ')}`
+      : res.reason === 'branch_moved'
+        ? `you switched from ${res.expected} to ${res.actual ?? 'a detached HEAD'} mid-run`
+        : res.reason === 'no_commits'
+          ? 'the agent committed nothing to apply'
+          : (res.error ?? 'the cherry-pick failed');
+
+  // A rollback that itself failed leaves commits in their history — never
+  // report that as "unchanged".
+  if (res.partiallyApplied) {
+    await report({
+      shas: res.appliedShas ?? [],
+      diffs,
+      ok: false,
+      reason: `${reason}. Some commits could not be rolled back and are still in your history`,
+    });
+    warn(`patch partially applied for intent ${intentId} — rollback failed; commits remain`);
+    return;
+  }
+
+  // Diffs go up even on a refusal: "you have uncommitted edits in X" is only
+  // actionable if you can see what the agent wanted to put there.
+  await report({ shas: [], diffs, ok: false, reason });
+  warn(`patch not applied: ${reason}`);
+}
+
+export async function runLiveTask({
+  mcpUrl,
+  token,
+  cwd,
+  baseRef,
+  repoRoot,
+  isAlive,
+  resumeIntentId,
+  onChild,
+}) {
   const claim = await mcpCall(mcpUrl, token, 'claim_next_intent', {}).catch(() => null);
   if (!claim || claim.claimed !== true) return { outcome: 'nothing' };
   const { runId, intentId } = claim;
   const brief = claim.brief ?? {};
   const title = brief.title ?? 'a task';
+
   // Re-claiming the SAME intent this worker was just working — either this
   // daemon's own memory (parked on a blocker, now resuming) or the persistent
   // task marker (the daemon restarted mid-task). Its worktree holds hours of
   // uncommitted work. Do NOT reset.
   const resuming = !!resumeIntentId && intentId === resumeIntentId;
   const resumedInPlace = !resuming && readTaskMarker(cwd) === intentId;
+
+  // CONSENT. A patch writes commits into the working checkout of whoever runs
+  // this daemon — chosen by a model, and triggerable by any teammate who
+  // @mentions one of your agents. Whether that is allowed at all belongs to the
+  // person whose disk it is, so `--no-patches` turns it into an ordinary branch
+  // + PR. The work is never refused, only routed the long way round, and the
+  // thread is told so nobody is left wondering where their Keep/Revert card is.
+  //
+  // Applies at PICKUP only. A patch run already underway keeps its placement:
+  // its worktree is based on the owner's current branch, so converting it to a
+  // PR mid-flight would open one whose diff carries the owner's unrelated
+  // commits — and resetting to base instead would throw away the agent's work.
+  // The setting refuses new patches; it does not retroactively rewrite consent
+  // that was already given when the task was picked up.
+  if (!ALLOW_PATCHES && brief.placement === 'patch' && !resuming && !resumedInPlace) {
+    brief.placement = 'branch';
+    info(`${c.dim('patch declined by this machine (--no-patches) — building a PR instead')}`);
+    await mcpCall(mcpUrl, token, 'report_progress', {
+      runId,
+      kind: 'status',
+      message:
+        'This machine does not accept patches, so this is going up as a branch + PR ' +
+        'instead of landing in the checkout directly.',
+    }).catch(() => {});
+  }
+
+  // Placement decides where the work lands: its own branch + PR (the default),
+  // or a patch cherry-picked straight into the owner's checkout.
+  const isPatch = brief.placement === 'patch';
+  // Persisted next to the task marker: a patch run that PARKS (rate limit, a
+  // blocker) or survives a daemon restart resumes without re-entering the
+  // checkout branch, and an in-memory base would be null by the time the
+  // cherry-pick runs — applyPatch would diff HEAD..HEAD and report no_commits,
+  // silently dropping the work.
+  let patchBase = isPatch ? readPatchBase(cwd) : null;
 
   // Revision resumes its PR branch; a genuinely fresh task gets a clean base
   // checkout; a resume (in-memory or marker) keeps its dirty worktree untouched.
@@ -396,8 +565,50 @@ export async function runLiveTask({ mcpUrl, token, cwd, baseRef, isAlive, resume
     } catch {
       if (!resuming && !resumedInPlace) resetWorktree(cwd, baseRef);
     }
+  } else if (isPatch && !resuming && !resumedInPlace) {
+    // PATCH placement: base off the branch the human is ACTUALLY on, so the
+    // change lands on their work rather than on main. Nothing is pushed and no
+    // PR is opened — the daemon cherry-picks the result across at the end.
+    patchBase = repoRoot ? ownerCurrentBranch(repoRoot) : null;
+    try {
+      if (!patchBase) throw new Error('owner is in a detached HEAD');
+      git(['fetch', 'origin', '--quiet'], cwd);
+      git(['checkout', '--detach', patchBase], cwd);
+      git(['reset', '--hard', patchBase], cwd);
+      git(['clean', '-fd'], cwd);
+    } catch {
+      // Can't mirror the owner's tree — fall back to a normal base checkout and
+      // let the apply step decline rather than landing something unexpected.
+      patchBase = null;
+      resetWorktree(cwd, baseRef);
+    }
+    writePatchBase(cwd, patchBase);
   } else if (!resuming && !resumedInPlace) {
-    resetWorktree(cwd, baseRef);
+    // STACKING (0.29.x): when the collision pass sequenced this intent behind
+    // one that shares its code, the server sends the blocker's branch as
+    // `baseBranch`. Basing off it means this agent sees that work immediately
+    // instead of waiting for a merge — the shared-checkout benefit, without a
+    // shared checkout. Same validation as `branch`: a server-supplied ref is
+    // never handed to git unchecked. Anything unusable falls back to the base,
+    // which is exactly the pre-stacking behaviour.
+    const stackOn =
+      brief.baseBranch && isValidBranch(brief.baseBranch, cwd, baseRef)
+        ? brief.baseBranch
+        : null;
+    let stacked = false;
+    if (stackOn) {
+      try {
+        git(['fetch', 'origin', '--quiet'], cwd);
+        git(['checkout', '--detach', `origin/${stackOn}`], cwd);
+        git(['reset', '--hard', `origin/${stackOn}`], cwd);
+        git(['clean', '-fd'], cwd);
+        stacked = true;
+      } catch {
+        // The blocker hasn't pushed yet — the wave ordering is what stops this
+        // being dispatched early, so falling back to base is safe, not wrong.
+      }
+    }
+    if (!stacked) resetWorktree(cwd, baseRef);
   }
   materializeInto(cwd); // resets wipe the synced env files — rewrite them
   writeTaskMarker(cwd, intentId);
@@ -421,15 +632,22 @@ export async function runLiveTask({ mcpUrl, token, cwd, baseRef, isAlive, resume
   delete env.ANTHROPIC_AUTH_TOKEN;
   delete env.ANTHROPIC_BASE_URL;
 
-  // Prior channel transcript — present when resuming a parked/re-claimed task;
-  // seed it so a fresh session picks up where the conversation left off. afterId
-  // starts at the last existing message so we never re-inject old ones as "new".
-  const prior = await mcpCall(mcpUrl, token, 'poll_channel', { runId }).catch(() => null);
-  const priorMsgs = prior?.messages ?? [];
+  // The conversation arrives WITH the brief (0.30.0) — the claim already read
+  // it, so asking again over poll_channel was a round-trip that told us nothing
+  // new. Older servers don't send it; fall back so a daemon ahead of the server
+  // still resumes with its transcript instead of silently starting cold.
+  let priorMsgs = brief.thread ?? null;
+  if (!priorMsgs) {
+    const prior = await mcpCall(mcpUrl, token, 'poll_channel', { runId }).catch(() => null);
+    priorMsgs = prior?.messages ?? [];
+  }
   const transcript = priorMsgs
     .map((m) => `${m.authorName || m.role}: ${m.content}`)
     .join('\n');
-  let afterId = priorMsgs.length ? priorMsgs[priorMsgs.length - 1].id : null;
+  // Where to resume polling from, so nothing already in the seed is re-injected
+  // as if it just arrived.
+  let afterId =
+    brief.lastMessageId ?? (priorMsgs.length ? priorMsgs[priorMsgs.length - 1].id : null);
 
   const input = makeInput(seedPrompt(runId, brief, transcript, resumedInPlace));
   const session = query({
@@ -547,6 +765,9 @@ export async function runLiveTask({ mcpUrl, token, cwd, baseRef, isAlive, resume
         // attempt's dirty files).
         if (completed) {
           clearTaskMarker(cwd);
+          if (isPatch) {
+            await landPatch({ mcpUrl, token, runId, intentId, repoRoot, cwd, patchBase, baseRef });
+          }
           return { outcome: 'done', title, intentId };
         }
 
@@ -607,7 +828,11 @@ export async function runLiveTask({ mcpUrl, token, cwd, baseRef, isAlive, resume
         // Idle turn with no completion — nudge a couple of times, then stop.
         if (nudges < 2) {
           nudges++;
-          input.push('Continue until the task is complete: open a draft PR and call complete, or report a blocker.');
+          input.push(
+            isPatch
+              ? 'Continue until the task is complete: commit your change (no branch, no push, no PR) and call complete, or report a blocker.'
+              : 'Continue until the task is complete: open a draft PR and call complete, or report a blocker.'
+          );
           continue;
         }
         return { outcome: 'stalled', title, intentId };
@@ -823,6 +1048,7 @@ export async function runLiveWorker({
         token,
         cwd,
         baseRef,
+        repoRoot,
         isAlive,
         resumeIntentId: lastIntentId,
         onChild,

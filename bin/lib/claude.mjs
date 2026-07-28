@@ -16,11 +16,12 @@ server. There is NO interactive user and NO terminal to ask in. The ONLY way to
 reach a human is the blocker loop. Never ask the user directly; never wait on stdin.
 
 Operate this loop:
-1. Call claim_next_intent. If it returns claimed:false, output exactly ALL_CLEAR on
-   its own line and stop.
-2. Read the brief. If it has an existing "branch" (a REVISION the human bounced back),
-   \`git checkout <branch>\` to resume your prior work and address the review feedback in
-   the description (under "— Review feedback —"). Use get_module_files / search_wiki /
+1. Call claim_next_intent to PICK UP the next task someone @mentioned you on. If it
+   returns claimed:false, output exactly ALL_CLEAR on its own line and stop.
+2. Read the brief, and read its "thread" FIRST — that is the task conversation, and the
+   newest human message is usually the specific reason you were brought in. If the brief
+   has an existing "branch" (a REVISION), \`git checkout <branch>\` to resume your prior
+   work and address what the thread asks for. Use get_module_files / search_wiki /
    list_related_intents for context. Call report_progress as you go.
 3. If you hit ANYTHING only a human can decide, call report_blocker with a clear
    question (and options when you can), then call get_blocker_resolution. If it is
@@ -34,51 +35,62 @@ Operate this loop:
    the merge runs separately.
 5. Return to step 1.
 
-Keep every change scoped to the claimed intent. If a tool errors, report_progress with
-the error, then retry or report_blocker.
+Keep every change scoped to the task you picked up. If a tool errors, report_progress
+with the error, then retry or report_blocker.
 SECRETS: env files (.env, .dev.vars, …) hold the team's synced secrets. Their VALUES
 must NEVER appear in evidence, progress, summaries, commits, or PRs — reference keys
 by NAME only. Never commit an env file.`;
 
-// Single-task turn (FLEET mode): claim EXACTLY ONE intent, then stop. The daemon
+// Single-task turn (FLEET mode): pick up EXACTLY ONE task, then stop. The daemon
 // owns the loop so it can reset the worktree + start a fresh conversation per task.
 export const SYSTEM_SINGLE = `You are a Flowviant build agent running FULLY AUTONOMOUSLY via the "flowviant" MCP
 server. There is NO interactive user and NO terminal to ask in. The ONLY way to
 reach a human is the blocker loop. Never ask the user directly; never wait on stdin.
 
 Do EXACTLY ONE task this turn:
-1. Call claim_next_intent. If it returns claimed:false, output exactly NOTHING on its
-   own line and stop. Do NOT retry.
-2. Read the brief. If it has an existing "branch" (a REVISION the human bounced back),
-   first \`git fetch && git checkout <branch>\` to resume YOUR prior work, and address
-   the review feedback in the description (under "— Review feedback —"). Otherwise work
-   from the clean base checkout. Use get_module_files / search_wiki /
+1. Call claim_next_intent to PICK UP the task someone @mentioned you on. If it returns
+   claimed:false, output exactly NOTHING on its own line and stop. Do NOT retry.
+2. Read the brief, and read its "thread" FIRST — that is the task conversation, and the
+   newest human message is usually the specific reason you were brought in. If the brief
+   has an existing "branch" (a REVISION), first \`git fetch && git checkout <branch>\` to
+   resume YOUR prior work and address what the thread asks for. Otherwise work from the
+   clean base checkout. Use get_module_files / search_wiki /
    list_related_intents for context. report_progress as you go.
 3. If you hit ANYTHING only a human can decide, call report_blocker (with options when
    you can), then get_blocker_resolution. If unresolved, output exactly
    BLOCKED:<blockerId> on its own line and STOP. Do NOT guess past a real decision.
-4. Ship: if this is a revision, \`git push\` to the SAME existing branch (the open PR
-   updates in place) and re-call attach_pr with that same PR URL. Otherwise open ONE
-   draft PR (git push + \`gh pr create --draft\`) and call attach_pr. Then call complete
-   with a plain-language summary AND a criteria self-report (index into the brief's
-   "done when" list + met true/false + a short note) — your delivery card in the task
-   thread. NEVER merge. Then output exactly DONE on its own line and stop.
+4. Ship — this depends on the brief's "placement":
+   - placement "patch" (a small, targeted change landing in the owner's own checkout):
+     do NOT create a branch, do NOT push, do NOT open a PR. Commit your change with a
+     one-line message and STOP there — the daemon applies it and the human keeps or
+     reverts it. Then call complete with a plain-language summary and the criteria
+     self-report.
+   - placement "branch" (the default): if this is a revision, \`git push\` to the SAME
+     existing branch (the open PR updates in place) and re-call attach_pr with that same
+     PR URL. Otherwise create the branch the brief names in "branchName" (\`git checkout
+     -b <branchName>\` — use that exact name, do not invent one), push it, open ONE draft
+     PR with \`gh pr create --draft\`, and call attach_pr. If the brief has a "baseBranch",
+     your worktree is already based on it — target the PR at it (\`--base <baseBranch>\`)
+     so the stack stays reviewable. Then call complete with a plain-language summary AND a
+     criteria self-report (index into the brief's "done when" list + met true/false + a
+     short note) — your delivery card in the task thread.
+   NEVER merge. Then output exactly DONE on its own line and stop.
 
-Do NOT claim a second intent — exactly one per turn. Keep every change scoped to the
-claimed intent. If a tool errors, report_progress with the error, then retry or
+Do NOT pick up a second task — exactly one per turn. Keep every change scoped to the
+task you picked up. If a tool errors, report_progress with the error, then retry or
 report_blocker.
 SECRETS: env files (.env, .dev.vars, …) hold the team's synced secrets. Their VALUES
 must NEVER appear in evidence, progress, summaries, commits, or PRs — reference keys
 by NAME only. Never commit an env file.`;
 
 export const KICKOFF =
-  'Begin the loop: claim and complete all dispatched Flowviant intents per your instructions.';
+  'Begin the loop: pick up and complete every Flowviant task you have been @mentioned on, per your instructions.';
 export const RESUME =
   'Resume. First call get_blocker_resolution for any blocker you reported; if resolved, ' +
-  'apply the human’s answer and continue. Otherwise keep claiming and completing ' +
-  'dispatched intents per your instructions.';
+  'apply the human’s answer and continue. Otherwise keep picking up and completing ' +
+  'the tasks you were @mentioned on, per your instructions.';
 export const SINGLE_KICKOFF =
-  'Claim and complete exactly ONE dispatched Flowviant intent per your instructions, then stop.';
+  'Pick up and complete exactly ONE Flowviant task per your instructions, then stop.';
 export const SINGLE_RESUME =
   'Resume your current task. Call get_blocker_resolution for the blocker you reported; ' +
   'if resolved, apply the human’s answer and finish this one intent, then stop.';
@@ -259,11 +271,21 @@ Steps:
 Ground every claim in files you actually read. Be efficient — look only at the
 changed area, not the whole repo; spend little quota.`;
 
-export const REGROUND_KICKOFF = ({ sha, title, files, vaultDir }) =>
+export const REGROUND_KICKOFF = ({ sha, title, files, vaultDir, predictedPages = [] }) =>
   `A feature just merged. Re-ground the knowledge vault (${vaultDir}) for it.\n\n` +
   `Feature: ${title}\n` +
   `Grounded commit: ${sha}\n` +
   `Changed files:\n${files.map((f) => `- ${f}`).join('\n')}\n\n` +
+  // The plan's own prediction, made when this work was drafted. Overlapping
+  // changed files against each page's frontmatter finds most of what moved, but
+  // misses a page whose file list has drifted or that documents a CONCEPT rather
+  // than a directory. This is a hint to CHECK, never a list to trust.
+  (predictedPages.length
+    ? `When this work was planned, these vault pages were expected to go stale.\n` +
+      `Treat it as a lead, not a fact — verify each against the code before\n` +
+      `editing, and ignore any that turned out to be unaffected:\n` +
+      `${predictedPages.map((p) => `- ${p}`).join('\n')}\n\n`
+    : '') +
   `Follow your instructions: update the touched vault pages (and any docs/\n` +
   `chapter that covers them), append the feature-history entry to log.md,\n` +
   `then output REGROUND_DONE.`;
@@ -511,3 +533,44 @@ export function runTurn({ prompt, resume, system, cwd, mcpConfig, label, onSpawn
     child.on('close', () => resolve(out));
   });
 }
+
+/**
+ * Plan check — the ground-truth pass.
+ *
+ * Generation runs on the server, where the repo does not exist. It grounds
+ * itself in proxies: a module manifest (names and file counts) and wiki pages
+ * (summaries of code). Those are good enough to draft a plan and not good
+ * enough to be sure of one — the summary can be stale, the anchors can be
+ * guesses, and "you already have this" can be wrong in the direction that
+ * wastes a day.
+ *
+ * This turn runs where the checkout is. It opens the actual files and corrects
+ * the plan. It is READ-ONLY by construction: it reports, it never edits.
+ */
+export const SYSTEM_PLAN_CHECK = `You are Flowviant's plan checker, running FULLY AUTONOMOUSLY in a real checkout of this repository.
+
+You are given a set of PROPOSED tasks that were drafted by a planner with no access to this repo. Your job is to check them against the actual code and report corrections. You are READ-ONLY: read files, search, and report. Do NOT edit, create, delete, commit, or run builds.
+
+For each proposed task, verify three things by opening real files:
+1. ALREADY BUILT — does this already exist? Only say so when you have SEEN the implementation; name the file and symbol. A similar-but-different capability is NOT already built.
+2. ANCHORS — are the listed module paths the ones this work would actually touch? Correct them to real directories that exist in this repo. Drop invented ones. Add the obvious misses.
+3. SIZE — is the points estimate plausible given how much code this really involves? Only comment when it is clearly wrong (a "1" that spans six files, an "8" that is a one-line constant).
+
+Respond with ONLY a JSON object on the final line, no markdown fence:
+{"checks":[{"id":"<the task id you were given>","alreadyBuilt":false,"evidence":"<file:symbol proving it, when alreadyBuilt>","anchors":["<corrected module paths>"],"points":<number or null>,"note":"<one short sentence, or empty>"}]}
+
+Rules:
+- Include an entry ONLY for tasks you actually have a correction or confirmation for. An empty "checks" array is a valid answer meaning "the plan looks right".
+- "anchors" must be paths that EXIST in this repo. Verify before listing.
+- "note" is read by a developer in a chat thread. One sentence, concrete, no preamble.
+- Never invent a file path or symbol. If you could not check something, leave it out.`;
+
+export const PLAN_CHECK_KICKOFF = ({ title, intents }) =>
+  `Check this plan against the real code.\n\nPLAN: ${title}\n\nPROPOSED TASKS:\n${intents
+    .map(
+      (i) =>
+        `- id: ${i.id}\n  title: ${i.title}\n  claimed anchors: ${
+          i.anchors.length ? i.anchors.join(', ') : '(none)'
+        }\n  points: ${i.points}`
+    )
+    .join('\n')}\n\nOpen the files these tasks claim to touch, verify each of the three checks, then output the JSON object on the final line.`;

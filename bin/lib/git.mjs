@@ -6,6 +6,26 @@ export function git(args, cwd) {
   return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 }
 
+/**
+ * Same call, UNTRIMMED — for `-z` (NUL-separated) output, where trimming would
+ * eat the final separator and the leading space of a status code.
+ *
+ * Anything that COMPARES two path lists has to use this. Git's default
+ * line-based output quotes and escapes any path that isn't plain ASCII, and it
+ * does so inconsistently between commands — so a comparison of `git status`
+ * paths against `git diff` paths silently stops matching the moment a filename
+ * has an accent in it. For the patch collision check, "silently stops matching"
+ * means "overwrites the edits it exists to protect".
+ */
+export function gitRaw(args, cwd) {
+  return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+}
+
+/** Split NUL-separated git output into entries. */
+export function splitNul(out) {
+  return String(out).split('\0').filter(Boolean);
+}
+
 export function repoRootOrDie() {
   try {
     return git(['rev-parse', '--show-toplevel'], process.cwd());
@@ -53,6 +73,14 @@ export function isValidBranch(branch, repoRoot, baseRef) {
   }
 }
 
+/** A commit sha from the server, before it reaches `git revert` argv. Server
+ *  values reaching git are validated here by convention (see isValidBranch,
+ *  isValidPrUrl) — a revision RANGE ("HEAD~10..HEAD") or a leading-dash option
+ *  must never pass, whatever the roster says. */
+export function isValidSha(sha) {
+  return typeof sha === 'string' && /^[0-9a-f]{7,40}$/.test(sha);
+}
+
 /** A roster agent id used as a filesystem path segment — strict allowlist so
  *  it can't traverse (`..`, `/`) out of the worktrees dir. */
 export function isSafePathSegment(id) {
@@ -70,6 +98,19 @@ export function detectBaseRef(repoRoot) {
   } catch {
     return 'HEAD';
   }
+}
+
+/**
+ * The BRANCH NAME behind a base ref.
+ *
+ * `detectBaseRef` returns a remote-tracking ref (`origin/main`) because that is
+ * what you check out and reset against. GitHub's API has never heard of it: a PR
+ * base must be a branch that exists in the repo, so `gh pr edit --base
+ * origin/main` 422s every time. Anything that talks to the provider needs this
+ * form, not the ref.
+ */
+export function baseBranchName(baseRef) {
+  return String(baseRef || '').replace(/^origin\//, '') || 'main';
 }
 
 export function resetWorktree(wt, baseRef) {

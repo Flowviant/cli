@@ -23,6 +23,7 @@ import {
   REFRESH_BEFORE_SECONDS,
   LIVE,
   AUTO_UPDATE,
+  ALLOW_PATCHES,
 } from './config.mjs';
 import { handleVersionSignal } from './update.mjs';
 import {
@@ -31,11 +32,13 @@ import {
   repoRootOrDie,
   detectBaseRef,
   originSlug,
+  baseBranchName,
   isValidPrUrl,
   isValidBranch,
   isSafePathSegment,
 } from './git.mjs';
 import { c, LABEL_COLORS, info, note, ok, warn, fail } from './ui.mjs';
+import { revertPatch, withPatchLock } from './patch.mjs';
 import {
   sleep,
   mcpConfigFor,
@@ -48,6 +51,8 @@ import {
   SYSTEM_WIKI,
   WIKI_KICKOFF,
   SYSTEM_REGROUND,
+  SYSTEM_PLAN_CHECK,
+  PLAN_CHECK_KICKOFF,
   REGROUND_KICKOFF,
 } from './claude.mjs';
 import { runLiveWorker } from './live.mjs';
@@ -197,6 +202,13 @@ export async function runFleetDaemon() {
   info(SAFE ? 'mode   · safe (restricted toolset)' : 'mode   · unattended (skips permission prompts)');
   info(`repo   · ${repoRoot}`);
   info(`base   · ${baseRef}`);
+  // Stated out loud because it is the one setting that lets something else write
+  // into the checkout you are sitting in.
+  info(
+    ALLOW_PATCHES
+      ? 'patches· accepted — small changes land in your checkout for Keep/Revert (--no-patches to refuse)'
+      : 'patches· refused — everything arrives as a branch + PR'
+  );
   info(`server · ${FLEET_URL}`);
   console.log('');
   await preflight({ needGit: true });
@@ -301,6 +313,149 @@ export async function runFleetDaemon() {
       /* best-effort — the job reappears next poll if this failed */
     }
   };
+  // Patch reverts: a patch landed straight in this checkout, and a human took it
+  // back. The commits are HERE, not on the server, so the reverse-apply happens
+  // here too — a revert, never a reset, because the owner has almost certainly
+  // worked on top by now. Serialised through the same lock as applies.
+  const PATCH_REVERT_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/patch-revert-done');
+  const reverting = new Set();
+  const processPatchRevertJobs = (jobs) => {
+    for (const job of jobs ?? []) {
+      if (!job || typeof job.id !== 'string' || !Array.isArray(job.shas)) continue;
+      if (reverting.has(job.id)) continue;
+      reverting.add(job.id);
+      (async () => {
+        try {
+          note(`${c.cyan('revert')} ${c.dim(`— ${job.title}`)}`);
+          const res = await withPatchLock(() =>
+            Promise.resolve(revertPatch({ repoRoot, shas: job.shas }))
+          );
+          if (res.ok) ok(`${c.dim('reverted')} ${job.title}`);
+          else warn(`revert failed for "${job.title}": ${res.error}`);
+          // ALWAYS report, success or not. Without this the flag stays set, the
+          // roster re-serves the job every poll, and each pass reverts the
+          // revert — the change flapping in and out of the owner's tree forever.
+          await reportMergeOutcome(PATCH_REVERT_DONE_URL, {
+            intentId: job.id,
+            ok: res.ok,
+            error: res.ok ? undefined : String(res.error ?? 'revert failed'),
+          });
+        } finally {
+          reverting.delete(job.id);
+        }
+      })();
+    }
+  };
+
+  // Plan checks: the ground-truth pass. Generation drafted these against a
+  // module manifest and wiki summaries — proxies for the repo. This runs where
+  // the checkout is, opens the real files, and reports corrections back into the
+  // thread. Read-only by construction; it never edits.
+  /**
+   * Pull the plan-check JSON off the tail of a Claude turn.
+   *
+   * The model is told to end with a bare JSON object, but a turn can trail
+   * prose, a fence, or a stray newline. Scan backwards for the last balanced
+   * object and validate it hard: anything shaped wrong is dropped rather than
+   * written into someone's plan. Returns null when nothing usable was found.
+   */
+  const parsePlanChecks = (out, intents) => {
+    const text = String(out ?? '');
+    const known = new Set(intents.map((i) => i.id));
+    const end = text.lastIndexOf('}');
+    if (end === -1) return null;
+    // NOTE: `lastIndexOf(x, -1)` returns 0, NOT -1 — the position argument is
+    // clamped, so the obvious `start = lastIndexOf('{', start - 1)` loop spins
+    // forever once it reaches index 0 and the parse fails. That hangs the
+    // daemon's event loop, not just this job. Walk with an explicit stop, and
+    // cap the attempts so a pathological turn can't burn the poll cycle either.
+    let start = text.lastIndexOf('{', end);
+    for (let attempts = 0; start !== -1 && attempts < 200; attempts++) {
+      let parsed = null;
+      try {
+        parsed = JSON.parse(text.slice(start, end + 1));
+      } catch {
+        /* not a complete object at this offset — step back and retry */
+      }
+      if (!parsed || !Array.isArray(parsed.checks)) {
+        if (start === 0) break;
+        start = text.lastIndexOf('{', start - 1);
+        continue;
+      }
+      return parsed.checks
+        .filter((ch) => ch && typeof ch.id === 'string' && known.has(ch.id))
+        .map((ch) => ({
+          id: ch.id,
+          alreadyBuilt: ch.alreadyBuilt === true,
+          evidence: typeof ch.evidence === 'string' ? ch.evidence.slice(0, 300) : '',
+          anchors: Array.isArray(ch.anchors)
+            ? ch.anchors.filter((a) => typeof a === 'string' && a.length < 200).slice(0, 6)
+            : [],
+          points:
+            typeof ch.points === 'number' && Number.isFinite(ch.points)
+              ? Math.max(0, Math.min(13, Math.round(ch.points)))
+              : null,
+          note: typeof ch.note === 'string' ? ch.note.slice(0, 400) : '',
+        }))
+        .slice(0, 30);
+    }
+    return null;
+  };
+
+  const PLAN_CHECK_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/plan-check-done');
+  const checkingPlans = new Set();
+  const processPlanCheckJobs = (jobs) => {
+    for (const job of jobs ?? []) {
+      if (!job || typeof job.id !== 'string' || !Array.isArray(job.intents)) continue;
+      if (checkingPlans.has(job.id)) continue;
+      if (job.intents.length === 0) continue;
+      checkingPlans.add(job.id);
+      (async () => {
+        try {
+          note(`${c.cyan('plan')} ${c.dim(`— checking "${job.title}" against your code…`)}`);
+          // Reuse the wiki worktree: a clean detached checkout at base, which is
+          // what "the real code" should mean here — not whatever half-finished
+          // state an agent worktree happens to be in.
+          if (!existsSync(wikiWt)) {
+            try {
+              git(['worktree', 'add', '--detach', wikiWt, baseRef], repoRoot);
+            } catch {
+              git(['worktree', 'prune'], repoRoot);
+              git(['worktree', 'add', '--detach', wikiWt, baseRef], repoRoot);
+            }
+          }
+          const out = await runTurn({
+            prompt: PLAN_CHECK_KICKOFF({ title: job.title, intents: job.intents }),
+            resume: false,
+            system: SYSTEM_PLAN_CHECK,
+            cwd: wikiWt,
+            wikiPerm: true, // read-only file perms — no MCP, no shell writes
+            label: c.cyan('[plan]'),
+          });
+          const checks = parsePlanChecks(out, job.intents);
+          if (checks === null) {
+            warn(`plan check for "${job.title}": no usable JSON — leaving the plan as drafted`);
+          }
+          await reportMergeOutcome(PLAN_CHECK_DONE_URL, {
+            intentId: job.id,
+            checks: checks ?? [],
+          });
+          if (checks?.length) {
+            ok(`${c.cyan('plan')} ${c.dim(`— ${checks.length} correction${checks.length === 1 ? '' : 's'} for "${job.title}"`)}`);
+          } else {
+            ok(`${c.cyan('plan')} ${c.dim(`— "${job.title}" checks out against your code`)}`);
+          }
+        } catch (e) {
+          warn(`plan check failed for "${job.title}": ${e?.message ?? e}`);
+          // Clear the flag anyway — a stuck job would re-run every poll forever.
+          await reportMergeOutcome(PLAN_CHECK_DONE_URL, { intentId: job.id, checks: [] });
+        } finally {
+          checkingPlans.delete(job.id);
+        }
+      })();
+    }
+  };
+
   const processMergeJobs = (jobs) => {
     for (const job of jobs ?? []) {
       if (!job || typeof job.id !== 'string') continue; // a null element would wedge the loop
@@ -322,6 +477,35 @@ export async function runFleetDaemon() {
             });
             warn(`merge REFUSED for "${job.title}": untrusted PR URL ${String(job.prUrl)}`);
             return;
+          }
+          // STACKED PR: it targets its blocker's branch so the review shows only
+          // its own diff. The server holds this job until that blocker merged, so
+          // by now the blocker's commits are in the base ref — re-point before
+          // squashing, or the change lands in the blocker's branch and never
+          // reaches the trunk while the card cheerfully says "Merged".
+          if (job.retargetToBase) {
+            try {
+              // baseBranchName, not baseRef: `gh pr edit --base` needs a branch
+              // that exists in the repo, and detectBaseRef hands back a
+              // remote-tracking ref (origin/main) that GitHub 422s on.
+              execFileSync('gh', ['pr', 'edit', job.prUrl, '--base', baseBranchName(baseRef)], {
+                cwd: repoRoot,
+                stdio: ['ignore', 'pipe', 'pipe'],
+              });
+            } catch (e) {
+              // Already targeting base is the common no-op; anything else is
+              // reported rather than merged into the wrong place.
+              const err = e.stderr?.toString?.() || e.message || '';
+              if (!/no changes|already/i.test(err)) {
+                mergeAttempts.delete(job.id);
+                await reportMergeOutcome(MERGE_FAILED_URL, {
+                  intentId: job.id,
+                  message: `could not retarget the stacked PR onto ${baseBranchName(baseRef)} — merging it now would land in the branch below it, not ${baseBranchName(baseRef)}`,
+                });
+                warn(`merge held for "${job.title}": retarget failed — ${err.split('\n')[0]}`);
+                return;
+              }
+            }
           }
           try {
             execFileSync('gh', ['pr', 'merge', job.prUrl, '--squash', '--delete-branch'], {
@@ -359,7 +543,7 @@ export async function runFleetDaemon() {
             // Direct enqueue = immediacy; the server's durable regroundJobs list
             // (created by merge-done above, cleared by our reground-done report)
             // is the restart-safe backstop — dedup'd here by groundedIntents.
-            enqueueReground(job.id, job.prUrl, job.title);
+            enqueueReground(job.id, job.prUrl, job.title, job.dirtiesPages);
           } else if (failedReason) {
             // Report into the thread (server narrates + re-arms the merge
             // button + notifies) — the job disappears from the roster.
@@ -503,10 +687,20 @@ export async function runFleetDaemon() {
     wikiQueue.push({ type: 'sweep' });
     void drainWiki();
   };
-  const enqueueReground = (intentId, prUrl, title) => {
+  const enqueueReground = (intentId, prUrl, title, dirtiesPages) => {
     if (!intentId || groundedIntents.has(intentId)) return;
     groundedIntents.add(intentId);
-    wikiQueue.push({ type: 'reground', intentId, prUrl, title: title || 'a delivered task' });
+    wikiQueue.push({
+      type: 'reground',
+      intentId,
+      prUrl,
+      title: title || 'a delivered task',
+      // What the PLAN thought this would invalidate. A hint, not the truth —
+      // the turn still reads the real changed files; this catches pages whose
+      // frontmatter file list has drifted, or that document a concept rather
+      // than a directory.
+      dirtiesPages: Array.isArray(dirtiesPages) ? dirtiesPages : [],
+    });
     void drainWiki();
   };
 
@@ -674,7 +868,13 @@ export async function runFleetDaemon() {
             } else {
               note(`${c.cyan('wiki')} ${c.dim(`— re-grounding after "${task.title}"…`)}`);
               const out = await runTurn({
-                prompt: REGROUND_KICKOFF({ sha, title: task.title, files, vaultDir }),
+                prompt: REGROUND_KICKOFF({
+                  sha,
+                  title: task.title,
+                  files,
+                  vaultDir,
+                  predictedPages: task.dirtiesPages ?? [],
+                }),
                 resume: false,
                 system: SYSTEM_REGROUND(vaultDir),
                 cwd: wikiWt,
@@ -820,6 +1020,8 @@ export async function runFleetDaemon() {
       if (updating) return;
     }
     processMergeJobs(roster.mergeJobs);
+    processPatchRevertJobs(roster.patchRevertJobs);
+    processPlanCheckJobs(roster.planCheckJobs);
     processCleanupJobs(roster.cleanupJobs);
     const rosterIds = new Set(roster.agents.map((a) => a.agentId));
 
@@ -912,7 +1114,7 @@ export async function runFleetDaemon() {
     enqueueSweep(roster.codeMapJob);
     for (const j of roster.regroundJobs ?? []) {
       if (!j || typeof j.intentId !== 'string') continue; // a null element would throw + wedge the loop
-      enqueueReground(j.intentId, j.prUrl, j.title);
+      enqueueReground(j.intentId, j.prUrl, j.title, j.dirtiesPages);
     }
     void drainWiki();
 
