@@ -54,6 +54,8 @@ import {
   SYSTEM_PLAN_CHECK,
   PLAN_CHECK_KICKOFF,
   REGROUND_KICKOFF,
+  SYSTEM_CONSULT,
+  CONSULT_KICKOFF,
 } from './claude.mjs';
 import { runLiveWorker } from './live.mjs';
 import { reapOrphanPreviews } from './preview.mjs';
@@ -402,6 +404,19 @@ export async function runFleetDaemon() {
     return null;
   };
 
+  /** A clean detached checkout at base — what "the real code" has to mean for a
+   *  question about the repo, rather than whatever half-finished state an agent
+   *  worktree happens to be in. Shared by the plan check and consults. */
+  const ensureWikiWorktree = () => {
+    if (existsSync(wikiWt)) return;
+    try {
+      git(['worktree', 'add', '--detach', wikiWt, baseRef], repoRoot);
+    } catch {
+      git(['worktree', 'prune'], repoRoot);
+      git(['worktree', 'add', '--detach', wikiWt, baseRef], repoRoot);
+    }
+  };
+
   const PLAN_CHECK_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/plan-check-done');
   const checkingPlans = new Set();
   const processPlanCheckJobs = (jobs) => {
@@ -413,17 +428,7 @@ export async function runFleetDaemon() {
       (async () => {
         try {
           note(`${c.cyan('plan')} ${c.dim(`— checking "${job.title}" against your code…`)}`);
-          // Reuse the wiki worktree: a clean detached checkout at base, which is
-          // what "the real code" should mean here — not whatever half-finished
-          // state an agent worktree happens to be in.
-          if (!existsSync(wikiWt)) {
-            try {
-              git(['worktree', 'add', '--detach', wikiWt, baseRef], repoRoot);
-            } catch {
-              git(['worktree', 'prune'], repoRoot);
-              git(['worktree', 'add', '--detach', wikiWt, baseRef], repoRoot);
-            }
-          }
+          ensureWikiWorktree();
           const out = await runTurn({
             prompt: PLAN_CHECK_KICKOFF({ title: job.title, intents: job.intents }),
             resume: false,
@@ -451,6 +456,57 @@ export async function runFleetDaemon() {
           await reportMergeOutcome(PLAN_CHECK_DONE_URL, { intentId: job.id, checks: [] });
         } finally {
           checkingPlans.delete(job.id);
+        }
+      })();
+    }
+  };
+
+  // Consults — a planning question aimed at THIS machine, answered by reading
+  // the repo. Deliberately the lightest job on the roster: same read-only
+  // detached checkout the plan check uses, no MCP, no writes, no run recorded.
+  const CONSULT_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/consult-done');
+  const answering = new Set();
+  const processConsultJobs = (jobs) => {
+    for (const job of jobs ?? []) {
+      if (!job || typeof job.id !== 'string' || !job.question) continue;
+      if (answering.has(job.id)) continue;
+      answering.add(job.id);
+      (async () => {
+        try {
+          note(`${c.cyan('ask')} ${c.dim(`— ${job.askedByName || 'someone'} asked about "${job.planTitle || 'a plan'}"`)}`);
+          ensureWikiWorktree();
+          const out = await runTurn({
+            prompt: CONSULT_KICKOFF({
+              planTitle: job.planTitle,
+              question: job.question,
+              askedByName: job.askedByName,
+            }),
+            resume: false,
+            system: SYSTEM_CONSULT,
+            cwd: wikiWt,
+            wikiPerm: true, // read-only file perms — no MCP, no shell writes
+            label: c.cyan('[ask]'),
+          });
+          const answer = (out || '').trim();
+          await reportMergeOutcome(CONSULT_DONE_URL, {
+            consultId: job.id,
+            ok: answer.length > 0,
+            // Scrub: an answer can quote config or env-adjacent code.
+            answer: envScrub(answer).slice(0, 8000),
+          });
+          ok(`${c.cyan('ask')} ${c.dim('— answered in the plan thread')}`);
+        } catch (e) {
+          // Settle it either way. A question that cannot be answered must not
+          // re-burn a Claude turn on every poll, and silence would leave the
+          // human waiting on a machine that already gave up.
+          await reportMergeOutcome(CONSULT_DONE_URL, {
+            consultId: job.id,
+            ok: false,
+            answer: e?.message ?? 'the read failed',
+          });
+          warn(`consult failed: ${e?.message ?? e}`);
+        } finally {
+          answering.delete(job.id);
         }
       })();
     }
@@ -1022,6 +1078,7 @@ export async function runFleetDaemon() {
     processMergeJobs(roster.mergeJobs);
     processPatchRevertJobs(roster.patchRevertJobs);
     processPlanCheckJobs(roster.planCheckJobs);
+    processConsultJobs(roster.consultJobs);
     processCleanupJobs(roster.cleanupJobs);
     const rosterIds = new Set(roster.agents.map((a) => a.agentId));
 
