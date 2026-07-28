@@ -172,10 +172,33 @@ questions, delivery summaries, commits, or PRs — reference keys by NAME only
 (e.g. "set STRIPE_KEY"). Never screenshot a terminal or page that displays a
 credential, and never commit an env file.`;
 
-/** The brief minus the conversation — that is rendered as prose, not JSON. */
+/** The brief minus the parts rendered as prose below (conversations, the ask). */
 function briefWithoutThread(brief) {
-  const { thread: _thread, lastMessageId: _lastMessageId, ...rest } = brief ?? {};
+  const {
+    thread: _thread,
+    lastMessageId: _lastMessageId,
+    plan: _plan,
+    asked: _asked,
+    ...rest
+  } = brief ?? {};
   return rest;
+}
+
+/** The plan this task was carved out of, when there was one. A slice cannot
+ *  reconstruct WHY it was cut this way from its own spec. */
+function planContext(brief) {
+  const plan = brief?.plan;
+  if (!plan) return [];
+  const turns = (plan.recentTurns ?? [])
+    .map((m) => `${m.authorName || m.role}: ${m.content}`)
+    .join('\n');
+  return [
+    ``,
+    `This task is ONE SLICE of a larger plan: "${plan.title || 'untitled plan'}".`,
+    plan.description ? `The plan:\n${plan.description}` : '',
+    turns ? `How the team was talking about it, most recent last:\n${turns}` : '',
+    `Build only YOUR slice — the rest is there so its shape makes sense.`,
+  ].filter(Boolean);
 }
 
 function seedPrompt(runId, brief, transcript, resumedInPlace) {
@@ -193,6 +216,17 @@ function seedPrompt(runId, brief, transcript, resumedInPlace) {
     // The conversation is rendered below as readable turns, not dumped twice as
     // JSON — it is the longest thing in the brief and the least useful as data.
     JSON.stringify(briefWithoutThread(brief), null, 2),
+    ...(brief?.asked
+      ? [
+          ``,
+          `What the human originally asked for, in their words:`,
+          `  "${brief.asked}"`,
+          `The specification above is someone's reading of that sentence, written`,
+          `without access to the repo. Where the two disagree, this is the one with`,
+          `a person behind it — say so rather than quietly picking one.`,
+        ]
+      : []),
+    ...planContext(brief),
     ...(transcript
       ? [
           ``,
