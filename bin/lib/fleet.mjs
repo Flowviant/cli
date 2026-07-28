@@ -299,9 +299,13 @@ export async function runFleetDaemon() {
   const MERGE_FAILED_URL = FLEET_URL.replace(/\/agents\/?$/, '/merge-failed');
   const merging = new Set();
   const mergeAttempts = new Map(); // job.id -> transient-failure count
+  /** Returns whether the server actually accepted it. Callers that spend a
+   *  Claude turn per attempt need to know: swallowing the failure silently made
+   *  an unreachable endpoint look identical to a settled job, so the turn
+   *  re-ran on every poll. */
   const reportMergeOutcome = async (url, body) => {
     try {
-      await fetch(url, {
+      const res = await fetch(url, {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${FLEET_TOKEN}`,
@@ -311,8 +315,10 @@ export async function runFleetDaemon() {
         signal: AbortSignal.timeout(30_000),
         body: JSON.stringify(body),
       });
+      return res.ok;
     } catch {
       /* best-effort — the job reappears next poll if this failed */
+      return false;
     }
   };
   // Patch reverts: a patch landed straight in this checkout, and a human took it
@@ -404,16 +410,49 @@ export async function runFleetDaemon() {
     return null;
   };
 
+  /**
+   * Everything that reads or rewrites the shared `wikiWt` worktree takes this:
+   * the wiki sweep, the post-merge re-ground, the plan check, and consults.
+   *
+   * They are one directory. The wiki queue hard-resets it (`checkout --detach`,
+   * `reset --hard`, `clean -fd`) between tasks, which pulls the files out from
+   * under anything else mid-read — and two Claude turns in one working tree is
+   * incoherent even without the reset.
+   */
+  let wikiLock = Promise.resolve();
+  const withWikiLock = (fn) => {
+    const run = wikiLock.then(fn, fn);
+    wikiLock = run.then(
+      () => {},
+      () => {}
+    );
+    return run;
+  };
+
   /** A clean detached checkout at base — what "the real code" has to mean for a
    *  question about the repo, rather than whatever half-finished state an agent
    *  worktree happens to be in. Shared by the plan check and consults. */
   const ensureWikiWorktree = () => {
-    if (existsSync(wikiWt)) return;
+    if (!existsSync(wikiWt)) {
+      try {
+        git(['worktree', 'add', '--detach', wikiWt, baseRef], repoRoot);
+      } catch {
+        git(['worktree', 'prune'], repoRoot);
+        git(['worktree', 'add', '--detach', wikiWt, baseRef], repoRoot);
+      }
+      return;
+    }
+    // It already exists — which means it is pinned to whatever base pointed at
+    // when it was FIRST created, possibly weeks ago. "Reads the real code" has
+    // to mean the current base, so re-point it. Best-effort: a stale answer
+    // beats no answer, and the next turn tries again.
     try {
-      git(['worktree', 'add', '--detach', wikiWt, baseRef], repoRoot);
+      git(['fetch', 'origin', '--quiet'], repoRoot);
+      git(['checkout', '--detach', baseRef], wikiWt);
+      git(['reset', '--hard', baseRef], wikiWt);
+      git(['clean', '-fd'], wikiWt);
     } catch {
-      git(['worktree', 'prune'], repoRoot);
-      git(['worktree', 'add', '--detach', wikiWt, baseRef], repoRoot);
+      /* offline, or a turn left it dirty — read what we have */
     }
   };
 
@@ -428,14 +467,17 @@ export async function runFleetDaemon() {
       (async () => {
         try {
           note(`${c.cyan('plan')} ${c.dim(`— checking "${job.title}" against your code…`)}`);
-          ensureWikiWorktree();
-          const out = await runTurn({
-            prompt: PLAN_CHECK_KICKOFF({ title: job.title, intents: job.intents }),
-            resume: false,
-            system: SYSTEM_PLAN_CHECK,
-            cwd: wikiWt,
-            wikiPerm: true, // read-only file perms — no MCP, no shell writes
-            label: c.cyan('[plan]'),
+          const out = await withWikiLock(async () => {
+            ensureWikiWorktree();
+            return runTurn({
+              prompt: PLAN_CHECK_KICKOFF({ title: job.title, intents: job.intents }),
+              resume: false,
+              system: SYSTEM_PLAN_CHECK,
+              cwd: wikiWt,
+              // Reads the repo and reports JSON — it authors nothing either.
+              readOnly: true,
+              label: c.cyan('[plan]'),
+            });
           });
           const checks = parsePlanChecks(out, job.intents);
           if (checks === null) {
@@ -466,39 +508,61 @@ export async function runFleetDaemon() {
   // detached checkout the plan check uses, no MCP, no writes, no run recorded.
   const CONSULT_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/consult-done');
   const answering = new Set();
+  const consultAttempts = new Map(); // consultId -> tries
+  /** Give up after this many turns on one question. A /consult-done that never
+   *  reaches the server (offline, 500) would otherwise re-run the whole Claude
+   *  turn every poll, forever, on the owner's quota. */
+  const MAX_CONSULT_TRIES = 3;
+  /** ONE consult at a time. They all read the same worktree, and the roster can
+   *  hand back a batch — un-awaited spawns meant N pending questions became N
+   *  concurrent `claude` processes on someone's laptop. */
+  let consultChain = Promise.resolve();
+
   const processConsultJobs = (jobs) => {
     for (const job of jobs ?? []) {
       if (!job || typeof job.id !== 'string' || !job.question) continue;
       if (answering.has(job.id)) continue;
+      const tries = (consultAttempts.get(job.id) ?? 0) + 1;
+      if (tries > MAX_CONSULT_TRIES) continue;
+      consultAttempts.set(job.id, tries);
       answering.add(job.id);
-      (async () => {
+      consultChain = consultChain.then(async () => {
         try {
           note(`${c.cyan('ask')} ${c.dim(`— ${job.askedByName || 'someone'} asked about "${job.planTitle || 'a plan'}"`)}`);
-          ensureWikiWorktree();
-          const out = await runTurn({
-            prompt: CONSULT_KICKOFF({
-              planTitle: job.planTitle,
-              question: job.question,
-              askedByName: job.askedByName,
-            }),
-            resume: false,
-            system: SYSTEM_CONSULT,
-            cwd: wikiWt,
-            wikiPerm: true, // read-only file perms — no MCP, no shell writes
-            label: c.cyan('[ask]'),
+          // Serialised against the wiki queue as well: that queue hard-resets
+          // this worktree mid-turn, which would pull the files out from under a
+          // consult that is reading them.
+          await withWikiLock(async () => {
+            ensureWikiWorktree();
+            const out = await runTurn({
+              prompt: CONSULT_KICKOFF({
+                planTitle: job.planTitle,
+                question: job.question,
+                askedByName: job.askedByName,
+              }),
+              resume: false,
+              system: SYSTEM_CONSULT,
+              cwd: wikiWt,
+              // TRULY read-only — no Write/Edit/rm, no MCP. The prompt also says
+              // not to change anything, but the prompt is what an injected
+              // question competes with; the toolset is what it cannot.
+              readOnly: true,
+              label: c.cyan('[ask]'),
+            });
+            const answer = (out || '').trim();
+            const posted = await reportMergeOutcome(CONSULT_DONE_URL, {
+              consultId: job.id,
+              ok: answer.length > 0,
+              // Scrub: an answer can quote config or env-adjacent code.
+              answer: envScrub(answer).slice(0, 8000),
+            });
+            if (posted) consultAttempts.delete(job.id);
+            ok(`${c.cyan('ask')} ${c.dim('— answered in the plan thread')}`);
           });
-          const answer = (out || '').trim();
-          await reportMergeOutcome(CONSULT_DONE_URL, {
-            consultId: job.id,
-            ok: answer.length > 0,
-            // Scrub: an answer can quote config or env-adjacent code.
-            answer: envScrub(answer).slice(0, 8000),
-          });
-          ok(`${c.cyan('ask')} ${c.dim('— answered in the plan thread')}`);
         } catch (e) {
-          // Settle it either way. A question that cannot be answered must not
-          // re-burn a Claude turn on every poll, and silence would leave the
-          // human waiting on a machine that already gave up.
+          // Settle it. A question that cannot be answered must not re-burn a
+          // Claude turn every poll, and silence would leave the human waiting on
+          // a machine that already gave up.
           await reportMergeOutcome(CONSULT_DONE_URL, {
             consultId: job.id,
             ok: false,
@@ -508,7 +572,7 @@ export async function runFleetDaemon() {
         } finally {
           answering.delete(job.id);
         }
-      })();
+      });
     }
   };
 
@@ -782,6 +846,9 @@ export async function runFleetDaemon() {
   async function drainWiki() {
     if (wikiBusy || wikiQueue.length === 0) return;
     wikiBusy = true;
+    // Held for the WHOLE drain: this loop resets the worktree between tasks, and
+    // a consult reading it mid-reset sees files vanish under it.
+    return withWikiLock(async () => {
     try {
       while (wikiQueue.length) {
         const task = wikiQueue.shift();
@@ -976,6 +1043,7 @@ export async function runFleetDaemon() {
     } finally {
       wikiBusy = false;
     }
+    });
   }
 
   let connected = false; // log the first successful poll once
