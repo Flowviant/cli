@@ -114,6 +114,15 @@ if (process.argv[2] === 'shot') {
 // `flowviant env <import|set|show>` — the CLI half of team env sync. Values
 // are sealed to the project pubkey ON THIS MACHINE (same write-only crypto as
 // the browser); `show` decrypts locally — it only works on an ENROLLED machine.
+// `flowviant mcp` — connect YOUR Claude to Flowviant so you can file work from
+// the terminal. Mints a `cli` credential: a separate principal from the build
+// workers, with only the management tools and no way to claim or ship work.
+if (process.argv[2] === 'mcp') {
+  const { runMcpCommand } = await import('./lib/mcp-cli.mjs');
+  await runMcpCommand(process.argv.slice(3));
+  process.exit(0);
+}
+
 if (process.argv[2] === 'env') {
   const { runEnvCommand } = await import('./lib/env-cli.mjs');
   await runEnvCommand(process.argv.slice(3));
