@@ -331,7 +331,7 @@ function makeInput(seedText) {
 function markerPath(cwd) {
   return join(git(['rev-parse', '--absolute-git-dir'], cwd), 'flowviant-task');
 }
-function readTaskMarker(cwd) {
+export function readTaskMarker(cwd) {
   try {
     return readFileSync(markerPath(cwd), 'utf8').trim() || null;
   } catch {

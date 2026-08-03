@@ -56,8 +56,10 @@ import {
   REGROUND_KICKOFF,
   SYSTEM_CONSULT,
   CONSULT_KICKOFF,
+  SYSTEM_QUICK_EDIT,
+  QUICK_EDIT_KICKOFF,
 } from './claude.mjs';
-import { runLiveWorker } from './live.mjs';
+import { runLiveWorker, readTaskMarker } from './live.mjs';
 import { reapOrphanPreviews } from './preview.mjs';
 import { preflight } from './preflight.mjs';
 import { connectStream } from './stream.mjs';
@@ -321,6 +323,27 @@ export async function runFleetDaemon() {
       return false;
     }
   };
+  /** Same POST, but hands back the parsed `data`. A compare-and-set answers in
+   *  the BODY (`taken: false` is a perfectly successful 200), so reading only
+   *  `res.ok` would tell a lane it won a race it actually lost. */
+  const postForData = async (url, body) => {
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${FLEET_TOKEN}`,
+          'User-Agent': USER_AGENT,
+          'Content-Type': 'application/json',
+        },
+        signal: AbortSignal.timeout(30_000),
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) return null;
+      return (await res.json())?.data ?? null;
+    } catch {
+      return null;
+    }
+  };
   // Patch reverts: a patch landed straight in this checkout, and a human took it
   // back. The commits are HERE, not on the server, so the reverse-apply happens
   // here too — a revert, never a reset, because the owner has almost certainly
@@ -517,6 +540,104 @@ export async function runFleetDaemon() {
    *  hand back a batch — un-awaited spawns meant N pending questions became N
    *  concurrent `claude` processes on someone's laptop. */
   let consultChain = Promise.resolve();
+
+  // Quick edits — a SECOND Claude alongside a task this machine is already
+  // building. Unlike every other roster job it does not get a worktree of its
+  // own: the whole point is to work in the one the running task opened, on that
+  // branch, so the change rides along with the delivery instead of becoming a
+  // second thing to merge.
+  const JOIN_TAKE_URL = FLEET_URL.replace(/\/agents\/?$/, '/join-take');
+  const JOIN_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/join-done');
+  const joining = new Set();
+  /** ONE quick edit at a time, ACROSS worktrees. Two of them in the same tree
+   *  would fight over the index; two in different trees would still be two extra
+   *  Claudes on the owner's account on top of the tasks already running. */
+  let joinChain = Promise.resolve();
+
+  /** The worktree currently building this intent, or null if this machine isn't.
+   *  The task marker lives in the worktree's git dir and is what a resume already
+   *  uses to recognise its own half-built tree, so it is the honest answer to
+   *  "where is this task actually being built". */
+  const worktreeBuilding = (intentId) => {
+    for (const w of workers.values()) {
+      try {
+        if (w.wt && readTaskMarker(w.wt) === intentId) return w;
+      } catch {
+        /* a worktree that vanished isn't building anything */
+      }
+    }
+    return null;
+  };
+
+  const processJoinJobs = (jobs) => {
+    for (const job of jobs ?? []) {
+      if (!job || typeof job.id !== 'string' || !job.instruction) continue;
+      if (joining.has(job.id)) continue;
+      joining.add(job.id);
+      joinChain = joinChain.then(async () => {
+        let settled = false;
+        try {
+          const target = worktreeBuilding(job.intentId);
+          if (!target) {
+            // The run ended (or moved) between the human pressing ⚡ and this
+            // poll. Settle rather than retry: there is no worktree to join, and
+            // an unsettled row holds the reset interlock open forever.
+            await reportMergeOutcome(JOIN_DONE_URL, {
+              joinId: job.id,
+              ok: false,
+              result: 'that task is no longer building on this machine',
+            });
+            settled = true;
+            return;
+          }
+          // Compare-and-set BEFORE spending a Claude turn: two lanes can wake on
+          // the same push, and running one instruction twice into one worktree
+          // is exactly the double-edit this is meant to avoid.
+          const claim = await postForData(JOIN_TAKE_URL, { joinId: job.id });
+          if (!claim?.taken) return;
+          note(
+            `${c.cyan('quick')} ${c.dim(`— ${job.askedByName || 'someone'} on "${job.intentTitle || 'a task'}"`)}`
+          );
+          const out = await runTurn({
+            prompt: QUICK_EDIT_KICKOFF({
+              intentTitle: job.intentTitle,
+              instruction: job.instruction,
+              askedByName: job.askedByName,
+            }),
+            // Never resume: this is its own tiny turn, not a continuation of the
+            // task's session. Resuming would hand it the other agent's context
+            // and, with it, the other agent's job.
+            resume: false,
+            system: SYSTEM_QUICK_EDIT,
+            cwd: target.wt,
+            // No MCP: a join records no run, claims nothing, completes nothing.
+            // Its only report is the one this daemon posts below.
+            label: c.cyan('[quick]'),
+          });
+          const summary = (out || '').trim();
+          await reportMergeOutcome(JOIN_DONE_URL, {
+            joinId: job.id,
+            ok: summary.length > 0,
+            // Scrub: a summary can quote config or env-adjacent code.
+            result: envScrub(summary).slice(0, 4000) || 'no change reported',
+          });
+          settled = true;
+          ok(`${c.cyan('quick')} ${c.dim('— landed on the task branch')}`);
+        } catch (e) {
+          warn(`quick edit failed: ${e?.message ?? e}`);
+          if (!settled) {
+            await reportMergeOutcome(JOIN_DONE_URL, {
+              joinId: job.id,
+              ok: false,
+              result: e?.message ?? 'the change could not be applied',
+            }).catch(() => {});
+          }
+        } finally {
+          joining.delete(job.id);
+        }
+      });
+    }
+  };
 
   const processConsultJobs = (jobs) => {
     for (const job of jobs ?? []) {
@@ -1147,6 +1268,7 @@ export async function runFleetDaemon() {
     processPatchRevertJobs(roster.patchRevertJobs);
     processPlanCheckJobs(roster.planCheckJobs);
     processConsultJobs(roster.consultJobs);
+    processJoinJobs(roster.joinJobs);
     processCleanupJobs(roster.cleanupJobs);
     const rosterIds = new Set(roster.agents.map((a) => a.agentId));
 
