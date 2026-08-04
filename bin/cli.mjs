@@ -42,11 +42,37 @@ import { runWorker, runStaticFleet } from './lib/single.mjs';
 import { runLogin } from './lib/login.mjs';
 import { preflight } from './lib/preflight.mjs';
 
-// `flowviant login` — device auth (recommended): approve a code in the
-// app, the credential is stored locally, then plain `flowviant` just runs.
+// `flowviant login` — device auth (recommended): approve a code in the app, the
+// credential is stored locally, and then we KEEP GOING into the daemon.
+//
+// It used to print "Now just run: npx flowviant" and exit. Everything about that
+// was technically correct and practically a dead end: the line scrolled past in
+// a terminal the user had already stopped reading (they were in the browser,
+// typing a code), and the app told them their machine would "come online
+// shortly" — which it never did, because nothing was running. The product
+// promise is install once; a second command you have to notice is not that.
+//
+// `--no-start` for scripts and CI, which want the credential and not a
+// long-running process.
 if (process.argv[2] === 'login') {
-  await runLogin();
-  process.exit(0);
+  const noStart = process.argv.includes('--no-start');
+  await runLogin({ thenStart: !noStart });
+  if (noStart) process.exit(0);
+  // Re-exec as a plain `flowviant` rather than falling through. config.mjs reads
+  // the credential at IMPORT time — which was before the login we just did — so
+  // this process still has an empty FLEET_TOKEN and would exit with "no
+  // credential found" seconds after saving one. Same shape as the self-update
+  // re-exec: stay alive as a thin proxy so the user's shell keeps one foreground
+  // process.
+  const { spawn } = await import('node:child_process');
+  const child = spawn(process.execPath, [process.argv[1]], {
+    stdio: 'inherit',
+    env: process.env,
+  });
+  // AWAIT it. Registering an exit handler and falling through would run the rest
+  // of this file in the parent — which has no credential — and print "no
+  // credential found" over the daemon that just started in the child.
+  process.exit(await new Promise((resolve) => child.on('exit', (code) => resolve(code ?? 0))));
 }
 
 // `flowviant update` — install the latest published version now. The daemon also

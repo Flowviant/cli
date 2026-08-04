@@ -45,7 +45,7 @@ async function post(url, body) {
   return j.data ?? j;
 }
 
-export async function runLogin() {
+export async function runLogin({ thenStart = false } = {}) {
   console.log(`\n  ${c.bold(c.cyan('◣ flowviant'))}  ${c.dim(`login · v${VERSION}`)}\n`);
   let start;
   try {
@@ -72,7 +72,14 @@ export async function runLogin() {
     if (poll.status === 'approved') {
       store({ fleetToken: poll.fleetToken, projectId: poll.projectId, mcpUrl: poll.mcpUrl });
       ok('connected — credential saved to ~/.flowviant/credentials.json');
-      console.log(`\n  Now just run:  ${c.bold('npx flowviant')}\n`);
+      // The daemon starts right here unless the caller opted out; telling
+      // someone to run a second command was the step that got missed, since by
+      // this point they are looking at the browser, not this terminal.
+      console.log(
+        thenStart
+          ? `\n  ${c.dim('starting your agent — leave this running')}\n`
+          : `\n  Now run:  ${c.bold('npx flowviant')}\n`
+      );
       return;
     }
     if (poll.status === 'expired') {
