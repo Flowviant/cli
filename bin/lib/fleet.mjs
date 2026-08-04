@@ -18,6 +18,7 @@ import {
   MCP_URL,
   SAFE,
   POLL_SECONDS,
+  MAX_CONCURRENT,
   IDLE_SECONDS,
   RECONCILE_SECONDS,
   REFRESH_BEFORE_SECONDS,
@@ -76,6 +77,11 @@ import { processDeployJobs, reportDeployConfig } from './deploy.mjs';
 async function fetchRoster(haveIds) {
   const url = new URL(FLEET_URL);
   if (haveIds.length) url.searchParams.set('have', haveIds.join(','));
+  // What this machine will run at once. The server grows lanes to meet waiting
+  // work beneath this, instead of the user pre-sizing a pool by hand — only the
+  // machine knows its cores, its RAM and whose Claude quota is being spent.
+  // Older servers ignore the param, so sending it is always safe.
+  url.searchParams.set('capacity', String(MAX_CONCURRENT));
   // Env-sync identity + materialized version (the Settings "env vN" chip).
   try {
     for (const [k, v] of Object.entries(await envQueryParams())) {
@@ -1170,6 +1176,7 @@ export async function runFleetDaemon() {
   let connected = false; // log the first successful poll once
   let rosterSig = null; // last roster membership, to log changes only
   let idleBeatAt = 0; // throttle the "still alive" idle heartbeat
+  let cappedWarned = false; // say once, not every reconcile, why extra lanes idle
   let joinCount = 0; // for stable per-agent label colours
 
   // ── Push channel: a server wake short-circuits the reconcile sleep so a job is
@@ -1296,6 +1303,23 @@ export async function runFleetDaemon() {
       }
       hasWorkByAgent.set(a.agentId, !!a.hasWork);
       if (!workers.has(a.agentId)) {
+        // Local ceiling, enforced and not merely requested. The roster can carry
+        // more lanes than this machine asked for — someone added capacity by
+        // hand, or a second machine shares the fleet — and each extra worker is
+        // another Claude session, another worktree and another dev server on
+        // somebody's laptop. Skipping the spawn does NOT strand the work: an
+        // @mention addresses the FLEET, so any running lane can claim it; the
+        // tasks queue behind the ones we did start.
+        if (workers.size >= MAX_CONCURRENT) {
+          if (!cappedWarned) {
+            cappedWarned = true;
+            info(
+              `running ${MAX_CONCURRENT} task${MAX_CONCURRENT === 1 ? '' : 's'} at a time on this machine — ` +
+                `more will queue (FLOWVIANT_MAX_CONCURRENT to change)`
+            );
+          }
+          continue;
+        }
         const wt = join(baseDir, `agent-${a.agentId}`);
         try {
           if (!existsSync(wt)) {

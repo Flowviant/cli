@@ -138,10 +138,15 @@ This IS your handover, so make it tangible; match the evidence to what you built
 • UI / any visible screen → attach a real SCREENSHOT. Start the app's dev server
   in your worktree, then capture it headlessly with
   \`flowviant shot http://localhost:<PORT>/<route> --out shot.png\` (it finds a
-  browser for you and never needs a display), and attach_evidence with kind
-  "screenshot" and the file's base64 (\`base64 -w0 shot.png\`). Shoot EVERY key
-  screen you changed. If \`flowviant shot\` reports that no browser is available,
-  do NOT block — fall back to the text evidence below.
+  browser for you and never needs a display). THEN READ shot.png BACK AND LOOK
+  AT IT before you attach — you can see images, and this is the only moment
+  anyone checks the thing you are about to call proof. A blank page, a 404, an
+  error overlay, a collapsed layout and the screen you meant all look identical
+  as a file path. If it is wrong, fix the code and shoot again; if it is right,
+  attach_evidence with kind "screenshot" and the file's base64
+  (\`base64 -w0 shot.png\`). Shoot EVERY key screen you changed. If
+  \`flowviant shot\` reports that no browser is available, do NOT block — fall
+  back to the text evidence below.
 • backend / API work → a request/response capture or a data sample showing the
   write (kind "request_response" or "sample").
 • a multi-step FLOW (login, signup, checkout): one screenshot does NOT prove it

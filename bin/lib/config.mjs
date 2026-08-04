@@ -3,7 +3,7 @@
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { homedir } from 'node:os';
+import { homedir, cpus } from 'node:os';
 
 // Read the daemon's version from its OWN package.json (always shipped in the npm
 // tarball) — never hardcode it. The hardcoded constant drifted: it sat at
@@ -58,6 +58,32 @@ export const STREAM_URL =
   process.env.FLOWVIANT_STREAM_URL ||
   FLEET_URL.replace(/\/agents(\/?)$/, '/stream$1').replace(/^http/, 'ws');
 export const POLL_SECONDS = Number(process.env.POLL_SECONDS || 20);
+
+/**
+ * How many tasks THIS MACHINE will build at once.
+ *
+ * The limit belongs here, not on the server: a task in flight is a Claude Code
+ * session plus its own git worktree plus whatever the project's dev server and
+ * tests want, and this process is the only party that can see the cores, the
+ * RAM and the fan. The server used to decide it, indirectly, by how many lanes
+ * a user had pre-sized with a dial — which asked them to answer a question
+ * about their laptop in a web app, before they knew what they were going to
+ * dispatch.
+ *
+ * Sent to the server on every roster poll so it can grow lanes to meet waiting
+ * work UNDER this ceiling, and enforced locally besides — the roster can carry
+ * more lanes than this (someone added capacity by hand, or a second machine
+ * shares the fleet), and a ceiling that only exists as a request is not one.
+ *
+ * Half the cores, floor 1, cap 4. Half because a build agent is not the only
+ * thing running — the user is working on this machine too — and 4 because past
+ * that the shared Claude account, not the CPU, is what runs out.
+ */
+export const MAX_CONCURRENT = (() => {
+  const asked = Number(process.env.FLOWVIANT_MAX_CONCURRENT);
+  if (Number.isFinite(asked) && asked >= 1) return Math.min(Math.floor(asked), 32);
+  return Math.max(1, Math.min(4, Math.floor((cpus().length || 2) / 2)));
+})();
 export const IDLE_SECONDS = Number(process.env.IDLE_SECONDS || 30);
 // Live mode: after this long idle-parked on a blocker, tear the session down to
 // free the Claude process (the intent stays claimed; it resumes when answered).
