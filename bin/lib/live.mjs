@@ -33,7 +33,14 @@ import {
 } from './config.mjs';
 import { c, info, ok, warn } from './ui.mjs';
 import { sleep } from './claude.mjs';
-import { git, resetWorktree, isValidBranch } from './git.mjs';
+import {
+  git,
+  resetWorktree,
+  isValidBranch,
+  checkpointWip,
+  restoreWip,
+  clearWip,
+} from './git.mjs';
 import { applyPatch, fileDiffs, ownerCurrentBranch, withPatchLock } from './patch.mjs';
 import { loadPreviewConfig, startPreview } from './preview.mjs';
 import { materializeInto, scrub as envScrub } from './env.mjs';
@@ -48,6 +55,11 @@ const LIVE_TARGET_URL = FLEET_URL.replace(/\/agents\/?$/, '/live-target');
 // missed heartbeats.
 const PREVIEW_TTL_MINUTES = 6;
 const PREVIEW_HEARTBEAT_MS = 90_000;
+// How often a running task snapshots its uncommitted work to the remote. Two
+// minutes bounds what an unannounced death can cost while staying invisible:
+// an unchanged tree writes no commit and pushes nothing, so an agent that is
+// thinking rather than editing costs one cheap tree comparison.
+const CHECKPOINT_MS = 120_000;
 async function registerLiveTarget(intentId, kind, url) {
   try {
     await fetch(LIVE_TARGET_URL, {
@@ -670,6 +682,20 @@ export async function runLiveTask({
     }
     if (!stacked) resetWorktree(cwd, baseRef);
   }
+  // A fresh checkout is not necessarily a fresh TASK. This machine may never
+  // have seen this intent while another one built on it for an hour before
+  // dying, being released, or simply being a different container — and that
+  // work is on the remote. Restoring here, AFTER the resets above, is what
+  // makes a sandbox a cache rather than the only copy: any machine can pick up
+  // any task exactly where it was left.
+  if (freshTree && restoreWip(cwd, intentId)) {
+    info(`${c.dim('restored work in progress from the last checkpoint')}`);
+    await mcpCall(mcpUrl, token, 'stream_turn', {
+      runId,
+      turnId: `restore:${runId}`,
+      text: 'Picked this up on another machine — restored the work in progress from its last checkpoint.',
+    }).catch(() => {});
+  }
   materializeInto(cwd); // resets wipe the synced env files — rewrite them
   writeTaskMarker(cwd, intentId);
 
@@ -708,6 +734,21 @@ export async function runLiveTask({
   // as if it just arrived.
   let afterId =
     brief.lastMessageId ?? (priorMsgs.length ? priorMsgs[priorMsgs.length - 1].id : null);
+
+  // Checkpoint on a timer for the whole session. Not on turn boundaries: the
+  // expensive-to-lose states are the ones that arrive without a boundary — the
+  // box is killed, the container is reclaimed, the process is OOMed — and a
+  // long tool-running turn is exactly when the most uncommitted work exists.
+  // Cheap when idle: an unchanged tree writes no commit and pushes nothing.
+  let landed = false; // set when the work reaches a branch/PR/patch — see finally
+  const checkpointTimer = setInterval(() => {
+    try {
+      checkpointWip(cwd, intentId);
+    } catch {
+      /* never let a snapshot disturb a running task */
+    }
+  }, CHECKPOINT_MS);
+  checkpointTimer.unref?.();
 
   const input = makeInput(seedPrompt(runId, brief, transcript, resumedInPlace));
   const session = query({
@@ -828,6 +869,7 @@ export async function runLiveTask({
           if (isPatch) {
             await landPatch({ mcpUrl, token, runId, intentId, repoRoot, cwd, patchBase, baseRef });
           }
+          landed = true;
           return { outcome: 'done', title, intentId };
         }
 
@@ -905,6 +947,7 @@ export async function runLiveTask({
         return { outcome: 'stalled', title, intentId };
       }
     }
+    landed = completed;
     return { outcome: completed ? 'done' : 'stalled', title, intentId };
   } catch (e) {
     const rl = classifyRateLimit(e);
@@ -917,6 +960,19 @@ export async function runLiveTask({
     }
     return { outcome: 'error', error: e?.message ?? String(e), title, intentId };
   } finally {
+    clearInterval(checkpointTimer);
+    // Last word on this task's state. If the work landed (branch pushed, PR
+    // open, patch applied) the checkpoint has served its purpose and the ref is
+    // deleted — otherwise it accumulates one hidden ref per task, forever, on
+    // everyone's remote. If it did NOT land, this is the most important
+    // checkpoint of the run: it is the one taken as the task parks, is released,
+    // hits a usage limit, or dies.
+    try {
+      if (landed) clearWip(cwd, intentId);
+      else checkpointWip(cwd, intentId);
+    } catch {
+      /* teardown must not throw */
+    }
     onChild?.(null); // no longer busy — token may rotate between tasks
     input.close();
     try {

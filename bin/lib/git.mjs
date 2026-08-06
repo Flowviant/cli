@@ -2,7 +2,9 @@
 
 import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { resolve, join } from 'node:path';
+import { rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 
 export function git(args, cwd) {
   return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
@@ -145,6 +147,117 @@ export function ensureWorktree(repoRoot, wt, ref) {
     git(['worktree', 'add', '--detach', wt, ref], repoRoot);
   }
   return { path: wt, fresh: true };
+}
+
+// ── WIP checkpoints: the sandbox's state, on the remote ────────────────────
+//
+// A task's uncommitted work used to exist in exactly one place — a directory on
+// whichever machine claimed it. That made the checkout precious: losing the box
+// lost the work, so a task was pinned to a host, the host had to be named in the
+// UI, and a container could never be thrown away. Pushing the work somewhere
+// durable inverts all of that. The sandbox becomes a cache.
+//
+// These snapshots go to `refs/flowviant-wip/<intentId>`, NOT to a branch: they
+// are machine state, not history, and they must never appear in a PR, a branch
+// listing, or anyone's `git log`. Force-pushed, because only the latest matters.
+
+const wipRef = (intentId) => `refs/flowviant-wip/${intentId}`;
+
+/** git, with extra environment — for GIT_INDEX_FILE and a committer identity we
+ *  can't assume the machine has configured. */
+function gitWithEnv(args, cwd, extraEnv) {
+  return execFileSync('git', args, {
+    cwd,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env, ...extraEnv },
+  }).trim();
+}
+
+/**
+ * Snapshot everything in the worktree — staged, unstaged and untracked — and
+ * push it, WITHOUT touching the agent's HEAD, index or files.
+ *
+ * That constraint is why this doesn't just commit. The agent is a live process
+ * with its own git intentions; committing under it would rewrite state it is
+ * mid-way through reasoning about, and `git stash` would rip the files out from
+ * under an editor. Building the tree in a throwaway index leaves the agent's
+ * world untouched — it cannot tell this happened.
+ *
+ * Returns the commit sha, or null if there was nothing dirty / no remote.
+ */
+export function checkpointWip(wt, intentId, baseRef) {
+  if (!isSafePathSegment(intentId)) return null;
+  const idx = join(tmpdir(), `flowviant-idx-${intentId}-${process.pid}`);
+  const env = {
+    GIT_INDEX_FILE: idx,
+    // A snapshot must never fail because the machine has no user.name — this is
+    // ours, not the user's, and it never lands in history anyone reads.
+    GIT_AUTHOR_NAME: 'Flowviant',
+    GIT_AUTHOR_EMAIL: 'daemon@flowviant.com',
+    GIT_COMMITTER_NAME: 'Flowviant',
+    GIT_COMMITTER_EMAIL: 'daemon@flowviant.com',
+  };
+  try {
+    const head = git(['rev-parse', 'HEAD'], wt);
+    gitWithEnv(['read-tree', head], wt, env);
+    gitWithEnv(['add', '-A'], wt, env);
+    const tree = gitWithEnv(['write-tree'], wt, env);
+    // Nothing changed since HEAD — no snapshot worth pushing.
+    if (tree === git(['rev-parse', `${head}^{tree}`], wt)) return null;
+    const commit = gitWithEnv(
+      ['commit-tree', tree, '-p', head, '-m', `flowviant wip ${intentId}`],
+      wt,
+      env
+    );
+    git(['push', '--force', 'origin', `${commit}:${wipRef(intentId)}`], wt);
+    return commit;
+  } catch {
+    // Offline, no push rights, a repo with no origin — a checkpoint is an
+    // optimisation, never a reason to fail a task.
+    return null;
+  } finally {
+    try {
+      rmSync(idx, { force: true });
+    } catch {
+      /* best-effort */
+    }
+    void baseRef;
+  }
+}
+
+/**
+ * Rebuild a worktree from its last pushed checkpoint. Returns true if one was
+ * found and applied.
+ *
+ * The reset is MIXED on purpose: it leaves the snapshot's content in the files
+ * with HEAD back at the parent, which is what the agent had before — dirty
+ * working tree, nothing staged it didn't stage itself. A soft reset would hand
+ * it a fully-staged index it never created.
+ */
+export function restoreWip(wt, intentId) {
+  if (!isSafePathSegment(intentId)) return false;
+  const ref = wipRef(intentId);
+  try {
+    git(['fetch', 'origin', `+${ref}:${ref}`], wt);
+    const commit = git(['rev-parse', ref], wt);
+    const parent = git(['rev-parse', `${commit}^`], wt);
+    git(['checkout', '--detach', commit], wt);
+    git(['reset', parent], wt);
+    return true;
+  } catch {
+    return false; // no checkpoint for this task, or it's unreachable
+  }
+}
+
+/** Drop a task's checkpoint once its work has landed somewhere real. */
+export function clearWip(wt, intentId) {
+  if (!isSafePathSegment(intentId)) return;
+  try {
+    git(['push', 'origin', '--delete', wipRef(intentId)], wt);
+  } catch {
+    /* already gone, or no remote */
+  }
 }
 
 export function resetWorktree(wt, baseRef) {
