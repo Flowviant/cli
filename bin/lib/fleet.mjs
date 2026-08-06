@@ -5,7 +5,7 @@
  * MCP token, and only spawns Claude when the server says an agent has work.
  */
 
-import { mkdirSync, existsSync, rmSync } from 'node:fs';
+import { mkdirSync, existsSync, rmSync, readdirSync, statSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
@@ -30,6 +30,7 @@ import { handleVersionSignal } from './update.mjs';
 import {
   git,
   resetWorktree,
+  ensureWorktree,
   repoRootOrDie,
   detectBaseRef,
   originSlug,
@@ -227,11 +228,31 @@ export async function runFleetDaemon() {
   reapOrphanPreviews((m) => info(m));
 
   // Persistent worktree home (0.9.0) — survives daemon restarts AND reboots,
-  // so Ctrl+C mid-task never loses local work. Keyed per repo path; each
-  // agent's worktree carries a task marker so a resumed claim keeps its files.
+  // so Ctrl+C mid-task never loses local work. Keyed per repo path.
   const repoKey = `${basename(repoRoot)}-${createHash('sha256').update(repoRoot).digest('hex').slice(0, 8)}`;
   const baseDir = join(homedir(), '.flowviant', 'worktrees', repoKey);
   mkdirSync(baseDir, { recursive: true });
+
+  // ONE CHECKOUT PER TASK, named after the task. Worktrees used to be
+  // `agent-<agentId>` — a long-lived tree per lane, reset to base between
+  // tasks — and that was the last thing a lane owned. Now a lane is a
+  // credential and nothing more, which is what makes it disposable: the server
+  // can hand any lane any task, and two tasks can never be in each other's
+  // files even when one is mid-edit.
+  const taskWorktreePath = (intentId) => join(baseDir, `task-${intentId}`);
+  const worktreeFor = (intentId) => {
+    const r = ensureWorktree(repoRoot, taskWorktreePath(intentId), baseRef);
+    // Only on creation: a resumed tree already has its env, and rewriting it
+    // mid-task would clobber anything the agent changed.
+    if (r.fresh) {
+      try {
+        materializeInto(r.path);
+      } catch {
+        /* best-effort — the task still builds, secrets-backed paths may 500 */
+      }
+    }
+    return r;
+  };
   try {
     const kb = Number(execFileSync('du', ['-sk', baseDir], { encoding: 'utf8' }).split('\t')[0]);
     if (kb > 1024)
@@ -240,6 +261,38 @@ export async function runFleetDaemon() {
       );
   } catch {
     /* du unavailable (Windows) — skip the disk line */
+  }
+
+  // Reap long-dead task checkouts. Per-lane trees were self-limiting — N lanes,
+  // N directories, reused forever. Per-task trees are not: every task ever
+  // built leaves one behind, so without this the disk grows without bound and
+  // `flowviant clean` becomes a chore rather than a convenience.
+  //
+  // Age, not state, is the test. The daemon has no list of which intents are
+  // still open, and asking the server for one would put a delete behind a
+  // network call that can fail — so anything untouched for a fortnight goes,
+  // which is far beyond how long a task stays reviewable and far beyond any
+  // pause a human takes mid-build. Runs at startup only: mid-run this would
+  // race a worker that is quietly parked on a blocker.
+  try {
+    const cutoff = Date.now() - 14 * 24 * 60 * 60 * 1000;
+    let reaped = 0;
+    for (const name of readdirSync(baseDir)) {
+      if (!name.startsWith('task-')) continue;
+      const p = join(baseDir, name);
+      try {
+        if (statSync(p).mtimeMs > cutoff) continue;
+        // Through git, so the worktree REGISTRATION goes too — an rm -rf leaves
+        // a stale entry that blocks re-adding the same path later.
+        git(['worktree', 'remove', '--force', p], repoRoot);
+        reaped++;
+      } catch {
+        /* held, gone, or not ours — leave it for `flowviant clean` */
+      }
+    }
+    if (reaped) info(`disk   · reclaimed ${reaped} task worktree${reaped === 1 ? '' : 's'} idle > 14d`);
+  } catch {
+    /* the worktree home may not exist yet on a first run */
   }
   const tokenByAgent = new Map(); // agentId -> latest worker token
   const mintedAt = new Map(); // agentId -> ms when we last got a fresh token
@@ -561,16 +614,17 @@ export async function runFleetDaemon() {
   let joinChain = Promise.resolve();
 
   /** The worktree currently building this intent, or null if this machine isn't.
-   *  The task marker lives in the worktree's git dir and is what a resume already
-   *  uses to recognise its own half-built tree, so it is the honest answer to
-   *  "where is this task actually being built". */
+   *  Now a direct lookup rather than a scan: a task's checkout is named after
+   *  the task, so there is exactly one place it could be. The marker is still
+   *  consulted, but for LIFECYCLE rather than identity — a directory that
+   *  outlived its run (finished, cleared its marker, kept for the review
+   *  preview) exists but is not building anything, and must not take an edit. */
   const worktreeBuilding = (intentId) => {
-    for (const w of workers.values()) {
-      try {
-        if (w.wt && readTaskMarker(w.wt) === intentId) return w;
-      } catch {
-        /* a worktree that vanished isn't building anything */
-      }
+    const wt = taskWorktreePath(intentId);
+    try {
+      if (existsSync(wt) && readTaskMarker(wt) === intentId) return { wt };
+    } catch {
+      /* a worktree that vanished isn't building anything */
     }
     return null;
   };
@@ -1320,36 +1374,33 @@ export async function runFleetDaemon() {
           }
           continue;
         }
-        const wt = join(baseDir, `agent-${a.agentId}`);
-        try {
-          if (!existsSync(wt)) {
-            try {
-              git(['worktree', 'add', '--detach', wt, baseRef], repoRoot);
-            } catch {
-              // A stale registration (e.g. after `flowviant clean` rm'd the
-              // dir) blocks re-adding the same path — prune and retry once.
-              git(['worktree', 'prune'], repoRoot);
-              git(['worktree', 'add', '--detach', wt, baseRef], repoRoot);
-            }
+        // LIVE lanes get NO checkout of their own — they ask for one per task,
+        // once they know which task. Poll mode is the legacy escape hatch and
+        // keeps its per-lane tree; it predates per-task sandboxes and isn't
+        // worth restructuring for a path nobody runs by default.
+        let wt = null;
+        if (!LIVE) {
+          try {
+            ensureWorktree(repoRoot, (wt = join(baseDir, `agent-${a.agentId}`)), baseRef);
+          } catch (e) {
+            fail(`could not create worktree for "${a.name}": ${e.message}`);
+            continue;
           }
-        } catch (e) {
-          fail(`could not create worktree for "${a.name}": ${e.message}`);
-          continue;
-        }
-        try {
-          materializeInto(wt); // synced env into the fresh worktree
-        } catch {
-          /* best-effort */
+          try {
+            materializeInto(wt); // synced env into the fresh worktree
+          } catch {
+            /* best-effort */
+          }
         }
         const colorFn = LABEL_COLORS[joinCount++ % LABEL_COLORS.length];
         const label = colorFn(`[${a.name}]`);
         const state = { alive: true, child: null };
-        ok(`${label} ${c.dim(`online — worktree ready${LIVE ? ' · live session' : ''}`)}`);
+        ok(`${label} ${c.dim(LIVE ? 'online — live session' : 'online — worktree ready')}`);
         const workerFn = LIVE ? runLiveWorker : runFleetWorker;
         const promise = workerFn({
           agentId: a.agentId,
           label,
-          cwd: wt,
+          ...(LIVE ? { worktreeFor } : { cwd: wt }),
           baseRef,
           repoRoot, // for copying the repo's local env into the preview worktree
 
@@ -1415,7 +1466,7 @@ export async function runFleetDaemon() {
     // Stop workers whose agent left the roster (removed in the app).
     for (const [id, w] of [...workers]) {
       if (!rosterIds.has(id)) {
-        warn(`${w.label} removed — stopping it now, freeing its worktree.`);
+        warn(`${w.label} removed — stopping it now.`);
         w.state.alive = false;
         // Immediate teardown (Q6=B): kill the in-flight Claude process now; its
         // task was already requeued server-side on removal.
@@ -1429,10 +1480,16 @@ export async function runFleetDaemon() {
         } catch {
           /* best-effort */
         }
-        try {
-          git(['worktree', 'remove', '--force', w.wt], repoRoot);
-        } catch {
-          /* best-effort */
+        // Only poll mode's per-lane tree dies with the lane. A live lane owns no
+        // checkout: the task it was building has its own, which must SURVIVE —
+        // removing a lane requeues its task, and the next lane to pick that task
+        // up resumes in that same directory rather than starting over.
+        if (w.wt) {
+          try {
+            git(['worktree', 'remove', '--force', w.wt], repoRoot);
+          } catch {
+            /* best-effort */
+          }
         }
         workers.delete(id);
         tokenByAgent.delete(id);

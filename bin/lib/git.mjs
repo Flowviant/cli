@@ -1,6 +1,8 @@
 /** Git worktree helpers (fleet & static-fleet modes). */
 
 import { execFileSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { resolve } from 'node:path';
 
 export function git(args, cwd) {
   return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
@@ -111,6 +113,38 @@ export function detectBaseRef(repoRoot) {
  */
 export function baseBranchName(baseRef) {
   return String(baseRef || '').replace(/^origin\//, '') || 'main';
+}
+
+/**
+ * Get a detached worktree at `wt`, creating it at `ref` if it isn't there.
+ *
+ * Returns `{ path, fresh }` — `fresh` is the whole point. A worktree that
+ * ALREADY existed is one somebody was mid-way through, and the caller must not
+ * reset it; a freshly created one is at base by construction and has nothing to
+ * preserve. That single bit replaces the in-memory `resuming` flag and the
+ * on-disk task marker for the common case, because once a worktree is named
+ * after its task, "does this directory exist" IS "am I resuming".
+ *
+ * The prune-and-retry is not paranoia: `git worktree add` refuses a path that
+ * is still REGISTERED even when the directory is gone (`flowviant clean` rm's
+ * the dirs, `git worktree list` keeps the stale entries), and that failure is
+ * permanent until pruned.
+ */
+export function ensureWorktree(repoRoot, wt, ref) {
+  // Resolve first. `existsSync` answers relative to THIS process's cwd while
+  // `git worktree add` answers relative to repoRoot, so a relative path makes
+  // the two disagree: the check says "not there", the add says "already
+  // exists", and the prune-and-retry can't fix a path that was never the one
+  // we looked at. Callers pass absolute paths today; this makes that not matter.
+  wt = resolve(wt);
+  if (existsSync(wt)) return { path: wt, fresh: false };
+  try {
+    git(['worktree', 'add', '--detach', wt, ref], repoRoot);
+  } catch {
+    git(['worktree', 'prune'], repoRoot);
+    git(['worktree', 'add', '--detach', wt, ref], repoRoot);
+  }
+  return { path: wt, fresh: true };
 }
 
 export function resetWorktree(wt, baseRef) {

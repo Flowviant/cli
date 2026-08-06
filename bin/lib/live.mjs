@@ -544,7 +544,7 @@ async function landPatch({ mcpUrl, token, runId, intentId, repoRoot, cwd, patchB
 export async function runLiveTask({
   mcpUrl,
   token,
-  cwd,
+  worktreeFor,
   baseRef,
   repoRoot,
   isAlive,
@@ -557,12 +557,26 @@ export async function runLiveTask({
   const brief = claim.brief ?? {};
   const title = brief.title ?? 'a task';
 
+  // THE SANDBOX BELONGS TO THE TASK, not to the lane that happened to pick it
+  // up. Worktrees used to be `agent-<agentId>` — one long-lived checkout per
+  // lane, wiped back to base between tasks — which is why a lane had to own
+  // anything at all, and why every claim had to work out whether the directory
+  // it was standing in held its own half-built work or somebody else's finished
+  // work. Keyed by intent, that question answers itself: the directory either
+  // exists (yours, mid-flight) or it doesn't (nothing to lose).
+  //
+  // Note this is the first point at which a worktree can be chosen — the claim
+  // is what tells us which task we're building, and the daemon has no business
+  // creating a checkout for work it hasn't been given.
+  const { path: cwd, fresh: freshTree } = worktreeFor(intentId);
+
   // Re-claiming the SAME intent this worker was just working — either this
-  // daemon's own memory (parked on a blocker, now resuming) or the persistent
-  // task marker (the daemon restarted mid-task). Its worktree holds hours of
-  // uncommitted work. Do NOT reset.
+  // daemon's own memory (parked on a blocker, now resuming) or a worktree that
+  // was already on disk (the daemon restarted mid-task). Either way it holds
+  // hours of uncommitted work. Do NOT reset. `!fresh` subsumes what the task
+  // marker used to tell us, since the directory is now named after the task.
   const resuming = !!resumeIntentId && intentId === resumeIntentId;
-  const resumedInPlace = !resuming && readTaskMarker(cwd) === intentId;
+  const resumedInPlace = !resuming && !freshTree;
 
   // CONSENT. A patch writes commits into the working checkout of whoever runs
   // this daemon — chosen by a model, and triggerable by any teammate who
@@ -839,11 +853,18 @@ export async function runLiveTask({
         // Torn down out from under us (restart / reassign in Flowviant): the
         // server killed this run — abandon the session, don't keep building.
         if (poll && poll.ok === false && poll.reason === 'run_not_active') {
-          // Discarded (restart/reassign): clear the marker AND reset the
-          // worktree so the next fresh claim starts from clean base, never
-          // resuming the abandoned attempt.
+          // Discarded (restart/reassign). REMOVE the checkout rather than reset
+          // it: the directory is named after the intent, so a restart of this
+          // same task would otherwise find it, read "already exists" as "I am
+          // resuming", and pick the abandoned attempt back up — the precise
+          // failure the old marker-clearing existed to prevent. Deleting it
+          // makes the next claim genuinely fresh.
           clearTaskMarker(cwd);
-          resetWorktree(cwd, baseRef);
+          try {
+            git(['worktree', 'remove', '--force', cwd], repoRoot);
+          } catch {
+            resetWorktree(cwd, baseRef); // couldn't remove it — at least empty it
+          }
           return { outcome: 'torn_down', title, intentId };
         }
         const fresh = (poll?.messages ?? []).filter((x) => x.role === 'user');
@@ -943,7 +964,10 @@ function copyLocalEnvFiles(repoRoot, worktree, log) {
 export async function runLiveWorker({
   agentId,
   label,
-  cwd,
+  // `(intentId) => { path, fresh }`. A lane no longer HAS a working directory —
+  // it is a credential and nothing else. Every checkout belongs to a task, so
+  // the worker asks for one only once it knows which task it is holding.
+  worktreeFor,
   baseRef,
   repoRoot,
   getToken,
@@ -1000,6 +1024,12 @@ export async function runLiveWorker({
   };
   const startReviewPreview = async (intentId) => {
     stopPreview();
+    if (!intentId) return;
+    // The finished task's own worktree — already on disk, so this is a lookup,
+    // not a creation. A review preview serves the branch that was just built,
+    // which now has a durable home instead of living in whichever lane's
+    // checkout happened to run it (and being wiped by that lane's next task).
+    const { path: cwd } = worktreeFor(intentId);
     const cfg = loadPreviewConfig(cwd);
     const kind = cfg?.ui ? 'ui' : cfg?.api ? 'api' : null;
     const entry = kind ? cfg[kind] : null;
@@ -1092,7 +1122,7 @@ export async function runLiveWorker({
       res = await runLiveTask({
         mcpUrl: getMcpUrl() ?? MCP_URL,
         token,
-        cwd,
+        worktreeFor,
         baseRef,
         repoRoot,
         isAlive,
