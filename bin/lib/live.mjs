@@ -893,6 +893,14 @@ export async function runLiveTask({
         }).catch(() => null);
         // Torn down out from under us (restart / reassign in Flowviant): the
         // server killed this run — abandon the session, don't keep building.
+        // RELEASED: stop, and touch nothing. The human freed the machine, not
+        // the work — the branch, the PR and the worktree all stay exactly as
+        // they are, and re-@mentioning resumes here rather than from base. The
+        // finally block takes a last checkpoint on the way out, so even the
+        // uncommitted edits survive to whichever machine picks it up next.
+        if (poll && poll.ok === false && poll.released) {
+          return { outcome: 'released', title, intentId };
+        }
         if (poll && poll.ok === false && poll.reason === 'run_not_active') {
           // Discarded (restart/reassign). REMOVE the checkout rather than reset
           // it: the directory is named after the intent, so a restart of this
@@ -1215,6 +1223,18 @@ export async function runLiveWorker({
       // The human restarted/reassigned the task in Flowviant. Drop everything —
       // the next fresh claim resets the worktree to base.
       info(`${label} ${c.dim(`"${res.title}" was restarted/reassigned — abandoned this attempt`)}`);
+      phase = '';
+      continue;
+    }
+    if (res.outcome === 'released') {
+      // Released: the human wanted the machine back, not the work undone. The
+      // session is already gone (the finally checkpointed on the way out) and
+      // the worktree stays untouched, so a later @mention resumes here rather
+      // than from base. Clear lastIntentId so this worker doesn't treat a
+      // future claim of the same task as its own in-memory resume — the
+      // on-disk checkout is the resume signal now, and it may well be a
+      // different machine that picks this up.
+      info(`${label} ${c.dim(`"${res.title}" was released — stopped; its work is kept`)}`);
       phase = '';
       continue;
     }
