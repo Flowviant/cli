@@ -28,6 +28,7 @@
  */
 
 import { spawn, execFileSync } from 'node:child_process';
+import { createServer } from 'node:net';
 import { readFileSync, writeFileSync, existsSync, mkdirSync, chmodSync, readdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir, platform, arch } from 'node:os';
@@ -216,6 +217,33 @@ const TUNNEL_RE = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/i;
 // Where a dev server announces it bound — "Local: http://localhost:3001/".
 const BIND_RE = /https?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0):(\d+)/i;
 
+/**
+ * A port nobody is on right now — bind :0, read what the kernel handed us, let
+ * it go. Inherently a RACE (someone could take it in the gap), which is fine:
+ * this is a hint passed as $PORT, and the tunnel still aims at whatever the
+ * server ACTUALLY announces. Worst case we lose the hint and land back on
+ * today's behaviour.
+ *
+ * Why this exists: previews only survived concurrency by luck. vite/next hop to
+ * the next free port when theirs is taken, so two tasks in one repo happened to
+ * work. Anything that binds a FIXED port and exits on EADDRINUSE — the `api`
+ * preview kind, an explicit `port` in preview.json, a plain app.listen(3000) —
+ * had its second preview die outright, reported as "dev server exited before it
+ * was reachable" with the real cause buried in the tail. That's not an edge
+ * case on a machine running up to MAX_CONCURRENT tasks, and it stops being one
+ * at all once the box is shared.
+ */
+async function freePort() {
+  return new Promise((resolve) => {
+    const srv = createServer();
+    srv.once('error', () => resolve(null)); // no port to be had — fall through
+    srv.listen(0, '127.0.0.1', () => {
+      const p = srv.address()?.port ?? null;
+      srv.close(() => resolve(p));
+    });
+  });
+}
+
 // ── Orphan reaping ─────────────────────────────────────────────────────────
 // Preview children (dev server + tunnel) are detached so we can kill the whole
 // group — but that also means they SURVIVE an ungraceful daemon death (SIGKILL,
@@ -307,6 +335,10 @@ export async function startPreview({
 }) {
   const cf = await ensureCloudflared(log);
   if (!cf) return null; // fall back to captured evidence
+  // Ask for a port nobody's on, and TELL the dev server about it (below) rather
+  // than hoping its framework hops. Null if we couldn't get one — everything
+  // downstream then behaves exactly as before.
+  const bindPort = await freePort();
   // Host the origin sees. Default 'localhost' (what a local browser sends) so
   // dev servers that validate Host — Vite server.allowedHosts, webpack, Next's
   // allowedDevOrigins — accept the tunnel. `hostHeader: false` in preview.json
@@ -320,10 +352,18 @@ export async function startPreview({
     // a reused/uncleaned worktree still previews. Harmless to tools that ignore
     // these vars; BROWSER=none stops any auto-open. A repo's preview.json `env`
     // is layered last, so it can override any of these.
+    // PORT is a HINT, deliberately: honoured by Next, Remix, Nuxt, CRA and any
+    // conventional `app.listen(process.env.PORT)`, ignored by Vite (which uses
+    // server.port and hops on its own) and overridden by an explicit --port in
+    // the dev script. All three outcomes are fine — the tunnel aims at the port
+    // the server ANNOUNCES, not at what we asked for, so a disregarded hint
+    // costs nothing and an honoured one is what makes two concurrent previews
+    // of one repo possible. Placed BEFORE extraEnv so preview.json still wins.
     const env = {
       ...process.env,
       VINEXT_NO_DEV_LOCK: '1',
       BROWSER: 'none',
+      ...(bindPort ? { PORT: String(bindPort) } : null),
       ...(extraEnv && typeof extraEnv === 'object' ? extraEnv : {}),
     };
     // detached so each gets its own process group — `bun run dev` via a shell
@@ -444,9 +484,11 @@ export async function startPreview({
       finish(null);
     });
 
-    // If the server never prints a URL we recognize (quiet server), tunnel to the
-    // configured port as a last resort.
-    bindTimer = setTimeout(() => void openTunnel(port), 30_000);
+    // If the server never prints a URL we recognize (quiet server), guess. Prefer
+    // the port we HANDED it over the one we inferred from its framework: a server
+    // quiet enough to reach this line is usually a plain node/express one, and
+    // those are exactly the ones that read $PORT.
+    bindTimer = setTimeout(() => void openTunnel(bindPort ?? port), 30_000);
     timer = setTimeout(() => {
       log?.(
         `preview tunnel did not come up in ${Math.round(timeoutMs / 1000)}s — skipping.${
