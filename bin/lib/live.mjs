@@ -564,6 +564,7 @@ export async function runLiveTask({
   isAlive,
   resumeIntentId,
   onChild,
+  onIntent,
 }) {
   const claim = await mcpCall(mcpUrl, token, 'claim_next_intent', {}).catch(() => null);
   if (!claim || claim.claimed !== true) return { outcome: 'nothing' };
@@ -582,6 +583,9 @@ export async function runLiveTask({
   // Note this is the first point at which a worktree can be chosen — the claim
   // is what tells us which task we're building, and the daemon has no business
   // creating a checkout for work it hasn't been given.
+  // Name the task this lane is holding, so its memory can be attributed to a
+  // task rather than to an anonymous pid.
+  onIntent?.(intentId);
   const { path: cwd, fresh: freshTree } = worktreeFor(intentId);
 
   // Re-claiming the SAME intent this worker was just working — either this
@@ -981,6 +985,7 @@ export async function runLiveTask({
       /* teardown must not throw */
     }
     onChild?.(null); // no longer busy — token may rotate between tasks
+    onIntent?.(null);
     input.close();
     try {
       await session.interrupt?.();
@@ -1039,6 +1044,7 @@ export async function runLiveWorker({
   isAlive,
   onTokenSuspect,
   onChild,
+  onIntent,
   onPreview,
 }) {
   // The intent this worker is holding across iterations. When a task parks on a
@@ -1183,6 +1189,7 @@ export async function runLiveWorker({
     let res;
     try {
       res = await runLiveTask({
+        onIntent,
         mcpUrl: getMcpUrl() ?? MCP_URL,
         token,
         worktreeFor,

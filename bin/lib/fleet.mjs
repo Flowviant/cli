@@ -74,6 +74,7 @@ import {
   scrub as envScrub,
 } from './env.mjs';
 import { processDeployJobs, reportDeployConfig } from './deploy.mjs';
+import { machineSnapshot } from './resources.mjs';
 
 async function fetchRoster(haveIds) {
   const url = new URL(FLEET_URL);
@@ -539,6 +540,8 @@ export async function runFleetDaemon() {
   };
 
   const PLAN_CHECK_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/plan-check-done');
+  // Machine telemetry — what the box is doing with itself, for the admin view.
+  const MACHINE_URL = FLEET_URL.replace(/\/agents\/?$/, '/machine');
   const checkingPlans = new Set();
   const processPlanCheckJobs = (jobs) => {
     for (const job of jobs ?? []) {
@@ -1411,6 +1414,12 @@ export async function runFleetDaemon() {
           onChild: (ch) => {
             state.child = ch;
           },
+          // Which task this lane is holding, so per-process memory can be
+          // attributed to a task rather than to an anonymous pid. "The box is
+          // full" is not actionable; "this task is holding 9GB" is.
+          onIntent: (id) => {
+            state.intentId = id;
+          },
           // Hold the preview's stop fn so teardown/removal can kill the detached
           // dev-server + tunnel (they survive our exit otherwise).
           onPreview: (stop) => {
@@ -1454,6 +1463,27 @@ export async function runFleetDaemon() {
         }
       }
     });
+
+    // Tell the app what this machine is doing with itself. Every reconcile,
+    // best-effort, and never awaited — telemetry that can delay a dispatch is
+    // worse than no telemetry.
+    //
+    // The one thing Flowviant could never answer about a task was "why is it
+    // slow", because the box was somebody's laptop and only they could look at
+    // it. Centralising is supposed to make one machine easier to manage than N
+    // laptops; that is only true if the machine is visible. Per-task RSS is the
+    // load-bearing part — "the box is full" is not actionable, "this task is
+    // holding 9GB" is.
+    void reportMergeOutcome(
+      MACHINE_URL,
+      machineSnapshot({
+        worktreeDir: baseDir,
+        tasks: [...workers].map(([, w]) => ({
+          intentId: w.state.intentId ?? null,
+          pid: w.state.child?.pid,
+        })),
+      })
+    );
 
     // Deploy: a deploy-authorized daemon reports its .flowviant/deploy.json and
     // runs queued deploy jobs (the server only sends deployJobs to authorized
