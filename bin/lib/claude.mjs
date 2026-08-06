@@ -603,13 +603,20 @@ export function runTurn({ prompt, resume, system, cwd, mcpConfig, label, onSpawn
     if (streamJson) args.push('--output-format', 'stream-json', '--verbose');
     // readOnly wins over wikiPerm: a consult must never inherit write tools.
     args.push(...(readOnly ? CONSULT_PERM : wikiPerm ? WIKI_PERM : PERM));
-    // Force the user's Claude Code subscription — never the API. A key exported in
-    // the shell would otherwise silently bill every poll-mode turn as raw API
-    // usage (same invariant live mode enforces on its SDK session env).
-    const env = { ...process.env };
-    delete env.ANTHROPIC_API_KEY;
-    delete env.ANTHROPIC_AUTH_TOKEN;
-    const child = spawn('claude', args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
+    // Whatever this machine is signed in with, we use. We do NOT pick.
+    //
+    // This used to delete ANTHROPIC_API_KEY and ANTHROPIC_AUTH_TOKEN to force
+    // the subscription path, which was right when the daemon ran on a
+    // developer's laptop: a key left in their shell would silently bill every
+    // turn as raw API usage instead of the plan they were already paying for.
+    // On a machine the project leaves running, an inherited org key is the
+    // POINT — deleting it is the daemon overriding the credential its operator
+    // deliberately configured.
+    //
+    // Which credential is correct, and whether an account may be shared, is
+    // between the operator and Anthropic. Flowviant does not detect it and does
+    // not enforce it; it runs Claude the ordinary way and relays what happens.
+    const child = spawn('claude', args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
     onSpawn?.(child);
     let out = '';
     const pfx = label ? `${label} ` : '';

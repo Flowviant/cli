@@ -7,9 +7,11 @@
  * the human's answer and injects it to resume in place). Same session = the
  * iterating loop, hosted through Flowviant.
  *
- * Auth invariant: the SDK runs the user's own Claude Code (subscription), never
- * the API — we strip ANTHROPIC_API_KEY from the session env so a key in the
- * user's shell can't silently divert to API billing.
+ * Auth: whatever this machine's Claude Code is signed in with. The daemon used
+ * to strip ANTHROPIC_API_KEY so a stray key couldn't divert a laptop's turns to
+ * API billing; on a machine the project leaves running an org key is the
+ * intended credential, and which one is legitimate is between the operator and
+ * Anthropic — not something Flowviant detects or enforces.
  *
  * NOTE: the SDK mechanics here (streaming-input continuity, tool_use visibility,
  * one result per turn) are validated by spikes; the end-to-end task loop needs a
@@ -709,14 +711,11 @@ export async function runLiveTask({
     }).catch(() => {});
   }
 
+  // The machine's own credentials, inherited as configured. See claude.mjs for
+  // why this no longer strips ANTHROPIC_API_KEY / AUTH_TOKEN / BASE_URL: on a
+  // machine the project leaves running, an org key is the intended credential
+  // and deleting it overrides the operator. Enforcement is Anthropic's.
   const env = { ...process.env };
-  // Force the user's Claude Code subscription — strip EVERY var that could
-  // divert to API billing or a proxy (poll mode strips these too; live mode
-  // was only clearing API_KEY, so an exported AUTH_TOKEN/BASE_URL silently
-  // billed the API on the default path).
-  delete env.ANTHROPIC_API_KEY;
-  delete env.ANTHROPIC_AUTH_TOKEN;
-  delete env.ANTHROPIC_BASE_URL;
 
   // The conversation arrives WITH the brief (0.30.0) — the claim already read
   // it, so asking again over poll_channel was a round-trip that told us nothing

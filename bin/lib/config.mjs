@@ -3,7 +3,7 @@
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { homedir, cpus } from 'node:os';
+import { homedir, cpus, totalmem } from 'node:os';
 
 // Read the daemon's version from its OWN package.json (always shipped in the npm
 // tarball) — never hardcode it. The hardcoded constant drifted: it sat at
@@ -60,29 +60,73 @@ export const STREAM_URL =
 export const POLL_SECONDS = Number(process.env.POLL_SECONDS || 20);
 
 /**
+ * What this machine can actually be given, read from the machine.
+ *
+ * `os.totalmem()` and `cpus().length` report the HOST inside a container: a
+ * 4GB container on a 256GB box reads 256GB and cheerfully oversubscribes until
+ * the OOM killer picks a victim — which, because it picks by resident size, is
+ * frequently not the task that caused it. cgroup v2 publishes the real limits,
+ * so read those first and treat the os module as the fallback it is.
+ */
+function machineLimits() {
+  const readCgroup = (f) => {
+    try {
+      return readFileSync(`/sys/fs/cgroup/${f}`, 'utf8').trim();
+    } catch {
+      return null;
+    }
+  };
+  let memBytes = totalmem();
+  const memMax = readCgroup('memory.max');
+  if (memMax && memMax !== 'max') {
+    const n = Number(memMax);
+    if (Number.isFinite(n) && n > 0) memBytes = Math.min(memBytes, n);
+  }
+  let cores = cpus().length || 2;
+  // "<quota> <period>" in microseconds, or "max <period>" for unlimited.
+  const cpuMax = readCgroup('cpu.max');
+  if (cpuMax && !cpuMax.startsWith('max')) {
+    const [q, p] = cpuMax.split(/\s+/).map(Number);
+    if (Number.isFinite(q) && Number.isFinite(p) && p > 0) {
+      cores = Math.max(1, Math.min(cores, Math.floor(q / p)));
+    }
+  }
+  return { memBytes, cores };
+}
+
+export const MACHINE = machineLimits();
+
+/**
  * How many tasks THIS MACHINE will build at once.
  *
  * The limit belongs here, not on the server: a task in flight is a Claude Code
  * session plus its own git worktree plus whatever the project's dev server and
  * tests want, and this process is the only party that can see the cores, the
- * RAM and the fan. The server used to decide it, indirectly, by how many lanes
- * a user had pre-sized with a dial — which asked them to answer a question
- * about their laptop in a web app, before they knew what they were going to
- * dispatch.
+ * RAM and the fan.
  *
  * Sent to the server on every roster poll so it can grow lanes to meet waiting
  * work UNDER this ceiling, and enforced locally besides — the roster can carry
- * more lanes than this (someone added capacity by hand, or a second machine
- * shares the fleet), and a ceiling that only exists as a request is not one.
+ * more lanes than this, and a ceiling that only exists as a request is not one.
  *
- * Half the cores, floor 1, cap 4. Half because a build agent is not the only
- * thing running — the user is working on this machine too — and 4 because past
- * that the shared Claude account, not the CPU, is what runs out.
+ * MEMORY is the bound, not cores. Cores oversubscribe gracefully (everything
+ * gets slower); memory does not (something dies, and not necessarily the
+ * offender). A task is a Claude session plus a dev server plus whatever the
+ * test runner spawns — call it 2GB, keep 2GB back for the operating system,
+ * and let cores cap it only when they are the scarcer thing.
+ *
+ * This used to be `min(4, cores/2)` — half the cores because "the user is
+ * working on this machine too", and a hard 4 because a personal Claude plan
+ * ran out before the CPU did. Both were laptop assumptions. The machine is now
+ * a box the project leaves running, so it reserves one core rather than half of
+ * them, and the ceiling is what the hardware can hold rather than a guess about
+ * somebody's plan.
  */
 export const MAX_CONCURRENT = (() => {
   const asked = Number(process.env.FLOWVIANT_MAX_CONCURRENT);
   if (Number.isFinite(asked) && asked >= 1) return Math.min(Math.floor(asked), 32);
-  return Math.max(1, Math.min(4, Math.floor((cpus().length || 2) / 2)));
+  const byMem = Math.floor((MACHINE.memBytes / 2 ** 30 - 2) / 2);
+  const byCpu = MACHINE.cores - 1;
+  return Math.max(1, Math.min(32, byMem, byCpu));
 })();
 export const IDLE_SECONDS = Number(process.env.IDLE_SECONDS || 30);
 // Live mode: after this long idle-parked on a blocker, tear the session down to
