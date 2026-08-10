@@ -38,6 +38,7 @@ import {
   isValidPrUrl,
   isValidBranch,
   isSafePathSegment,
+  worktreeDiffstat,
 } from './git.mjs';
 import { c, LABEL_COLORS, info, note, ok, warn, fail } from './ui.mjs';
 import { revertPatch, withPatchLock } from './patch.mjs';
@@ -122,6 +123,61 @@ async function fetchRoster(haveIds) {
   return data; // { mcpUrl, leaseTtlSeconds, agents: [{agentId,name,token,reviewGate,hasWork}] }
 }
 
+const RUN_DIFFSTAT_URL = FLEET_URL.replace(/\/agents\/?$/, '/run-diffstat');
+
+/**
+ * Post what a run has changed, every 20s, until the returned stop() is called.
+ *
+ * Daemon-side rather than an MCP tool the agent calls: the agent forgets, each
+ * call costs tokens, and anything the agent reports about itself is downstream
+ * of whatever it is currently reading. The daemon owns the worktree, so it can
+ * just look.
+ *
+ * Only posts when the numbers MOVED. A run that sits on a blocker for an hour
+ * would otherwise write the same row 180 times, and a timestamp that keeps
+ * refreshing on an unchanged diff is the kind of liveness signal that hides a
+ * stall instead of showing it.
+ */
+function sampleDiffstat(cwd, baseRef, intentId) {
+  let last = '';
+  let alive = true;
+  const post = async () => {
+    if (!alive) return;
+    let stat = null;
+    try {
+      stat = worktreeDiffstat(cwd, baseRef);
+    } catch {
+      return; // a worktree mid-reset is not an error worth reporting
+    }
+    if (!stat) return;
+    const key = JSON.stringify(stat);
+    if (key === last) return;
+    last = key;
+    try {
+      await fetch(RUN_DIFFSTAT_URL, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${FLEET_TOKEN}`,
+          'User-Agent': USER_AGENT,
+          'Content-Type': 'application/json',
+        },
+        signal: AbortSignal.timeout(15_000),
+        body: JSON.stringify({ intentId, diffstat: stat }),
+      });
+    } catch {
+      /* best-effort: the next sample supersedes a dropped one */
+    }
+  };
+  const t = setInterval(() => void post(), 20_000);
+  // Kick once after a beat so a fast task still reports something before it ends.
+  const first = setTimeout(() => void post(), 5_000);
+  return () => {
+    alive = false;
+    clearInterval(t);
+    clearTimeout(first);
+  };
+}
+
 // One roster agent's loop: persistent worktree, one intent per turn, reset to
 // base between tasks (fresh conversation), resume in place while on a blocker.
 async function runFleetWorker({ agentId, label, cwd, baseRef, getToken, getHasWork, getNext, getMcpUrl, isAlive, onChild, onTokenSuspect }) {
@@ -160,6 +216,13 @@ async function runFleetWorker({ agentId, label, cwd, baseRef, getToken, getHasWo
     // could pair one task's flags with another's work.
     const next = resuming ? null : getNext?.(agentId) || null;
     let out = '';
+    // Report what this run is changing, while it is changing it. The commits
+    // endpoint can only describe work that has already reached the provider, so
+    // without this the app has nothing to say about a task for the whole time it
+    // is being built. Only when we know WHICH task this turn is for — the same
+    // hint that carries its model and effort — because a diffstat attributed to
+    // the wrong run is worse than none.
+    const stopDiffstat = next?.intentId ? sampleDiffstat(cwd, baseRef, next.intentId) : null;
     try {
       out = await runTurn({
         prompt: resuming ? SINGLE_RESUME : SINGLE_KICKOFF(next?.intentId),
@@ -176,6 +239,7 @@ async function runFleetWorker({ agentId, label, cwd, baseRef, getToken, getHasWo
         onSpawn: (ch) => onChild?.(ch),
       });
     } finally {
+      stopDiffstat?.();
       rmSync(dir, { recursive: true, force: true });
       onChild?.(null);
     }

@@ -1,7 +1,7 @@
 /** Git worktree helpers (fleet & static-fleet modes). */
 
 import { execFileSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync, statSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -273,4 +273,74 @@ export function resetWorktree(wt, baseRef) {
   } catch (e) {
     console.error(`  (worktree reset to ${baseRef} failed: ${e.message})`);
   }
+}
+
+/**
+ * What has changed in this worktree since `baseRef` — committed or not.
+ *
+ * The definition matters. `git diff --numstat <base>` (no `..HEAD`) compares the
+ * base against the WORKING TREE, so it covers commits the agent has made, staged
+ * work, and edits it has not committed yet. Anything narrower would go blank at
+ * the exact moments you look: right after a commit, or before the first one.
+ *
+ * Untracked files are added separately — they are invisible to `git diff` and
+ * are usually the most interesting thing an agent has done (a new module, a new
+ * test). Their line counts are read here rather than inferred; a file too large
+ * to be source is reported as a path with no counts instead of being read into
+ * memory.
+ *
+ * PATHS AND COUNTS ONLY. Nothing in here returns file content.
+ */
+export function worktreeDiffstat(cwd, baseRef, { maxFiles = 200 } = {}) {
+  const files = [];
+  let additions = 0;
+  let deletions = 0;
+
+  const add = (path, added, removed) => {
+    additions += added;
+    deletions += removed;
+    files.push({ path, added, removed });
+  };
+
+  try {
+    for (const line of git(['diff', '--numstat', baseRef, '--'], cwd).split('\n')) {
+      if (!line.trim()) continue;
+      const [a, d, ...rest] = line.split('\t');
+      const path = rest.join('\t');
+      if (!path) continue;
+      // Binary files report '-' for both counts; they changed, but not by lines.
+      add(path, a === '-' ? 0 : Number(a) || 0, d === '-' ? 0 : Number(d) || 0);
+    }
+  } catch {
+    // No base ref yet, or not a repo — nothing to report rather than a crash.
+    return null;
+  }
+
+  try {
+    const untracked = git(['ls-files', '--others', '--exclude-standard'], cwd)
+      .split('\n')
+      .filter(Boolean);
+    for (const path of untracked) {
+      let added = 0;
+      try {
+        const { size } = statSync(join(cwd, path));
+        // 2 MB: past this it is a build artifact or a binary, and reading it to
+        // count newlines would be the most expensive thing this daemon does.
+        if (size <= 2_000_000) {
+          added = readFileSync(join(cwd, path), 'utf8').split('\n').length;
+        }
+      } catch {
+        /* vanished between listing and reading — report the path, no counts */
+      }
+      add(path, added, 0);
+    }
+  } catch {
+    /* untracked listing failed — the tracked half still stands */
+  }
+
+  if (files.length === 0) return null;
+  // Totals stay whole while the LIST is capped: a truncated list must never
+  // quietly shrink the number printed beside it.
+  const truncated = Math.max(0, files.length - maxFiles);
+  return { files: files.slice(0, maxFiles), additions, deletions, truncated };
 }
