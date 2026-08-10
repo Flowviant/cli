@@ -124,7 +124,7 @@ async function fetchRoster(haveIds) {
 
 // One roster agent's loop: persistent worktree, one intent per turn, reset to
 // base between tasks (fresh conversation), resume in place while on a blocker.
-async function runFleetWorker({ agentId, label, cwd, baseRef, getToken, getHasWork, getMcpUrl, isAlive, onChild, onTokenSuspect }) {
+async function runFleetWorker({ agentId, label, cwd, baseRef, getToken, getHasWork, getNext, getMcpUrl, isAlive, onChild, onTokenSuspect }) {
   let resuming = false;
   let needsReset = true; // reset to base before a FRESH task, not on idle polls
   let phase = ''; // '', 'idle', 'blocked' — log each transition once, not per poll
@@ -154,15 +154,25 @@ async function runFleetWorker({ agentId, label, cwd, baseRef, getToken, getHasWo
       needsReset = false;
     }
     const { dir, path: mcpConfig } = mcpConfigFor(token, getMcpUrl());
+    // The task the server says is next for this lane, read ONCE per turn: the
+    // model and effort below become process flags, so they must describe the
+    // same task the kickoff tells Claude to claim. Re-reading the map mid-turn
+    // could pair one task's flags with another's work.
+    const next = resuming ? null : getNext?.(agentId) || null;
     let out = '';
     try {
       out = await runTurn({
-        prompt: resuming ? SINGLE_RESUME : SINGLE_KICKOFF,
+        prompt: resuming ? SINGLE_RESUME : SINGLE_KICKOFF(next?.intentId),
         resume: resuming,
         system: SYSTEM_SINGLE,
         cwd,
         mcpConfig,
         label,
+        // Per-task overrides — null/absent means this machine's own defaults
+        // (FLOWVIANT_MODEL, and Claude Code's own effort). A resume keeps the
+        // session it already has, so there is nothing to re-pick there.
+        model: next?.model || undefined,
+        effort: next?.effort || undefined,
         onSpawn: (ch) => onChild?.(ch),
       });
     } finally {
@@ -298,6 +308,13 @@ export async function runFleetDaemon() {
   const tokenByAgent = new Map(); // agentId -> latest worker token
   const mintedAt = new Map(); // agentId -> ms when we last got a fresh token
   const hasWorkByAgent = new Map(); // agentId -> server says it has claimable work
+  // agentId -> the intent the server would hand this lane next: { intentId,
+  // title, model, effort }. `--model`/`--effort` are fixed when Claude starts,
+  // and by then nothing has been claimed — so the server names the task first
+  // and the turn pins its claim to that id. Absent on older servers, in which
+  // case the lane behaves exactly as it did before: generic kickoff, machine
+  // defaults.
+  const nextByAgent = new Map();
   let leaseTtlSeconds = 24 * 60 * 60; // updated from each roster response
   let mcpUrl = MCP_URL;
   const workers = new Map(); // agentId -> { state, promise, wt, label }
@@ -1359,6 +1376,8 @@ export async function runFleetDaemon() {
         mintedAt.set(a.agentId, Date.now());
       }
       hasWorkByAgent.set(a.agentId, !!a.hasWork);
+      if (a.next && typeof a.next.intentId === 'string') nextByAgent.set(a.agentId, a.next);
+      else nextByAgent.delete(a.agentId);
       if (!workers.has(a.agentId)) {
         // Local ceiling, enforced and not merely requested. The roster can carry
         // more lanes than this machine asked for — someone added capacity by
@@ -1409,6 +1428,7 @@ export async function runFleetDaemon() {
 
           getToken: (id) => tokenByAgent.get(id),
           getHasWork: (id) => hasWorkByAgent.get(id) ?? false,
+          getNext: (id) => nextByAgent.get(id) ?? null,
           getMcpUrl: () => mcpUrl,
           isAlive: () => state.alive,
           onChild: (ch) => {
@@ -1524,6 +1544,7 @@ export async function runFleetDaemon() {
         workers.delete(id);
         tokenByAgent.delete(id);
         hasWorkByAgent.delete(id);
+        nextByAgent.delete(id);
         mintedAt.delete(id); // was leaked on removal (finding 14)
       }
     }

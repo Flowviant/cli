@@ -89,8 +89,18 @@ export const RESUME =
   'Resume. First call get_blocker_resolution for any blocker you reported; if resolved, ' +
   'apply the human’s answer and continue. Otherwise keep picking up and completing ' +
   'the tasks you were @mentioned on, per your instructions.';
-export const SINGLE_KICKOFF =
-  'Pick up and complete exactly ONE Flowviant task per your instructions, then stop.';
+// `intentId` is the task the SERVER says this lane is next in line for. Naming
+// it matters beyond saving a lookup: the daemon has already spawned this Claude
+// with that task's --model and --effort, and those cannot change once the
+// process exists. Left to pick freely, a lane could claim a sibling task and
+// run it under settings its owner chose for something else. Omitted (older
+// server, or nothing waiting) it falls back to the original free pick.
+export const SINGLE_KICKOFF = (intentId) =>
+  intentId
+    ? `Pick up Flowviant task ${intentId} — call claim_next_intent with intentId "${intentId}" — ` +
+      'complete exactly that ONE task per your instructions, then stop. If that ' +
+      'claim comes back unavailable, claim whatever is next for you instead.'
+    : 'Pick up and complete exactly ONE Flowviant task per your instructions, then stop.';
 export const SINGLE_RESUME =
   'Resume your current task. Call get_blocker_resolution for the blocker you reported; ' +
   'if resolved, apply the human’s answer and finish this one intent, then stop.';
@@ -590,7 +600,7 @@ function handleStreamLine(line, { cwd, emit, onActivity, appendText }) {
 // returned string for sentinel detection, and each activity is handed to
 // `onActivity` so the caller can forward progress. Build-agent turns leave it
 // off and keep the raw text passthrough + line sentinels.
-export function runTurn({ prompt, resume, system, cwd, mcpConfig, label, onSpawn, streamJson, onActivity, wikiPerm, readOnly }) {
+export function runTurn({ prompt, resume, system, cwd, mcpConfig, label, onSpawn, streamJson, onActivity, wikiPerm, readOnly, model, effort }) {
   return new Promise((resolve) => {
     const args = [];
     if (resume) args.push('--continue');
@@ -599,7 +609,12 @@ export function runTurn({ prompt, resume, system, cwd, mcpConfig, label, onSpawn
     if (mcpConfig) args.push('--mcp-config', mcpConfig);
     // Pin the model — never inherit the user's global default (which may be a
     // 1M/long-context tier their subscription can't bill autonomous work on).
-    args.push('--model', MODEL);
+    // A per-task override (chosen in the app, validated server-side against a
+    // fixed list before it ever reaches this argv) wins over the machine pin;
+    // absent, the pin stands. Effort has no machine-level pin at all: unset
+    // means Claude Code's own default, which is the honest resting state.
+    args.push('--model', model || MODEL);
+    if (effort) args.push('--effort', effort);
     if (streamJson) args.push('--output-format', 'stream-json', '--verbose');
     // readOnly wins over wikiPerm: a consult must never inherit write tools.
     args.push(...(readOnly ? CONSULT_PERM : wikiPerm ? WIKI_PERM : PERM));
