@@ -531,7 +531,10 @@ export function humanizeToolUse(name, input = {}, cwd = '') {
     case 'Edit': {
       const p = String(input.file_path ?? '');
       const tail = p.split('/').slice(-2).join('/');
-      return { kind: 'write', label: `${name === 'Write' ? '+ page' : '~ page'} ${tail}` };
+      // `path` is what lets a caller count DISTINCT pages: a page written once
+      // and then edited twice is one page, and the label alone cannot say that
+      // (it changes between '+ page' and '~ page' for the same file).
+      return { kind: 'write', path: p, label: `${name === 'Write' ? '+ page' : '~ page'} ${tail}` };
     }
     case 'Grep':
       return {

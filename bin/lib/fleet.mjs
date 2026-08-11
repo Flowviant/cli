@@ -133,13 +133,20 @@ const RUN_DIFFSTAT_URL = FLEET_URL.replace(/\/agents\/?$/, '/run-diffstat');
  * of whatever it is currently reading. The daemon owns the worktree, so it can
  * just look.
  *
- * Only posts when the numbers MOVED. A run that sits on a blocker for an hour
- * would otherwise write the same row 180 times, and a timestamp that keeps
- * refreshing on an unchanged diff is the kind of liveness signal that hides a
- * stall instead of showing it.
+ * Posts when the numbers MOVED, and otherwise once every couple of minutes to
+ * say the worktree is still being watched. Both halves are needed. Writing the
+ * same row every 20s would make a wedged turn look busy; never re-writing it
+ * makes a HEALTHY run look dead, because the reader treats a sample it has not
+ * seen refreshed in three minutes as a daemon that stopped — and an agent that
+ * finishes editing and then spends fifteen minutes running the test suite
+ * produces exactly the same silence as one that died. REFRESH_MS sits well
+ * inside that window so an idle-but-live worktree keeps its panel.
  */
-function sampleDiffstat(cwd, baseRef, intentId) {
+const DIFFSTAT_REFRESH_MS = 120_000;
+
+function sampleDiffstat(cwd, baseRef, intentId, agentId) {
   let last = '';
+  let lastSentAt = 0;
   let alive = true;
   const post = async () => {
     if (!alive) return;
@@ -151,10 +158,9 @@ function sampleDiffstat(cwd, baseRef, intentId) {
     }
     if (!stat) return;
     const key = JSON.stringify(stat);
-    if (key === last) return;
-    last = key;
+    if (key === last && Date.now() - lastSentAt < DIFFSTAT_REFRESH_MS) return;
     try {
-      await fetch(RUN_DIFFSTAT_URL, {
+      const res = await fetch(RUN_DIFFSTAT_URL, {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${FLEET_TOKEN}`,
@@ -162,10 +168,20 @@ function sampleDiffstat(cwd, baseRef, intentId) {
           'Content-Type': 'application/json',
         },
         signal: AbortSignal.timeout(15_000),
-        body: JSON.stringify({ intentId, diffstat: stat }),
+        // The lane, not just the task: the server matches the run on both, so a
+        // sample can only ever overwrite the diffstat of THIS lane's own run.
+        body: JSON.stringify({ intentId, agentId, diffstat: stat }),
       });
+      // Only a sample the server ACCEPTED counts as sent. Marking it delivered
+      // before the round-trip meant a dropped request suppressed every retry
+      // for as long as the numbers held still — which is precisely when the
+      // reader is about to expire the panel.
+      if (res.ok) {
+        last = key;
+        lastSentAt = Date.now();
+      }
     } catch {
-      /* best-effort: the next sample supersedes a dropped one */
+      /* best-effort: `last` is untouched, so the next tick tries again */
     }
   };
   const t = setInterval(() => void post(), 20_000);
@@ -183,6 +199,11 @@ function sampleDiffstat(cwd, baseRef, intentId) {
 async function runFleetWorker({ agentId, label, cwd, baseRef, getToken, getHasWork, getNext, getMcpUrl, isAlive, onChild, onTokenSuspect }) {
   let resuming = false;
   let needsReset = true; // reset to base before a FRESH task, not on idle polls
+  // The task this lane is currently holding. `next` only arrives on a FRESH
+  // turn, but a run that comes back from a blocker is still building the same
+  // intent — without remembering it here, the entire post-blocker half of a run
+  // reports no diffstat and the tray blanks mid-build.
+  let heldIntentId = null;
   let phase = ''; // '', 'idle', 'blocked' — log each transition once, not per poll
   const enter = (p, fn, msg) => {
     if (phase !== p) {
@@ -215,14 +236,19 @@ async function runFleetWorker({ agentId, label, cwd, baseRef, getToken, getHasWo
     // same task the kickoff tells Claude to claim. Re-reading the map mid-turn
     // could pair one task's flags with another's work.
     const next = resuming ? null : getNext?.(agentId) || null;
+    if (next?.intentId) heldIntentId = next.intentId;
     let out = '';
     // Report what this run is changing, while it is changing it. The commits
     // endpoint can only describe work that has already reached the provider, so
     // without this the app has nothing to say about a task for the whole time it
     // is being built. Only when we know WHICH task this turn is for — the same
     // hint that carries its model and effort — because a diffstat attributed to
-    // the wrong run is worse than none.
-    const stopDiffstat = next?.intentId ? sampleDiffstat(cwd, baseRef, next.intentId) : null;
+    // the wrong run is worse than none. On a resume that is the intent this
+    // lane already holds; the worktree it is about to keep editing is the same
+    // one, so the samples describe the same run.
+    const stopDiffstat = heldIntentId
+      ? sampleDiffstat(cwd, baseRef, heldIntentId, agentId)
+      : null;
     try {
       out = await runTurn({
         prompt: resuming ? SINGLE_RESUME : SINGLE_KICKOFF(next?.intentId),
@@ -253,6 +279,7 @@ async function runFleetWorker({ agentId, label, cwd, baseRef, getToken, getHasWo
     if (sawSentinel(out, 'NOTHING')) {
       enter('idle', info, 'idle — no work assigned');
       resuming = false;
+      heldIntentId = null; // let go of the task, and of its diffstat
       await sleep(IDLE_SECONDS);
       continue;
     }
@@ -261,6 +288,7 @@ async function runFleetWorker({ agentId, label, cwd, baseRef, getToken, getHasWo
       phase = '';
       resuming = false;
       needsReset = true;
+      heldIntentId = null;
       continue;
     }
     // No sentinel — the turn didn't complete the protocol. Almost always the
@@ -273,7 +301,10 @@ async function runFleetWorker({ agentId, label, cwd, baseRef, getToken, getHasWo
     // failure, not completion — retry in place and KEEP the worktree. Resetting
     // here would wipe the blocked task's uncommitted changes. Only a fresh-task
     // turn (not resuming) warrants a clean slate next time.
-    if (!resuming) needsReset = true;
+    if (!resuming) {
+      needsReset = true;
+      heldIntentId = null; // fresh slate next turn — nothing held to sample
+    }
     await sleep(IDLE_SECONDS);
   }
   info(`${label} stopped`);
@@ -1142,6 +1173,14 @@ export async function runFleetDaemon() {
         const startedAt = Date.now();
         let filesRead = 0;
         let phase = 'reading';
+        // Distinct vault pages this turn has written. Counted HERE, from the
+        // stream, because it is the only place that knows mid-turn: the daemon
+        // syncs the vault to the server once, AFTER the turn returns, so a
+        // server-side count of "rows touched since the turn began" is zero for
+        // the entire writing phase — which is exactly how long the bar needs it.
+        // A Set, not a counter: pages get written once and then edited, and
+        // three tool calls on one page are one page.
+        const pagesSeen = new Set();
         const feed = [];
         const frame = (extra) => ({
           mode,
@@ -1149,12 +1188,16 @@ export async function runFleetDaemon() {
           activity: feed[feed.length - 1] ?? '',
           recent: feed.slice(-24),
           filesRead,
+          pagesWritten: pagesSeen.size,
           elapsedSec: Math.round((Date.now() - startedAt) / 1000),
           ...extra,
         });
         const onActivity = (a) => {
           if (a.kind === 'read') filesRead++;
-          if (a.kind === 'write') phase = 'writing';
+          if (a.kind === 'write') {
+            phase = 'writing';
+            pagesSeen.add(a.path || a.label);
+          }
           // Collapse runs of bare "thinking…" so the feed doesn't fill with it.
           if (!(a.label === 'thinking…' && feed[feed.length - 1] === 'thinking…')) {
             feed.push(a.label);

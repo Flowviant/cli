@@ -290,6 +290,11 @@ export function resetWorktree(wt, baseRef) {
  * memory.
  *
  * PATHS AND COUNTS ONLY. Nothing in here returns file content.
+ *
+ * Both git calls are `-z`, for the reason gitRaw exists: git's line-based output
+ * QUOTES any path that is not plain ASCII, so an accented filename arrives as
+ * "n\303\251w.txt" — a string that is not the path, cannot be stat'd, and reads
+ * as garbage in the tray. `-z` emits paths verbatim.
  */
 export function worktreeDiffstat(cwd, baseRef, { maxFiles = 200 } = {}) {
   const files = [];
@@ -303,11 +308,20 @@ export function worktreeDiffstat(cwd, baseRef, { maxFiles = 200 } = {}) {
   };
 
   try {
-    for (const line of git(['diff', '--numstat', baseRef, '--'], cwd).split('\n')) {
-      if (!line.trim()) continue;
-      const [a, d, ...rest] = line.split('\t');
-      const path = rest.join('\t');
-      if (!path) continue;
+    // `--numstat -z` frames a normal change as one field, "added\tdeleted\tpath",
+    // but a RENAME as three: "added\tdeleted\t" (empty path), then the old path,
+    // then the new one. An empty path is therefore the rename marker, and the
+    // next two fields belong to it — read line-wise instead, a rename would
+    // report a file literally named "old => new".
+    const fields = splitNul(gitRaw(['diff', '--numstat', '-z', baseRef, '--'], cwd));
+    for (let i = 0; i < fields.length; i++) {
+      const [a, d, ...rest] = fields[i].split('\t');
+      let path = rest.join('\t');
+      if (!path) {
+        path = fields[i + 2] ?? fields[i + 1]; // the post-rename name is what exists now
+        i += 2;
+        if (!path) continue;
+      }
       // Binary files report '-' for both counts; they changed, but not by lines.
       add(path, a === '-' ? 0 : Number(a) || 0, d === '-' ? 0 : Number(d) || 0);
     }
@@ -317,20 +331,32 @@ export function worktreeDiffstat(cwd, baseRef, { maxFiles = 200 } = {}) {
   }
 
   try {
-    const untracked = git(['ls-files', '--others', '--exclude-standard'], cwd)
-      .split('\n')
-      .filter(Boolean);
+    const untracked = splitNul(
+      gitRaw(['ls-files', '--others', '--exclude-standard', '-z'], cwd)
+    );
     for (const path of untracked) {
       let added = 0;
-      try {
-        const { size } = statSync(join(cwd, path));
-        // 2 MB: past this it is a build artifact or a binary, and reading it to
-        // count newlines would be the most expensive thing this daemon does.
-        if (size <= 2_000_000) {
-          added = readFileSync(join(cwd, path), 'utf8').split('\n').length;
+      // Past the cap this path will not be shown, so do not pay to read it.
+      // This is the one place the totals can undercount, and reaching it takes
+      // an untracked tree bigger than the list itself — a generated directory
+      // .gitignore missed. Statting and reading all of it on a 20s interval
+      // would block the roster poll and every other lane on this daemon.
+      if (files.length < maxFiles) {
+        try {
+          const { size } = statSync(join(cwd, path));
+          // 2 MB: past this it is a build artifact or a binary, and reading it to
+          // count newlines would be the most expensive thing this daemon does.
+          if (size <= 2_000_000) {
+            const text = readFileSync(join(cwd, path), 'utf8');
+            // Lines, not segments. A file ending in a newline — i.e. essentially
+            // every source file an agent writes — splits into one more piece
+            // than it has lines, and that +1 was landing in the totals shown
+            // beside git's own counts.
+            added = text ? text.split('\n').length - (text.endsWith('\n') ? 1 : 0) : 0;
+          }
+        } catch {
+          /* vanished between listing and reading — report the path, no counts */
         }
-      } catch {
-        /* vanished between listing and reading — report the path, no counts */
       }
       add(path, added, 0);
     }
