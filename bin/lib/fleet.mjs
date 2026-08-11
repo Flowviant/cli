@@ -1537,6 +1537,12 @@ export async function runFleetDaemon() {
           getHasWork: (id) => hasWorkByAgent.get(id) ?? false,
           getNext: (id) => nextByAgent.get(id) ?? null,
           getMcpUrl: () => mcpUrl,
+          // Injected rather than imported: fleet.mjs imports live.mjs, so live
+          // cannot import back. The live worker is the DEFAULT one, and until
+          // this was passed down the whole run-diffstat pipeline was reachable
+          // only under FLOWVIANT_POLL=1 — the app's live-changes panel had no
+          // data source at all for the path everybody actually runs.
+          sampleDiffstat,
           isAlive: () => state.alive,
           onChild: (ch) => {
             state.child = ch;

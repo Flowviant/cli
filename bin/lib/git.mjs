@@ -5,6 +5,7 @@ import { existsSync, readFileSync, statSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { materializedFiles } from './env.mjs';
 
 export function git(args, cwd) {
   return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
@@ -185,6 +186,14 @@ function gitWithEnv(args, cwd, extraEnv) {
  * world untouched — it cannot tell this happened.
  *
  * Returns the commit sha, or null if there was nothing dirty / no remote.
+ *
+ * This PUSHES, so what it stages is a security boundary, not a detail: the
+ * daemon materializes plaintext env-vault secrets into this same worktree.
+ * They are gitignored (materializeInto refuses to write them otherwise), and
+ * `git add -A` honours .gitignore — but the whole point of the bug this guards
+ * against was an exclusion mechanism that silently did nothing, so the paths
+ * are ALSO subtracted by pathspec here. Two independent mechanisms, because one
+ * of them failing quietly is exactly what put secrets on a remote branch.
  */
 export function checkpointWip(wt, intentId, baseRef) {
   if (!isSafePathSegment(intentId)) return null;
@@ -201,7 +210,11 @@ export function checkpointWip(wt, intentId, baseRef) {
   try {
     const head = git(['rev-parse', 'HEAD'], wt);
     gitWithEnv(['read-tree', head], wt, env);
-    gitWithEnv(['add', '-A'], wt, env);
+    gitWithEnv(
+      ['add', '-A', '--', '.', ...materializedFiles(wt).map((p) => `:(exclude)${p}`)],
+      wt,
+      env
+    );
     const tree = gitWithEnv(['write-tree'], wt, env);
     // Nothing changed since HEAD — no snapshot worth pushing.
     if (tree === git(['rev-parse', `${head}^{tree}`], wt)) return null;
@@ -343,11 +356,19 @@ export function worktreeDiffstat(cwd, baseRef, { maxFiles = 200 } = {}) {
       // would block the roster poll and every other lane on this daemon.
       if (files.length < maxFiles) {
         try {
-          const { size } = statSync(join(cwd, path));
-          // 2 MB: past this it is a build artifact or a binary, and reading it to
-          // count newlines would be the most expensive thing this daemon does.
-          if (size <= 2_000_000) {
+          const st = statSync(join(cwd, path));
+          // Regular files ONLY. `git ls-files --others` will happily name a
+          // symlink or a fifo, and readFileSync on a fifo or a character device
+          // BLOCKS — on a 20s interval, on the daemon's single thread, that is
+          // the whole process wedged waiting for a device that may never write.
+          // 2 MB: past that it is a build artifact or a binary, and reading it
+          // to count newlines would be the most expensive thing this daemon does.
+          if (st.isFile() && st.size <= 2_000_000) {
             const text = readFileSync(join(cwd, path), 'utf8');
+            // A NUL byte means binary. Counting "lines" in a PNG produces a
+            // number that is not wrong so much as meaningless, and it was being
+            // summed into the total shown beside git's real counts.
+            if (text.includes('\0')) throw new Error('binary');
             // Lines, not segments. A file ending in a newline — i.e. essentially
             // every source file an agent writes — splits into one more piece
             // than it has lines, and that +1 was landing in the totals shown

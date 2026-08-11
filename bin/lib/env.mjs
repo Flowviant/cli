@@ -213,19 +213,39 @@ export async function loadCachedEnv(projectId) {
 
 // ── Materialization ────────────────────────────────────────────────────────
 
-/** Per-worktree git exclude — untracked AND unstageable. A git worktree's
- *  `.git` is a FILE pointing at its private gitdir; info/exclude there applies
- *  to that worktree only and never touches the user's repo. */
+/**
+ * Add the materialized paths to the exclude file git ACTUALLY READS.
+ *
+ * This used to resolve the worktree's own gitdir (`.git/worktrees/<name>`) and
+ * write `info/exclude` there, on the belief that it "applies to that worktree
+ * only and never touches the user's repo". Git does not read that file: it
+ * resolves `info/exclude` against $GIT_COMMON_DIR — the main `.git` — so in
+ * every linked worktree the daemon creates, the exclusion did nothing at all.
+ * The plaintext secret files stayed visible to `git add -A`, which is what
+ * `checkpointWip` runs before force-pushing a WIP commit to the remote.
+ *
+ * `--git-common-dir` is asked of git rather than derived, because that is the
+ * one answer that cannot drift from what git itself will consult. The file is
+ * local to the clone and never committed.
+ *
+ * This is a CONVENIENCE, not the guarantee. The guarantee is the check-ignore
+ * verification in materializeInto, which refuses to write a secret that git can
+ * still see.
+ */
 function excludeInWorktree(wt, relPaths) {
   try {
-    const dotGit = join(wt, '.git');
-    let gitdir = dotGit;
+    let gitdir;
     try {
-      const content = readFileSync(dotGit, 'utf8');
-      const m = content.match(/^gitdir:\s*(.+)\s*$/m);
-      if (m) gitdir = resolve(wt, m[1].trim());
+      gitdir = resolve(
+        wt,
+        execFileSync('git', ['rev-parse', '--git-common-dir'], {
+          cwd: wt,
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'ignore'],
+        }).trim()
+      );
     } catch {
-      /* .git is a directory (main checkout) — use it directly */
+      return; // not a repo — materializeInto's check-ignore gate will refuse anyway
     }
     const excludePath = join(gitdir, 'info', 'exclude');
     mkdirSync(dirname(excludePath), { recursive: true });
@@ -262,6 +282,27 @@ function isTrackedInGit(wt, relPath) {
       stdio: 'ignore',
     });
     return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Will git hide this path? Asked of git, never inferred.
+ *
+ * This is the gate that makes writing a secret safe, and it is asked AFTER the
+ * exclude file is updated so it reflects the state the agent will actually run
+ * under. It fails CLOSED: any error — not a repo, git missing, a weird
+ * pathspec — reads as "not ignored", so the secret is not written. A wrong
+ * "yes" here puts plaintext on a remote branch; a wrong "no" costs a warning.
+ */
+function isIgnoredInGit(wt, relPath) {
+  try {
+    execFileSync('git', ['check-ignore', '-q', '--', relPath], {
+      cwd: wt,
+      stdio: 'ignore',
+    });
+    return true; // exit 0 = ignored
   } catch {
     return false;
   }
@@ -334,10 +375,23 @@ export function materializeInto(wt) {
     byFile.set(v.targetFile, list);
   }
 
+  // Exclude BEFORE writing, not after. The old order wrote plaintext first and
+  // tried to hide it afterwards, so every failure mode — and the exclude file
+  // being the wrong one, which it was — left a readable secret in a tree that
+  // `checkpointWip` force-pushes.
+  excludeInWorktree(wt, [...byFile.keys()]);
+
   const written = [];
   for (const [file, list] of byFile) {
     if (isTrackedInGit(wt, file)) {
       warn(`env: "${file}" is tracked in git — refusing to write secrets there (gitignore it). Its keys are NOT materialized.`);
+      continue;
+    }
+    // The load-bearing check. A materialized secret sits in a worktree whose
+    // whole tree gets `git add -A`'d and force-pushed by the WIP checkpoint, so
+    // "git cannot see this file" is a precondition for writing it, not a nicety.
+    if (!isIgnoredInGit(wt, file)) {
+      warn(`env: "${file}" is not gitignored — refusing to write secrets there. Add it to .gitignore. Its keys are NOT materialized.`);
       continue;
     }
     try {
@@ -369,7 +423,18 @@ export function materializeInto(wt) {
   }
   for (const f of written) knownTargetFiles.add(f);
   lastFilesByWorktree.set(wt, written);
-  if (written.length) excludeInWorktree(wt, written);
+}
+
+/**
+ * The secret files this daemon has materialized into `wt`.
+ *
+ * Exists so anything that stages the whole tree can subtract them by pathspec.
+ * Belt to the check-ignore braces: `git add -A` obeys .gitignore, so a properly
+ * ignored file is already safe — but "already safe" was the assumption that put
+ * plaintext on a remote branch, and a second, independent mechanism is cheap.
+ */
+export function materializedFiles(wt) {
+  return [...(lastFilesByWorktree.get(wt) ?? [])];
 }
 
 // ── Uplink scrubbing ───────────────────────────────────────────────────────

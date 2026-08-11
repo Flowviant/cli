@@ -565,6 +565,8 @@ export async function runLiveTask({
   resumeIntentId,
   onChild,
   onIntent,
+  sampleDiffstat,
+  agentId,
 }) {
   const claim = await mcpCall(mcpUrl, token, 'claim_next_intent', {}).catch(() => null);
   if (!claim || claim.claimed !== true) return { outcome: 'nothing' };
@@ -753,15 +755,31 @@ export async function runLiveTask({
   }, CHECKPOINT_MS);
   checkpointTimer.unref?.();
 
+  // Report what this run is changing WHILE it changes it. Started here, beside
+  // the checkpoint timer, because both want the same two facts — a worktree and
+  // the task it belongs to — and both must be torn down on every exit from this
+  // function. Unlike poll mode there is nothing to predict: the claim above
+  // already told us the real intent.
+  const stopDiffstat = sampleDiffstat?.(cwd, baseRef, intentId, agentId) ?? null;
+
   const input = makeInput(seedPrompt(runId, brief, transcript, resumedInPlace));
   const session = query({
     prompt: input.stream(),
     options: {
       cwd,
       env,
-      // Pin the model — never inherit the user's global default (which may be a
-      // 1M/long-context tier their subscription can't bill autonomous work on).
-      model: MODEL,
+      // Per-task first, this machine's default second. The task's own choice
+      // comes off the BRIEF rather than the roster hint, because the claim has
+      // already happened here — this is the task we actually got, not the one
+      // the server guessed we would get.
+      //
+      // Still pinned either way: never inherit the user's global default, which
+      // may be a 1M/long-context tier their subscription cannot bill autonomous
+      // work on.
+      model: brief.agentModel || MODEL,
+      // Omitted entirely when unset — Claude Code's own default is the right
+      // answer, and passing undefined effort is not the same as not passing it.
+      ...(brief.agentEffort ? { effort: brief.agentEffort } : {}),
       permissionMode: SAFE ? 'default' : 'bypassPermissions',
       ...(SAFE ? { allowedTools: SAFE_TOOLS } : {}),
       systemPrompt: { type: 'preset', preset: 'claude_code', append: SYSTEM_LIVE },
@@ -972,6 +990,10 @@ export async function runLiveTask({
     return { outcome: 'error', error: e?.message ?? String(e), title, intentId };
   } finally {
     clearInterval(checkpointTimer);
+    // Same finally as the checkpoint: every path out of this task — done,
+    // parked, rate-limited, thrown — must stop reporting a worktree that is
+    // about to stop being this run's.
+    stopDiffstat?.();
     // Last word on this task's state. If the work landed (branch pushed, PR
     // open, patch applied) the checkpoint has served its purpose and the ref is
     // deleted — otherwise it accumulates one hidden ref per task, forever, on
@@ -1046,6 +1068,11 @@ export async function runLiveWorker({
   onChild,
   onIntent,
   onPreview,
+  /** Start posting this run's worktree diffstat; returns stop(). Injected from
+   *  fleet.mjs (which imports this module, so the dependency cannot go the
+   *  other way). Optional so a caller without it degrades to no panel rather
+   *  than crashing. */
+  sampleDiffstat,
 }) {
   // The intent this worker is holding across iterations. When a task parks on a
   // blocker its worktree keeps uncommitted work; on the resume claim we must NOT
@@ -1198,6 +1225,8 @@ export async function runLiveWorker({
         isAlive,
         resumeIntentId: lastIntentId,
         onChild,
+        sampleDiffstat,
+        agentId,
       });
     } catch (e) {
       enter('error', warn, `${c.yellow('error')} ${c.dim(`— ${e?.message ?? e}`)}`);
