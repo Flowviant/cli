@@ -44,7 +44,7 @@ import { c, LABEL_COLORS, info, note, ok, warn, fail } from './ui.mjs';
 import { revertPatch, withPatchLock } from './patch.mjs';
 import {
   sleep,
-  mcpConfigFor,
+  mcpFor,
   runTurn,
   sawSentinel,
   blockedId,
@@ -76,6 +76,7 @@ import {
 } from './env.mjs';
 import { processDeployJobs, reportDeployConfig } from './deploy.mjs';
 import { machineSnapshot } from './resources.mjs';
+import { detectRuntimes } from './runtimes.mjs';
 
 async function fetchRoster(haveIds) {
   const url = new URL(FLEET_URL);
@@ -85,6 +86,26 @@ async function fetchRoster(haveIds) {
   // machine knows its cores, its RAM and whose Claude quota is being spent.
   // Older servers ignore the param, so sending it is always safe.
   url.searchParams.set('capacity', String(MAX_CONCURRENT));
+  // WHICH CLIs this machine actually has, so the app can stop guessing.
+  //
+  // Until now every surface that listed Gemini or Codex said "not wired up yet"
+  // and meant it literally: nothing had ever looked. That was the honest answer
+  // while it was true, and it stops being honest the moment a second runtime can
+  // run — an app that cannot tell "Codex is not installed" from "we never
+  // checked" will confidently tell you the wrong one.
+  //
+  // A statement about this MACHINE and nothing else: no account, no quota, no
+  // entitlement. Detection is cached after the first poll (one version probe per
+  // CLI), so this costs a query param thereafter. Older servers ignore an
+  // unknown param, so sending it is always safe.
+  try {
+    const drivable = detectRuntimes()
+      .filter((r) => r.dispatchable)
+      .map((r) => r.id);
+    if (drivable.length) url.searchParams.set('runtimes', drivable.join(','));
+  } catch {
+    /* detection is best-effort — a probe must never fail the poll */
+  }
   // Env-sync identity + materialized version (the Settings "env vN" chip).
   try {
     for (const [k, v] of Object.entries(await envQueryParams())) {
@@ -204,6 +225,9 @@ async function runFleetWorker({ agentId, label, cwd, baseRef, getToken, getHasWo
   // intent — without remembering it here, the entire post-blocker half of a run
   // reports no diffstat and the tray blanks mid-build.
   let heldIntentId = null;
+  // The CLI the task in flight is being built by — held across a resume for
+  // the reason documented at the assignment below.
+  let heldRuntime = 'claude';
   let phase = ''; // '', 'idle', 'blocked' — log each transition once, not per poll
   const enter = (p, fn, msg) => {
     if (phase !== p) {
@@ -230,13 +254,21 @@ async function runFleetWorker({ agentId, label, cwd, baseRef, getToken, getHasWo
       materializeInto(cwd); // reset wiped the env files (git clean -fd) — rewrite
       needsReset = false;
     }
-    const { dir, path: mcpConfig } = mcpConfigFor(token, getMcpUrl());
     // The task the server says is next for this lane, read ONCE per turn: the
-    // model and effort below become process flags, so they must describe the
-    // same task the kickoff tells Claude to claim. Re-reading the map mid-turn
-    // could pair one task's flags with another's work.
+    // runtime, model and effort below become process flags, so they must
+    // describe the same task the kickoff tells the agent to claim. Re-reading
+    // the map mid-turn could pair one task's flags with another's work.
     const next = resuming ? null : getNext?.(agentId) || null;
     if (next?.intentId) heldIntentId = next.intentId;
+    // WHICH CLI builds this one. Chosen in the app by @mentioning it and carried
+    // on the roster hint; absent (older server, or a task captured before there
+    // was a choice) it is Claude, which is what every task ran on until now.
+    //
+    // A resume must keep the runtime it started on — the session, the worktree
+    // and the branch all belong to that CLI, and handing its half-finished work
+    // to a different one mid-task is not a fallback, it is a second author.
+    if (!resuming) heldRuntime = next?.runtime || 'claude';
+    const { dir, args: mcpArgs, env: mcpEnv } = mcpFor(heldRuntime, token, getMcpUrl());
     let out = '';
     // Report what this run is changing, while it is changing it. The commits
     // endpoint can only describe work that has already reached the provider, so
@@ -255,10 +287,12 @@ async function runFleetWorker({ agentId, label, cwd, baseRef, getToken, getHasWo
         resume: resuming,
         system: SYSTEM_SINGLE,
         cwd,
-        mcpConfig,
+        runtime: heldRuntime,
+        mcpArgs,
+        mcpEnv,
         label,
         // Per-task overrides — null/absent means this machine's own defaults
-        // (FLOWVIANT_MODEL, and Claude Code's own effort). A resume keeps the
+        // (FLOWVIANT_MODEL, and the CLI's own effort). A resume keeps the
         // session it already has, so there is nothing to re-pick there.
         model: next?.model || undefined,
         effort: next?.effort || undefined,
@@ -266,7 +300,9 @@ async function runFleetWorker({ agentId, label, cwd, baseRef, getToken, getHasWo
       });
     } finally {
       stopDiffstat?.();
-      rmSync(dir, { recursive: true, force: true });
+      // `dir` is null for a runtime that needed no file on disk (Codex reads its
+      // token from the environment) — rmSync would throw on undefined.
+      if (dir) rmSync(dir, { recursive: true, force: true });
       onChild?.(null);
     }
     if (!isAlive()) break;

@@ -1,7 +1,14 @@
 /**
- * Driving Claude Code: the operating-contract system prompts, the permission
- * posture, and one `claude -p` turn. The hard rule baked into both prompts:
- * there is no interactive user — the only channel to a human is the blocker loop.
+ * Driving a coding CLI: the operating-contract system prompts, the permission
+ * posture, and one headless turn. The hard rule baked into both prompts: there
+ * is no interactive user — the only channel to a human is the blocker loop.
+ *
+ * `runTurn` used to BE `claude -p`, argv and all. The argv, the binary, the way
+ * the MCP server is handed over and the shape of the event stream now come from
+ * the runtime registry (runtimes.mjs), because those four things are exactly
+ * what differs between one CLI and the next. What stays here is everything that
+ * is about FLOWVIANT rather than about a vendor: the contract prompts, the
+ * permission sets, the sentinel protocol, and the turn plumbing.
  */
 
 import { spawn } from 'node:child_process';
@@ -9,6 +16,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { SAFE, MODEL } from './config.mjs';
+import { runtimeById, humanizeClaudeTool } from './runtimes.mjs';
 
 // Multi-task loop (TOKEN / TOKENS modes): drain the whole queue in one session.
 export const SYSTEM_MULTI = `You are a Flowviant build agent running FULLY AUTONOMOUSLY via the "flowviant" MCP
@@ -16,13 +24,13 @@ server. There is NO interactive user and NO terminal to ask in. The ONLY way to
 reach a human is the blocker loop. Never ask the user directly; never wait on stdin.
 
 Operate this loop:
-1. Call claim_next_intent to PICK UP the next task someone @mentioned you on. If it
+1. Call claim_next_task to PICK UP the next task someone @mentioned you on. If it
    returns claimed:false, output exactly ALL_CLEAR on its own line and stop.
 2. Read the brief, and read its "thread" FIRST — that is the task conversation, and the
    newest human message is usually the specific reason you were brought in. If the brief
    has an existing "branch" (a REVISION), \`git checkout <branch>\` to resume your prior
    work and address what the thread asks for. Use get_module_files / search_wiki /
-   list_related_intents for context. Call report_progress as you go.
+   list_related_tasks for context. Call report_progress as you go.
 3. If you hit ANYTHING only a human can decide, call report_blocker with a clear
    question (and options when you can), then call get_blocker_resolution. If it is
    not yet resolved, output exactly BLOCKED:<blockerId> on its own line and STOP.
@@ -48,14 +56,14 @@ server. There is NO interactive user and NO terminal to ask in. The ONLY way to
 reach a human is the blocker loop. Never ask the user directly; never wait on stdin.
 
 Do EXACTLY ONE task this turn:
-1. Call claim_next_intent to PICK UP the task someone @mentioned you on. If it returns
+1. Call claim_next_task to PICK UP the task someone @mentioned you on. If it returns
    claimed:false, output exactly NOTHING on its own line and stop. Do NOT retry.
 2. Read the brief, and read its "thread" FIRST — that is the task conversation, and the
    newest human message is usually the specific reason you were brought in. If the brief
    has an existing "branch" (a REVISION), first \`git fetch && git checkout <branch>\` to
    resume YOUR prior work and address what the thread asks for. Otherwise work from the
    clean base checkout. Use get_module_files / search_wiki /
-   list_related_intents for context. report_progress as you go.
+   list_related_tasks for context. report_progress as you go.
 3. If you hit ANYTHING only a human can decide, call report_blocker (with options when
    you can), then get_blocker_resolution. If unresolved, output exactly
    BLOCKED:<blockerId> on its own line and STOP. Do NOT guess past a real decision.
@@ -97,7 +105,7 @@ export const RESUME =
 // server, or nothing waiting) it falls back to the original free pick.
 export const SINGLE_KICKOFF = (intentId) =>
   intentId
-    ? `Pick up Flowviant task ${intentId} — call claim_next_intent with intentId "${intentId}" — ` +
+    ? `Pick up Flowviant task ${intentId} — call claim_next_task with taskId "${intentId}" — ` +
       'complete exactly that ONE task per your instructions, then stop. If that ' +
       'claim comes back unavailable, claim whatever is next for you instead.'
     : 'Pick up and complete exactly ONE Flowviant task per your instructions, then stop.';
@@ -508,49 +516,32 @@ export function mcpConfigFor(token, mcpUrl) {
   return { dir, path: p };
 }
 
-// Shorten an absolute tool path to a repo-relative one for legible output.
-const shortPath = (p, cwd) => {
-  if (typeof p !== 'string') return '';
-  let s = p;
-  if (cwd && s.startsWith(cwd)) s = s.slice(cwd.length).replace(/^\/+/, '');
-  return s;
-};
+/**
+ * Hand a runtime the flowviant MCP server, however that runtime wants it.
+ *
+ * Returns `{ dir, args, env }`: `dir` is a temp directory to delete after the
+ * turn (null when the runtime needed no file at all), `args` splice into argv,
+ * `env` merges into the child's environment. The shape is identical for every
+ * runtime precisely because the mechanism is not — Claude wants a JSON file
+ * path, Codex wants two `-c` overrides and reads the token out of the
+ * environment. Callers should not have to know which.
+ */
+export function mcpFor(runtimeId, token, mcpUrl) {
+  const rt = runtimeById(runtimeId);
+  if (!rt.mcp) throw new Error(`runtime '${rt.id}' cannot take an MCP server: ${rt.blocked}`);
+  return rt.mcp(token, mcpUrl);
+}
 
 // Turn one Claude tool_use into a compact activity {kind, label}, or null for
 // tools not worth surfacing. `kind:'read'` is what the file counter counts; a
 // Write/Edit of a vault page is the "writing" signal. Used by wiki turns to
 // stream exactly which files Claude is touching (daemon console + app cover).
-export function humanizeToolUse(name, input = {}, cwd = '') {
-  switch (name) {
-    case 'Read':
-      return { kind: 'read', label: `read ${shortPath(input.file_path, cwd)}` };
-    // Vault authoring: Write/Edit of a markdown page is the "writing" signal
-    // (the wiki turn's only legal writes are vault files). Label with the last
-    // two path segments — the vault lives outside cwd, so shortPath can't trim.
-    case 'Write':
-    case 'Edit': {
-      const p = String(input.file_path ?? '');
-      const tail = p.split('/').slice(-2).join('/');
-      // `path` is what lets a caller count DISTINCT pages: a page written once
-      // and then edited twice is one page, and the label alone cannot say that
-      // (it changes between '+ page' and '~ page' for the same file).
-      return { kind: 'write', path: p, label: `${name === 'Write' ? '+ page' : '~ page'} ${tail}` };
-    }
-    case 'Grep':
-      return {
-        kind: 'search',
-        label: `grep ${JSON.stringify(input.pattern ?? '')}${input.path ? ` in ${shortPath(input.path, cwd)}` : ''}`,
-      };
-    case 'Glob':
-      return { kind: 'glob', label: `glob ${input.pattern ?? ''}` };
-    case 'LS':
-      return { kind: 'list', label: `ls ${shortPath(input.path ?? '.', cwd)}` };
-    case 'Bash':
-      return { kind: 'bash', label: `$ ${String(input.command ?? '').replace(/\s+/g, ' ').slice(0, 60)}` };
-    default:
-      return null; // other tools: silent
-  }
-}
+//
+// The body moved to runtimes.mjs, beside Codex's equivalent, because they are
+// the same job for two vendors and keeping them apart is how the two activity
+// vocabularies drift. Re-exported under its original name: a dozen call sites
+// know it, and none of them care where it lives.
+export const humanizeToolUse = humanizeClaudeTool;
 
 // Collapse whitespace + clip so a narration/thinking snippet is one tidy feed line.
 const oneLine = (s, n = 160) => String(s).replace(/\s+/g, ' ').trim().slice(0, n);
@@ -603,24 +594,40 @@ function handleStreamLine(line, { cwd, emit, onActivity, appendText }) {
 // returned string for sentinel detection, and each activity is handed to
 // `onActivity` so the caller can forward progress. Build-agent turns leave it
 // off and keep the raw text passthrough + line sentinels.
-export function runTurn({ prompt, resume, system, cwd, mcpConfig, label, onSpawn, streamJson, onActivity, wikiPerm, readOnly, model, effort }) {
+export function runTurn({ prompt, resume, system, cwd, mcpConfig, mcpArgs, mcpEnv, runtime = 'claude', label, onSpawn, streamJson, onActivity, wikiPerm, readOnly, model, effort }) {
   return new Promise((resolve) => {
-    const args = [];
-    if (resume) args.push('--continue');
-    args.push('-p', prompt, '--append-system-prompt', system);
-    // Wiki-vault turns are pure file work — no MCP server at all.
-    if (mcpConfig) args.push('--mcp-config', mcpConfig);
-    // Pin the model — never inherit the user's global default (which may be a
-    // 1M/long-context tier their subscription can't bill autonomous work on).
-    // A per-task override (chosen in the app, validated server-side against a
-    // fixed list before it ever reaches this argv) wins over the machine pin;
-    // absent, the pin stands. Effort has no machine-level pin at all: unset
-    // means Claude Code's own default, which is the honest resting state.
-    args.push('--model', model || MODEL);
-    if (effort) args.push('--effort', effort);
-    if (streamJson) args.push('--output-format', 'stream-json', '--verbose');
+    const rt = runtimeById(runtime);
+    if (!rt.args) {
+      // Reached only if a brief names a runtime this daemon declares but cannot
+      // drive. Fail as a turn with no sentinel — the loop already treats that as
+      // "the protocol did not complete" and retries, rather than inventing a
+      // completion for work that never started.
+      console.error(`\nerror: cannot run '${rt.label}' — ${rt.blocked}`);
+      resolve('');
+      return;
+    }
+    // Pin the model — never inherit the user's global default (which for Claude
+    // may be a 1M/long-context tier their subscription can't bill autonomous
+    // work on). A per-task override (chosen in the app, validated server-side
+    // against a fixed list before it ever reaches this argv) wins over the
+    // machine pin; absent, the pin stands. Effort has no machine-level pin at
+    // all: unset means the CLI's own default, the honest resting state.
+    //
     // readOnly wins over wikiPerm: a consult must never inherit write tools.
-    args.push(...(readOnly ? CONSULT_PERM : wikiPerm ? WIKI_PERM : PERM));
+    const args = rt.args({
+      prompt,
+      system,
+      model,
+      effort,
+      resume,
+      streamJson,
+      perm: readOnly ? CONSULT_PERM : wikiPerm ? WIKI_PERM : PERM,
+      // Handed to the adapter rather than appended here, because WHERE these go
+      // is a property of the CLI: Codex reads its prompt as a trailing
+      // positional, so a flag after it is a flag in the wrong place.
+      // Wiki-vault turns are pure file work and pass neither — no MCP at all.
+      mcp: mcpConfig ? ['--mcp-config', mcpConfig] : (mcpArgs ?? []),
+    });
     // Whatever this machine is signed in with, we use. We do NOT pick.
     //
     // This used to delete ANTHROPIC_API_KEY and ANTHROPIC_AUTH_TOKEN to force
@@ -632,18 +639,41 @@ export function runTurn({ prompt, resume, system, cwd, mcpConfig, label, onSpawn
     // deliberately configured.
     //
     // Which credential is correct, and whether an account may be shared, is
-    // between the operator and Anthropic. Flowviant does not detect it and does
-    // not enforce it; it runs Claude the ordinary way and relays what happens.
-    const child = spawn('claude', args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+    // between the operator and the vendor. Flowviant does not detect it and does
+    // not enforce it; it runs the CLI the ordinary way and relays what happens.
+    const child = spawn(rt.bin, args, {
+      cwd,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      // Only ADDS to the environment (the worker token, for runtimes that read
+      // it from there). Never replaces it: the CLI's own credentials live in
+      // this environment, and handing it a curated one signs it out.
+      ...(mcpEnv ? { env: { ...process.env, ...mcpEnv } } : {}),
+    });
     onSpawn?.(child);
     let out = '';
     const pfx = label ? `${label} ` : '';
     const emit = (s) => process.stdout.write(pfx ? s.replace(/\n/g, `\n${pfx}`) : s);
 
-    if (streamJson) {
+    // A runtime with its own parser is ALWAYS line-parsed — for Codex the JSONL
+    // stream is the only output there is, so treating it as raw text would print
+    // event objects at the operator and, worse, hand the sentinel matcher a
+    // string containing every word the model reasoned about.
+    const lineParsed = streamJson || Boolean(rt.parse);
+    if (lineParsed) {
       let buf = '';
       const appendText = (t) => {
         out += t;
+      };
+      /** One line of the child's stdout, in whichever dialect it speaks. */
+      const onLine = (line) => {
+        if (!rt.parse) return handleStreamLine(line, { cwd, emit, onActivity, appendText });
+        const ev = rt.parse(line, cwd);
+        if (!ev) return;
+        if (ev.text) appendText(ev.text);
+        if (ev.activity) {
+          emit(`${ev.activity.label}\n`);
+          onActivity?.(ev.activity);
+        }
       };
       child.stdout.on('data', (d) => {
         buf += d.toString();
@@ -651,7 +681,7 @@ export function runTurn({ prompt, resume, system, cwd, mcpConfig, label, onSpawn
         while ((nl = buf.indexOf('\n')) >= 0) {
           const line = buf.slice(0, nl);
           buf = buf.slice(nl + 1);
-          if (line.trim()) handleStreamLine(line, { cwd, emit, onActivity, appendText });
+          if (line.trim()) onLine(line);
         }
       });
       // stderr is not JSON (warnings/errors) — pass through and keep for sentinels.
@@ -662,14 +692,14 @@ export function runTurn({ prompt, resume, system, cwd, mcpConfig, label, onSpawn
       });
       child.on('error', (e) => {
         if (e.code === 'ENOENT') {
-          console.error("\nerror: 'claude' CLI not found on PATH. Install Claude Code first.");
+          console.error(`\nerror: '${rt.bin}' CLI not found on PATH. Install ${rt.label} first: ${rt.install}`);
           process.exit(1);
         }
         console.error(e);
         resolve(out);
       });
       child.on('close', () => {
-        if (buf.trim()) handleStreamLine(buf, { cwd, emit, onActivity, appendText });
+        if (buf.trim()) onLine(buf);
         resolve(out);
       });
       return;
@@ -684,7 +714,7 @@ export function runTurn({ prompt, resume, system, cwd, mcpConfig, label, onSpawn
     child.stderr.on('data', onChunk);
     child.on('error', (e) => {
       if (e.code === 'ENOENT') {
-        console.error("\nerror: 'claude' CLI not found on PATH. Install Claude Code first.");
+        console.error(`\nerror: '${rt.bin}' CLI not found on PATH. Install ${rt.label} first: ${rt.install}`);
         process.exit(1);
       }
       console.error(e);

@@ -568,7 +568,7 @@ export async function runLiveTask({
   sampleDiffstat,
   agentId,
 }) {
-  const claim = await mcpCall(mcpUrl, token, 'claim_next_intent', {}).catch(() => null);
+  const claim = await mcpCall(mcpUrl, token, 'claim_next_task', {}).catch(() => null);
   if (!claim || claim.claimed !== true) return { outcome: 'nothing' };
   const { runId, intentId } = claim;
   const brief = claim.brief ?? {};
