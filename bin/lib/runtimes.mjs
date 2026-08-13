@@ -382,6 +382,14 @@ export const RUNTIMES = {
    * stdio deliberately, to remove every confound — no bearer token to reject,
    * no network, no TLS. The difference is the config LOCATION and nothing else.
    *
+   * AND IT SURVIVES THE TRUST VARIABLE, which was the obvious objection: agy
+   * keeps a `trustedWorkspaces` list in settings.json, a fresh per-task worktree
+   * is not on it, and an untrusted folder demonstrably changes behaviour (the
+   * model stops treating cwd as its workspace and works out of its own scratch
+   * dir). Adding the worktree to `trustedWorkspaces` and re-running changed
+   * nothing: the server still never spawned, the model still answered NO_MCP.
+   * So the workspace config is not trust-gated, it is simply not read.
+   *
    * So Antigravity's MCP config is machine-wide IN PRACTICE, and the original
    * blocker's conclusion stands even though its cited reason never did: every
    * lane on the box would share one worker token, which is exactly the blast
@@ -401,10 +409,25 @@ export const RUNTIMES = {
    *      a lane on a signed-out agy burns five minutes per turn looking like a
    *      hang. Preflight cannot see it: `--version` succeeds while signed out.
    *   2. `--sandbox` IS A BOOLEAN ("terminal restrictions enabled"), not a mode
-   *      selector. No read-only / workspace-write / danger-full-access axis, so a
-   *      `consult` posture cannot be expressed per invocation at all — it lives
-   *      in the machine-wide permissions engine. Opposite shape from Codex's gap
-   *      and harder: Codex was missing a flag, this is missing an axis.
+   *      selector — but a CONSULT POSTURE IS STILL EXPRESSIBLE, and this was
+   *      recorded backwards here for a while. It does not come from `--sandbox`
+   *      at all; it comes from headless mode's default. Any tool needing a
+   *      permission that cannot be prompted for is AUTO-DENIED:
+   *        "User denied permission to run command: <cmd>"
+   *        "a tool required the 'command' permission that headless mode cannot
+   *         prompt for, so it was auto-denied."
+   *      Observed repeatedly, including for an entirely benign `pwd && ls -la`,
+   *      and a local listener confirmed no egress in any run. Reads (list_dir,
+   *      file reads) work throughout. So: NOT passing
+   *      `--dangerously-skip-permissions` IS the consult posture, and passing it
+   *      is the build posture — both per invocation, both harness-enforced
+   *      rather than model-instructed. `--mode plan` is a separate, WEAKER thing:
+   *      it steers behaviour and blocks workspace writes, but it is not what
+   *      stops command execution.
+   *      RESIDUAL RISK, and it has no fix from here: `permissions.allow` in the
+   *      machine-wide settings.json is inherited, so a user who has allowed
+   *      `command(...)` widens every consult on that box. Codex has
+   *      `--ignore-user-config` for exactly this; agy has no equivalent.
    *   3. No `mcp` subcommand; `/mcp` is interactive-only.
    *   4. It attempts to INSTALL PLAYWRIGHT at startup (observed failing 404
    *      against playwright.azureedge.net). A daemon runtime that downloads and
