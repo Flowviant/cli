@@ -121,7 +121,7 @@ export function machineSnapshot({ worktreeDir, tasks = [] } = {}) {
     diskTotal: disk?.total ?? null,
     // Per-task, so "the box is full" can be traced to the task that filled it.
     tasks: tasks
-      .map((t) => ({ intentId: t.intentId, rss: processTreeRssBytes(t.pid) }))
-      .filter((t) => t.intentId && t.rss),
+      .map((t) => ({ taskId: t.intentId, rss: processTreeRssBytes(t.pid) }))
+      .filter((t) => t.taskId && t.rss),
   };
 }

@@ -88,7 +88,7 @@ async function registerLiveTarget(intentId, kind, url) {
         'Content-Type': 'application/json',
       },
       signal: AbortSignal.timeout(30_000),
-      body: JSON.stringify({ intentId, kind, url, ttlMinutes: PREVIEW_TTL_MINUTES }),
+      body: JSON.stringify({ taskId: intentId, kind, url, ttlMinutes: PREVIEW_TTL_MINUTES }),
     });
   } catch {
     /* best-effort — the tunnel still works; it just isn't linked in the app */
@@ -108,7 +108,7 @@ function clearLiveTarget(intentId, kind) {
       'Content-Type': 'application/json',
     },
     signal: AbortSignal.timeout(5_000),
-    body: JSON.stringify({ intentId, kind }),
+    body: JSON.stringify({ taskId: intentId, kind }),
   }).catch(() => {});
 }
 
@@ -127,7 +127,7 @@ function postPreviewNote(intentId, text) {
     signal: AbortSignal.timeout(10_000),
     // Scrub: preview failure reasons can quote dev-server output, which can
     // echo env values.
-    body: JSON.stringify({ intentId, text: envScrub(text) }),
+    body: JSON.stringify({ taskId: intentId, text: envScrub(text) }),
   }).catch(() => {});
 }
 
@@ -1274,7 +1274,13 @@ export async function runLiveTask({
     runtimes: DRIVABLE_HERE,
   }).catch(() => null);
   if (!claim || claim.claimed !== true) return { outcome: 'nothing' };
-  const { runId, intentId } = claim;
+  const runId = claim.runId;
+  // New name first: the server returns `taskId` natively and mirrors
+  // `intentId` beside it for exactly this read. Reading taskId is what lets
+  // that mirror (and the fleet routes' intentId compat) retire once
+  // daemon:min passes this release. The variable keeps the old spelling —
+  // it is the daemon's internal word, not a wire field.
+  const intentId = claim.taskId ?? claim.intentId;
   const brief = claim.brief ?? {};
   const title = brief.title ?? 'a task';
 

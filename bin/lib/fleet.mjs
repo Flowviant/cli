@@ -191,7 +191,7 @@ function sampleDiffstat(cwd, baseRef, intentId, agentId) {
         signal: AbortSignal.timeout(15_000),
         // The lane, not just the task: the server matches the run on both, so a
         // sample can only ever overwrite the diffstat of THIS lane's own run.
-        body: JSON.stringify({ intentId, agentId, diffstat: stat }),
+        body: JSON.stringify({ taskId: intentId, agentId, diffstat: stat }),
       });
       // Only a sample the server ACCEPTED counts as sent. Marking it delivered
       // before the round-trip meant a dropped request suppressed every retry
@@ -575,7 +575,7 @@ export async function runFleetDaemon() {
           // roster re-serves the job every poll, and each pass reverts the
           // revert — the change flapping in and out of the owner's tree forever.
           await reportMergeOutcome(PATCH_REVERT_DONE_URL, {
-            intentId: job.id,
+            taskId: job.id,
             ok: res.ok,
             error: res.ok ? undefined : String(res.error ?? 'revert failed'),
           });
@@ -693,9 +693,12 @@ export async function runFleetDaemon() {
   const checkingPlans = new Set();
   const processPlanCheckJobs = (jobs) => {
     for (const job of jobs ?? []) {
-      if (!job || typeof job.id !== 'string' || !Array.isArray(job.intents)) continue;
+      // New name first; the roster mirrors `intents` off `tasks` for exactly
+      // this fallback window.
+      const planTasks = Array.isArray(job?.tasks) ? job.tasks : job?.intents;
+      if (!job || typeof job.id !== 'string' || !Array.isArray(planTasks)) continue;
       if (checkingPlans.has(job.id)) continue;
-      if (job.intents.length === 0) continue;
+      if (planTasks.length === 0) continue;
       checkingPlans.add(job.id);
       (async () => {
         try {
@@ -711,7 +714,7 @@ export async function runFleetDaemon() {
           const out = await withWikiLock(async () => {
             ensureWikiWorktree();
             return runTurn({
-              prompt: PLAN_CHECK_KICKOFF({ title: job.title, intents: job.intents }),
+              prompt: PLAN_CHECK_KICKOFF({ title: job.title, intents: planTasks }),
               resume: false,
               system: SYSTEM_PLAN_CHECK,
               cwd: wikiWt,
@@ -721,12 +724,12 @@ export async function runFleetDaemon() {
               label: c.cyan('[plan]'),
             });
           });
-          const checks = parsePlanChecks(out, job.intents);
+          const checks = parsePlanChecks(out, planTasks);
           if (checks === null) {
             warn(`plan check for "${job.title}": no usable JSON — leaving the plan as drafted`);
           }
           await reportMergeOutcome(PLAN_CHECK_DONE_URL, {
-            intentId: job.id,
+            taskId: job.id,
             checks: checks ?? [],
           });
           if (checks?.length) {
@@ -737,7 +740,7 @@ export async function runFleetDaemon() {
         } catch (e) {
           warn(`plan check failed for "${job.title}": ${e?.message ?? e}`);
           // Clear the flag anyway — a stuck job would re-run every poll forever.
-          await reportMergeOutcome(PLAN_CHECK_DONE_URL, { intentId: job.id, checks: [] });
+          await reportMergeOutcome(PLAN_CHECK_DONE_URL, { taskId: job.id, checks: [] });
         } finally {
           checkingPlans.delete(job.id);
         }
@@ -797,7 +800,7 @@ export async function runFleetDaemon() {
       joinChain = joinChain.then(async () => {
         let settled = false;
         try {
-          const target = worktreeBuilding(job.intentId);
+          const target = worktreeBuilding(job.taskId ?? job.intentId);
           if (!target) {
             // The run ended (or moved) between the human pressing ⚡ and this
             // poll. Settle rather than retry: there is no worktree to join, and
@@ -818,11 +821,11 @@ export async function runFleetDaemon() {
           const claim = await postForData(JOIN_TAKE_URL, { joinId: job.id });
           if (!claim?.taken) return;
           note(
-            `${c.cyan('quick')} ${c.dim(`— ${job.askedByName || 'someone'} on "${job.intentTitle || 'a task'}"`)}`
+            `${c.cyan('quick')} ${c.dim(`— ${job.askedByName || 'someone'} on "${job.taskTitle || job.intentTitle || 'a task'}"`)}`
           );
           const out = await runTurn({
             prompt: QUICK_EDIT_KICKOFF({
-              intentTitle: job.intentTitle,
+              intentTitle: job.taskTitle ?? job.intentTitle,
               instruction: job.instruction,
               askedByName: job.askedByName,
             }),
@@ -946,7 +949,7 @@ export async function runFleetDaemon() {
           if (!isValidPrUrl(job.prUrl, originSlug(repoRoot))) {
             mergeAttempts.delete(job.id);
             await reportMergeOutcome(MERGE_FAILED_URL, {
-              intentId: job.id,
+              taskId: job.id,
               message: 'refused: PR URL is not a pull request in this repository',
             });
             warn(`merge REFUSED for "${job.title}": untrusted PR URL ${String(job.prUrl)}`);
@@ -973,7 +976,7 @@ export async function runFleetDaemon() {
               if (!/no changes|already/i.test(err)) {
                 mergeAttempts.delete(job.id);
                 await reportMergeOutcome(MERGE_FAILED_URL, {
-                  intentId: job.id,
+                  taskId: job.id,
                   message: `could not retarget the stacked PR onto ${baseBranchName(baseRef)} — merging it now would land in the branch below it, not ${baseBranchName(baseRef)}`,
                 });
                 warn(`merge held for "${job.title}": retarget failed — ${err.split('\n')[0]}`);
@@ -1010,7 +1013,7 @@ export async function runFleetDaemon() {
           }
           if (merged) {
             mergeAttempts.delete(job.id);
-            await reportMergeOutcome(MERGE_DONE_URL, { intentId: job.id });
+            await reportMergeOutcome(MERGE_DONE_URL, { taskId: job.id });
             ok(`${c.cyan('merged')} ${c.dim(`— ${job.title} → ${baseRef}`)}`);
             // The code just landed — re-ground the living wiki for what shipped
             // (touched nodes re-read + a persistent feature-history node).
@@ -1023,7 +1026,7 @@ export async function runFleetDaemon() {
             // button + notifies) — the job disappears from the roster.
             mergeAttempts.delete(job.id);
             await reportMergeOutcome(MERGE_FAILED_URL, {
-              intentId: job.id,
+              taskId: job.id,
               message: failedReason,
             });
             warn(`merge failed for "${job.title}": ${failedReason} — reported to the thread`);
@@ -1083,7 +1086,7 @@ export async function runFleetDaemon() {
           } else if (job.prUrl || job.branch) {
             warn(`cleanup REFUSED for "${job.title}": untrusted PR/branch value`);
           }
-          await reportMergeOutcome(CLEANUP_DONE_URL, { intentId: job.id });
+          await reportMergeOutcome(CLEANUP_DONE_URL, { taskId: job.id });
           ok(`${c.cyan('cleaned')} ${c.dim(`— ${job.title}`)}`);
         } finally {
           cleaning.delete(job.id);
@@ -1397,7 +1400,7 @@ export async function runFleetDaemon() {
             // sweep), so a failing re-ground can't loop-burn quota. Only a
             // crash BEFORE this line leaves the job listed for a retry.
             regroundAttempts.delete(task.intentId);
-            await reportMergeOutcome(REGROUND_DONE_URL, { intentId: task.intentId });
+            await reportMergeOutcome(REGROUND_DONE_URL, { taskId: task.intentId });
           }
         } catch (e) {
           warn(`wiki ${task.type} failed: ${e.message}`);
@@ -1553,7 +1556,13 @@ export async function runFleetDaemon() {
         mintedAt.set(a.agentId, Date.now());
       }
       hasWorkByAgent.set(a.agentId, !!a.hasWork);
-      if (a.next && typeof a.next.intentId === 'string') nextByAgent.set(a.agentId, a.next);
+      // The hint's task id, new name first. Normalized ONTO `intentId` here so
+      // every downstream read (poll worker, kickoff, diffstat attribution)
+      // keeps its one spelling — intent is still the daemon's internal word,
+      // taskId is the wire's.
+      const nextId = a.next && (a.next.taskId ?? a.next.intentId);
+      if (a.next && typeof nextId === 'string')
+        nextByAgent.set(a.agentId, { ...a.next, intentId: nextId });
       else nextByAgent.delete(a.agentId);
       if (!workers.has(a.agentId)) {
         // Local ceiling, enforced and not merely requested. The roster can carry
@@ -1647,8 +1656,9 @@ export async function runFleetDaemon() {
     // whose earlier mint failed.
     enqueueSweep(roster.codeMapJob);
     for (const j of roster.regroundJobs ?? []) {
-      if (!j || typeof j.intentId !== 'string') continue; // a null element would throw + wedge the loop
-      enqueueReground(j.intentId, j.prUrl, j.title, j.dirtiesPages);
+      const rid = j && (j.taskId ?? j.intentId); // new name first, old as fallback
+      if (!j || typeof rid !== 'string') continue; // a null element would throw + wedge the loop
+      enqueueReground(rid, j.prUrl, j.title, j.dirtiesPages);
     }
     void drainWiki();
 
