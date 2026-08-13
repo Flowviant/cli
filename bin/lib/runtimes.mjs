@@ -209,6 +209,13 @@ export const RUNTIMES = {
      *  only — it is an Anthropic SDK, not a CLI contract. Everything else runs
      *  the subprocess path. */
     live: true,
+    /**
+     * Every profile, because every profile is DEFINED in its vocabulary: the
+     * three `--allowedTools` lists in claude.mjs are what "build", "wiki" and
+     * "consult" currently mean. That is a statement about where the contract was
+     * written, not a claim that only Claude could ever satisfy it.
+     */
+    profiles: ['build', 'wiki', 'consult'],
     mcp: claudeMcp,
     /**
      * Claude takes the operating contract as a real system prompt, which is the
@@ -237,6 +244,28 @@ export const RUNTIMES = {
     install: 'npm i -g @openai/codex',
     login: 'codex login',
     live: false,
+    /**
+     * BUILD ONLY, and this is an unwired gap rather than a property of Codex.
+     *
+     * `args()` below destructures `perm` as `_perm` and ignores it: the only
+     * posture it expresses is `--sandbox workspace-write|danger-full-access`.
+     * That is a FILESYSTEM boundary, and the three profiles are a VERB
+     * allowlist — different shapes. claude.mjs states the reason next to
+     * WIKI_PERM: "Command execution is the line: it enables network exfil, which
+     * plain file writes never do." A sandbox that stops writes and still lets the
+     * model run arbitrary commands does not express `consult`, whose whole point
+     * is that a question ANY project editor can type steers the turn.
+     *
+     * Build is different and genuinely fine: a build turn is SUPPOSED to write,
+     * run tests and push, its prompt comes from a brief rather than a free-text
+     * question, and the sandbox modes cover the posture it needs.
+     *
+     * Add 'consult' here the moment `args()` can express a turn that cannot
+     * execute arbitrary commands and cannot reach the network — not merely one
+     * that cannot write. Same for 'wiki', which additionally needs writes scoped
+     * to the vault.
+     */
+    profiles: ['build'],
     mcp: codexMcp,
     /**
      * Codex has NO system-prompt flag. The contract therefore rides inside the
@@ -304,6 +333,8 @@ export const RUNTIMES = {
     install: 'see antigravity.google/docs/cli',
     login: 'agy',
     live: false,
+    /** None, because it cannot reach the MCP server at all — see `blocked`. */
+    profiles: [],
     mcp: null,
     args: null,
     parse: null,
@@ -343,6 +374,43 @@ export const runtimeById = (id) => RUNTIMES[id] ?? RUNTIMES.claude;
  * disagree the daemon either claims work it cannot build or refuses work it can.
  */
 export const drivableHere = (rt) => Boolean(rt.mcp && rt.args);
+
+/**
+ * WHICH RUNTIME RUNS A JOB THAT NOBODY @MENTIONED.
+ *
+ * Building a task has an author: you @mentioned a CLI, and that is the only
+ * dispatch in this product. The other turns have none — the wiki sweep, the
+ * re-ground, the plan check, the quick edit and the consult are all started by
+ * the daemon or the server, and until now every one of them took `runTurn`'s
+ * default parameter value and ran Claude. That was not a decision; it was five
+ * call sites omitting an argument, and it only looked correct while Claude was
+ * the only runtime and preflight refused to start without it.
+ *
+ * A PROFILE is a promise about what is IMPOSSIBLE during the turn, not a flag
+ * list — flag lists are per-vendor, promises are not, and the goal is that every
+ * runtime behaves the same way predictably. A runtime declares the profiles it
+ * can actually express; one that cannot express a profile does not get that job,
+ * rather than getting it with weaker guarantees nobody wrote down.
+ *
+ * Claude first when it qualifies — not favouritism, and worth saying plainly:
+ * these prompts were written and tuned against it, so it is the known-good
+ * answer and anything else is a substitution. When it is absent, any runtime
+ * that can express the profile runs the job, which is the whole point.
+ */
+export function pickRuntimeFor(profile, { detected } = {}) {
+  const rows = detected ?? detectRuntimes();
+  const ok = (id) => {
+    const rt = RUNTIMES[id];
+    return Boolean(
+      rt &&
+        drivableHere(rt) &&
+        (rt.profiles ?? []).includes(profile) &&
+        rows.find((d) => d.id === id)?.installed
+    );
+  };
+  if (ok('claude')) return 'claude';
+  return Object.keys(RUNTIMES).find(ok) ?? null;
+}
 
 // ── Detection ──────────────────────────────────────────────────────────────
 

@@ -76,7 +76,7 @@ import {
 } from './env.mjs';
 import { processDeployJobs, reportDeployConfig } from './deploy.mjs';
 import { machineSnapshot } from './resources.mjs';
-import { detectRuntimes } from './runtimes.mjs';
+import { detectRuntimes, pickRuntimeFor, RUNTIMES } from './runtimes.mjs';
 
 async function fetchRoster(haveIds) {
   const url = new URL(FLEET_URL);
@@ -699,6 +699,14 @@ export async function runFleetDaemon() {
       checkingPlans.add(job.id);
       (async () => {
         try {
+          // WHICH CLI answers a turn nobody @mentioned. Resolved per job rather
+          // than once at startup: a CLI can be installed while the daemon runs.
+          const planRt = pickRuntimeFor('consult');
+          if (!planRt) {
+            warn(`plan check for "${job.title}" skipped — no installed CLI can run a read-only turn`);
+            checkingPlans.delete(job.id);
+            return;
+          }
           note(`${c.cyan('plan')} ${c.dim(`— checking "${job.title}" against your code…`)}`);
           const out = await withWikiLock(async () => {
             ensureWikiWorktree();
@@ -709,6 +717,7 @@ export async function runFleetDaemon() {
               cwd: wikiWt,
               // Reads the repo and reports JSON — it authors nothing either.
               readOnly: true,
+              runtime: planRt,
               label: c.cyan('[plan]'),
             });
           });
@@ -804,6 +813,8 @@ export async function runFleetDaemon() {
           // Compare-and-set BEFORE spending a Claude turn: two lanes can wake on
           // the same push, and running one instruction twice into one worktree
           // is exactly the double-edit this is meant to avoid.
+          const quickRt = pickRuntimeFor('build');
+          if (!quickRt) return; // nothing here can edit code; leave the join unclaimed
           const claim = await postForData(JOIN_TAKE_URL, { joinId: job.id });
           if (!claim?.taken) return;
           note(
@@ -821,6 +832,7 @@ export async function runFleetDaemon() {
             resume: false,
             system: SYSTEM_QUICK_EDIT,
             cwd: target.wt,
+            runtime: quickRt,
             // No MCP: a join records no run, claims nothing, completes nothing.
             // Its only report is the one this daemon posts below.
             label: c.cyan('[quick]'),
@@ -864,6 +876,15 @@ export async function runFleetDaemon() {
           // Serialised against the wiki queue as well: that queue hard-resets
           // this worktree mid-turn, which would pull the files out from under a
           // consult that is reading them.
+          // A consult's prompt is steered by a question ANY project editor can
+          // type, so the profile is the enforcement and a runtime that cannot
+          // express it does not get the job. Today that means Claude; see the
+          // `profiles` notes in runtimes.mjs for exactly what Codex is missing.
+          const consultRt = pickRuntimeFor('consult');
+          if (!consultRt) {
+            warn('a consult is waiting, but no installed CLI can run a read-only turn');
+            return;
+          }
           await withWikiLock(async () => {
             ensureWikiWorktree();
             const out = await runTurn({
@@ -879,6 +900,7 @@ export async function runFleetDaemon() {
               // not to change anything, but the prompt is what an injected
               // question competes with; the toolset is what it cannot.
               readOnly: true,
+              runtime: consultRt,
               label: c.cyan('[ask]'),
             });
             const answer = (out || '').trim();
@@ -1296,14 +1318,23 @@ export async function runFleetDaemon() {
               warn(`wiki vault sync failed: ${e.message} — pages stay local; next turn retries`);
             }
           };
+          // The cartographer needs to read the repo and write ONLY the vault —
+          // a narrower promise than "build", so it is its own profile.
+          const wikiRt = pickRuntimeFor('wiki');
+          if (!wikiRt) {
+            warn('wiki generation skipped — no installed CLI can run a vault-scoped turn');
+            return;
+          }
+          const wikiLabel = RUNTIMES[wikiRt].label;
           if (task.type === 'sweep') {
-            note(`${c.cyan('wiki')} ${c.dim('— regenerating: your Claude is reading the repo…')}`);
+            note(`${c.cyan('wiki')} ${c.dim(`— regenerating: your ${wikiLabel} is reading the repo…`)}`);
             const out = await runTurn({
               prompt: WIKI_KICKOFF(sha, vaultDir),
               resume: false,
               system: SYSTEM_WIKI(vaultDir),
               cwd: wikiWt,
               wikiPerm: true,
+              runtime: wikiRt,
               label: c.cyan('[wiki]'),
               streamJson: true,
               onActivity,
@@ -1346,6 +1377,7 @@ export async function runFleetDaemon() {
                 system: SYSTEM_REGROUND(vaultDir),
                 cwd: wikiWt,
                 wikiPerm: true,
+                runtime: wikiRt,
                 label: c.cyan('[wiki]'),
                 streamJson: true,
                 onActivity,

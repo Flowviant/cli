@@ -692,8 +692,18 @@ export function runTurn({ prompt, resume, system, cwd, mcpConfig, mcpArgs, mcpEn
       });
       child.on('error', (e) => {
         if (e.code === 'ENOENT') {
+          // A MISSING CLI FAILS THE TURN, NOT THE DAEMON. This called
+          // process.exit(1), which was defensible while `claude` was the only
+          // runtime and preflight refused to start without it — the process
+          // could not reach here. Both halves of that are gone: preflight is now
+          // fatal only when NOTHING is drivable, so a Codex-only machine starts
+          // legitimately, and the wiki/plan-check/consult turns still ask for
+          // Claude by default. On such a machine the first wiki sweep would have
+          // killed the whole daemon, taking every in-flight build with it,
+          // because one background job could not find one binary.
           console.error(`\nerror: '${rt.bin}' CLI not found on PATH. Install ${rt.label} first: ${rt.install}`);
-          process.exit(1);
+          resolve('');
+          return;
         }
         console.error(e);
         resolve(out);
