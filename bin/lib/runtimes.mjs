@@ -361,85 +361,66 @@ export const RUNTIMES = {
   },
 
   /**
-   * DECLARED, NOT DRIVABLE — but NOT for the reason this comment used to give.
+   * DECLARED, NOT DRIVABLE — and this is now MEASURED rather than argued.
    *
-   * THE OLD REASON WAS WRONG, and wrong about a filename. It said workspace-local
-   * `.agents/mcp_config.json` is "read-but-ignored (upstream antigravity-cli#60)".
-   * Issue #60 is titled "Project-local `.antigravitycli/mcp_config.json`
-   * mcpServers is read but ignored" — a DIFFERENT directory. `.antigravitycli/`
-   * is the CLI's project-DISCOVERY folder; `.agents/` is its workspace
-   * CUSTOMIZATION folder. The reporter had put their config in the wrong place,
-   * and we inherited their conclusion.
+   * The reason went wrong twice before it went right, so the evidence is written
+   * down here in full. First it cited upstream antigravity-cli#60, which is about
+   * `.antigravitycli/mcp_config.json` — the project-DISCOVERY folder — while
+   * claiming it was about `.agents/`, the workspace-CUSTOMIZATION folder. Then,
+   * on reading the docs (antigravity.google/docs/mcp describes `.agents/`, and
+   * Google's own codelab creates it), this comment swung the other way and said
+   * the blocker looked wrong. Both were reasoning from paperwork.
    *
-   * `.agents/mcp_config.json` is the documented workspace path — antigravity.google
-   * /docs/mcp, and Google's own codelab does `mkdir -p .agents` then verifies with
-   * `/mcp` inside agy. A server entry takes `serverUrl` + `transport` + `headers`,
-   * so a bearer token goes in as `{"Authorization": "Bearer <token>"}`. Since every
-   * Flowviant task already builds in its OWN worktree, a workspace-local file IS a
-   * per-lane token — the isolation the old comment called impossible, with no HOME
-   * repointing, so the cached-credential objection dissolves with it.
+   * THE TEST, run against agy 1.1.12, signed in, in a real git repo:
+   * the SAME minimal stdio MCP server, declared two ways.
+   *   • workspace `<worktree>/.agents/mcp_config.json` → the server process is
+   *     NEVER SPAWNED. Not connected-and-failed: never launched. The model
+   *     answers "NO_MCP".
+   *   • global `~/.gemini/config/mcp_config.json` → spawns immediately and
+   *     handshakes: server/discover, initialize, notifications/initialized,
+   *     tools/list.
+   * stdio deliberately, to remove every confound — no bearer token to reject,
+   * no network, no TLS. The difference is the config LOCATION and nothing else.
    *
-   * It stays undrivable because none of that is OBSERVED. `agy` is not installed
-   * here, so the above is documentation. Three things are genuinely unknown and
-   * one is likely fatal:
-   *   (a) does the workspace file MERGE with the global one or OVERRIDE it?
-   *       Undocumented; merge means a stale HOME entry still loads.
-   *   (b) is workspace load gated on folder TRUST? CHANGELOG 1.1.0 fixed
-   *       `.agents/hooks.json` not loading "after trusting a folder", and a fresh
-   *       per-task worktree is an untrusted folder EVERY TIME. This is the most
-   *       likely real blocker.
-   *   (c) is it re-read per invocation?
-   * The cheap check, once `agy` exists: drop a `.agents/mcp_config.json` in a
-   * throwaway worktree, run `agy -p "hi" --output-format stream-json`, and read
-   * the `tools` array in the `init` event — the flowviant tools appear or they
-   * do not.
+   * So Antigravity's MCP config is machine-wide IN PRACTICE, and the original
+   * blocker's conclusion stands even though its cited reason never did: every
+   * lane on the box would share one worker token, which is exactly the blast
+   * radius the per-lane token exists to prevent. That is why this stays
+   * undrivable, and it is a property of the CLI rather than something we can
+   * work around from here.
    *
-   * TWO THINGS TO CARRY OVER WHEN IT IS WIRED:
-   *   • The token must be LITERAL in the file — `${VAR}` is not expanded (upstream
-   *     #233 asks for it). So a plaintext bearer lands on disk inside the
-   *     worktree, which is the same `git add -A` exposure that got AGENTS.md
-   *     rejected for Codex. It needs `.git/info/exclude` and a teardown scrub,
-   *     and it is strictly worse than Codex's env-var hand-off.
-   *   • PERMISSIONS ARE STILL MACHINE-WIDE. `~/.gemini/antigravity-cli/settings.json`
-   *     holds the allow/ask/deny engine, and it is the only documented location.
-   *     Even with MCP per-workspace, that is a real per-lane gap for `profiles`
-   *     below: two lanes cannot hold different postures at once.
+   * A TRAP FOR WHOEVER RE-TESTS THIS: agy exposes MCP through a single generic
+   * `call_mcp_tool` dispatcher, so per-server tools NEVER appear in the `init`
+   * event's tools array even when a server is loaded correctly. Reading that
+   * array tells you nothing. Watch the server process instead, or ask the model.
    *
-   * Pin any wiring to agy >= 1.1.10 — `--model`/`--effort` were ignored in
-   * headless before it, and `--output-format` only arrived in 1.1.8.
-   *
-   * OBSERVED against the real 1.1.12 binary (fetched from Google's bucket and
-   * SHA512-verified; not installed). The MCP question is STILL open, because
-   * answering it needs a signed-in session — but four other things are now facts
-   * rather than documentation, and two of them are new obstacles:
-   *
-   *   1. AUTH IS INTERACTIVE OAUTH, with no headless credential path in `--help`.
-   *      A signed-out `agy -p` prints a Google consent URL to stderr, waits, and
-   *      then emits `{"event":"result","result":{"status":"ERROR","error":
-   *      "authentication failed or timed out"}}`. It does not fail fast: it sits
-   *      until `--print-timeout` (default 5m). A lane that picked up work on a
-   *      signed-out agy would burn five minutes per turn looking like a hang.
-   *      Preflight cannot detect this either — `--version` succeeds while
-   *      signed out, same blind spot every runtime has here.
-   *   2. `--sandbox` IS A BOOLEAN ("Run in a sandbox with terminal restrictions
-   *      enabled"), not a mode selector. There is no `read-only` /
-   *      `workspace-write` / `danger-full-access` axis like Codex's, so the
-   *      posture for a `consult` cannot be expressed per invocation at all — it
-   *      lives in the machine-wide permissions engine. That makes `profiles`
-   *      harder here than for Codex, not easier.
-   *   3. NO `mcp` SUBCOMMAND. `/mcp` is an interactive slash command, so the
-   *      only headless window into which servers loaded is the `init` event of
-   *      `--output-format stream-json` — which needs auth first. That is why
-   *      the workspace-config question cannot be settled without a login.
-   *   4. It tries to INSTALL PLAYWRIGHT on startup (observed failing with a 404
+   * FOUR MORE FACTS from the same session, each an independent obstacle:
+   *   1. AUTH IS INTERACTIVE OAUTH (bubbletea TUI; needs a real /dev/tty), with
+   *      no headless credential path. A signed-out `agy -p` prints a consent URL
+   *      and then SITS until `--print-timeout` (default 5m) before erroring — so
+   *      a lane on a signed-out agy burns five minutes per turn looking like a
+   *      hang. Preflight cannot see it: `--version` succeeds while signed out.
+   *   2. `--sandbox` IS A BOOLEAN ("terminal restrictions enabled"), not a mode
+   *      selector. No read-only / workspace-write / danger-full-access axis, so a
+   *      `consult` posture cannot be expressed per invocation at all — it lives
+   *      in the machine-wide permissions engine. Opposite shape from Codex's gap
+   *      and harder: Codex was missing a flag, this is missing an axis.
+   *   3. No `mcp` subcommand; `/mcp` is interactive-only.
+   *   4. It attempts to INSTALL PLAYWRIGHT at startup (observed failing 404
    *      against playwright.azureedge.net). A daemon runtime that downloads and
-   *      runs a browser driver is a surprise worth knowing about before this is
-   *      wired into a machine the project leaves running.
+   *      runs a browser driver is worth knowing before it goes on a machine the
+   *      project leaves running.
    *
-   * To finish the test: sign in once (`agy` interactively, follow the consent
-   * URL), then in a throwaway git worktree containing `.agents/mcp_config.json`
-   * run `agy -p "list your tools" --output-format stream-json` and read the
-   * `init` event's tools array.
+   * There is no npm package. `antigravity-cli` (0.0.1, "placeholder") and `agy`
+   * (0.0.0, empty) on npm are SQUATS by unrelated accounts; the real channel is
+   * the install script at antigravity.google, which is why `install` below says
+   * to see the docs rather than naming an npm command.
+   *
+   * WHAT WOULD UNBLOCK IT: a per-invocation MCP flag or env var, or workspace
+   * configs actually being honoured. Re-test with the two-location stdio probe
+   * above — it is five minutes and it answers the question outright. Pin any
+   * wiring to >= 1.1.10 (`--model`/`--effort` were ignored in headless before it;
+   * `--output-format` arrived in 1.1.8).
    */
   antigravity: {
     id: 'antigravity',
@@ -455,7 +436,7 @@ export const RUNTIMES = {
     args: null,
     parse: null,
     blocked:
-      'unverified: its workspace MCP config looks per-worktree (so per-lane), but nothing has tested whether a fresh untrusted worktree loads it',
+      'its MCP config is machine-wide — a workspace .agents/mcp_config.json is never loaded (measured), so every lane would share one token',
   },
 };
 
