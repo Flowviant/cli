@@ -719,14 +719,26 @@ function parseMediatedResult(out) {
   // `stalled` after two nudges. Reproduced before fixing.
   let tried = 0;
   for (let i = text.lastIndexOf('{'); i >= 0; i = text.lastIndexOf('{', i - 1)) {
-    // Bounded: an unbalanced brace in prose scans to end-of-text, and a build's
-    // output can be very long. The real object is at the end — 200 candidates is
-    // far past any honest wrapper and keeps a pathological output from stalling
-    // the turn loop instead of the model.
-    if (++tried > 200) break;
-    const span = balancedSpan(text, i);
-    const cand = span && tryJson(span);
-    if (cand) return cand;
+    // A candidate must OPEN ITS OWN LINE (whitespace aside). A form echoed
+    // mid-sentence is how a hypothetical became a delivery card: `I would
+    // return {"outcome":"done",…} once done. But I could not…` parsed as done
+    // and posted a completed card for a failed build (reproduced). A real form
+    // — bare, fenced, or followed by notes — opens at a line start, and a
+    // wrapper that inlines it gets the nudge, which asks for the bare object
+    // anyway. A wrong card has no recovery; a nudge does. Skipped candidates
+    // don't count against the bound, which also keeps a trailing prose brace
+    // from burning slots the real object needs.
+    const bol = text.lastIndexOf('\n', i - 1) + 1;
+    if (!text.slice(bol, i).trim()) {
+      // Bounded: an unbalanced brace scans to end-of-text, and a build's output
+      // can be very long. The real object is at the end — 200 candidates is far
+      // past any honest wrapper and keeps a pathological output from stalling
+      // the turn loop instead of the model.
+      if (++tried > 200) break;
+      const span = balancedSpan(text, i);
+      const cand = span && tryJson(span);
+      if (cand) return cand;
+    }
     if (i === 0) break;
   }
   return null;
@@ -767,9 +779,12 @@ const PR_URL_RE = /^https:\/\/github\.com\/[^/]+\/[^/]+\/pull\/\d+/;
 function sanitizeCriteria(criteria) {
   if (!Array.isArray(criteria)) return null;
   const rows = criteria
-    .filter((c) => c && Number.isFinite(c.index) && typeof c.met === 'boolean')
+    // A negative index is DROPPED, not clamped: Math.max(0, …) would silently
+    // re-attribute the row to criterion 0, which is a wrong self-report rather
+    // than a missing one.
+    .filter((c) => c && Number.isFinite(c.index) && c.index >= 0 && typeof c.met === 'boolean')
     .map((c) => ({
-      index: Math.max(0, Math.trunc(c.index)),
+      index: Math.trunc(c.index),
       met: c.met,
       ...(typeof c.note === 'string' && c.note ? { note: c.note.slice(0, 500) } : {}),
     }))
@@ -854,7 +869,6 @@ async function driveMediated({
   const rt = runtimeById(runtimeId);
   const dir = mkdtempSync(join(tmpdir(), 'flowviant-schema-'));
   const schemaPath = join(dir, 'result.schema.json');
-  writeFileSync(schemaPath, JSON.stringify(MEDIATED_RESULT_SCHEMA), { mode: 0o600 });
 
   // The agent cannot call report_progress, so the daemon narrates for it off the
   // parsed activity stream. Throttled: a build touches hundreds of files and the
@@ -876,6 +890,9 @@ async function driveMediated({
   let resume = false;
   let nudges = 0;
   try {
+    // Inside the try so a failed write (disk full) still removes `dir` in the
+    // finally instead of leaking one temp directory per attempt.
+    writeFileSync(schemaPath, JSON.stringify(MEDIATED_RESULT_SCHEMA), { mode: 0o600 });
     for (;;) {
       if (!isAlive()) return { outcome: 'blocked', title, intentId };
       let out = '';
@@ -922,22 +939,49 @@ async function driveMediated({
       }
 
       if (result.outcome === 'blocked') {
-        const q = String(result.blockerQuestion ?? result.summary ?? '').trim();
-        const posted = await mcpCall(mcpUrl, token, 'report_blocker', {
-          runId,
-          taskId: intentId,
-          type: 'question',
-          payload: {
-            question: q || 'The agent stopped and did not say why.',
-            options: Array.isArray(result.blockerOptions) ? result.blockerOptions : undefined,
-          },
-        }).catch(() => null);
+        // Clamp AND scrub, same discipline as postComplete below, and for the
+        // same reason: on this path the DAEMON is the caller, so the model never
+        // sees the server's zod rejection and cannot self-correct. The server
+        // caps question at 2000 and options at 10×500 (questionPayloadSchema) —
+        // an oversize value posted raw is a rejected post, i.e. a question that
+        // silently never reaches the human. And the question is model narration
+        // leaving the box, exactly what the uplink scrub exists for.
+        const q =
+          envScrub(String(result.blockerQuestion ?? result.summary ?? '').trim()).slice(0, 2000) ||
+          'The agent stopped and did not say why.';
+        const options = (Array.isArray(result.blockerOptions) ? result.blockerOptions : [])
+          .filter((o) => typeof o === 'string' && o.trim())
+          .map((o) => envScrub(o.trim()).slice(0, 500))
+          .filter(Boolean)
+          .slice(0, 10);
+        const post = () =>
+          mcpCall(mcpUrl, token, 'report_blocker', {
+            runId,
+            taskId: intentId,
+            type: 'question',
+            payload: { question: q, ...(options.length ? { options } : {}) },
+          }).catch(() => null);
+        // One retry: reportBlockerOnce is idempotent server-side, and a dropped
+        // response is the documented reason it is.
+        let posted = await post();
+        if (!posted?.blockerId && !posted?.id) {
+          await sleep(2);
+          posted = await post();
+        }
         const blockerId = posted?.blockerId ?? posted?.id ?? null;
         if (!blockerId) {
           // The question exists only in this process. Say why on the way out —
           // silence here reads identically to a human who has not answered yet.
-          warn(`report_blocker did not return an id (${posted?.reason ?? 'no response'}) — the question was not posted`);
-          return { outcome: 'blocked', title, intentId };
+          //
+          // 'error', NOT 'blocked': on every driver 'blocked' means "shutting
+          // down mid-park", and runLiveWorker BREAKS on it — a lane that ends
+          // its loop is never respawned (workers.delete fires only on roster
+          // removal), so returning it here turned one failed post into a lane
+          // that sat dead-but-listed until the daemon restarted. 'error' takes
+          // the refresh-token-and-retry path, and the shared finally's
+          // checkpoint keeps the work for whoever picks the task back up.
+          warn(`report_blocker did not return an id (${posted?.reason ?? posted?.raw ?? 'no response'}) — the question was not posted`);
+          return { outcome: 'error', error: 'report_blocker failed', title, intentId };
         }
         const res = await waitForResolution(mcpUrl, token, blockerId, isAlive);
         if (res.status === 'resolved') {
