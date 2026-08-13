@@ -614,6 +614,17 @@ export function runTurn({ prompt, resume, system, cwd, mcpConfig, mcpArgs, mcpEn
     // all: unset means the CLI's own default, the honest resting state.
     //
     // readOnly wins over wikiPerm: a consult must never inherit write tools.
+    //
+    // TWO FORMS OF THE SAME DECISION, and the redundancy is deliberate rather
+    // than sloppy. `profile` is the NAME of the posture — a promise about what
+    // must be impossible during the turn — and every runtime expresses it in its
+    // own vocabulary: Claude as an `--allowedTools` verb list, Codex as a kernel
+    // sandbox mode plus feature toggles. `perm` is Claude's expression, still
+    // computed here only because those three arrays live in this file; it
+    // collapses into the registry the day every runtime expresses every profile.
+    // Both derive from the same branch, so they cannot disagree about which
+    // posture a turn is running under.
+    const profile = readOnly ? 'consult' : wikiPerm ? 'wiki' : 'build';
     const args = rt.args({
       prompt,
       system,
@@ -621,6 +632,7 @@ export function runTurn({ prompt, resume, system, cwd, mcpConfig, mcpArgs, mcpEn
       effort,
       resume,
       streamJson,
+      profile,
       perm: readOnly ? CONSULT_PERM : wikiPerm ? WIKI_PERM : PERM,
       // Handed to the adapter rather than appended here, because WHERE these go
       // is a property of the CLI: Codex reads its prompt as a trailing

@@ -142,6 +142,19 @@ function parseCodexLine(line, cwd) {
         activity: { kind: 'error', label: oneLine(ev.error?.message ?? 'turn failed') },
         text: '',
       };
+    // A bare `error` event — the shape an auth failure arrives in ("401
+    // Unauthorized: Missing bearer…", observed against 0.147.0 with no
+    // credentials). It used to fall through to `default` and be dropped, which
+    // meant a signed-out Codex produced an EMPTY turn: no sentinel, so the
+    // driver nudged twice and reported `stalled`, and the thread said the agent
+    // gave up rather than that the CLI is not signed in. The message goes into
+    // `text` so it reaches the operator's console AND the usage-limit
+    // classifier, which reads exactly this stream.
+    case 'error':
+      return {
+        activity: { kind: 'error', label: oneLine(ev.message ?? 'error') },
+        text: `${ev.message ?? ''}\n`,
+      };
     default:
       return null; // thread.started / turn.started / item.started / item.updated
   }
@@ -245,27 +258,24 @@ export const RUNTIMES = {
     login: 'codex login',
     live: false,
     /**
-     * BUILD ONLY, and this is an unwired gap rather than a property of Codex.
+     * BUILD AND CONSULT. See `args()` below for how consult is expressed — the
+     * short version is that Codex keeps the promise at the kernel rather than in
+     * a verb allowlist, and for a consult's actual threat (exfiltration driven
+     * by an injected question) that is sufficient and arguably stronger.
      *
-     * `args()` below destructures `perm` as `_perm` and ignores it: the only
-     * posture it expresses is `--sandbox workspace-write|danger-full-access`.
-     * That is a FILESYSTEM boundary, and the three profiles are a VERB
-     * allowlist — different shapes. claude.mjs states the reason next to
-     * WIKI_PERM: "Command execution is the line: it enables network exfil, which
-     * plain file writes never do." A sandbox that stops writes and still lets the
-     * model run arbitrary commands does not express `consult`, whose whole point
-     * is that a question ANY project editor can type steers the turn.
+     * NOT 'wiki', and the reason is mundane rather than deep: the vault lives at
+     * ~/.flowviant/vaults/<id>, OUTSIDE the worktree Codex would run in, so
+     * `workspace-write` cannot reach it. It needs the vault path threaded down
+     * to `args()` as `--add-dir` / `writable_roots`, which nothing passes yet.
+     * Network is already denied by default in workspace-write, so the exfil half
+     * of WIKI_PERM's reasoning is covered — this is a plumbing gap, not a
+     * safety one.
      *
-     * Build is different and genuinely fine: a build turn is SUPPOSED to write,
-     * run tests and push, its prompt comes from a brief rather than a free-text
-     * question, and the sandbox modes cover the posture it needs.
-     *
-     * Add 'consult' here the moment `args()` can express a turn that cannot
-     * execute arbitrary commands and cannot reach the network — not merely one
-     * that cannot write. Same for 'wiki', which additionally needs writes scoped
-     * to the vault.
+     * Enforcement was verified on Linux (bubblewrap + seccomp). macOS Seatbelt
+     * and Windows are UNTESTED; if this daemon starts running there, re-verify
+     * before trusting the consult posture on those platforms.
      */
-    profiles: ['build'],
+    profiles: ['build', 'consult'],
     mcp: codexMcp,
     /**
      * Codex has NO system-prompt flag. The contract therefore rides inside the
@@ -287,17 +297,62 @@ export const RUNTIMES = {
      * placed before it. Appending them after the positional is the kind of argv
      * that parses today and stops parsing on some future clap upgrade.
      */
-    args({ prompt, system, model, effort, resume, perm: _perm, mcp = [] }) {
+    args({ prompt, system, model, effort, resume, profile = 'build', mcp = [] }) {
       const a = ['exec'];
       if (resume) a.push('resume', '--last');
       a.push('--json');
       if (model) a.push('--model', model);
       // Effort is a config value on Codex rather than a flag.
       if (effort) a.push('-c', `model_reasoning_effort="${effort}"`);
-      // The daemon's posture, mapped: SAFE keeps writes inside the workspace,
-      // the default lets the agent run its own tests and git commands. Neither
-      // asks a human — there is no human on this end of the pipe.
-      a.push('--sandbox', SAFE ? 'workspace-write' : 'danger-full-access');
+
+      if (profile === 'consult') {
+        // A CONSULT, EXPRESSED THE ONLY WAY CODEX CAN EXPRESS IT — and it is a
+        // different shape from Claude's, which is the whole reason `profile` is
+        // a promise rather than a flag list.
+        //
+        // Claude gets a VERB allowlist: Read, Grep, Glob and a handful of
+        // read-only Bash forms, with nothing that reaches the network. Codex has
+        // no such thing — it has no file-read tool at all, so reading the repo
+        // IS command execution (`cat`, `rg`). Removing the shell leaves the
+        // model with exactly ["update_plan","request_user_input"], which cannot
+        // answer a question about a codebase. You get both capabilities or
+        // neither.
+        //
+        // So the promise is kept one layer down instead. `read-only` is
+        // kernel-enforced (bubblewrap + seccomp on Linux): writes fail, and a
+        // direct-IP connect fails with "Operation not permitted" — socket() is
+        // denied, not merely DNS. An injected command still RUNS and still
+        // cannot take the repository anywhere, which is the threat a consult
+        // actually has: its prompt is steered by a question any project editor
+        // can type. Arguably a stronger guarantee than the allowlist, being
+        // below the agent rather than inside it.
+        a.push('--sandbox', 'read-only');
+
+        // THE HOLE THE SANDBOX DOES NOT COVER. `web_search` ships in `codex
+        // exec`'s default tool list even without --search, and it executes
+        // SERVER-SIDE at OpenAI — no local sandbox touches it. An injected turn
+        // could pack repo contents into a query and egress them straight past
+        // everything above. Both spellings, because the two config systems
+        // disagree about which one is live.
+        a.push('-c', 'tools.web_search=false', '-c', 'web_search="disabled"');
+
+        // Sub-agents would be a second turn whose posture nobody here chose.
+        a.push('-c', 'features.multi_agent=false', '-c', 'features.goals=false');
+
+        // HERMETIC. Without these a user's ~/.codex/config.toml, a project
+        // `.rules` execpolicy file, or their own MCP servers can widen a posture
+        // we are asserting on their behalf — silently, and on the one turn whose
+        // prompt comes from someone else's typing.
+        a.push('--ignore-user-config', '--ignore-rules');
+      } else {
+        // The daemon's build posture, mapped: SAFE keeps writes inside the
+        // workspace, the default lets the agent run its own tests and git
+        // commands. Neither asks a human — there is no human on this end of the
+        // pipe. Deliberately NOT hermetic: a build is work the user asked for by
+        // @mentioning this CLI, and their own config is theirs to apply.
+        a.push('--sandbox', SAFE ? 'workspace-write' : 'danger-full-access');
+      }
+
       a.push(...mcp);
       a.push(`${system}\n\n---\n\n${prompt}`);
       return a;
