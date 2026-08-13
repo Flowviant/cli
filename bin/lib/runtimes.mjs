@@ -766,7 +766,7 @@ export function pickRuntimeFor(profile, { detected } = {}) {
 // ── Detection ──────────────────────────────────────────────────────────────
 
 /**
- * Which of these is on this machine, asked once.
+ * Which of these is on this machine, asked at most once per DETECT_TTL_MS.
  *
  * `--version` rather than `which`: a binary on PATH that cannot execute (a
  * broken install, a wrong-arch download, a shell alias pointing at nothing) is
@@ -779,8 +779,18 @@ export function pickRuntimeFor(profile, { detected } = {}) {
  * account, no quota, no entitlement. Flowviant relays; it does not enforce.
  */
 let detectedCache = null;
+let detectedAt = 0;
+// The cache EXPIRES rather than living for the process: pickRuntimeFor's whole
+// premise is "a CLI can be installed while the daemon runs", and both it and
+// the roster poll read this cache — a forever-cache made that comment a lie
+// (nothing after preflight ever passed refresh, so a mid-run install was
+// invisible until restart, to the server included). 5 minutes keeps the probes
+// (3 sync --version execs) off the hot path while an install still surfaces on
+// the next poll or job.
+const DETECT_TTL_MS = 5 * 60 * 1000;
 export function detectRuntimes({ refresh = false } = {}) {
-  if (detectedCache && !refresh) return detectedCache;
+  if (detectedCache && !refresh && Date.now() - detectedAt < DETECT_TTL_MS) return detectedCache;
+  detectedAt = Date.now();
   detectedCache = Object.values(RUNTIMES).map((rt) => {
     let version = null;
     try {
