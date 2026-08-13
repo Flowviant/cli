@@ -44,12 +44,25 @@ import {
   clearWip,
 } from './git.mjs';
 import { applyPatch, fileDiffs, ownerCurrentBranch, withPatchLock } from './patch.mjs';
+import { RUNTIMES } from './runtimes.mjs';
 import { loadPreviewConfig, startPreview } from './preview.mjs';
 import { materializeInto, scrub as envScrub } from './env.mjs';
 
 // Register a branch preview's tunnel URL with Flowviant (fleet-authed). The
 // reviewer then drives it via "Open live preview" in the node.
 const LIVE_TARGET_URL = FLEET_URL.replace(/\/agents\/?$/, '/live-target');
+
+/**
+ * What a live session can build, sent on every claim.
+ *
+ * Read off the registry rather than written as `['claude']` so that the day a
+ * second runtime gains an SDK session, marking `live: true` there is the whole
+ * change — a hand-written list here would keep withholding its work and the
+ * reason would be three files away from the flag that looks like it decides.
+ */
+const LIVE_RUNTIMES = Object.values(RUNTIMES)
+  .filter((r) => r.live === true && r.mcp && r.args)
+  .map((r) => r.id);
 // Short TTL + a heartbeat that re-asserts while the tunnel is alive. So a live
 // preview stays linked indefinitely (survives long reviews), but one whose
 // daemon DIED ungracefully (no more heartbeats) drops off the card within the
@@ -568,7 +581,24 @@ export async function runLiveTask({
   sampleDiffstat,
   agentId,
 }) {
-  const claim = await mcpCall(mcpUrl, token, 'claim_next_task', {}).catch(() => null);
+  // SAY WHAT THIS WORKER CAN DRIVE. The claim is UNPINNED — this worker asks for
+  // whatever is next rather than for a named task — and that is deliberate (the
+  // roster hint is a prediction made before anything is claimed, so pinning to it
+  // would sometimes pin to the wrong task). The cost of not pinning is that the
+  // server decides, and until it was told, it decided using the MACHINE's
+  // capability report: on a box with Codex installed it would hand a
+  // codex-addressed task to this worker, which drives the Anthropic Agent SDK
+  // and nothing else, and Claude would build it. Nobody was told. The @mention is
+  // the only dispatch in this product, and silently answering it with a different
+  // CLI is the same class of bug as dispatching from the wrong surface.
+  //
+  // A live session is Claude-only by construction, not by configuration — it is
+  // an SDK, not a subprocess — so this list is exactly the runtimes marked
+  // `live` in the registry. An older server ignores the argument and behaves as
+  // before; that degrade is what `daemon:min` is for.
+  const claim = await mcpCall(mcpUrl, token, 'claim_next_task', {
+    runtimes: LIVE_RUNTIMES,
+  }).catch(() => null);
   if (!claim || claim.claimed !== true) return { outcome: 'nothing' };
   const { runId, intentId } = claim;
   const brief = claim.brief ?? {};

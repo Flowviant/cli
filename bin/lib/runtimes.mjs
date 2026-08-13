@@ -31,7 +31,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { SAFE, MODEL, USER_AGENT } from './config.mjs';
+import { SAFE, MODEL, USER_AGENT, LIVE } from './config.mjs';
 
 /** Truncate for a one-line activity label. */
 const oneLine = (s, n = 140) =>
@@ -316,6 +316,29 @@ export const DISPATCHABLE = Object.values(RUNTIMES).filter((r) => r.mcp && r.arg
 
 export const runtimeById = (id) => RUNTIMES[id] ?? RUNTIMES.claude;
 
+/**
+ * Can the worker this daemon is running actually DRIVE this runtime right now?
+ *
+ * `dispatchable` answers "is the CLI installed and does this module know how to
+ * spawn it" — a fact about the machine. This answers a narrower question about
+ * THIS PROCESS, and the two came apart the moment live mode became the default.
+ *
+ * Live mode does not spawn a CLI at all: it drives the Anthropic Agent SDK
+ * in-process, which is why `claude.live` is the only `true` in the registry. So
+ * on a machine with Codex installed, `dispatchable` says codex and the live
+ * worker still cannot build a codex task — and it was claiming them anyway and
+ * building them with Claude, because a claim that names no runtime gets whatever
+ * is next in line.
+ *
+ * Reporting drivability rather than installation is what makes the app's answer
+ * true: "this machine cannot drive Codex" is a fact the user can act on (restart
+ * with FLOWVIANT_POLL=1, or wait for the live subprocess path), where "Codex is
+ * installed" plus a task that never starts is a mystery. Activity, never
+ * aspiration.
+ */
+export const drivableHere = (rt) =>
+  Boolean(rt.mcp && rt.args) && (LIVE ? rt.live === true : true);
+
 // ── Detection ──────────────────────────────────────────────────────────────
 
 /**
@@ -355,8 +378,15 @@ export function detectRuntimes({ refresh = false } = {}) {
       version,
       // Installed and drivable are different questions, and conflating them is
       // how a user ends up @mentioning something that silently never starts.
-      dispatchable: version !== null && Boolean(rt.mcp && rt.args),
-      blocked: rt.blocked ?? null,
+      // THREE questions, in fact — see `drivableHere`: the CLI can be installed,
+      // and this module can know how to spawn it, and the worker this daemon is
+      // running can still be unable to drive it.
+      dispatchable: version !== null && drivableHere(rt),
+      blocked:
+        rt.blocked ??
+        (version !== null && Boolean(rt.mcp && rt.args) && !drivableHere(rt)
+          ? 'this daemon is in live mode, which drives Claude in-process — run with FLOWVIANT_POLL=1 to build with this CLI'
+          : null),
     };
   });
   return detectedCache;
