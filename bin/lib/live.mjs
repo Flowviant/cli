@@ -673,6 +673,33 @@ SECRETS: env files (.env, .dev.vars, …) hold the team's synced secrets. Their
 VALUES must NEVER appear in the summary, in commits, or in a PR — reference keys
 by NAME only. Never commit an env file.`;
 
+/**
+ * Walk forward from an opening brace to its MATCHING close, or null.
+ *
+ * String-aware, because the thing being matched is JSON and this object's whole
+ * job is to carry human prose: a summary reading `fixed the {x} case` would
+ * otherwise close the object early, and an escaped quote inside it would end the
+ * string early. Depth counting alone is not enough.
+ */
+function balancedSpan(text, start) {
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === '\\') esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') inStr = true;
+    else if (ch === '{') depth++;
+    else if (ch === '}' && --depth === 0) return text.slice(start, i + 1);
+  }
+  return null;
+}
+
 /** Pull the result object out of a turn's output. */
 function parseMediatedResult(out) {
   const text = String(out ?? '').trim();
@@ -683,9 +710,22 @@ function parseMediatedResult(out) {
   // build. Last rather than first: any preamble comes before the answer.
   const direct = tryJson(text);
   if (direct) return direct;
-  const start = text.lastIndexOf('{');
-  for (let i = start; i >= 0; i = text.lastIndexOf('{', i - 1)) {
-    const cand = tryJson(text.slice(i, text.lastIndexOf('}') + 1));
+  // Each candidate open brace gets its OWN close, found by scanning forward.
+  // The previous version anchored every attempt on `text.lastIndexOf('}')` —
+  // recomputed per iteration but loop-INVARIANT, so it was always the final `}`
+  // of the whole output. Only the start moved; the end never retreated. Any
+  // sentence after the object containing a brace (`Note: the } above closes it`)
+  // therefore made every slice unparseable, and a FINISHED build came back as
+  // `stalled` after two nudges. Reproduced before fixing.
+  let tried = 0;
+  for (let i = text.lastIndexOf('{'); i >= 0; i = text.lastIndexOf('{', i - 1)) {
+    // Bounded: an unbalanced brace in prose scans to end-of-text, and a build's
+    // output can be very long. The real object is at the end — 200 candidates is
+    // far past any honest wrapper and keeps a pathological output from stalling
+    // the turn loop instead of the model.
+    if (++tried > 200) break;
+    const span = balancedSpan(text, i);
+    const cand = span && tryJson(span);
     if (cand) return cand;
     if (i === 0) break;
   }

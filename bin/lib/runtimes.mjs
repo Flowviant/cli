@@ -650,8 +650,13 @@ export const RUNTIMES = {
   },
 };
 
-/** Runtimes this daemon can actually put a task on. */
-export const DISPATCHABLE = Object.values(RUNTIMES).filter((r) => r.mcp && r.args);
+// DELETED: `DISPATCHABLE`, a `mcp && args` filter last described as "runtimes
+// this daemon can actually put a task on". It had no importers left — `canRun`
+// replaced it — but it was the exact predicate the per-profile split exists to
+// correct, still exported under a name that invites reuse, and it answers FALSE
+// for Antigravity on every job. The next caller to reach for the obvious-looking
+// constant would have silently undone this release. `canRun(rt, profile)` /
+// `drivableHere(rt)` below are the answers.
 
 export const runtimeById = (id) => RUNTIMES[id] ?? RUNTIMES.claude;
 
