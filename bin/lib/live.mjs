@@ -701,6 +701,74 @@ function tryJson(s) {
 }
 
 /**
+ * The server's own rule for a PR URL (`mcpAttachPrSchema`), checked BEFORE the
+ * call instead of discovered as a swallowed rejection after it.
+ *
+ * The result schema can only say `prUrl: string` — the model writes the value
+ * freehand — and the server's zod REJECTS a non-github or non-pull URL, so a
+ * plausible-looking mistake meant the PR was never linked and the task never
+ * moved to `review`, with nothing anywhere saying so. Deliberately NOT expressed
+ * as a `pattern` in MEDIATED_RESULT_SCHEMA: the mediated path is the one whose
+ * schema enforcement is a vendor flag we verified empirically on exactly one
+ * version, and adding a keyword that CLI may not implement risks the working
+ * case to defend the broken one. Validate on our side, where we know the rules.
+ */
+const PR_URL_RE = /^https:\/\/github\.com\/[^/]+\/[^/]+\/pull\/\d+/;
+
+/**
+ * Coerce the model's criteria self-report into the shape `complete` accepts.
+ *
+ * MEDIATED_RESULT_SCHEMA can only say `index: number`; the server says
+ * `int().min(0)`, note ≤500, array ≤50 — and ONE bad row makes the whole
+ * `complete` call throw, which on this path means no delivery card at all. So
+ * repairable rows are repaired and the rest dropped: a self-report missing an
+ * entry is worth far more than a card that never arrives.
+ */
+function sanitizeCriteria(criteria) {
+  if (!Array.isArray(criteria)) return null;
+  const rows = criteria
+    .filter((c) => c && Number.isFinite(c.index) && typeof c.met === 'boolean')
+    .map((c) => ({
+      index: Math.max(0, Math.trunc(c.index)),
+      met: c.met,
+      ...(typeof c.note === 'string' && c.note ? { note: c.note.slice(0, 500) } : {}),
+    }))
+    .slice(0, 50);
+  return rows.length ? rows : null;
+}
+
+/**
+ * Post the delivery card, and get one honest retry at it.
+ *
+ * The retry drops `criteria` on purpose. runId, outcome and summary are all
+ * daemon-controlled and already clamped, so the only argument that can still be
+ * rejected is the one the model wrote — and dropping it also re-enters
+ * `complete`'s idempotent branch, which is what recovers the OTHER failure the
+ * server documents here (`task_status_failed`: the run row moved but the task's
+ * status write didn't, and the fix is to call again).
+ *
+ * Returns false only on an EXPLICIT `ok: false`. An unparseable or empty
+ * response is treated as success: this verdict decides whether the run is left
+ * for the stale sweep to roll back and rebuild, and a transient hiccup is not
+ * worth rebuilding a finished task over.
+ */
+async function postComplete({ mcpUrl, token, runId, outcome, summary, criteria }) {
+  const rows = sanitizeCriteria(criteria);
+  const call = (args) =>
+    mcpCall(mcpUrl, token, 'complete', args).catch((e) => ({
+      ok: false,
+      reason: e?.message ?? String(e),
+    }));
+  const base = { runId, outcome, summary };
+  let res = await call(rows ? { ...base, criteria: rows } : base);
+  if (res?.ok === false && rows) {
+    warn(`complete rejected (${res.reason ?? 'unknown'}) — retrying without the criteria self-report`);
+    res = await call(base);
+  }
+  return res?.ok !== false;
+}
+
+/**
  * Drive a task with a runtime that cannot reach the MCP server at all.
  *
  * THE CLI DOES THE WORK; THE DAEMON DOES THE PAPERWORK. Antigravity's server
@@ -825,7 +893,12 @@ async function driveMediated({
           },
         }).catch(() => null);
         const blockerId = posted?.blockerId ?? posted?.id ?? null;
-        if (!blockerId) return { outcome: 'blocked', title, intentId };
+        if (!blockerId) {
+          // The question exists only in this process. Say why on the way out —
+          // silence here reads identically to a human who has not answered yet.
+          warn(`report_blocker did not return an id (${posted?.reason ?? 'no response'}) — the question was not posted`);
+          return { outcome: 'blocked', title, intentId };
+        }
         const res = await waitForResolution(mcpUrl, token, blockerId, isAlive);
         if (res.status === 'resolved') {
           prompt = `The human answered your blocker: ${JSON.stringify(res.answer)}\nApply it and continue, then return the result form.`;
@@ -837,25 +910,61 @@ async function driveMediated({
       }
 
       // done / failed — either way the turn is over and the thread gets a card.
+      //
+      // NOTHING FROM HERE DOWN IS BEST-EFFORT, and that is the difference this
+      // path has to make up for. On the direct-MCP paths the AGENT makes these
+      // calls and sees the rejection, so it corrects and retries; a mediated
+      // agent never learns that the daemon's call failed. Swallowing them (which
+      // is what this shipped as) produced the worst available outcome: the PR
+      // silently unlinked, the task never moved to `review`, no delivery card —
+      // and `markLanded()` firing anyway, so the shared `finally` DELETED the WIP
+      // checkpoint for work the control plane had never been told about.
       if (result.prUrl && !isPatch) {
-        await mcpCall(mcpUrl, token, 'attach_pr', {
-          runId,
-          prUrl: String(result.prUrl),
-          ...(result.branch ? { branch: String(result.branch) } : {}),
-        }).catch(() => {});
+        const prUrl = String(result.prUrl).trim();
+        if (!PR_URL_RE.test(prUrl)) {
+          // The model can fix this one, so ask it to — it already opened the PR.
+          if (nudges < 2) {
+            nudges++;
+            prompt =
+              `"${prUrl}" is not a GitHub pull request URL (expected https://github.com/<owner>/<repo>/pull/<number>). ` +
+              'Do NOT redo any work and do NOT open another PR. Return the result form again with the real URL of the ' +
+              'pull request you already opened, or omit prUrl entirely if you did not open one.';
+            continue;
+          }
+          warn(`attach_pr skipped: unusable prUrl ${prUrl}`);
+        } else {
+          const attached = await mcpCall(mcpUrl, token, 'attach_pr', {
+            runId,
+            prUrl,
+            ...(result.branch ? { branch: String(result.branch) } : {}),
+          }).catch((e) => ({ ok: false, reason: e?.message ?? String(e) }));
+          if (attached?.ok === false) warn(`attach_pr rejected: ${attached.reason ?? 'unknown'}`);
+        }
       }
       clearTaskMarker(cwd);
-      if (result.outcome === 'done' && isPatch) {
+      const done = result.outcome === 'done';
+      if (done && isPatch) {
         await landPatch({ mcpUrl, token, runId, intentId, repoRoot, cwd, patchBase, baseRef });
       }
-      await mcpCall(mcpUrl, token, 'complete', {
+      const carded = await postComplete({
+        mcpUrl,
+        token,
         runId,
-        outcome: result.outcome === 'done' ? 'completed' : 'failed',
+        outcome: done ? 'completed' : 'failed',
         summary: envScrub(String(result.summary ?? '').slice(0, 4000)),
-        ...(Array.isArray(result.criteria) ? { criteria: result.criteria } : {}),
-      }).catch(() => {});
-      if (result.outcome === 'done') markLanded();
-      return { outcome: result.outcome === 'done' ? 'done' : 'stalled', title, intentId };
+        criteria: result.criteria,
+      });
+      if (!carded) {
+        // No delivery card exists, so this run is not done however the work
+        // ended. `landed` deliberately stays false: the shared finally takes one
+        // last checkpoint instead of deleting the WIP ref, and the run is left
+        // active for the stale sweep to roll back and re-dispatch — recoverable,
+        // unlike reporting success into a thread that shows nothing.
+        warn('complete failed — leaving the run for the server to reclaim');
+        return { outcome: 'error', error: 'complete rejected', title, intentId };
+      }
+      if (done) markLanded();
+      return { outcome: done ? 'done' : 'stalled', title, intentId };
     }
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -1355,6 +1464,25 @@ export async function runLiveTask({
     lastBeat = Date.now();
     void mcpCall(mcpUrl, token, 'heartbeat', { runId }).catch(() => {});
   };
+  // AND ON A TIMER, because "activity" is not a signal every driver has.
+  //
+  // `beat()` used to be called from exactly ONE place — the live session's
+  // message loop, below — and the two other drivers return before they ever
+  // reach it. So a mediated or subprocess turn renewed the task lease only
+  // incidentally: `report_progress`, which fires only when the CLI happens to
+  // emit a tool activity and is throttled to one per 8s. Meanwhile Antigravity
+  // is handed `--print-timeout 60m` and AGENT_LEASE_TTL_MINUTES is 30, so a
+  // quiet stretch INSIDE a turn we explicitly permitted made the task stale to
+  // `isEligible` and claimable by another worker while it was still building it.
+  // `heartbeat` renews the task lease server-side (refreshTaskLeaseRemote), not
+  // just this token's last-seen, which is exactly the thing that goes stale.
+  //
+  // Fires at half the throttle window; `beat()`'s own guard is what rate-limits
+  // the wire, so session traffic and this timer cannot double up. Started here
+  // rather than in each driver for the same reason the checkpoint timer is
+  // shared: three drivers with three answers is how this diverged once already.
+  const heartbeatTimer = setInterval(beat, 30_000);
+  heartbeatTimer.unref?.();
 
   const flush = async () => {
     if (turnId && turnText.trim()) {
@@ -1574,6 +1702,7 @@ export async function runLiveTask({
     return { outcome: 'error', error: e?.message ?? String(e), title, intentId };
   } finally {
     clearInterval(checkpointTimer);
+    clearInterval(heartbeatTimer);
     // Same finally as the checkpoint: every path out of this task — done,
     // parked, rate-limited, thrown — must stop reporting a worktree that is
     // about to stop being this run's.
