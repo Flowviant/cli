@@ -407,6 +407,39 @@ export const RUNTIMES = {
    *
    * Pin any wiring to agy >= 1.1.10 — `--model`/`--effort` were ignored in
    * headless before it, and `--output-format` only arrived in 1.1.8.
+   *
+   * OBSERVED against the real 1.1.12 binary (fetched from Google's bucket and
+   * SHA512-verified; not installed). The MCP question is STILL open, because
+   * answering it needs a signed-in session — but four other things are now facts
+   * rather than documentation, and two of them are new obstacles:
+   *
+   *   1. AUTH IS INTERACTIVE OAUTH, with no headless credential path in `--help`.
+   *      A signed-out `agy -p` prints a Google consent URL to stderr, waits, and
+   *      then emits `{"event":"result","result":{"status":"ERROR","error":
+   *      "authentication failed or timed out"}}`. It does not fail fast: it sits
+   *      until `--print-timeout` (default 5m). A lane that picked up work on a
+   *      signed-out agy would burn five minutes per turn looking like a hang.
+   *      Preflight cannot detect this either — `--version` succeeds while
+   *      signed out, same blind spot every runtime has here.
+   *   2. `--sandbox` IS A BOOLEAN ("Run in a sandbox with terminal restrictions
+   *      enabled"), not a mode selector. There is no `read-only` /
+   *      `workspace-write` / `danger-full-access` axis like Codex's, so the
+   *      posture for a `consult` cannot be expressed per invocation at all — it
+   *      lives in the machine-wide permissions engine. That makes `profiles`
+   *      harder here than for Codex, not easier.
+   *   3. NO `mcp` SUBCOMMAND. `/mcp` is an interactive slash command, so the
+   *      only headless window into which servers loaded is the `init` event of
+   *      `--output-format stream-json` — which needs auth first. That is why
+   *      the workspace-config question cannot be settled without a login.
+   *   4. It tries to INSTALL PLAYWRIGHT on startup (observed failing with a 404
+   *      against playwright.azureedge.net). A daemon runtime that downloads and
+   *      runs a browser driver is a surprise worth knowing about before this is
+   *      wired into a machine the project leaves running.
+   *
+   * To finish the test: sign in once (`agy` interactively, follow the consent
+   * URL), then in a throwaway git worktree containing `.agents/mcp_config.json`
+   * run `agy -p "list your tools" --output-format stream-json` and read the
+   * `init` event's tools array.
    */
   antigravity: {
     id: 'antigravity',
