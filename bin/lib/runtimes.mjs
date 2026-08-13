@@ -31,7 +31,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { SAFE, MODEL, USER_AGENT, LIVE } from './config.mjs';
+import { SAFE, MODEL, USER_AGENT } from './config.mjs';
 
 /** Truncate for a one-line activity label. */
 const oneLine = (s, n = 140) =>
@@ -319,25 +319,30 @@ export const runtimeById = (id) => RUNTIMES[id] ?? RUNTIMES.claude;
 /**
  * Can the worker this daemon is running actually DRIVE this runtime right now?
  *
- * `dispatchable` answers "is the CLI installed and does this module know how to
- * spawn it" — a fact about the machine. This answers a narrower question about
- * THIS PROCESS, and the two came apart the moment live mode became the default.
+ * `dispatchable` on a detection row answers "is the CLI installed"; this answers
+ * "and can this process build with it", which is a different question and was
+ * briefly a narrower one.
  *
- * Live mode does not spawn a CLI at all: it drives the Anthropic Agent SDK
- * in-process, which is why `claude.live` is the only `true` in the registry. So
- * on a machine with Codex installed, `dispatchable` says codex and the live
- * worker still cannot build a codex task — and it was claiming them anyway and
- * building them with Claude, because a claim that names no runtime gets whatever
- * is next in line.
+ * THE HISTORY MATTERS, because the answer moved twice. Live mode became the
+ * default and does not spawn a CLI at all — it drives the Anthropic Agent SDK
+ * in-process — so for one release this returned false for every non-live runtime
+ * under LIVE. That was honest rather than correct: a machine with Codex reported
+ * it could not drive Codex, which was true of the worker as it then existed, and
+ * `@codex` tasks visibly waited instead of being silently built by Claude.
  *
- * Reporting drivability rather than installation is what makes the app's answer
- * true: "this machine cannot drive Codex" is a fact the user can act on (restart
- * with FLOWVIANT_POLL=1, or wait for the live subprocess path), where "Codex is
- * installed" plus a task that never starts is a mystery. Activity, never
- * aspiration.
+ * 0.40.0 made it wrong by making it unnecessary. `driveSubprocess` (live.mjs)
+ * gives live mode a subprocess path for non-live runtimes, sharing the same
+ * worktree prep, patch landing, checkpointing and teardown as the session path.
+ * So the restriction is gone and this is back to "installed, and this module
+ * knows how to spawn it" — which is what the registry's `live` flag always
+ * described: not which runtimes can run, but which get a session instead of a
+ * subprocess.
+ *
+ * LIVE is no longer read here. That is deliberate and load-bearing: this
+ * predicate feeds both the roster report AND the claim, and if the two ever
+ * disagree the daemon either claims work it cannot build or refuses work it can.
  */
-export const drivableHere = (rt) =>
-  Boolean(rt.mcp && rt.args) && (LIVE ? rt.live === true : true);
+export const drivableHere = (rt) => Boolean(rt.mcp && rt.args);
 
 // ── Detection ──────────────────────────────────────────────────────────────
 
@@ -382,11 +387,7 @@ export function detectRuntimes({ refresh = false } = {}) {
       // and this module can know how to spawn it, and the worker this daemon is
       // running can still be unable to drive it.
       dispatchable: version !== null && drivableHere(rt),
-      blocked:
-        rt.blocked ??
-        (version !== null && Boolean(rt.mcp && rt.args) && !drivableHere(rt)
-          ? 'this daemon is in live mode, which drives Claude in-process — run with FLOWVIANT_POLL=1 to build with this CLI'
-          : null),
+      blocked: rt.blocked ?? null,
     };
   });
   return detectedCache;

@@ -34,7 +34,7 @@ import {
   ALLOW_PATCHES,
 } from './config.mjs';
 import { c, info, ok, warn } from './ui.mjs';
-import { sleep } from './claude.mjs';
+import { sleep, runTurn, mcpFor, sawSentinel, blockedId } from './claude.mjs';
 import {
   git,
   resetWorktree,
@@ -44,7 +44,7 @@ import {
   clearWip,
 } from './git.mjs';
 import { applyPatch, fileDiffs, ownerCurrentBranch, withPatchLock } from './patch.mjs';
-import { RUNTIMES } from './runtimes.mjs';
+import { RUNTIMES, runtimeById, drivableHere } from './runtimes.mjs';
 import { loadPreviewConfig, startPreview } from './preview.mjs';
 import { materializeInto, scrub as envScrub } from './env.mjs';
 
@@ -53,16 +53,19 @@ import { materializeInto, scrub as envScrub } from './env.mjs';
 const LIVE_TARGET_URL = FLEET_URL.replace(/\/agents\/?$/, '/live-target');
 
 /**
- * What a live session can build, sent on every claim.
+ * What THIS WORKER can build, sent on every claim.
  *
- * Read off the registry rather than written as `['claude']` so that the day a
- * second runtime gains an SDK session, marking `live: true` there is the whole
- * change — a hand-written list here would keep withholding its work and the
- * reason would be three files away from the flag that looks like it decides.
+ * Deliberately the same predicate the roster report uses (`drivableHere`), not a
+ * hand-written list. The claim and the report answer the same question to two
+ * different consumers, and if they ever disagree the daemon either claims work it
+ * cannot build — the exact bug this argument was added to close — or refuses work
+ * it can. One source, so they cannot drift.
+ *
+ * Note this is NOT the live-session list. A live worker builds Claude tasks
+ * through the SDK and everything else through `driveSubprocess`, so both belong
+ * here; `live` chooses the driver, it does not gate participation.
  */
-const LIVE_RUNTIMES = Object.values(RUNTIMES)
-  .filter((r) => r.live === true && r.mcp && r.args)
-  .map((r) => r.id);
+const DRIVABLE_HERE = Object.values(RUNTIMES).filter(drivableHere).map((r) => r.id);
 // Short TTL + a heartbeat that re-asserts while the tunnel is alive. So a live
 // preview stays linked indefinitely (survives long reviews), but one whose
 // daemon DIED ungracefully (no more heartbeats) drops off the card within the
@@ -203,6 +206,36 @@ secrets. Their VALUES must NEVER appear in evidence, progress reports, blocker
 questions, delivery summaries, commits, or PRs — reference keys by NAME only
 (e.g. "set STRIPE_KEY"). Never screenshot a terminal or page that displays a
 credential, and never commit an env file.`;
+
+/**
+ * The same contract, for a runtime that has no live session.
+ *
+ * A non-live runtime is driven as a SUBPROCESS: one headless turn, then the
+ * process exits and the daemon decides what happens next. That transport cannot
+ * see tool calls the way the SDK stream can — there is no `tool_use` block to
+ * read `complete` or `report_blocker` off — so the turn has to SAY how it ended.
+ * Hence the sentinels, which are the same three words the legacy poll path has
+ * always used; this is a transport detail bolted onto the contract, not a second
+ * contract, which is why it is SYSTEM_LIVE plus an epilogue rather than a
+ * parallel prompt that would drift from it.
+ *
+ * The claim instruction that opens SYSTEM_SINGLE is deliberately absent: the
+ * daemon already claimed this task before spawning, so a second claim would come
+ * back `active_run` and the turn would waste itself puzzling over it.
+ */
+const SYSTEM_SUBPROCESS = `${SYSTEM_LIVE}
+
+HOW THIS TURN ENDS. You are running as a one-shot process, not in a live session,
+so the daemon can only see what you print. End your turn by printing EXACTLY ONE
+of these on a line by itself, as the last thing you output:
+  DONE                — the task is complete (you called complete, and opened the
+                        PR unless placement is "patch")
+  BLOCKED:<blockerId> — you called report_blocker and are waiting on a human. Use
+                        the id report_blocker returned. STOP after printing it;
+                        you will be run again with the answer.
+Print nothing else on that line. Do not print a sentinel you have not earned — a
+DONE without a complete call strands the work, and the team is told the task
+finished when it did not.`;
 
 /** The brief minus the parts rendered as prose below (conversations, the ask). */
 function briefWithoutThread(brief) {
@@ -568,6 +601,194 @@ async function landPatch({ mcpUrl, token, runId, intentId, repoRoot, cwd, patchB
   warn(`patch not applied: ${reason}`);
 }
 
+/**
+ * Drive a task with a runtime that has no live session.
+ *
+ * Same job, same outcomes, different transport. `runLiveTask` owns everything
+ * around this — the claim, the worktree, the branch/patch/stack setup, the WIP
+ * checkpoint timer, the diffstat sampler and the teardown — and calls one of two
+ * drivers in the middle. That split is the whole point: routing non-live
+ * runtimes at the WORKER level instead (the obvious shortcut, since the legacy
+ * poll worker already spawns Codex) would have sent them down a path with no
+ * patch landing, no WIP checkpoint/restore and no preview, so a `placement:
+ * "patch"` task would follow its instructions to commit-and-stop and then wait
+ * forever for a daemon that never picks it up.
+ *
+ * What is genuinely lost versus a live session, stated plainly rather than
+ * discovered: a teammate's mid-task message cannot interrupt a running turn. It
+ * lands between turns instead, which is the same place a poll-mode message has
+ * always landed. Everything else — blockers, stop, teardown, release, patches,
+ * checkpoints — behaves the same because it is the same surrounding code.
+ */
+async function driveSubprocess({
+  runtimeId,
+  mcpUrl,
+  token,
+  runId,
+  intentId,
+  title,
+  cwd,
+  brief,
+  isPatch,
+  patchBase,
+  repoRoot,
+  baseRef,
+  label,
+  seedText,
+  afterId,
+  isAlive,
+  onChild,
+  markLanded,
+}) {
+  let resume = false;
+  let nudges = 0;
+  let held = false;
+  let prompt = seedText;
+
+  for (;;) {
+    if (!isAlive()) return { outcome: 'blocked', title, intentId };
+
+    // A fresh token hand-off per turn: the worker token is minted per lane and
+    // may rotate between turns, and for Codex it rides in the environment rather
+    // than on disk, so there is nothing to clean up in that case (`dir` is null).
+    const { dir, args: mcpArgs, env: mcpEnv } = mcpFor(runtimeId, token, mcpUrl);
+    let out = '';
+    try {
+      out = await runTurn({
+        prompt,
+        resume,
+        system: SYSTEM_SUBPROCESS,
+        cwd,
+        runtime: runtimeId,
+        mcpArgs,
+        mcpEnv,
+        label,
+        // Per-task first, this machine's default second — off the BRIEF, which is
+        // the task we actually hold, never the roster's guess.
+        model: brief.agentModel || undefined,
+        effort: brief.agentEffort || undefined,
+        onSpawn: (ch) => onChild?.(ch),
+      });
+    } catch (e) {
+      // Defensive only. runTurn resolves rather than rejects on a failed child —
+      // see the rate-limit note below — so this catches a throw from the
+      // plumbing around it, not from the CLI.
+      return { outcome: 'error', error: e?.message ?? String(e), title, intentId };
+    } finally {
+      if (dir) rmSync(dir, { recursive: true, force: true });
+      onChild?.(null);
+    }
+    if (!isAlive()) return { outcome: 'blocked', title, intentId };
+
+    // A USAGE LIMIT reads differently here than it does in a live session, and
+    // getting that wrong would show the user's own plan limit as a Flowviant
+    // stall. The SDK THROWS on a 429, which is why the live path classifies an
+    // exception; `runTurn` resolves with whatever the child printed no matter
+    // how it exited, so the only evidence a subprocess leaves is text.
+    //
+    // Read the TAIL only, and only when the turn produced no sentinel. The whole
+    // transcript is the model's narration, and an agent that writes "we should
+    // handle rate limit errors" into a code comment would otherwise park a
+    // perfectly healthy run. A fatal CLI error is the last thing printed. Both
+    // ways of being wrong here are recoverable — a false park retries after the
+    // reset, a missed limit reads as a stall and is re-dispatched — so the tail
+    // heuristic buys the common case without risking the work.
+    if (!sawSentinel(out, 'DONE') && !blockedId(out)) {
+      const rl = classifyRateLimit(out.slice(-4000));
+      if (rl.isRateLimit) {
+        await mcpCall(mcpUrl, token, 'report_paused', { runId, resetAt: rl.resetAt }).catch(() => {});
+        return { outcome: 'rate_limited', resetAt: rl.resetAt, runId, title, intentId };
+      }
+    }
+
+    // Every turn after the first continues the CLI's own session where the
+    // runtime supports it (`--continue` / `resume --last`), so the agent keeps
+    // its reasoning rather than re-reading the brief cold each time.
+    resume = true;
+
+    const bid = blockedId(out);
+    if (bid) {
+      const res = await waitForResolution(mcpUrl, token, bid, isAlive);
+      if (res.status === 'resolved') {
+        prompt = `The human answered your blocker: ${JSON.stringify(res.answer)}\nApply it and continue.`;
+        nudges = 0;
+        continue;
+      }
+      if (res.status === 'timeout') return { outcome: 'parked', title, intentId };
+      return { outcome: 'blocked', title, intentId };
+    }
+
+    if (sawSentinel(out, 'DONE')) {
+      // Identical to the live path's completion, and it must stay identical: the
+      // marker clear is what stops this worktree being read as a resume of a
+      // task that has finished (or been discarded and restarted).
+      clearTaskMarker(cwd);
+      if (isPatch) {
+        await landPatch({ mcpUrl, token, runId, intentId, repoRoot, cwd, patchBase, baseRef });
+      }
+      markLanded();
+      return { outcome: 'done', title, intentId };
+    }
+
+    // No sentinel: the turn ended without saying how. Before nudging, find out
+    // whether the RUN still exists — a restart or a release from the app tears
+    // it down out from under us, and nudging a dead run just burns the user's
+    // quota. Same three answers the live loop reads, for the same reasons.
+    const poll = await mcpCall(mcpUrl, token, 'poll_channel', {
+      runId,
+      ...(afterId ? { afterId } : {}),
+    }).catch(() => null);
+    if (poll && poll.ok === false && poll.released) {
+      return { outcome: 'released', title, intentId };
+    }
+    if (poll && poll.ok === false && poll.reason === 'run_not_active') {
+      clearTaskMarker(cwd);
+      try {
+        git(['worktree', 'remove', '--force', cwd], repoRoot);
+      } catch {
+        resetWorktree(cwd, baseRef);
+      }
+      return { outcome: 'torn_down', title, intentId };
+    }
+
+    const fresh = (poll?.messages ?? []).filter((x) => x.role === 'user');
+    if (fresh.length) afterId = fresh[fresh.length - 1].id;
+
+    if (fresh.some((f) => STOP_RE.test(f.content))) {
+      held = true;
+      prompt =
+        'A teammate asked you to STOP. Halt, summarize where you are in one line, and wait for direction — do not continue until told.';
+      continue;
+    }
+    if (fresh.length) {
+      prompt = fresh
+        .map((f) => (f.authorName ? `${f.authorName}: ` : '') + f.content)
+        .join('\n');
+      nudges = 0;
+      held = false;
+      continue;
+    }
+    if (held) {
+      const next = await waitForMessage(mcpUrl, token, runId, afterId, isAlive);
+      if (!next) return { outcome: 'parked', title, intentId };
+      held = false;
+      nudges = 0;
+      afterId = next.id;
+      prompt = (next.authorName ? `${next.authorName}: ` : '') + next.content;
+      continue;
+    }
+
+    if (nudges < 2) {
+      nudges++;
+      prompt = isPatch
+        ? 'Continue until the task is complete: commit your change (no branch, no push, no PR) and call complete, then print DONE. Or report a blocker and print BLOCKED:<id>.'
+        : 'Continue until the task is complete: open a draft PR and call complete, then print DONE. Or report a blocker and print BLOCKED:<id>.';
+      continue;
+    }
+    return { outcome: 'stalled', title, intentId };
+  }
+}
+
 export async function runLiveTask({
   mcpUrl,
   token,
@@ -592,12 +813,11 @@ export async function runLiveTask({
   // the only dispatch in this product, and silently answering it with a different
   // CLI is the same class of bug as dispatching from the wrong surface.
   //
-  // A live session is Claude-only by construction, not by configuration — it is
-  // an SDK, not a subprocess — so this list is exactly the runtimes marked
-  // `live` in the registry. An older server ignores the argument and behaves as
-  // before; that degrade is what `daemon:min` is for.
+  // The list is every runtime this daemon can spawn or session, NOT just the
+  // live ones — `driveSubprocess` below builds the rest. An older server ignores
+  // the argument and behaves as before; that degrade is what `daemon:min` is for.
   const claim = await mcpCall(mcpUrl, token, 'claim_next_task', {
-    runtimes: LIVE_RUNTIMES,
+    runtimes: DRIVABLE_HERE,
   }).catch(() => null);
   if (!claim || claim.claimed !== true) return { outcome: 'nothing' };
   const { runId, intentId } = claim;
@@ -792,8 +1012,16 @@ export async function runLiveTask({
   // already told us the real intent.
   const stopDiffstat = sampleDiffstat?.(cwd, baseRef, intentId, agentId) ?? null;
 
-  const input = makeInput(seedPrompt(runId, brief, transcript, resumedInPlace));
-  const session = query({
+  // WHICH CLI builds this one, off the brief — the task we actually hold, not
+  // the roster's prediction. Only Claude has a live session (it is an Anthropic
+  // SDK, not a CLI contract); everything else is driven as a subprocess by
+  // `driveSubprocess` below, which is what the registry's `live` flag has always
+  // said would happen and what live mode never implemented.
+  const rt = runtimeById(brief.agentRuntime ?? 'claude');
+  const seedText = seedPrompt(runId, brief, transcript, resumedInPlace);
+  const input = rt.live ? makeInput(seedText) : null;
+  const session = rt.live
+    ? query({
     prompt: input.stream(),
     options: {
       cwd,
@@ -821,26 +1049,32 @@ export async function runLiveTask({
         },
       },
     },
-  });
+      })
+    : null;
 
   // Mark this worker BUSY for the daemon's reconcile loop: buildHave keeps the
   // worker's token while a session is live (never rotate a credential out from
   // under it), and teardown/agent-removal can interrupt the SDK session via this
   // marker's kill(). Cleared in finally. Mirrors poll mode's onChild(child).
-  onChild?.({
-    kill: () => {
-      try {
-        session.interrupt?.();
-      } catch {
-        /* already ending */
-      }
-      try {
-        session.return?.();
-      } catch {
-        /* already closed */
-      }
-    },
-  });
+  // The subprocess driver registers its own handle per turn (runTurn's onSpawn),
+  // because there the killable thing is a child process and it only exists while
+  // a turn is actually running.
+  if (session) {
+    onChild?.({
+      kill: () => {
+        try {
+          session.interrupt?.();
+        } catch {
+          /* already ending */
+        }
+        try {
+          session.return?.();
+        } catch {
+          /* already closed */
+        }
+      },
+    });
+  }
 
   let turnId = null;
   let turnText = '';
@@ -880,6 +1114,39 @@ export async function runLiveTask({
   };
 
   try {
+    // THE SEAM. Everything above prepared this task — the claim, the checkout,
+    // the branch or patch base, the restored work in progress, the checkpoint
+    // timer and the diffstat sampler — and everything in the `finally` below
+    // tears it down. Only the middle differs by runtime, so only the middle
+    // branches, and a non-live runtime inherits the other two thirds unchanged.
+    if (!session) {
+      return await driveSubprocess({
+        runtimeId: rt.id,
+        mcpUrl,
+        token,
+        runId,
+        intentId,
+        title,
+        cwd,
+        brief,
+        isPatch,
+        patchBase,
+        repoRoot,
+        baseRef,
+        label: `[${rt.label}]`,
+        seedText,
+        afterId,
+        isAlive,
+        onChild,
+        // `landed` decides whether the finally deletes this task's WIP ref or
+        // takes one last checkpoint, so the driver has to be able to set it —
+        // returning it would be too late, the finally runs first.
+        markLanded: () => {
+          landed = true;
+        },
+      });
+    }
+
     for await (const m of session) {
       if (!isAlive()) return { outcome: 'blocked', title, intentId };
       beat(); // any session traffic = alive (throttled to 1/min)
@@ -1038,14 +1305,17 @@ export async function runLiveTask({
     }
     onChild?.(null); // no longer busy — token may rotate between tasks
     onIntent?.(null);
-    input.close();
+    // Only a live session has a streaming input to close or a generator to
+    // return. The subprocess driver's children are already gone — runTurn awaits
+    // each one — and it clears its own onChild handle per turn.
+    input?.close();
     try {
-      await session.interrupt?.();
+      await session?.interrupt?.();
     } catch {
       /* session already ended */
     }
     try {
-      await session.return?.();
+      await session?.return?.();
     } catch {
       /* generator already closed */
     }
