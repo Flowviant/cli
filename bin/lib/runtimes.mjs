@@ -21,6 +21,15 @@
  * Claude Code and Codex both do all four. Antigravity does 1, 3 and 4 and is
  * declared below with the exact reason it cannot yet do 2.
  *
+ * BUT ONLY A BUILD NEEDS ALL FOUR, and that qualifier was missing long enough to
+ * cost Antigravity every capability it has. Requirement 2 is the CONTROL PLANE —
+ * claiming, blockers, PRs, completing — and only a build uses it. A wiki turn
+ * writes markdown the daemon syncs afterwards; a consult answers a question in
+ * prose. Both already run with no MCP on every runtime, Claude included. So
+ * drivability is per PROFILE (`canRun`), not one verdict per runtime, and a CLI
+ * that cannot be handed a per-invocation MCP config is still a perfectly good
+ * cartographer.
+ *
  * WHAT THIS MODULE DELIBERATELY DOES NOT DO: pick. Which runtime runs a task is
  * decided in the app, by @mentioning it (CLAUDE.md: the @mention is the only
  * dispatch), and arrives on the brief. Detection here answers "what does this
@@ -158,6 +167,72 @@ function parseCodexLine(line, cwd) {
     default:
       return null; // thread.started / turn.started / item.started / item.updated
   }
+}
+
+// ── Antigravity ────────────────────────────────────────────────────────────
+
+/**
+ * `agy --output-format stream-json` emits `{event: init|step_update|result}`.
+ * Tool names read off a live 1.1.12 session rather than guessed.
+ */
+function humanizeAgyTool(name, p = {}, cwd = '') {
+  const path = p.TargetFile ?? p.AbsolutePath ?? p.DirectoryPath ?? p.File ?? '';
+  const tail = String(path).split('/').slice(-2).join('/');
+  switch (name) {
+    case 'view_file':
+    case 'read_resource':
+      return { kind: 'read', label: `read ${shortPath(path, cwd)}` };
+    case 'write_to_file':
+    case 'replace_file_content':
+    case 'multi_replace_file_content':
+      return {
+        kind: 'write',
+        path: String(path),
+        label: `${name === 'write_to_file' ? '+ page' : '~ page'} ${tail || 'file'}`,
+      };
+    case 'grep_search':
+      return { kind: 'search', label: `grep ${oneLine(p.Query ?? p.SearchTerm ?? '', 60)}` };
+    case 'find_by_name':
+      return { kind: 'glob', label: `find ${oneLine(p.Pattern ?? '', 60)}` };
+    case 'list_dir':
+      return { kind: 'list', label: `ls ${shortPath(path, cwd)}` };
+    case 'run_command':
+      return { kind: 'bash', label: `$ ${oneLine(p.CommandLine, 60)}` };
+    case 'call_mcp_tool':
+      return { kind: 'tool', label: `mcp.${p.ToolName ?? ''}` };
+    default:
+      return null;
+  }
+}
+
+function parseAgyLine(line, cwd) {
+  let ev;
+  try {
+    ev = JSON.parse(line);
+  } catch {
+    return null;
+  }
+  if (ev.event === 'step_update') {
+    const su = ev.step_update ?? {};
+    const ti = su.tool_info;
+    if (!ti) return null;
+    const err = ti.error?.message;
+    if (err) return { activity: { kind: 'error', label: oneLine(err) }, text: '' };
+    // Each tool is reported twice — once ACTIVE, once DONE — so only the
+    // terminal state emits, otherwise every action appears in the thread twice.
+    if (su.state && su.state !== 'DONE') return null;
+    return { activity: humanizeAgyTool(ti.name, ti.parameters ?? {}, cwd), text: '' };
+  }
+  if (ev.event === 'result') {
+    const r = ev.result ?? {};
+    // The final answer is the ONLY sentinel-bearing text: agy has no incremental
+    // assistant-message event, so a turn's whole verdict arrives here at once.
+    return {
+      activity: r.error ? { kind: 'error', label: oneLine(r.error) } : null,
+      text: `${r.response ?? ''}${r.error ? `\n${r.error}` : ''}\n`,
+    };
+  }
+  return null;
 }
 
 // ── The registry ───────────────────────────────────────────────────────────
@@ -478,10 +553,65 @@ export const RUNTIMES = {
     login: 'agy',
     live: false,
     /** None, because it cannot reach the MCP server at all — see `blocked`. */
-    profiles: [],
+    /**
+     * WIKI AND CONSULT, BUT NOT BUILD — and the split is the whole point of
+     * making drivability per-profile rather than one verdict.
+     *
+     * Only a BUILD needs the MCP control plane: claiming, reporting a blocker,
+     * attaching a PR, completing. A wiki turn writes markdown files that the
+     * daemon syncs afterwards, and a consult answers a question in prose; BOTH
+     * already run with no MCP at all on every runtime, Claude included. Gating
+     * them on an MCP capability they never use was a test of the wrong thing,
+     * and it is what kept Antigravity at zero for months.
+     *
+     * Build returns here when the mediated adapter lands (the daemon holds the
+     * MCP connection and the CLI just returns schema-enforced JSON via
+     * `--json-schema`), which needs no per-invocation MCP config from the vendor
+     * at all.
+     */
+    profiles: ['wiki', 'consult'],
     mcp: null,
-    args: null,
-    parse: null,
+    args({ prompt, system, model, effort, resume, profile = 'build', vaultDir }) {
+      const a = [];
+      if (resume) a.push('--continue');
+      // No system-prompt flag, same weakening as Codex: the contract rides in
+      // the prompt, fenced and first.
+      a.push('-p', `${system}\n\n---\n\n${prompt}`);
+      a.push('--output-format', 'stream-json');
+      if (model) a.push('--model', model);
+      if (effort) a.push('--effort', effort);
+
+      if (profile === 'wiki') {
+        // THE CARTOGRAPHER, at the same bar WIKI_PERM sets for Claude — writes
+        // allowed, network shut. Both halves measured on 1.1.12:
+        //   • headless cannot prompt, so anything needing approval is
+        //     auto-denied — including the file writes a wiki turn exists to
+        //     make. `--dangerously-skip-permissions` is what grants them.
+        //   • `--sandbox` blocks egress: with it, curl returned 400 and a local
+        //     listener saw nothing; without it, 200 and the request arrived.
+        // Upstream #36 warns these two cancel out (skip-permissions
+        // auto-approving the sandbox-bypass prompt). It does NOT reproduce on
+        // 1.1.12 — tested together, the write landed and the network stayed
+        // shut. Re-check on upgrade: if it ever does cancel, this posture
+        // silently becomes "wiki turn with internet", which is the one line
+        // WIKI_PERM draws ("Command execution is the line: it enables network
+        // exfil").
+        if (vaultDir) a.push('--add-dir', vaultDir);
+        a.push('--sandbox', '--dangerously-skip-permissions');
+        // A sweep reads a whole repository; the 5m default would guillotine it.
+        a.push('--print-timeout', '60m');
+      } else if (profile === 'consult') {
+        // NOTHING GRANTED, deliberately. The headless default IS the consult
+        // posture: `run_command` comes back "User denied permission… headless
+        // mode cannot prompt for it, so it was auto-denied", observed even for a
+        // benign `pwd && ls -la`, with no egress in any run. Reads keep working,
+        // which is all a consult needs. Passing --dangerously-skip-permissions
+        // here would hand a question ANY project editor can type a shell.
+        a.push('--print-timeout', '10m');
+      }
+      return a;
+    },
+    parse: parseAgyLine,
     blocked:
       'its MCP config is machine-wide — a workspace .agents/mcp_config.json is never loaded (measured), so every lane would share one token',
   },
@@ -518,7 +648,35 @@ export const runtimeById = (id) => RUNTIMES[id] ?? RUNTIMES.claude;
  * predicate feeds both the roster report AND the claim, and if the two ever
  * disagree the daemon either claims work it cannot build or refuses work it can.
  */
-export const drivableHere = (rt) => Boolean(rt.mcp && rt.args);
+/**
+ * WHICH PROFILES NEED THE MCP CONTROL PLANE. Only one does.
+ *
+ * A BUILD has to claim work, report a blocker, attach a PR and complete — that
+ * is the control plane, and a runtime that cannot reach it cannot participate.
+ * A WIKI turn writes markdown the daemon syncs afterwards. A CONSULT answers a
+ * question in prose. Neither passes an MCP config on ANY runtime today, Claude
+ * included — check the two call sites in fleet.mjs, they hand `runTurn` no
+ * `mcpArgs` at all.
+ *
+ * Conflating them cost Antigravity every capability it has: `mcp && args` was
+ * the single drivability test, so a machine-wide MCP config disqualified it from
+ * two jobs that never open an MCP connection.
+ */
+const PROFILE_NEEDS_MCP = { build: true, wiki: false, consult: false };
+
+/** Can this runtime do this job on this machine? */
+export const canRun = (rt, profile) =>
+  Boolean(rt?.args) &&
+  (rt.profiles ?? []).includes(profile) &&
+  (!PROFILE_NEEDS_MCP[profile] || Boolean(rt.mcp));
+
+/**
+ * Reported on the roster poll and sent on every claim, so it answers the
+ * DISPATCH question specifically: can an @mention of this runtime result in a
+ * task being built? That is `build`, and build is the profile that needs MCP —
+ * which is why a runtime can be undispatchable and still run wiki and consult.
+ */
+export const drivableHere = (rt) => canRun(rt, 'build');
 
 /**
  * WHICH RUNTIME RUNS A JOB THAT NOBODY @MENTIONED.
@@ -544,15 +702,8 @@ export const drivableHere = (rt) => Boolean(rt.mcp && rt.args);
  */
 export function pickRuntimeFor(profile, { detected } = {}) {
   const rows = detected ?? detectRuntimes();
-  const ok = (id) => {
-    const rt = RUNTIMES[id];
-    return Boolean(
-      rt &&
-        drivableHere(rt) &&
-        (rt.profiles ?? []).includes(profile) &&
-        rows.find((d) => d.id === id)?.installed
-    );
-  };
+  const ok = (id) =>
+    canRun(RUNTIMES[id], profile) && Boolean(rows.find((d) => d.id === id)?.installed);
   if (ok('claude')) return 'claude';
   return Object.keys(RUNTIMES).find(ok) ?? null;
 }
