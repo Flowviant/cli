@@ -7,7 +7,7 @@
 import { execFileSync } from 'node:child_process';
 import { ok, warn, info, c } from './ui.mjs';
 import { addLocalBinToPath, promptYesNo, installClaude, installGh } from './install.mjs';
-import { RUNTIMES, detectRuntimes } from './runtimes.mjs';
+import { RUNTIMES, detectRuntimes, mediatedSafeGap } from './runtimes.mjs';
 
 function present(cmd) {
   try {
@@ -71,6 +71,16 @@ export async function preflight({ needGit = true } = {}) {
     }
   }
   const drivable = detected.filter((r) => r.dispatchable);
+  // SAFE mode narrows what an agent may do — except on a runtime whose only
+  // permission control is all-or-nothing. Say so at startup rather than letting
+  // an operator believe a setting is in force that isn't.
+  for (const r of drivable) {
+    if (mediatedSafeGap(RUNTIMES[r.id])) {
+      warn(
+        `${RUNTIMES[r.id].bin}: FLOWVIANT_SAFE cannot narrow this runtime — it has no per-invocation permission control, so its builds run unrestricted`
+      );
+    }
+  }
   // Name the alternatives once, and only when there is nothing to build with —
   // a working machine does not need a catalogue of the CLIs it is not using.
   if (drivable.length === 0) {

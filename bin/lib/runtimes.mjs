@@ -310,11 +310,11 @@ export const RUNTIMES = {
      * strongest form of it available anywhere: `--append-system-prompt` sits
      * above the conversation rather than inside it.
      */
-    args({ prompt, system, model, effort, resume, streamJson, perm, mcp = [] }) {
+    args({ prompt, system, model, effort, resume, streamJson, perm, mcp = [], resultSchemaArgs = [] }) {
       const a = [];
       if (resume) a.push('--continue');
       a.push('-p', prompt, '--append-system-prompt', system);
-      a.push(...mcp);
+      a.push(...mcp, ...resultSchemaArgs);
       a.push('--model', model || MODEL);
       if (effort) a.push('--effort', effort);
       if (streamJson) a.push('--output-format', 'stream-json', '--verbose');
@@ -371,7 +371,7 @@ export const RUNTIMES = {
      * placed before it. Appending them after the positional is the kind of argv
      * that parses today and stops parsing on some future clap upgrade.
      */
-    args({ prompt, system, model, effort, resume, profile = 'build', vaultDir, mcp = [] }) {
+    args({ prompt, system, model, effort, resume, profile = 'build', vaultDir, mcp = [], resultSchemaArgs = [] }) {
       const a = ['exec'];
       if (resume) a.push('resume', '--last');
       a.push('--json');
@@ -452,11 +452,15 @@ export const RUNTIMES = {
         a.push('--sandbox', SAFE ? 'workspace-write' : 'danger-full-access');
       }
 
-      a.push(...mcp);
+      a.push(...mcp, ...resultSchemaArgs);
       a.push(`${system}\n\n---\n\n${prompt}`);
       return a;
     },
     parse: parseCodexLine,
+    /** `codex exec --output-schema <file>` constrains the FINAL message to a
+     *  JSON Schema. Only needed on the mediated path; the direct path reports
+     *  through MCP tool calls, which are already structured. */
+    resultSchema: (path) => ['--output-schema', path],
   },
 
   /**
@@ -569,9 +573,9 @@ export const RUNTIMES = {
      * `--json-schema`), which needs no per-invocation MCP config from the vendor
      * at all.
      */
-    profiles: ['wiki', 'consult'],
+    profiles: ['build', 'wiki', 'consult'],
     mcp: null,
-    args({ prompt, system, model, effort, resume, profile = 'build', vaultDir }) {
+    args({ prompt, system, model, effort, resume, profile = 'build', vaultDir, resultSchemaArgs = [] }) {
       const a = [];
       if (resume) a.push('--continue');
       // No system-prompt flag, same weakening as Codex: the contract rides in
@@ -580,6 +584,7 @@ export const RUNTIMES = {
       a.push('--output-format', 'stream-json');
       if (model) a.push('--model', model);
       if (effort) a.push('--effort', effort);
+      a.push(...resultSchemaArgs);
 
       if (profile === 'wiki') {
         // THE CARTOGRAPHER, at the same bar WIKI_PERM sets for Claude — writes
@@ -600,6 +605,24 @@ export const RUNTIMES = {
         a.push('--sandbox', '--dangerously-skip-permissions');
         // A sweep reads a whole repository; the 5m default would guillotine it.
         a.push('--print-timeout', '60m');
+      } else if (profile === 'build') {
+        // A BUILD WRITES, and headless auto-denies anything needing approval —
+        // so without this every edit comes back "User denied permission" and the
+        // turn reports failure having touched nothing. Caught only because an
+        // end-to-end test had to add the flag by hand to work.
+        //
+        // NOT `--sandbox` here, unlike wiki: a build has to `git push` and run
+        // `gh pr create`, so it needs the network by definition. The containment
+        // is the worktree, as it is for every runtime.
+        //
+        // FLOWVIANT_SAFE HAS NO EXPRESSION ON THIS RUNTIME. Claude narrows to an
+        // allowlist and Codex to `workspace-write`; agy's only per-invocation
+        // control is this boolean, and its allow/deny engine is machine-wide.
+        // So a SAFE-mode operator gets an agy build that is not actually
+        // narrowed — which is why `mediatedSafeGap` is surfaced rather than
+        // quietly ignored.
+        a.push('--dangerously-skip-permissions');
+        a.push('--print-timeout', '60m');
       } else if (profile === 'consult') {
         // NOTHING GRANTED, deliberately. The headless default IS the consult
         // posture: `run_command` comes back "User denied permission… headless
@@ -612,6 +635,16 @@ export const RUNTIMES = {
       return a;
     },
     parse: parseAgyLine,
+    /**
+     * `--json-schema` enforces the shape of the final result — verified against
+     * 1.1.12, which returned exactly the object asked for. This is what makes a
+     * BUILD possible on a runtime that cannot be handed an MCP config: the CLI
+     * stops needing to CALL anything and just returns a filled-in form, and the
+     * daemon makes the control-plane calls on its behalf with the lane's own
+     * per-lane token. Strictly better than parsing markers out of prose, which a
+     * model can wrap in a code fence, truncate or hallucinate.
+     */
+    resultSchema: (path) => ['--json-schema', path],
     blocked:
       'its MCP config is machine-wide — a workspace .agents/mcp_config.json is never loaded (measured), so every lane would share one token',
   },
@@ -664,11 +697,28 @@ export const runtimeById = (id) => RUNTIMES[id] ?? RUNTIMES.claude;
  */
 const PROFILE_NEEDS_MCP = { build: true, wiki: false, consult: false };
 
+/**
+ * A build needs the control plane, but NOT necessarily an MCP config of its own.
+ * A runtime that can return schema-enforced output is driven MEDIATED: the
+ * daemon holds the MCP connection with the lane's own token and makes the calls,
+ * and the CLI just returns a filled-in form. So "can build" is "can reach the
+ * control plane, by either route".
+ */
+export const mediated = (rt) => Boolean(rt && !rt.mcp && rt.resultSchema);
+
+/**
+ * A mediated runtime whose only permission control is all-or-nothing, so
+ * FLOWVIANT_SAFE cannot narrow its BUILD. Surfaced rather than swallowed: an
+ * operator who set SAFE asked for something we cannot give them here, and
+ * silently running unnarrowed would be the daemon deciding that on their behalf.
+ */
+export const mediatedSafeGap = (rt) => SAFE && mediated(rt);
+
 /** Can this runtime do this job on this machine? */
 export const canRun = (rt, profile) =>
   Boolean(rt?.args) &&
   (rt.profiles ?? []).includes(profile) &&
-  (!PROFILE_NEEDS_MCP[profile] || Boolean(rt.mcp));
+  (!PROFILE_NEEDS_MCP[profile] || Boolean(rt.mcp) || mediated(rt));
 
 /**
  * Reported on the roster poll and sent on every claim, so it answers the

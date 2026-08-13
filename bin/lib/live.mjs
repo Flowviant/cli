@@ -44,7 +44,7 @@ import {
   clearWip,
 } from './git.mjs';
 import { applyPatch, fileDiffs, ownerCurrentBranch, withPatchLock } from './patch.mjs';
-import { RUNTIMES, runtimeById, drivableHere } from './runtimes.mjs';
+import { RUNTIMES, runtimeById, drivableHere, mediated } from './runtimes.mjs';
 import { loadPreviewConfig, startPreview } from './preview.mjs';
 import { materializeInto, scrub as envScrub } from './env.mjs';
 
@@ -602,6 +602,267 @@ async function landPatch({ mcpUrl, token, runId, intentId, repoRoot, cwd, patchB
 }
 
 /**
+ * The FORM a mediated runtime fills in instead of calling tools.
+ *
+ * Every field maps to one control-plane call the daemon makes on the agent's
+ * behalf, which is why the shape is this small: it is not a report, it is the
+ * arguments to `complete` / `report_blocker` / `attach_pr` with the runId taken
+ * out (the agent has no business naming a run it cannot see).
+ */
+const MEDIATED_RESULT_SCHEMA = {
+  type: 'object',
+  required: ['outcome', 'summary'],
+  additionalProperties: false,
+  properties: {
+    outcome: { type: 'string', enum: ['done', 'blocked', 'failed'] },
+    summary: { type: 'string' },
+    prUrl: { type: 'string' },
+    branch: { type: 'string' },
+    blockerQuestion: { type: 'string' },
+    blockerOptions: { type: 'array', items: { type: 'string' } },
+    criteria: {
+      type: 'array',
+      items: {
+        type: 'object',
+        required: ['index', 'met'],
+        properties: {
+          index: { type: 'number' },
+          met: { type: 'boolean' },
+          note: { type: 'string' },
+        },
+      },
+    },
+  },
+};
+
+/**
+ * The contract for a runtime that cannot reach the flowviant MCP server.
+ *
+ * SYSTEM_LIVE tells the agent to call tools. This one tells it there are none —
+ * which has to be said explicitly, because the brief it is about to read is full
+ * of references to a control plane it cannot touch, and an agent that spends its
+ * turn hunting for `report_progress` is an agent that does not build anything.
+ */
+const SYSTEM_MEDIATED = `You are a Flowviant build agent working ONE task, running FULLY AUTONOMOUSLY.
+There is NO interactive user, NO terminal to ask in, and — importantly — NO
+Flowviant tools available to you in this session. Do not look for them. A daemon
+is watching this run and reports on your behalf: your file edits, commands and
+progress are already visible to the team as you work.
+
+Do the work described in the brief below, in the checkout you are running in.
+Ship it exactly as the brief's "placement" says:
+• placement "patch": commit your change with a one-line message and STOP. No
+  branch, no push, no PR — the daemon carries it into the owner's checkout.
+• placement "branch" (the default): create the branch named in "branchName" (use
+  that exact name), push it, and open ONE draft pull request with
+  \`gh pr create --draft\`. If the brief has a "baseBranch", target it with
+  \`--base <baseBranch>\`. NEVER merge.
+
+THEN RETURN THE RESULT FORM as your final answer, and nothing else — it is a
+strict JSON schema and it is the only way anything you did gets recorded:
+• outcome "done" — you finished. Include a plain-language "summary" for the
+  humans (it becomes your delivery card), the "prUrl" and "branch" if you opened
+  one, and a "criteria" self-report indexing into the brief's "done when" list.
+• outcome "blocked" — you hit a decision only a human can make. Put the question
+  in "blockerQuestion" and any choices in "blockerOptions", and STOP. You will be
+  run again with the answer.
+• outcome "failed" — you could not do it. Say why in "summary".
+Do not invent a prUrl you did not open, and do not report "done" for work you did
+not finish: the summary is shown to a person as a claim about what exists.
+SECRETS: env files (.env, .dev.vars, …) hold the team's synced secrets. Their
+VALUES must NEVER appear in the summary, in commits, or in a PR — reference keys
+by NAME only. Never commit an env file.`;
+
+/** Pull the result object out of a turn's output. */
+function parseMediatedResult(out) {
+  const text = String(out ?? '').trim();
+  if (!text) return null;
+  // The whole answer SHOULD be the object — that is what schema enforcement
+  // buys. Fall back to the last balanced {...} for a runtime that wraps it in a
+  // fence or adds a sentence, so one chatty model does not strand a finished
+  // build. Last rather than first: any preamble comes before the answer.
+  const direct = tryJson(text);
+  if (direct) return direct;
+  const start = text.lastIndexOf('{');
+  for (let i = start; i >= 0; i = text.lastIndexOf('{', i - 1)) {
+    const cand = tryJson(text.slice(i, text.lastIndexOf('}') + 1));
+    if (cand) return cand;
+    if (i === 0) break;
+  }
+  return null;
+}
+function tryJson(s) {
+  try {
+    const v = JSON.parse(s);
+    return v && typeof v === 'object' && typeof v.outcome === 'string' ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Drive a task with a runtime that cannot reach the MCP server at all.
+ *
+ * THE CLI DOES THE WORK; THE DAEMON DOES THE PAPERWORK. Antigravity's server
+ * list is machine-wide (measured — a workspace-local config is never read), so
+ * handing it a per-lane worker token is impossible and handing it a shared one
+ * would make every lane indistinguishable to the control plane. Instead nothing
+ * is handed over: the agent gets a brief and returns a filled-in form, and every
+ * control-plane call below is made by the daemon with the lane's OWN token, over
+ * its own HTTP. Per-lane isolation is preserved by removing the need for the
+ * agent to have a credential at all.
+ *
+ * The cost, and it is real: NO ON-DEMAND CONTEXT. A direct-MCP agent can call
+ * search_wiki or get_module_files the moment it realises it does not understand
+ * a subsystem. A mediated one only knows what was in the brief. That is a
+ * genuine capability difference and it is why this is the fallback shape rather
+ * than the default — runtimes that CAN hold an MCP config keep the full tool
+ * surface.
+ *
+ * Also not yet carried: attach_evidence. A mediated agent cannot upload a
+ * screenshot, so its delivery card arrives without the proof a Claude lane's
+ * would have. Fixable (the agent writes files, the daemon uploads them) and
+ * deliberately not in this first pass.
+ */
+async function driveMediated({
+  runtimeId,
+  mcpUrl,
+  token,
+  runId,
+  intentId,
+  title,
+  cwd,
+  brief,
+  isPatch,
+  patchBase,
+  repoRoot,
+  baseRef,
+  label,
+  seedText,
+  isAlive,
+  onChild,
+  markLanded,
+}) {
+  const rt = runtimeById(runtimeId);
+  const dir = mkdtempSync(join(tmpdir(), 'flowviant-schema-'));
+  const schemaPath = join(dir, 'result.schema.json');
+  writeFileSync(schemaPath, JSON.stringify(MEDIATED_RESULT_SCHEMA), { mode: 0o600 });
+
+  // The agent cannot call report_progress, so the daemon narrates for it off the
+  // parsed activity stream. Throttled: a build touches hundreds of files and the
+  // thread is for humans, not for a filesystem log.
+  let lastReport = 0;
+  const narrate = (activity) => {
+    if (!activity?.label) return;
+    const now = Date.now();
+    if (now - lastReport < 8000) return;
+    lastReport = now;
+    void mcpCall(mcpUrl, token, 'report_progress', {
+      runId,
+      kind: activity.kind === 'error' ? 'error' : 'progress',
+      message: envScrub(activity.label),
+    }).catch(() => {});
+  };
+
+  let prompt = seedText;
+  let resume = false;
+  let nudges = 0;
+  try {
+    for (;;) {
+      if (!isAlive()) return { outcome: 'blocked', title, intentId };
+      let out = '';
+      try {
+        out = await runTurn({
+          prompt,
+          resume,
+          system: SYSTEM_MEDIATED,
+          cwd,
+          runtime: runtimeId,
+          // NO MCP. That is the entire point of this path.
+          resultSchemaArgs: rt.resultSchema?.(schemaPath) ?? [],
+          label,
+          model: brief.agentModel || undefined,
+          effort: brief.agentEffort || undefined,
+          onActivity: narrate,
+          onSpawn: (ch) => onChild?.(ch),
+        });
+      } catch (e) {
+        return { outcome: 'error', error: e?.message ?? String(e), title, intentId };
+      } finally {
+        onChild?.(null);
+      }
+      if (!isAlive()) return { outcome: 'blocked', title, intentId };
+      resume = true;
+
+      const rl = classifyRateLimit(String(out).slice(-4000));
+      const result = parseMediatedResult(out);
+      if (!result && rl.isRateLimit) {
+        await mcpCall(mcpUrl, token, 'report_paused', { runId, resetAt: rl.resetAt }).catch(() => {});
+        return { outcome: 'rate_limited', resetAt: rl.resetAt, runId, title, intentId };
+      }
+
+      if (!result) {
+        // No form came back. Same posture as a missing sentinel on the other
+        // paths: nudge, then give up rather than invent an outcome.
+        if (nudges < 2) {
+          nudges++;
+          prompt =
+            'You did not return the result form. Return ONLY the JSON object described in your instructions, describing what you did.';
+          continue;
+        }
+        return { outcome: 'stalled', title, intentId };
+      }
+
+      if (result.outcome === 'blocked') {
+        const q = String(result.blockerQuestion ?? result.summary ?? '').trim();
+        const posted = await mcpCall(mcpUrl, token, 'report_blocker', {
+          runId,
+          taskId: intentId,
+          type: 'question',
+          payload: {
+            question: q || 'The agent stopped and did not say why.',
+            options: Array.isArray(result.blockerOptions) ? result.blockerOptions : undefined,
+          },
+        }).catch(() => null);
+        const blockerId = posted?.blockerId ?? posted?.id ?? null;
+        if (!blockerId) return { outcome: 'blocked', title, intentId };
+        const res = await waitForResolution(mcpUrl, token, blockerId, isAlive);
+        if (res.status === 'resolved') {
+          prompt = `The human answered your blocker: ${JSON.stringify(res.answer)}\nApply it and continue, then return the result form.`;
+          nudges = 0;
+          continue;
+        }
+        if (res.status === 'timeout') return { outcome: 'parked', title, intentId };
+        return { outcome: 'blocked', title, intentId };
+      }
+
+      // done / failed — either way the turn is over and the thread gets a card.
+      if (result.prUrl && !isPatch) {
+        await mcpCall(mcpUrl, token, 'attach_pr', {
+          runId,
+          prUrl: String(result.prUrl),
+          ...(result.branch ? { branch: String(result.branch) } : {}),
+        }).catch(() => {});
+      }
+      clearTaskMarker(cwd);
+      if (result.outcome === 'done' && isPatch) {
+        await landPatch({ mcpUrl, token, runId, intentId, repoRoot, cwd, patchBase, baseRef });
+      }
+      await mcpCall(mcpUrl, token, 'complete', {
+        runId,
+        outcome: result.outcome === 'done' ? 'completed' : 'failed',
+        summary: envScrub(String(result.summary ?? '').slice(0, 4000)),
+        ...(Array.isArray(result.criteria) ? { criteria: result.criteria } : {}),
+      }).catch(() => {});
+      if (result.outcome === 'done') markLanded();
+      return { outcome: result.outcome === 'done' ? 'done' : 'stalled', title, intentId };
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/**
  * Drive a task with a runtime that has no live session.
  *
  * Same job, same outcomes, different transport. `runLiveTask` owns everything
@@ -1119,6 +1380,32 @@ export async function runLiveTask({
     // timer and the diffstat sampler — and everything in the `finally` below
     // tears it down. Only the middle differs by runtime, so only the middle
     // branches, and a non-live runtime inherits the other two thirds unchanged.
+    if (!session && mediated(rt)) {
+      // No MCP config this runtime can hold, so it is handed none: the daemon
+      // makes every control-plane call itself with this lane's own token.
+      return await driveMediated({
+        runtimeId: rt.id,
+        mcpUrl,
+        token,
+        runId,
+        intentId,
+        title,
+        cwd,
+        brief,
+        isPatch,
+        patchBase,
+        repoRoot,
+        baseRef,
+        label: `[${rt.label}]`,
+        seedText,
+        isAlive,
+        onChild,
+        markLanded: () => {
+          landed = true;
+        },
+      });
+    }
+
     if (!session) {
       return await driveSubprocess({
         runtimeId: rt.id,

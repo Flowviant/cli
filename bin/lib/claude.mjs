@@ -594,7 +594,7 @@ function handleStreamLine(line, { cwd, emit, onActivity, appendText }) {
 // returned string for sentinel detection, and each activity is handed to
 // `onActivity` so the caller can forward progress. Build-agent turns leave it
 // off and keep the raw text passthrough + line sentinels.
-export function runTurn({ prompt, resume, system, cwd, mcpConfig, mcpArgs, mcpEnv, runtime = 'claude', label, onSpawn, streamJson, onActivity, wikiPerm, readOnly, vaultDir, model, effort }) {
+export function runTurn({ prompt, resume, system, cwd, mcpConfig, mcpArgs, mcpEnv, runtime = 'claude', label, onSpawn, streamJson, onActivity, wikiPerm, readOnly, vaultDir, resultSchemaArgs, model, effort }) {
   return new Promise((resolve) => {
     const rt = runtimeById(runtime);
     if (!rt.args) {
@@ -637,6 +637,11 @@ export function runTurn({ prompt, resume, system, cwd, mcpConfig, mcpArgs, mcpEn
       // runtime that can path-scope its writes needs to know WHERE the vault is,
       // and Claude — which cannot — simply ignores it.
       vaultDir,
+      // Structured-output flags for the MEDIATED path. Handed to the adapter
+      // rather than appended here for the same reason `mcp` is: Codex takes its
+      // prompt as a trailing positional, so a flag after it is in the wrong
+      // place.
+      resultSchemaArgs,
       perm: readOnly ? CONSULT_PERM : wikiPerm ? WIKI_PERM : PERM,
       // Handed to the adapter rather than appended here, because WHERE these go
       // is a property of the CLI: Codex reads its prompt as a trailing
