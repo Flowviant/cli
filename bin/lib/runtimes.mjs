@@ -306,24 +306,52 @@ export const RUNTIMES = {
   },
 
   /**
-   * DECLARED, NOT DRIVABLE — and the reason is specific, not a shrug.
+   * DECLARED, NOT DRIVABLE — but NOT for the reason this comment used to give.
    *
-   * `agy` has everything else this needs: `-p` for headless, `--output-format
-   * stream-json`, `--model`, `--effort`, `--continue`, and
-   * `--dangerously-skip-permissions`. What it has no per-invocation form of is
-   * the MCP server: config lives at `~/.gemini/config/mcp_config.json`, the
-   * workspace-local `.agents/mcp_config.json` is read-but-ignored (upstream
-   * antigravity-cli#60), and the HOME-level file cannot be made per-lane —
-   * pointing HOME elsewhere would take the cached credentials the headless mode
-   * signs in with along with it.
+   * THE OLD REASON WAS WRONG, and wrong about a filename. It said workspace-local
+   * `.agents/mcp_config.json` is "read-but-ignored (upstream antigravity-cli#60)".
+   * Issue #60 is titled "Project-local `.antigravitycli/mcp_config.json`
+   * mcpServers is read but ignored" — a DIFFERENT directory. `.antigravitycli/`
+   * is the CLI's project-DISCOVERY folder; `.agents/` is its workspace
+   * CUSTOMIZATION folder. The reporter had put their config in the wrong place,
+   * and we inherited their conclusion.
    *
-   * So running Antigravity today means one shared MCP token across every lane on
-   * the machine, which is exactly the blast radius the per-lane token exists to
-   * prevent. It is listed so `flowviant doctor` can say "installed, and here is
-   * what is missing" rather than pretending we never looked — the same posture
-   * the app's @ tray takes. When either the workspace config is fixed upstream
-   * or a flag appears, this becomes an `mcp` function and a `parse`, and nothing
-   * else in the daemon changes.
+   * `.agents/mcp_config.json` is the documented workspace path — antigravity.google
+   * /docs/mcp, and Google's own codelab does `mkdir -p .agents` then verifies with
+   * `/mcp` inside agy. A server entry takes `serverUrl` + `transport` + `headers`,
+   * so a bearer token goes in as `{"Authorization": "Bearer <token>"}`. Since every
+   * Flowviant task already builds in its OWN worktree, a workspace-local file IS a
+   * per-lane token — the isolation the old comment called impossible, with no HOME
+   * repointing, so the cached-credential objection dissolves with it.
+   *
+   * It stays undrivable because none of that is OBSERVED. `agy` is not installed
+   * here, so the above is documentation. Three things are genuinely unknown and
+   * one is likely fatal:
+   *   (a) does the workspace file MERGE with the global one or OVERRIDE it?
+   *       Undocumented; merge means a stale HOME entry still loads.
+   *   (b) is workspace load gated on folder TRUST? CHANGELOG 1.1.0 fixed
+   *       `.agents/hooks.json` not loading "after trusting a folder", and a fresh
+   *       per-task worktree is an untrusted folder EVERY TIME. This is the most
+   *       likely real blocker.
+   *   (c) is it re-read per invocation?
+   * The cheap check, once `agy` exists: drop a `.agents/mcp_config.json` in a
+   * throwaway worktree, run `agy -p "hi" --output-format stream-json`, and read
+   * the `tools` array in the `init` event — the flowviant tools appear or they
+   * do not.
+   *
+   * TWO THINGS TO CARRY OVER WHEN IT IS WIRED:
+   *   • The token must be LITERAL in the file — `${VAR}` is not expanded (upstream
+   *     #233 asks for it). So a plaintext bearer lands on disk inside the
+   *     worktree, which is the same `git add -A` exposure that got AGENTS.md
+   *     rejected for Codex. It needs `.git/info/exclude` and a teardown scrub,
+   *     and it is strictly worse than Codex's env-var hand-off.
+   *   • PERMISSIONS ARE STILL MACHINE-WIDE. `~/.gemini/antigravity-cli/settings.json`
+   *     holds the allow/ask/deny engine, and it is the only documented location.
+   *     Even with MCP per-workspace, that is a real per-lane gap for `profiles`
+   *     below: two lanes cannot hold different postures at once.
+   *
+   * Pin any wiring to agy >= 1.1.10 — `--model`/`--effort` were ignored in
+   * headless before it, and `--output-format` only arrived in 1.1.8.
    */
   antigravity: {
     id: 'antigravity',
@@ -338,7 +366,8 @@ export const RUNTIMES = {
     mcp: null,
     args: null,
     parse: null,
-    blocked: 'no per-invocation MCP config — its server list is machine-wide, so every lane would share one token',
+    blocked:
+      'unverified: its workspace MCP config looks per-worktree (so per-lane), but nothing has tested whether a fresh untrusted worktree loads it',
   },
 };
 
