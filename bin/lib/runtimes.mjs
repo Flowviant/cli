@@ -263,19 +263,18 @@ export const RUNTIMES = {
      * a verb allowlist, and for a consult's actual threat (exfiltration driven
      * by an injected question) that is sufficient and arguably stronger.
      *
-     * NOT 'wiki', and the reason is mundane rather than deep: the vault lives at
-     * ~/.flowviant/vaults/<id>, OUTSIDE the worktree Codex would run in, so
-     * `workspace-write` cannot reach it. It needs the vault path threaded down
-     * to `args()` as `--add-dir` / `writable_roots`, which nothing passes yet.
-     * Network is already denied by default in workspace-write, so the exfil half
-     * of WIKI_PERM's reasoning is covered — this is a plumbing gap, not a
-     * safety one.
+     * ALL THREE, and `wiki` is the one worth pausing on: Codex expresses it
+     * MORE strictly than Claude does. A cartographer must read the repo and
+     * write only the vault; Claude's WIKI_PERM cannot path-scope Write and says
+     * so, leaning on the worktree reset as a backstop. Codex's permission
+     * profiles enforce the same rule in the kernel — measured: repo readable,
+     * vault writable, repo writes refused, network off.
      *
      * Enforcement was verified on Linux (bubblewrap + seccomp). macOS Seatbelt
      * and Windows are UNTESTED; if this daemon starts running there, re-verify
      * before trusting the consult posture on those platforms.
      */
-    profiles: ['build', 'consult'],
+    profiles: ['build', 'consult', 'wiki'],
     mcp: codexMcp,
     /**
      * Codex has NO system-prompt flag. The contract therefore rides inside the
@@ -297,7 +296,7 @@ export const RUNTIMES = {
      * placed before it. Appending them after the positional is the kind of argv
      * that parses today and stops parsing on some future clap upgrade.
      */
-    args({ prompt, system, model, effort, resume, profile = 'build', mcp = [] }) {
+    args({ prompt, system, model, effort, resume, profile = 'build', vaultDir, mcp = [] }) {
       const a = ['exec'];
       if (resume) a.push('resume', '--last');
       a.push('--json');
@@ -343,6 +342,31 @@ export const RUNTIMES = {
         // `.rules` execpolicy file, or their own MCP servers can widen a posture
         // we are asserting on their behalf — silently, and on the one turn whose
         // prompt comes from someone else's typing.
+        a.push('--ignore-user-config', '--ignore-rules');
+      } else if (profile === 'wiki' && vaultDir) {
+        // THE CARTOGRAPHER, AND THIS ONE IS STRICTER THAN CLAUDE'S.
+        //
+        // A wiki turn reads the whole repo and writes ONLY the vault. Claude
+        // cannot actually express that: WIKI_PERM hands it Write/Edit and its own
+        // comment admits "Write/Edit can't be path-scoped here; the worktree
+        // reset is the backstop" — i.e. the cartographer CAN scribble on the
+        // checkout and we clean up afterwards.
+        //
+        // Codex's permission profiles take a per-path filesystem map, so the
+        // rule is enforced by the kernel instead of apologised for. Measured:
+        // repo readable, vault writable, repo writes fail "Read-only file
+        // system", and curl returns 000 — the network is off, which is the half
+        // WIKI_PERM was really protecting (its comment: "Command execution is
+        // the line: it enables network exfil").
+        //
+        // The table is set WHOLE rather than as a dotted key, and that is not
+        // style: `-c permissions.wiki.filesystem."<path>"="write"` splits the
+        // dotted path on the dots INSIDE the path, and every real vault lives
+        // under `~/.flowviant/vaults/…`. It fails with "filesystem path must be
+        // absolute", which reads like a path problem and is a parsing one.
+        a.push('-c', 'permissions.flowviantwiki.extends=":read-only"');
+        a.push('-c', `permissions.flowviantwiki.filesystem={"${vaultDir}"="write"}`);
+        a.push('-P', 'flowviantwiki');
         a.push('--ignore-user-config', '--ignore-rules');
       } else {
         // The daemon's build posture, mapped: SAFE keeps writes inside the
