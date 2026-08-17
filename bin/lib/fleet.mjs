@@ -1289,6 +1289,127 @@ export async function runFleetDaemon() {
     }
   };
 
+  // Ship — a session's branch merging to main, on the human's word.
+  //
+  // --no-ff, NEVER squash: every delivered card carries commit shas as its
+  // receipts, and a squash would point them all at commits that no longer
+  // exist on main. Sequence: refuse a dirty worktree (auto-committing someone's
+  // mid-thought state is not shipping, it is guessing), fold main INTO the
+  // branch first so conflicts surface in the worktree where the session can
+  // resolve them, collect the branch's own commits (the server's
+  // reconciliation input), then merge outward through a throwaway worktree so
+  // nobody's checkout moves. Failures report INTO the tab — a ship that failed
+  // silently leaves the human believing their work is on main.
+  const SHIP_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/ship-done');
+  const shipping = new Set();
+  let shipChain = Promise.resolve();
+
+  const processShipJobs = (jobs) => {
+    for (const job of jobs ?? []) {
+      if (!job || typeof job.sessionId !== 'string') continue;
+      if (shipping.has(job.sessionId)) continue;
+      shipping.add(job.sessionId);
+      shipChain = shipChain.then(async () => {
+        const done = (payload) =>
+          reportMergeOutcome(SHIP_DONE_URL, { sessionId: job.sessionId, ...payload }).catch(
+            () => {}
+          );
+        try {
+          if (!isSafePathSegment(job.sessionId)) {
+            await done({ ok: false, error: 'invalid session id' });
+            return;
+          }
+          note(`${c.cyan('ship')} ${c.dim(`— "${job.sessionName || job.sessionId}"`)}`);
+          const wt = join(baseDir, 'sessions', job.sessionId);
+          if (!existsSync(wt)) {
+            await done({ ok: false, error: 'no session worktree on this machine' });
+            return;
+          }
+          if (git(['status', '--porcelain'], wt) !== '') {
+            await done({
+              ok: false,
+              error:
+                'the session has uncommitted changes — ask it to commit or discard them first',
+            });
+            return;
+          }
+          try {
+            git(['fetch', 'origin', '--quiet'], repoRoot);
+          } catch {
+            /* offline fetch — merge against what we have */
+          }
+          // Fold main into the branch FIRST: conflicts land here, in the
+          // session's own worktree, where the next turn can resolve them.
+          try {
+            git(['merge', '--no-edit', baseRef], wt);
+          } catch {
+            try {
+              git(['merge', '--abort'], wt);
+            } catch {
+              /* nothing in progress */
+            }
+            await done({
+              ok: false,
+              error: 'conflicts with main — ask the session to resolve them, then ship again',
+            });
+            return;
+          }
+          // The branch's own commits — the server's reconciliation input.
+          // --no-merges: fold-commits describe plumbing, not work.
+          const commits = git([
+            'log',
+            `${baseRef}..HEAD`,
+            '--no-merges',
+            '--format=%H%x09%s',
+          ], wt)
+            .split('\n')
+            .filter(Boolean)
+            .map((l) => {
+              const [sha, ...rest] = l.split('\t');
+              return { sha, subject: envScrub(rest.join('\t')).slice(0, 200) };
+            });
+          if (commits.length === 0) {
+            await done({ ok: false, error: 'nothing to ship — no commits on the session branch' });
+            return;
+          }
+          // Merge outward through a throwaway worktree so no checkout moves.
+          const branch = `session/${job.sessionId}`;
+          const tmp = join(baseDir, 'ship', job.sessionId);
+          try {
+            try {
+              git(['worktree', 'remove', '--force', tmp], repoRoot);
+            } catch {
+              /* not there — fine */
+            }
+            git(['worktree', 'add', '--detach', tmp, baseRef], repoRoot);
+            git([
+              'merge',
+              '--no-ff',
+              branch,
+              '-m',
+              `ship(${job.sessionName || job.sessionId.slice(0, 8)}): ${commits.length} commit${commits.length === 1 ? '' : 's'}`,
+            ], tmp);
+            git(['push', 'origin', `HEAD:${baseBranchName(baseRef)}`], tmp);
+          } finally {
+            try {
+              git(['worktree', 'remove', '--force', tmp], repoRoot);
+              git(['worktree', 'prune'], repoRoot);
+            } catch {
+              /* best effort */
+            }
+          }
+          await done({ ok: true, commits });
+          ok(`${c.cyan('ship')} ${c.dim(`— ${commits.length} commit${commits.length === 1 ? '' : 's'} on main`)}`);
+        } catch (e) {
+          await done({ ok: false, error: envScrub(e?.message ?? 'the merge failed').slice(0, 500) });
+          warn(`ship failed: ${e?.message ?? e}`);
+        } finally {
+          shipping.delete(job.sessionId);
+        }
+      });
+    }
+  };
+
   const processMergeJobs = (jobs) => {
     for (const job of jobs ?? []) {
       if (!job || typeof job.id !== 'string') continue; // a null element would wedge the loop
@@ -1886,6 +2007,7 @@ export async function runFleetDaemon() {
     processPlanCheckJobs(roster.planCheckJobs);
     processConsultJobs(roster.consultJobs);
     processWorkTurns(roster.workTurnJobs);
+    processShipJobs(roster.shipJobs);
     processJoinJobs(roster.joinJobs);
     processCleanupJobs(roster.cleanupJobs);
     const rosterIds = new Set(roster.agents.map((a) => a.agentId));
