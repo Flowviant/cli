@@ -59,6 +59,8 @@ import {
   REGROUND_KICKOFF,
   SYSTEM_PLAN,
   PLAN_TURN_KICKOFF,
+  SYSTEM_WORK,
+  WORK_TURN_KICKOFF,
   SYSTEM_QUICK_EDIT,
   QUICK_EDIT_KICKOFF,
 } from './claude.mjs';
@@ -1099,6 +1101,194 @@ export async function runFleetDaemon() {
     }
   };
 
+  // ── Work sessions — the Workbench tabs ─────────────────────────────────────
+  //
+  // A tab is a held Claude session with BUILD permissions in a PERSISTENT
+  // worktree on its own branch. The opposite of a plan directory on both
+  // counts: nothing here is detached and nothing is ever reset — uncommitted
+  // state between turns IS the session, and blowing it away would be closing
+  // the human's editor mid-thought.
+  const WORK_TOKEN_URL = FLEET_URL.replace(/\/agents\/?$/, '/work-token');
+  const WORK_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/work-turn-done');
+  const workAnswering = new Set();
+  const workAttempts = new Map(); // turn id -> tries
+  const MAX_WORK_TRIES = 3;
+  /** Per-SESSION serialization, parallel ACROSS sessions: turns within one tab
+   *  must land in order (they share a directory and a context), but two tabs
+   *  are two terminals — the human opened both on purpose. */
+  const workChains = new Map(); // sessionId -> Promise
+
+  let workToken = null;
+  const mintWorkToken = async (force = false) => {
+    if (workToken && !force) return workToken;
+    try {
+      const res = await fetch(WORK_TOKEN_URL, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${FLEET_TOKEN}`, 'User-Agent': USER_AGENT },
+      });
+      if (!res.ok) return null;
+      const data = await res.json().catch(() => null);
+      workToken = data?.data?.token ?? null;
+      return workToken;
+    } catch {
+      return null;
+    }
+  };
+
+  /**
+   * This tab's worktree — its held context, expressed as a place, ON A BRANCH.
+   *
+   * Fresh: branch `session/<id>` off the current base. Existing: touched not at
+   * all — no fetch-reset-clean like a plan directory, because the dirty state
+   * is the point. If the directory was retired but the branch survives, the
+   * worktree re-attaches to the branch and the committed work is still there.
+   */
+  const sessionWtFor = (sessionId) => {
+    if (!isSafePathSegment(sessionId)) return null;
+    const wt = join(baseDir, 'sessions', sessionId);
+    const fresh = !existsSync(wt);
+    if (fresh) {
+      const branch = `session/${sessionId}`;
+      try {
+        git(['worktree', 'add', '-b', branch, wt, baseRef], repoRoot);
+      } catch {
+        git(['worktree', 'prune'], repoRoot);
+        try {
+          // The branch may already exist (a retired directory's work) — attach.
+          git(['worktree', 'add', wt, branch], repoRoot);
+        } catch {
+          try {
+            git(['worktree', 'add', '-b', branch, wt, baseRef], repoRoot);
+          } catch {
+            return null;
+          }
+        }
+      }
+    }
+    return { wt, fresh };
+  };
+
+  /**
+   * Retire the least-recently-touched CLEAN session directories past the cap.
+   * A dirty worktree is never touched — uncommitted work is the human's, and a
+   * resource bound does not outrank it. Committed work survives retirement on
+   * the session branch either way.
+   */
+  const MAX_WORK_DIRS = 12;
+  const workTouched = new Map(); // sessionId -> ms
+  const retireIdleWorkSessions = () => {
+    const dir = join(baseDir, 'sessions');
+    if (!existsSync(dir)) return;
+    let ids;
+    try {
+      ids = readdirSync(dir);
+    } catch {
+      return;
+    }
+    if (ids.length <= MAX_WORK_DIRS) return;
+    const oldestFirst = ids.sort(
+      (a, b) => (workTouched.get(a) ?? 0) - (workTouched.get(b) ?? 0)
+    );
+    let excess = ids.length - MAX_WORK_DIRS;
+    for (const id of oldestFirst) {
+      if (excess <= 0) break;
+      const wt = join(dir, id);
+      try {
+        if (git(['status', '--porcelain'], wt).trim() !== '') continue; // dirty — skip
+        git(['worktree', 'remove', wt], repoRoot);
+        workTouched.delete(id);
+        excess--;
+      } catch {
+        /* leave it; a directory we can't cleanly remove is not worth a turn */
+      }
+    }
+    try {
+      git(['worktree', 'prune'], repoRoot);
+    } catch {
+      /* best effort */
+    }
+  };
+
+  const processWorkTurns = (jobs) => {
+    for (const job of jobs ?? []) {
+      if (!job || typeof job.id !== 'string' || !job.body || !job.sessionId) continue;
+      if (workAnswering.has(job.id)) continue;
+      const tries = (workAttempts.get(job.id) ?? 0) + 1;
+      if (tries > MAX_WORK_TRIES) continue;
+      workAttempts.set(job.id, tries);
+      workAnswering.add(job.id);
+      const chain = workChains.get(job.sessionId) ?? Promise.resolve();
+      workChains.set(
+        job.sessionId,
+        chain.then(async () => {
+          try {
+            note(
+              `${c.cyan('tab')} ${c.dim(`— ${job.askedByName || 'the owner'} in "${job.sessionName || 'a session'}"`)}`
+            );
+            const workRt = pickRuntimeFor('build');
+            if (!workRt) {
+              warn('a session turn is waiting, but no installed CLI can build here');
+              return;
+            }
+            const token = await mintWorkToken();
+            if (!token) {
+              warn('a session turn is waiting, but the work credential could not be minted');
+              return;
+            }
+            const dir = sessionWtFor(job.sessionId);
+            if (!dir) {
+              warn('a session turn is waiting, but its worktree could not be opened');
+              return;
+            }
+            workTouched.set(job.sessionId, Date.now());
+            const resume = !dir.fresh && Boolean(job.sessionRef);
+            const mcp = mcpFor(workRt, token, mcpUrl);
+            let out;
+            try {
+              out = await runTurn({
+                prompt: WORK_TURN_KICKOFF({
+                  sessionId: job.sessionId,
+                  sessionName: job.sessionName,
+                  message: job.body,
+                  askedByName: job.askedByName,
+                }),
+                resume,
+                system: SYSTEM_WORK,
+                cwd: dir.wt,
+                mcpArgs: mcp.args,
+                mcpEnv: mcp.env,
+                runtime: workRt,
+                label: c.cyan('[tab]'),
+              });
+            } finally {
+              if (mcp.dir) rmSync(mcp.dir, { recursive: true, force: true });
+            }
+            const answer = (out || '').trim();
+            const posted = await reportMergeOutcome(WORK_DONE_URL, {
+              turnId: job.id,
+              ok: answer.length > 0,
+              // Scrub: a reply can quote config or env-adjacent code.
+              answer: envScrub(answer).slice(0, 16000),
+              sessionRef: dir.wt,
+            });
+            if (posted) workAttempts.delete(job.id);
+            ok(`${c.cyan('tab')} ${c.dim('— replied in the session')}`);
+            retireIdleWorkSessions();
+          } catch (e) {
+            await reportMergeOutcome(WORK_DONE_URL, {
+              turnId: job.id,
+              ok: false,
+              answer: e?.message ?? 'the session turn failed',
+            });
+            warn(`session turn failed: ${e?.message ?? e}`);
+          } finally {
+            workAnswering.delete(job.id);
+          }
+        })
+      );
+    }
+  };
+
   const processMergeJobs = (jobs) => {
     for (const job of jobs ?? []) {
       if (!job || typeof job.id !== 'string') continue; // a null element would wedge the loop
@@ -1695,6 +1885,7 @@ export async function runFleetDaemon() {
     processPatchRevertJobs(roster.patchRevertJobs);
     processPlanCheckJobs(roster.planCheckJobs);
     processConsultJobs(roster.consultJobs);
+    processWorkTurns(roster.workTurnJobs);
     processJoinJobs(roster.joinJobs);
     processCleanupJobs(roster.cleanupJobs);
     const rosterIds = new Set(roster.agents.map((a) => a.agentId));
