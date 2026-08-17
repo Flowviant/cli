@@ -125,12 +125,15 @@ const DIFF_STATUS = { A: 'added', D: 'removed', M: 'modified' };
  * pass back to `git diff -- <path>`. A rename showing up as a delete plus an add
  * is a slightly longer diff and a correct one.
  */
-export function fileDiffs(cwd, base) {
+export function fileDiffs(cwd, base, { range, maxFiles = MAX_DIFF_FILES } = {}) {
+  // `range` lets the per-COMMIT walk reuse this (`sha^..sha`); without it the
+  // original meaning holds — everything the agent did since `base`.
+  const rev = range ?? `${base}..HEAD`;
   let numstat = '';
   let names = '';
   try {
-    numstat = git(['diff', '--numstat', '--no-renames', `${base}..HEAD`], cwd);
-    names = git(['diff', '--name-status', '--no-renames', `${base}..HEAD`], cwd);
+    numstat = git(['diff', '--numstat', '--no-renames', rev], cwd);
+    names = git(['diff', '--name-status', '--no-renames', rev], cwd);
   } catch {
     return [];
   }
@@ -144,7 +147,7 @@ export function fileDiffs(cwd, base) {
 
   const out = [];
   for (const line of numstat.split('\n')) {
-    if (out.length >= MAX_DIFF_FILES) break;
+    if (out.length >= maxFiles) break;
     const m = /^(\d+|-)\t(\d+|-)\t(.+)$/.exec(line.replace(/\n$/, ''));
     if (!m) continue;
     const path = m[3].trim();
@@ -154,7 +157,7 @@ export function fileDiffs(cwd, base) {
     let patch = null;
     if (!binary) {
       try {
-        const full = git(['diff', `${base}..HEAD`, '--', path], cwd);
+        const full = git(['diff', rev, '--', path], cwd);
         // Drop git's own "diff --git a/… b/…" preamble; the card shows the path.
         const at = full.indexOf('@@');
         const hunks = at === -1 ? full : full.slice(at);
@@ -292,4 +295,69 @@ export function revertPatch({ repoRoot, shas }) {
     }
     return { ok: false, error: e?.message ?? String(e) };
   }
+}
+
+
+// How many commits of a task's branch we carry across. The server used to read
+// this from GitHub and capped at 50 for the same reason: each commit costs a
+// diff, and a runaway branch must not fan out unbounded work or produce a row
+// too big to read on every card render. Truncation keeps the MOST RECENT
+// commits — the tail is what a reviewer is looking at.
+const MAX_COMMITS = 50;
+
+/**
+ * A task branch's commits with their real per-file diffs, in the exact shape
+ * the server's GitHub read used to return (`TaskCommit[]`).
+ *
+ * This is the function that let the GitHub App die. The server used to resolve
+ * the project's linked repo, mint an installation token, fetch
+ * `GET /pulls/{n}/commits` and then run an N+1 of `GET /commits/{sha}` for the
+ * per-file patches — up to ~52 API calls to describe work THIS process had just
+ * performed, in a checkout it is standing in. Now the daemon reports it through
+ * `report_commits` and the server reads a row.
+ *
+ * Oldest → newest, because the thread appends chronologically.
+ */
+export function commitHistory(cwd, base) {
+  let log = '';
+  try {
+    // %x1f/%x1e are unit/record separators: a commit subject can contain
+    // anything, tabs and pipes included, so the delimiters have to be bytes a
+    // human will never type.
+    log = git(
+      ['log', '--reverse', `--max-count=${MAX_COMMITS}`, '--format=%H%x1f%s%x1f%an%x1f%aI%x1e', `${base}..HEAD`],
+      cwd,
+    );
+  } catch {
+    return [];
+  }
+
+  const out = [];
+  for (const record of log.split('\x1e')) {
+    const line = record.trim();
+    if (!line) continue;
+    const [sha, message, authorName, committedAt] = line.split('\x1f');
+    if (!sha) continue;
+    // First-parent range for the commit itself. A root commit has no `^`, in
+    // which case git's empty-tree hash gives us the whole thing as an add.
+    let range = `${sha}^..${sha}`;
+    try {
+      git(['rev-parse', `${sha}^`], cwd);
+    } catch {
+      range = `4b825dc642cb6eb9a060e54bf8d69288fbee4904..${sha}`;
+    }
+    const files = fileDiffs(cwd, null, { range });
+    out.push({
+      sha,
+      message: (message ?? '').slice(0, 500),
+      authorName: (authorName ?? '').slice(0, 200),
+      authorLogin: null,
+      committedAt: committedAt ?? new Date().toISOString(),
+      url: null,
+      additions: files.reduce((n, f) => n + f.additions, 0),
+      deletions: files.reduce((n, f) => n + f.deletions, 0),
+      files,
+    });
+  }
+  return out;
 }

@@ -43,7 +43,7 @@ import {
   restoreWip,
   clearWip,
 } from './git.mjs';
-import { applyPatch, fileDiffs, ownerCurrentBranch, withPatchLock } from './patch.mjs';
+import { applyPatch, commitHistory, fileDiffs, ownerCurrentBranch, withPatchLock } from './patch.mjs';
 import { RUNTIMES, runtimeById, drivableHere, mediated } from './runtimes.mjs';
 import { loadPreviewConfig, startPreview } from './preview.mjs';
 import { materializeInto, scrub as envScrub } from './env.mjs';
@@ -316,6 +316,33 @@ function seedPrompt(runId, brief, transcript, resumedInPlace) {
 // The flowviant MCP endpoint handles tools/call statelessly with a bearer
 // worker token — no handshake — so this is all the daemon needs.
 let rpcId = 0;
+/**
+ * Push this task's commits + real diffs to the control plane.
+ *
+ * The server used to fetch exactly this from github.com with a GitHub App
+ * installation token — the app existed largely for it. We are standing in the
+ * worktree that produced these commits, so we send them: the thread's diff
+ * timeline, the review quiz and the merge gate's approved-head pin all read
+ * what lands here.
+ *
+ * Best-effort by design. A failure here must never fail the run — the work is
+ * committed and the PR is open either way, and the next push reports again.
+ * What it costs when it does fail is visible rather than silent: the thread
+ * shows no diffs, which is the same thing it showed when GitHub was unreachable.
+ */
+async function reportCommits({ mcpUrl, token, runId, cwd, baseRef }) {
+  try {
+    const base = baseRef ?? 'HEAD';
+    const commits = commitHistory(cwd, base);
+    if (commits.length === 0) return;
+    const headSha = commits[commits.length - 1].sha;
+    const res = await mcpCall(mcpUrl, token, 'report_commits', { runId, headSha, commits });
+    if (res?.ok === false) warn(`report_commits rejected: ${res.reason ?? 'unknown'}`);
+  } catch (e) {
+    warn(`report_commits skipped: ${e?.message ?? String(e)}`);
+  }
+}
+
 async function mcpCall(mcpUrl, token, name, args) {
   const res = await fetch(mcpUrl, {
     method: 'POST',
@@ -1023,6 +1050,7 @@ async function driveMediated({
             ...(result.branch ? { branch: String(result.branch) } : {}),
           }).catch((e) => ({ ok: false, reason: e?.message ?? String(e) }));
           if (attached?.ok === false) warn(`attach_pr rejected: ${attached.reason ?? 'unknown'}`);
+          else await reportCommits({ mcpUrl, token, runId, cwd, baseRef });
         }
       }
       clearTaskMarker(cwd);
