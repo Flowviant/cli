@@ -57,8 +57,8 @@ import {
   SYSTEM_PLAN_CHECK,
   PLAN_CHECK_KICKOFF,
   REGROUND_KICKOFF,
-  SYSTEM_CONSULT,
-  CONSULT_KICKOFF,
+  SYSTEM_PLAN,
+  PLAN_TURN_KICKOFF,
   SYSTEM_QUICK_EDIT,
   QUICK_EDIT_KICKOFF,
 } from './claude.mjs';
@@ -748,20 +748,154 @@ export async function runFleetDaemon() {
     }
   };
 
-  // Consults — a planning question aimed at THIS machine, answered by reading
-  // the repo. Deliberately the lightest job on the roster: same read-only
-  // detached checkout the plan check uses, no MCP, no writes, no run recorded.
+  // ── Planning sessions ────────────────────────────────────────────────────
+  //
+  // A turn in a plan thread, answered inside a HELD session. This was the
+  // consult, which answered one question in prose and kept nothing: it existed
+  // because the planner was a different, weaker brain and this turn's only job
+  // was to correct it from the real code. That planner is gone, so the session
+  // reads the repo AND writes the plan, over many turns, in one context.
+  //
+  // Two things changed shape as a result.
+  //
+  // ONE WORKTREE PER PLAN, not the shared `wikiWt`. Every CLI here resumes with
+  // "continue the last session in this directory" (`--continue`, `resume
+  // --last`) rather than by session id, so the WORKING DIRECTORY *is* the
+  // session handle. A shared directory would have made two plans on one machine
+  // take turns wearing each other's context — and the wiki queue hard-resets
+  // that directory between tasks, which would pull the files out from under a
+  // session mid-argument. A private detached checkout per plan also means plan
+  // turns no longer queue behind the wiki lock.
+  //
+  // IT CARRIES MCP. A consult passed none — nothing to write. A session spawns
+  // slices, re-shapes them, drops them and maintains the spec, all of which are
+  // control-plane calls. The token is the fleet's PLAN principal, whose entire
+  // tool set is those five: it cannot claim, cannot open a worktree, cannot
+  // commit. That absence is the product rule, not a hardening measure — it is
+  // what makes "add a dark mode toggle" typed at a plan add a slice instead of
+  // building one, with nothing reading the sentence to decide.
   const CONSULT_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/consult-done');
+  const PLAN_TOKEN_URL = FLEET_URL.replace(/\/agents\/?$/, '/plan-token');
   const answering = new Set();
-  const consultAttempts = new Map(); // consultId -> tries
-  /** Give up after this many turns on one question. A /consult-done that never
+  const consultAttempts = new Map(); // turn id -> tries
+  /** Give up after this many turns on one message. A /consult-done that never
    *  reaches the server (offline, 500) would otherwise re-run the whole Claude
    *  turn every poll, forever, on the owner's quota. */
   const MAX_CONSULT_TRIES = 3;
-  /** ONE consult at a time. They all read the same worktree, and the roster can
-   *  hand back a batch — un-awaited spawns meant N pending questions became N
-   *  concurrent `claude` processes on someone's laptop. */
+  /** ONE planning turn at a time on this machine. Sessions are per-plan so they
+   *  no longer collide on a directory, but the roster can hand back a batch, and
+   *  un-awaited spawns would put N concurrent CLI processes on someone's laptop
+   *  for what is, on the human's side, a chat. */
   let consultChain = Promise.resolve();
+
+  /**
+   * The plan credential, cached until it stops working.
+   *
+   * Minted lazily rather than at startup: most daemons never host a planning
+   * session, and a token nobody uses is a credential sitting on disk for no
+   * reason. Rotated by the server on every mint, so a re-mint after a 401 is the
+   * recovery path.
+   */
+  let planToken = null;
+  const mintPlanToken = async (force = false) => {
+    if (planToken && !force) return planToken;
+    try {
+      const res = await fetch(PLAN_TOKEN_URL, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${FLEET_TOKEN}`, 'User-Agent': USER_AGENT },
+      });
+      if (!res.ok) return null;
+      const data = await res.json().catch(() => null);
+      planToken = data?.data?.token ?? null;
+      return planToken;
+    } catch {
+      return null;
+    }
+  };
+
+  /**
+   * This plan's session directory — its context, expressed as a place.
+   *
+   * A detached checkout at base, like a consult's, but PRIVATE and PERSISTENT:
+   * private so `--continue` resumes this argument rather than whichever ran last
+   * on the box, persistent so it survives the daemon restarting or updating
+   * under it. Re-pointed at the current base each turn, because "reads your
+   * code" has to mean the code as it is now — a plan that runs for days would
+   * otherwise keep answering from the commit it was opened at.
+   *
+   * Returns null when the id is not a safe path segment: it comes off the wire.
+   */
+  const planWtFor = (planId) => {
+    if (!isSafePathSegment(planId)) return null;
+    const wt = join(baseDir, 'plans', planId);
+    const fresh = !existsSync(wt);
+    if (fresh) {
+      try {
+        git(['worktree', 'add', '--detach', wt, baseRef], repoRoot);
+      } catch {
+        git(['worktree', 'prune'], repoRoot);
+        try {
+          git(['worktree', 'add', '--detach', wt, baseRef], repoRoot);
+        } catch {
+          return null;
+        }
+      }
+    } else {
+      try {
+        git(['fetch', 'origin', '--quiet'], repoRoot);
+        git(['checkout', '--detach', baseRef], wt);
+        git(['reset', '--hard', baseRef], wt);
+        git(['clean', '-fd'], wt);
+      } catch {
+        /* offline, or a turn left it dirty — read what we have */
+      }
+    }
+    return { wt, fresh };
+  };
+
+  /**
+   * Retire the least-recently-touched session directories.
+   *
+   * The bound belongs HERE, in the machine, and never in the interface: ten
+   * plans open across a team is ten checkouts on one box, which is a resource
+   * question. Announcing a session limit in the app would be advertising
+   * capacity, which this product does not do. A retired session simply rebuilds
+   * from the spec next time it is asked for — the fallback the server already
+   * expects, and which the thread says out loud when it happens.
+   */
+  const MAX_PLAN_SESSIONS = 8;
+  const planTouched = new Map(); // planId -> ms
+  const retireIdlePlanSessions = () => {
+    const dir = join(baseDir, 'plans');
+    if (!existsSync(dir)) return;
+    let ids;
+    try {
+      ids = readdirSync(dir);
+    } catch {
+      return;
+    }
+    if (ids.length <= MAX_PLAN_SESSIONS) return;
+    const oldestFirst = ids.sort(
+      (a, b) => (planTouched.get(a) ?? 0) - (planTouched.get(b) ?? 0)
+    );
+    for (const id of oldestFirst.slice(0, ids.length - MAX_PLAN_SESSIONS)) {
+      try {
+        git(['worktree', 'remove', '--force', join(dir, id)], repoRoot);
+      } catch {
+        try {
+          rmSync(join(dir, id), { recursive: true, force: true });
+        } catch {
+          /* it is a directory we will overwrite next time; not worth failing a turn */
+        }
+      }
+      planTouched.delete(id);
+    }
+    try {
+      git(['worktree', 'prune'], repoRoot);
+    } catch {
+      /* best effort */
+    }
+  };
 
   // Quick edits — a SECOND Claude alongside a task this machine is already
   // building. Unlike every other roster job it does not get a worktree of its
@@ -875,57 +1009,89 @@ export async function runFleetDaemon() {
       answering.add(job.id);
       consultChain = consultChain.then(async () => {
         try {
-          note(`${c.cyan('ask')} ${c.dim(`— ${job.askedByName || 'someone'} asked about "${job.planTitle || 'a plan'}"`)}`);
-          // Serialised against the wiki queue as well: that queue hard-resets
-          // this worktree mid-turn, which would pull the files out from under a
-          // consult that is reading them.
-          // A consult's prompt is steered by a question ANY project editor can
-          // type, so the profile is the enforcement and a runtime that cannot
-          // express it does not get the job. Today that means Claude; see the
-          // `profiles` notes in runtimes.mjs for exactly what Codex is missing.
-          const consultRt = pickRuntimeFor('consult');
-          if (!consultRt) {
-            warn('a consult is waiting, but no installed CLI can run a read-only turn');
+          note(`${c.cyan('plan')} ${c.dim(`— ${job.askedByName || 'someone'} on "${job.planTitle || 'a plan'}"`)}`);
+          // The profile is the enforcement, not the prompt: this turn is steered
+          // by anything a project editor can type, and it holds write tools. A
+          // runtime that cannot express `plan` does not get the job rather than
+          // getting it with guarantees nobody wrote down — which today excludes
+          // Antigravity, whose mediated shape fits a build and not an argument.
+          const planRt = pickRuntimeFor('plan');
+          if (!planRt) {
+            warn('a planning turn is waiting, but no installed CLI can run a planning session');
             return;
           }
-          await withWikiLock(async () => {
-            ensureWikiWorktree();
-            const out = await runTurn({
-              prompt: CONSULT_KICKOFF({
+          const token = await mintPlanToken();
+          if (!token) {
+            warn('a planning turn is waiting, but the plan credential could not be minted');
+            return;
+          }
+          const dir = planWtFor(job.taskId);
+          if (!dir) {
+            warn(`a planning turn is waiting, but its session directory could not be opened`);
+            return;
+          }
+          planTouched.set(job.taskId, Date.now());
+          // Resume only when this plan already HAS a session here. A fresh
+          // directory means either the first turn or a session we retired, and
+          // both want the same thing: start over from the spec, which the
+          // kickoff carries. `--continue` against an empty directory is not an
+          // error on every CLI, so asking `fresh` is what keeps it honest.
+          const resume = !dir.fresh && Boolean(job.sessionRef);
+          const mcp = mcpFor(planRt, token, mcpUrl);
+          let out;
+          try {
+            out = await runTurn({
+              prompt: PLAN_TURN_KICKOFF({
+                planId: job.taskId,
                 planTitle: job.planTitle,
                 question: job.question,
                 askedByName: job.askedByName,
+                // Sent only when we are NOT resuming: a live session already has
+                // the argument in its context, and re-stating the spec every
+                // turn would spend tokens telling it what it just wrote. On a
+                // rebuild it is the whole inheritance.
+                spec: resume ? null : job.spec,
               }),
-              resume: false,
-              system: SYSTEM_CONSULT,
-              cwd: wikiWt,
-              // TRULY read-only — no Write/Edit/rm, no MCP. The prompt also says
-              // not to change anything, but the prompt is what an injected
-              // question competes with; the toolset is what it cannot.
-              readOnly: true,
-              runtime: consultRt,
-              label: c.cyan('[ask]'),
+              resume,
+              system: SYSTEM_PLAN,
+              cwd: dir.wt,
+              // Read the repo, write the PLAN. No Edit/Write/commit anywhere in
+              // the toolset — the prompt says so too, but the prompt is what an
+              // injected message competes with.
+              planPerm: true,
+              mcpArgs: mcp.args,
+              mcpEnv: mcp.env,
+              runtime: planRt,
+              label: c.cyan('[plan]'),
             });
-            const answer = (out || '').trim();
-            const posted = await reportMergeOutcome(CONSULT_DONE_URL, {
-              consultId: job.id,
-              ok: answer.length > 0,
-              // Scrub: an answer can quote config or env-adjacent code.
-              answer: envScrub(answer).slice(0, 8000),
-            });
-            if (posted) consultAttempts.delete(job.id);
-            ok(`${c.cyan('ask')} ${c.dim('— answered in the plan thread')}`);
+          } finally {
+            if (mcp.dir) rmSync(mcp.dir, { recursive: true, force: true });
+          }
+          const answer = (out || '').trim();
+          const posted = await reportMergeOutcome(CONSULT_DONE_URL, {
+            consultId: job.id,
+            ok: answer.length > 0,
+            // Scrub: a reply can quote config or env-adjacent code.
+            answer: envScrub(answer).slice(0, 8000),
+            // The handle the server stores, reported on EVERY turn: a session we
+            // had to rebuild comes back under a new directory state, and a
+            // stored handle that does not follow it leaves later turns trying to
+            // resume something that is gone.
+            sessionRef: dir.wt,
           });
+          if (posted) consultAttempts.delete(job.id);
+          ok(`${c.cyan('plan')} ${c.dim('— replied in the plan thread')}`);
+          retireIdlePlanSessions();
         } catch (e) {
-          // Settle it. A question that cannot be answered must not re-burn a
-          // Claude turn every poll, and silence would leave the human waiting on
-          // a machine that already gave up.
+          // Settle it. A turn that cannot be answered must not re-burn quota
+          // every poll, and silence would leave the human waiting on a machine
+          // that already gave up.
           await reportMergeOutcome(CONSULT_DONE_URL, {
             consultId: job.id,
             ok: false,
-            answer: e?.message ?? 'the read failed',
+            answer: e?.message ?? 'the planning turn failed',
           });
-          warn(`consult failed: ${e?.message ?? e}`);
+          warn(`planning turn failed: ${e?.message ?? e}`);
         } finally {
           answering.delete(job.id);
         }

@@ -299,11 +299,11 @@ export const RUNTIMES = {
     live: true,
     /**
      * Every profile, because every profile is DEFINED in its vocabulary: the
-     * three `--allowedTools` lists in claude.mjs are what "build", "wiki" and
-     * "consult" currently mean. That is a statement about where the contract was
-     * written, not a claim that only Claude could ever satisfy it.
+     * four `--allowedTools` lists in claude.mjs are what "build", "wiki",
+     * "consult" and "plan" currently mean. That is a statement about where the
+     * contract was written, not a claim that only Claude could ever satisfy it.
      */
-    profiles: ['build', 'wiki', 'consult'],
+    profiles: ['build', 'wiki', 'consult', 'plan'],
     mcp: claudeMcp,
     /**
      * Claude takes the operating contract as a real system prompt, which is the
@@ -349,7 +349,7 @@ export const RUNTIMES = {
      * and Windows are UNTESTED; if this daemon starts running there, re-verify
      * before trusting the consult posture on those platforms.
      */
-    profiles: ['build', 'consult', 'wiki'],
+    profiles: ['build', 'consult', 'wiki', 'plan'],
     mcp: codexMcp,
     /**
      * Codex has NO system-prompt flag. The contract therefore rides inside the
@@ -417,6 +417,30 @@ export const RUNTIMES = {
         // `.rules` execpolicy file, or their own MCP servers can widen a posture
         // we are asserting on their behalf — silently, and on the one turn whose
         // prompt comes from someone else's typing.
+        a.push('--ignore-user-config', '--ignore-rules');
+      } else if (profile === 'plan') {
+        // A PLANNING SESSION. Read-only on the filesystem, exactly like a
+        // consult — the writes it makes go through the control plane, not
+        // through this box — so the kernel sandbox is the same one, and for the
+        // same reason: this turn's prompt is steered by anything a project
+        // editor can type.
+        //
+        // Everything the consult branch above closes stays closed, and the
+        // reasoning is unchanged, so it is not restated: web_search egresses
+        // server-side at OpenAI where no local sandbox reaches it, sub-agents
+        // would be a turn whose posture nobody here chose, and a user's own
+        // config or MCP servers must not widen a posture we are asserting on
+        // their behalf.
+        //
+        // What differs from a consult is the ONE thing this profile exists for:
+        // an MCP config IS passed, carrying the plan principal's token. That
+        // token's whole tool set is the five plan tools — the server refuses
+        // anything else on it — so the control plane being open here does not
+        // widen what a hijacked turn could reach beyond the plan it is already
+        // sitting in.
+        a.push('--sandbox', 'read-only');
+        a.push('-c', 'tools.web_search=false', '-c', 'web_search="disabled"');
+        a.push('-c', 'features.multi_agent=false', '-c', 'features.goals=false');
         a.push('--ignore-user-config', '--ignore-rules');
       } else if (profile === 'wiki' && vaultDir) {
         // THE CARTOGRAPHER, AND THIS ONE IS STRICTER THAN CLAUDE'S.
@@ -572,6 +596,17 @@ export const RUNTIMES = {
      * MCP connection and the CLI just returns schema-enforced JSON via
      * `--json-schema`), which needs no per-invocation MCP config from the vendor
      * at all.
+     *
+     * PLAN IS ABSENT ON PURPOSE, and NOT because a planning turn is beyond it —
+     * it reads code as well as anything here. A plan session is a conversation
+     * that makes many control-plane calls as it goes (spawn a slice, re-shape
+     * it, drop it, rewrite the spec), and mediation turns a turn into ONE
+     * schema-enforced form the daemon then applies. That shape fits a build,
+     * whose outcome is a single structured result; it does not yet fit an
+     * argument. Note that `canRun` would otherwise say yes via `mediated()` and
+     * hand this runtime a job it cannot finish — declaring the profile is the
+     * only thing standing between here and that. Mediated planning is a real
+     * design (the session returns its writes as a batch), just not a built one.
      */
     profiles: ['build', 'wiki', 'consult'],
     mcp: null,
@@ -687,7 +722,7 @@ export const runtimeById = (id) => RUNTIMES[id] ?? RUNTIMES.claude;
  * disagree the daemon either claims work it cannot build or refuses work it can.
  */
 /**
- * WHICH PROFILES NEED THE MCP CONTROL PLANE. Only one does.
+ * WHICH PROFILES NEED THE MCP CONTROL PLANE. Two do.
  *
  * A BUILD has to claim work, report a blocker, attach a PR and complete — that
  * is the control plane, and a runtime that cannot reach it cannot participate.
@@ -696,11 +731,17 @@ export const runtimeById = (id) => RUNTIMES[id] ?? RUNTIMES.claude;
  * included — check the two call sites in fleet.mjs, they hand `runTurn` no
  * `mcpArgs` at all.
  *
+ * A PLAN is the second one, and it is the reason the consult stopped being the
+ * whole story: a planning session does not answer a question, it WRITES the plan
+ * — spawns the slices, re-shapes them, drops them, maintains the spec. Every one
+ * of those is a control-plane call, so a runtime that cannot reach MCP cannot
+ * host a session, however well it reads code.
+ *
  * Conflating them cost Antigravity every capability it has: `mcp && args` was
  * the single drivability test, so a machine-wide MCP config disqualified it from
  * two jobs that never open an MCP connection.
  */
-const PROFILE_NEEDS_MCP = { build: true, wiki: false, consult: false };
+const PROFILE_NEEDS_MCP = { build: true, wiki: false, consult: false, plan: true };
 
 /**
  * A build needs the control plane, but NOT necessarily an MCP config of its own.
