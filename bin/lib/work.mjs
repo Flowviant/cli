@@ -23,7 +23,7 @@ import { git, baseBranchName, isSafePathSegment } from './git.mjs';
 import { c, note, ok, warn } from './ui.mjs';
 import { mcpFor, runTurn } from './claude.mjs';
 import { SYSTEM_WORK, WORK_TURN_KICKOFF } from './prompts.mjs';
-import { scrub as envScrub } from './env.mjs';
+import { materializeInto, scrub as envScrub } from './env.mjs';
 import { detectRuntimes, pickRuntimeFor, RUNTIMES } from './runtimes.mjs';
 
 export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLeaseTtl }) {
@@ -199,6 +199,20 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
           }
         }
       }
+      // Synced env into the fresh worktree, exactly like a task checkout gets
+      // (worktreeFor): a tab builds and runs dev servers here, and without the
+      // bundle every session build was missing its .env while dispatched runs
+      // got theirs. Only on creation — a live directory's env belongs to the
+      // session, same as a resumed task tree. Ship's dirty-check is safe by
+      // construction: materializeInto writes ONLY gitignored paths (it refuses
+      // otherwise), and ignored files never appear in `git status --porcelain`.
+      // Best-effort, like everywhere else — the session still builds; paths
+      // that need secrets may 500.
+      try {
+        materializeInto(wt);
+      } catch {
+        /* best-effort */
+      }
     }
     return { wt, fresh };
   };
@@ -285,6 +299,33 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
       /* best-effort */
     }
     return false;
+  };
+
+  /**
+   * Live session-turn CLI children, with the lock each one holds. The daemon's
+   * teardown SIGTERMs them: an orphaned CLI keeps editing the session worktree
+   * and burning quota after the daemon is gone, and — the lock covering only
+   * DEAD pids — a child that outlived the daemon would leave a live-pid lock
+   * that makes the restarted daemon skip the tab's turns. Killing on shutdown
+   * closes that path; the lock's stale-pid handling covers the killed child.
+   */
+  const workChildren = new Map(); // child process -> lockPath | null
+  const shutdownWork = () => {
+    for (const [ch, lockPath] of workChildren) {
+      try {
+        ch.kill('SIGTERM');
+      } catch {
+        /* best-effort */
+      }
+      if (lockPath) {
+        try {
+          rmSync(lockPath, { force: true });
+        } catch {
+          /* best-effort */
+        }
+      }
+    }
+    workChildren.clear();
   };
 
   /**
@@ -423,6 +464,7 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
           // settled on their own terms.
           workAttempts.set(job.id, tries + 1);
           let out;
+          const spawned = []; // this turn's children, for the teardown registry
           try {
             const turnArgs = {
               prompt: WORK_TURN_KICKOFF({
@@ -438,7 +480,10 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
               runtime: rt.id,
               label: c.cyan('[tab]'),
               onSpawn: (ch) => {
-                if (lockPath && ch?.pid) {
+                if (!ch) return;
+                spawned.push(ch);
+                workChildren.set(ch, lockPath ?? null);
+                if (lockPath && ch.pid) {
                   try {
                     writeFileSync(lockPath, String(ch.pid));
                   } catch {
@@ -454,6 +499,7 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
             // never reset — instead of bricking the tab forever.
             if (resume && !(out || '').trim()) out = await runTurn({ ...turnArgs, resume: false });
           } finally {
+            for (const ch of spawned) workChildren.delete(ch);
             if (lockPath) {
               try {
                 rmSync(lockPath, { force: true });
@@ -741,5 +787,5 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
     }
   };
 
-  return { flushWorkReports, processWorkTurns, processShipJobs, retireWorkSessions };
+  return { flushWorkReports, processWorkTurns, processShipJobs, retireWorkSessions, shutdownWork };
 }

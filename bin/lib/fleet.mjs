@@ -458,6 +458,7 @@ export async function runFleetDaemon() {
   const workers = new Map(); // agentId -> { state, promise, wt, label }
   let daemonAlive = true; // flipped false on shutdown so the stream stops reconnecting
   let stream = null; // push channel handle (set once the loop is set up)
+  let workShutdown = null; // kills live session-turn CLIs (set with the work manager below)
 
   // Shutdown KEEPS the worktrees: in-flight local work survives Ctrl+C and
   // resumes in place on the next run (the task marker matches). Worktrees are
@@ -475,6 +476,14 @@ export async function runFleetDaemon() {
     // it on the same vault dir + sync state.
     try {
       wikiChild?.kill('SIGKILL');
+    } catch {
+      /* best-effort */
+    }
+    // Session-turn CLIs die with the daemon too: an orphan keeps editing the
+    // session worktree and burning quota, and its live-pid lock would make the
+    // restarted daemon skip that tab's turns for as long as it survived.
+    try {
+      workShutdown?.();
     } catch {
       /* best-effort */
     }
@@ -500,6 +509,15 @@ export async function runFleetDaemon() {
     note('shutting down — stopping workers. Worktrees are kept: in-flight work resumes next run.');
     teardown();
     process.exit(130);
+  });
+  // A service manager stops the daemon with SIGTERM, not Ctrl+C. Without this
+  // handler every child survived a `systemctl stop` — the exact orphaning the
+  // teardown exists to prevent.
+  process.on('SIGTERM', () => {
+    console.log('');
+    note('shutting down (SIGTERM) — stopping workers. Worktrees are kept: in-flight work resumes next run.');
+    teardown();
+    process.exit(143);
   });
   // Keep the daemon alive on a stray rejection. Many loops here are fire-and-
   // forget (`void drainWiki()`, dispatch, sync) and rely on their callees never
@@ -1118,6 +1136,7 @@ export async function runFleetDaemon() {
     processWorkTurns,
     processShipJobs,
     retireWorkSessions,
+    shutdownWork,
   } = createWorkManager({
     repoRoot,
     baseDir,
@@ -1125,6 +1144,7 @@ export async function runFleetDaemon() {
     getMcpUrl: () => mcpUrl,
     getLeaseTtl: () => leaseTtlSeconds,
   });
+  workShutdown = shutdownWork; // teardown can now reach the live session CLIs
 
   const processMergeJobs = (jobs) => {
     for (const job of jobs ?? []) {
