@@ -45,6 +45,45 @@ import { detectRuntimes, canRun, RUNTIMES } from './runtimes.mjs';
 import { isTerminalSessionLive, isAgyConversationLive } from './localSessions.mjs';
 import { homedir } from 'node:os';
 
+/**
+ * The shape a per-tab model name must have before it rides argv as
+ * `--model <name>`. Conservative for the same reason the codex thread id is
+ * (below): it comes off the wire and lands in a child process's arguments —
+ * alphanumerics plus dot/dash/underscore, at most 40 characters, and NEVER a
+ * leading dash, which is an argv that parses as a flag.
+ */
+const WORK_MODEL_RE = /^[a-zA-Z0-9._][a-zA-Z0-9._-]{0,39}$/;
+
+/** The five efforts the CLIs actually accept. A literal set rather than a
+ *  pattern: there is no such thing as an effort we haven't heard of, and the
+ *  server's own union is exactly this list. */
+const WORK_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
+
+/**
+ * WHICH BRAIN, AT WHICH EFFORT — the tab's own pick, off the roster.
+ *
+ * Absent is the resting state and it must stay genuinely absent: every tab ran
+ * with no `--model` and no `--effort` until now, so a job that names neither
+ * has to produce the byte-identical argv it produced yesterday — Claude falling
+ * back to the machine's MODEL pin, codex and agy to their own defaults. Hence
+ * an object with the key MISSING rather than one holding null: a null would
+ * reach the builders as a value and Claude's `model || MODEL` is the only one
+ * that would survive it.
+ *
+ * A value that fails its guard is DROPPED, not passed through and not an error.
+ * The honest outcome of "the server named a model this machine can't spell" is
+ * the machine's own default — a turn that runs — rather than a flag no CLI
+ * understands and a tab that fails every message.
+ */
+function brainFor(job) {
+  const out = {};
+  const model = typeof job?.model === 'string' ? job.model.trim() : '';
+  if (model && WORK_MODEL_RE.test(model)) out.model = model;
+  const effort = typeof job?.effort === 'string' ? job.effort.trim() : '';
+  if (effort && WORK_EFFORTS.has(effort)) out.effort = effort;
+  return out;
+}
+
 export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLeaseTtl }) {
   const WORK_TOKEN_URL = FLEET_URL.replace(/\/agents\/?$/, '/work-token');
   const WORK_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/work-turn-done');
@@ -879,6 +918,10 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
           const mcp = plainTab
             ? { args: [], env: null, dir: null }
             : mcpFor(rt.id, mint.token, getMcpUrl());
+          // The tab's model/effort, if it named any. Spread into turnArgs so
+          // BOTH runTurn calls below carry it — the retry is the same turn on
+          // the same brain, not a quieter second opinion.
+          const brain = brainFor(job);
           // Attempts count RUNS: the infra refusals above consumed nothing and
           // settled on their own terms.
           workAttempts.set(job.id, tries + 1);
@@ -908,6 +951,8 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
               // ordinary --continue resume path, unchanged.
               ...(adopting ? { adoptResumeId: job.adopt.id } : {}),
               system: plainTab ? SYSTEM_WORK_PLAIN : SYSTEM_WORK,
+              // Present only when the tab named one — see brainFor.
+              ...brain,
               cwd: dir.wt,
               mcpArgs: mcp.args,
               mcpEnv: mcp.env,
