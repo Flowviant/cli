@@ -302,27 +302,22 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
   };
 
   /**
-   * Live session-turn CLI children, with the lock each one holds. The daemon's
-   * teardown SIGTERMs them: an orphaned CLI keeps editing the session worktree
-   * and burning quota after the daemon is gone, and — the lock covering only
-   * DEAD pids — a child that outlived the daemon would leave a live-pid lock
-   * that makes the restarted daemon skip the tab's turns. Killing on shutdown
-   * closes that path; the lock's stale-pid handling covers the killed child.
+   * Live session-turn CLI children. The daemon's teardown SIGTERMs them: an
+   * orphaned CLI keeps editing the session worktree and burning quota after
+   * the daemon is gone. Each child's pid-lock is deliberately LEFT IN PLACE —
+   * a CLI can trap SIGTERM to finish an in-flight request and outlive this
+   * loop by seconds, and removing the lock in the same tick handed the
+   * restarted daemon a green light to spawn a second CLI into the same held
+   * context. turnLockedByLivePid already covers both outcomes: it waits while
+   * the pid lives and clears the lock once it is dead.
    */
   const workChildren = new Map(); // child process -> lockPath | null
   const shutdownWork = () => {
-    for (const [ch, lockPath] of workChildren) {
+    for (const [ch] of workChildren) {
       try {
         ch.kill('SIGTERM');
       } catch {
         /* best-effort */
-      }
-      if (lockPath) {
-        try {
-          rmSync(lockPath, { force: true });
-        } catch {
-          /* best-effort */
-        }
       }
     }
     workChildren.clear();
@@ -548,16 +543,28 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
   //
   // --no-ff, NEVER squash: every delivered card carries commit shas as its
   // receipts, and a squash would point them all at commits that no longer
-  // exist on main. Sequence: re-open the worktree if it was retired (the
-  // BRANCH is the session's work; the directory is a cache), refuse a dirty
-  // worktree (auto-committing someone's mid-thought state is not shipping, it
-  // is guessing), refuse a worktree that left its own branch, fold main INTO
-  // the branch first so conflicts surface where the session can resolve them,
+  // exist on main. Sequence: idempotency FIRST (a re-offered job after a lost
+  // report recovers its receipts and re-reports — it must never re-merge, and
+  // never be refused by checks that judge a merge this job already made).
+  // Then two paths. A LIVE session: re-open the worktree if it was retired,
+  // defer while a turn's CLI holds it, refuse a dirty worktree
+  // (auto-committing someone's mid-thought state is not shipping, it is
+  // guessing), refuse a worktree that left its own branch, fold main INTO the
+  // branch first so conflicts surface where the session can resolve them,
   // then merge THE RESOLVED TIP outward through a throwaway worktree so
   // nobody's checkout moves — receipts and merged ref are the same sha by
-  // construction. Every exit reports ship-done exactly once; a ship that
-  // failed silently leaves the human believing their work is on main.
-  const processShipJobs = (jobs) => {
+  // construction. An ENDED session (absent from the roster's
+  // activeWorkSessions): the BRANCH is the session now — nobody can commit,
+  // discard, or resolve anything in its directory, so the checks whose
+  // remedies address a live tab don't apply; merge the tip directly through
+  // the throwaway, and a conflict fails honestly. Every exit reports
+  // ship-done exactly once — except a deliberate deferral, re-offered next
+  // poll; a ship that failed silently leaves the human believing their work
+  // is on main.
+  const processShipJobs = (jobs, activeIds) => {
+    // Field absent (older server) = no liveness signal: treat every session
+    // as live, which keeps the stricter checks.
+    const liveIds = Array.isArray(activeIds) ? new Set(activeIds) : null;
     for (const job of jobs ?? []) {
       if (!job || typeof job.sessionId !== 'string') continue;
       if (shipping.has(job.sessionId)) continue;
@@ -570,6 +577,7 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
       // (above) keeps overlapping polls from queueing the same job twice.
       chainFor(job.sessionId, async () => {
         let settled = false;
+        let deferred = false;
         const done = async (payload) => {
           if (settled) return;
           settled = true;
@@ -599,12 +607,173 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
             });
             return;
           }
+          try {
+            git(['fetch', 'origin', '--quiet'], repoRoot);
+          } catch {
+            /* offline fetch — merge against what we have */
+          }
+          const ancestorOfBase = (ref) => {
+            try {
+              git(['merge-base', '--is-ancestor', ref, baseRef], repoRoot);
+              return true;
+            } catch {
+              return false;
+            }
+          };
+          // The machine may have no git identity, and a merge COMMIT needs
+          // one. Prefer the user's own config; fall back to the daemon's (the
+          // same fallback checkpointWip uses) so a bare machine doesn't fail
+          // the fold with "Please tell me who you are".
+          let idEnv = null;
+          try {
+            git(['config', 'user.email'], repoRoot);
+          } catch {
+            idEnv = {
+              GIT_AUTHOR_NAME: 'Flowviant',
+              GIT_AUTHOR_EMAIL: 'daemon@flowviant.com',
+              GIT_COMMITTER_NAME: 'Flowviant',
+              GIT_COMMITTER_EMAIL: 'daemon@flowviant.com',
+            };
+          }
+          const gitMerge = (args, cwd) =>
+            execFileSync('git', args, {
+              cwd,
+              encoding: 'utf8',
+              stdio: ['ignore', 'pipe', 'pipe'],
+              ...(idEnv ? { env: { ...process.env, ...idEnv } } : {}),
+            });
+          // Receipts for a range: --no-merges, because fold commits describe
+          // plumbing, not work.
+          const logCommits = (range) =>
+            git(['log', range, '--no-merges', '--format=%H%x09%s'], repoRoot)
+              .split('\n')
+              .filter(Boolean)
+              .map((l) => {
+                const [sha, ...rest] = l.split('\t');
+                return { sha, subject: envScrub(rest.join('\t')).slice(0, 200) };
+              });
+          // Merge outward through a throwaway worktree so no checkout moves.
+          // The throwaway dies on EVERY exit — success, conflict or throw —
+          // or the next ship of this session trips over its corpse.
+          const mergeOutward = (tip, count) => {
+            const tmp = join(baseDir, 'ship', job.sessionId);
+            try {
+              try {
+                git(['worktree', 'remove', '--force', tmp], repoRoot);
+              } catch {
+                /* not there — fine */
+              }
+              git(['worktree', 'add', '--detach', tmp, baseRef], repoRoot);
+              gitMerge(
+                [
+                  'merge',
+                  '--no-ff',
+                  tip,
+                  '-m',
+                  `ship(${job.sessionName || job.sessionId.slice(0, 8)}): ${count} commit${count === 1 ? '' : 's'}`,
+                ],
+                tmp
+              );
+              git(['push', 'origin', `HEAD:${baseBranchName(baseRef)}`], tmp);
+            } finally {
+              try {
+                git(['worktree', 'remove', '--force', tmp], repoRoot);
+                git(['worktree', 'prune'], repoRoot);
+              } catch {
+                /* best effort */
+              }
+            }
+          };
+          // Idempotency: base already contains the branch tip. A re-offered
+          // job after a lost report lands here — never a re-merge, and never
+          // "nothing to ship" AS A FAILURE for work that in fact shipped. The
+          // receipts must not die with the lost report: the --no-ff merge
+          // commit that carried the tip in holds it as its SECOND parent, so
+          // the original commit list is recoverable — settling with none
+          // would silently skip the reconciliation backstop for this branch.
+          if (branchExists && ancestorOfBase(branch)) {
+            const tip = git(['rev-parse', branch], repoRoot);
+            let commits = [];
+            try {
+              const m = git(['log', baseRef, '--merges', '--format=%H %P', '-n', '500'], repoRoot)
+                .split('\n')
+                .map((l) => l.trim().split(' '))
+                .find((p) => p.length >= 3 && p[2] === tip);
+              if (m) commits = logCommits(`${m[1]}..${tip}`);
+            } catch {
+              /* recovery is best-effort — an ok ship with no receipts beats a false failure */
+            }
+            await done({
+              ok: true,
+              commits,
+              note: `${baseBranchName(baseRef)} already contains this session's branch — nothing new to merge`,
+            });
+            ok(`${c.cyan('ship')} ${c.dim('— already on main; nothing new to merge')}`);
+            return;
+          }
+          const ended = liveIds ? !liveIds.has(job.sessionId) : false;
+          if (ended) {
+            // The tab is closed: no turn can commit, discard, or resolve
+            // anything in the directory, so a dirty worktree must not strand
+            // the branch's committed work in review forever. Ship the TIP.
+            if (!branchExists) {
+              await done({
+                ok: false,
+                error: 'nothing to ship — this session has no branch on this machine',
+              });
+              return;
+            }
+            const tip = git(['rev-parse', branch], repoRoot);
+            const commits = logCommits(`${baseRef}..${tip}`);
+            if (commits.length === 0) {
+              await done({
+                ok: false,
+                error: 'nothing to ship — no commits on the session branch',
+              });
+              return;
+            }
+            try {
+              mergeOutward(tip, commits.length);
+            } catch (e) {
+              const detail = `${e?.stdout ?? ''}\n${e?.stderr ?? ''}\n${e?.message ?? ''}`;
+              if (/conflict/i.test(detail)) {
+                await done({
+                  ok: false,
+                  error:
+                    'conflicts with main — the tab is closed, so open a new session from this branch to resolve them, then ship again',
+                });
+              } else {
+                const line = envScrub(
+                  String(detail)
+                    .split('\n')
+                    .find((l) => l.trim()) ?? 'git merge failed'
+                );
+                await done({ ok: false, error: `the merge failed: ${line.slice(0, 300)}` });
+              }
+              return;
+            }
+            await done({ ok: true, commits });
+            ok(`${c.cyan('ship')} ${c.dim(`— ${commits.length} commit${commits.length === 1 ? '' : 's'} on main`)}`);
+            return;
+          }
           const dir = sessionWtFor(job.sessionId);
           if (!dir) {
             await done({
               ok: false,
               error: 'the session worktree could not be opened on this machine',
             });
+            return;
+          }
+          // A live CLI is in this worktree — a restarted daemon's orphan
+          // mid-turn (in-process the chain serializes, but the lock is the
+          // only guarantee that survives a crash). Folding under it would
+          // rewrite HEAD inside a held conversation; defer like the turn
+          // path, and the job re-offers next poll.
+          if (turnLockedByLivePid(sessionMetaPath(dir.wt, 'flowviant-turn.lock'))) {
+            warn(
+              `a turn is still running in "${job.sessionName || job.sessionId}" — ship waits for it`
+            );
+            deferred = true;
             return;
           }
           if (git(['status', '--porcelain'], dir.wt) !== '') {
@@ -632,53 +801,6 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
             });
             return;
           }
-          try {
-            git(['fetch', 'origin', '--quiet'], repoRoot);
-          } catch {
-            /* offline fetch — merge against what we have */
-          }
-          const ancestorOfBase = (ref) => {
-            try {
-              git(['merge-base', '--is-ancestor', ref, baseRef], repoRoot);
-              return true;
-            } catch {
-              return false;
-            }
-          };
-          // Idempotency: base already contains the branch tip. A re-offered
-          // job after a lost report lands here — never a re-merge, and never
-          // "nothing to ship" AS A FAILURE for work that in fact shipped.
-          if (ancestorOfBase(branch)) {
-            await done({
-              ok: true,
-              commits: [],
-              note: `${baseBranchName(baseRef)} already contains this session's branch — nothing new to merge`,
-            });
-            ok(`${c.cyan('ship')} ${c.dim('— already on main; nothing new to merge')}`);
-            return;
-          }
-          // The machine may have no git identity, and a merge COMMIT needs
-          // one. Prefer the user's own config; fall back to the daemon's (the
-          // same fallback checkpointWip uses) so a bare machine doesn't fail
-          // the fold with "Please tell me who you are".
-          let idEnv = null;
-          try {
-            git(['config', 'user.email'], dir.wt);
-          } catch {
-            idEnv = {
-              GIT_AUTHOR_NAME: 'Flowviant',
-              GIT_AUTHOR_EMAIL: 'daemon@flowviant.com',
-              GIT_COMMITTER_NAME: 'Flowviant',
-              GIT_COMMITTER_EMAIL: 'daemon@flowviant.com',
-            };
-          }
-          const gitMerge = (args, cwd) =>
-            execFileSync('git', args, {
-              cwd,
-              encoding: 'utf8',
-              stdio: ['ignore', 'pipe', 'pipe'],
-              ...(idEnv ? { env: { ...process.env, ...idEnv } } : {}),
-            });
           // Fold main into the branch FIRST: conflicts land here, in the
           // session's own worktree, where the next turn can resolve them.
           try {
@@ -711,19 +833,9 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
           }
           // Resolve the EXACT sha to merge, then compute the receipts from it:
           // one X for both, so the ledger can never carry receipts for commits
-          // that did not land. --no-merges: fold commits describe plumbing,
-          // not work.
+          // that did not land.
           const tip = git(['rev-parse', branch], repoRoot);
-          const commits = git(
-            ['log', `${baseRef}..${tip}`, '--no-merges', '--format=%H%x09%s'],
-            dir.wt
-          )
-            .split('\n')
-            .filter(Boolean)
-            .map((l) => {
-              const [sha, ...rest] = l.split('\t');
-              return { sha, subject: envScrub(rest.join('\t')).slice(0, 200) };
-            });
+          const commits = logCommits(`${baseRef}..${tip}`);
           if (commits.length === 0) {
             // Post-fold this is nearly unreachable (a zero-commit branch is an
             // ancestor of base, settled above) — but if the branch's commits
@@ -738,36 +850,7 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
             }
             return;
           }
-          // Merge outward through a throwaway worktree so no checkout moves.
-          const tmp = join(baseDir, 'ship', job.sessionId);
-          try {
-            try {
-              git(['worktree', 'remove', '--force', tmp], repoRoot);
-            } catch {
-              /* not there — fine */
-            }
-            git(['worktree', 'add', '--detach', tmp, baseRef], repoRoot);
-            gitMerge(
-              [
-                'merge',
-                '--no-ff',
-                tip,
-                '-m',
-                `ship(${job.sessionName || job.sessionId.slice(0, 8)}): ${commits.length} commit${commits.length === 1 ? '' : 's'}`,
-              ],
-              tmp
-            );
-            git(['push', 'origin', `HEAD:${baseBranchName(baseRef)}`], tmp);
-          } finally {
-            // The throwaway dies on EVERY exit — success, refusal or throw —
-            // or the next ship of this session trips over its corpse.
-            try {
-              git(['worktree', 'remove', '--force', tmp], repoRoot);
-              git(['worktree', 'prune'], repoRoot);
-            } catch {
-              /* best effort */
-            }
-          }
+          mergeOutward(tip, commits.length);
           await done({ ok: true, commits });
           ok(`${c.cyan('ship')} ${c.dim(`— ${commits.length} commit${commits.length === 1 ? '' : 's'} on main`)}`);
         } catch (e) {
@@ -777,8 +860,9 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
             error: envScrub(String(e?.message ?? 'the merge failed')).slice(0, 500),
           });
         } finally {
-          if (!settled) {
-            // Belt over braces: NO exit path may leave the ship unreported.
+          if (!settled && !deferred) {
+            // Belt over braces: NO exit path may leave the ship unreported —
+            // a deferral is the one deliberate exception, re-offered next poll.
             await done({ ok: false, error: 'the ship did not complete — check the daemon log' });
           }
           shipping.delete(job.sessionId);

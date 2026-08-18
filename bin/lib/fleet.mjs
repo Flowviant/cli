@@ -1747,7 +1747,9 @@ export async function runFleetDaemon() {
     processPlanCheckJobs(roster.planCheckJobs);
     processConsultJobs(roster.consultJobs);
     processWorkTurns(roster.workTurnJobs);
-    processShipJobs(roster.shipJobs);
+    // The roster's live-session list rides along: an ENDED session's ship
+    // must not be refused by checks whose remedies need a live tab.
+    processShipJobs(roster.shipJobs, roster.activeWorkSessions);
     // AFTER the work/ship intake: retirement is the server saying which
     // sessions are LIVE, and the guards above (chains, shipping) are populated
     // by the intake this same tick.
