@@ -1213,6 +1213,7 @@ export async function runFleetDaemon() {
     processWorkTurns,
     processShipJobs,
     retireWorkSessions,
+    reportWorktrees,
     shutdownWork,
   } = createWorkManager({
     repoRoot,
@@ -1831,6 +1832,11 @@ export async function runFleetDaemon() {
     // sessions are LIVE, and the guards above (chains, shipping) are populated
     // by the intake this same tick.
     retireWorkSessions(roster.activeWorkSessions);
+    // …and what the SURVIVING ones hold: branch, ahead-of-base, diffstat.
+    // Throttled inside, never awaited — a `git status` the human cannot run
+    // themselves from a browser, relayed. After retirement so a directory that
+    // just went away is not reported as a place.
+    reportWorktrees(roster.activeWorkSessions);
     // Terminal-session presence, throttled + dedup'd inside; never awaited —
     // the daemon's own worktrees are carved out (a session the daemon spawned
     // is already a tab, not something to offer adopting).

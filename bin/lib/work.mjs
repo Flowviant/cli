@@ -43,6 +43,7 @@ import {
 import { materializeInto, scrub as envScrub } from './env.mjs';
 import { detectRuntimes, canRun, RUNTIMES } from './runtimes.mjs';
 import { isTerminalSessionLive, isAgyConversationLive } from './localSessions.mjs';
+import { worktreeDiff } from './worktreeDiff.mjs';
 import { homedir } from 'node:os';
 
 /**
@@ -89,6 +90,7 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
   const WORK_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/work-turn-done');
   const SHIP_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/ship-done');
   const ACTIVITY_URL = FLEET_URL.replace(/\/agents\/?$/, '/session-activity');
+  const WORKTREES_URL = FLEET_URL.replace(/\/agents\/?$/, '/session-worktrees');
   const workAnswering = new Set(); // turn ids currently queued/running here
   const workAttempts = new Map(); // turn id -> completed runTurn attempts
   const MAX_WORK_TRIES = 3;
@@ -244,6 +246,67 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
         }
       },
     };
+  };
+
+  /**
+   * WHERE EACH TAB IS STANDING, and what it holds — the readout a human would
+   * get by running `git status` in the session's directory, which is the one
+   * thing they cannot do from a browser.
+   *
+   * Two triggers, both cheap: right after a turn settles (the moment the diff
+   * changed) and a throttled sweep over every live session (a human editing in
+   * the worktree, a build writing files, a ship landing). Best-effort like the
+   * narrator: never awaited by a turn, every failure swallowed.
+   */
+  const WORKTREE_SWEEP_MS = 60_000;
+  let lastWorktreeSweep = 0;
+  let sweepingWorktrees = false;
+  const postWorktrees = async (reports) => {
+    if (!reports.length) return;
+    try {
+      await fetch(WORKTREES_URL, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${FLEET_TOKEN}`,
+          'User-Agent': USER_AGENT,
+          'Content-Type': 'application/json',
+        },
+        signal: AbortSignal.timeout(20_000),
+        body: JSON.stringify({ reports }),
+      });
+    } catch {
+      /* a readout — the next sweep carries it */
+    }
+  };
+  const sessionWorktreeReport = (sessionId) => {
+    if (!isSafePathSegment(sessionId)) return null;
+    const d = worktreeDiff(join(baseDir, 'sessions', sessionId), baseRef);
+    return d ? { sessionId, ...d } : null;
+  };
+  /** One session, now — called after its turn settles. */
+  const reportSessionWorktree = async (sessionId) => {
+    const r = sessionWorktreeReport(sessionId);
+    if (r) await postWorktrees([r]);
+  };
+  /** Every live session, throttled — called from the reconcile loop. */
+  const reportWorktrees = (activeIds) => {
+    if (!Array.isArray(activeIds) || activeIds.length === 0) return;
+    if (sweepingWorktrees) return;
+    if (Date.now() - lastWorktreeSweep < WORKTREE_SWEEP_MS) return;
+    sweepingWorktrees = true;
+    lastWorktreeSweep = Date.now();
+    void (async () => {
+      try {
+        const reports = [];
+        for (const id of activeIds.slice(0, 20)) {
+          const r = sessionWorktreeReport(id);
+          if (r) reports.push(r);
+        }
+        await postWorktrees(reports);
+      } finally {
+        sweepingWorktrees = false;
+      }
+    })();
   };
 
   let flushingReports = false;
@@ -1174,6 +1237,12 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
           warn(`session turn failed: ${e?.message ?? e}`);
         } finally {
           workAnswering.delete(job.id);
+          // The turn just changed the directory — say what it looks like now,
+          // whether it succeeded or blew up (a failed turn can still have
+          // written half a file, and the tab should show that honestly). NOT
+          // awaited: this runs inside the session's chain, and a slow POST
+          // would delay the next turn of that tab behind a readout.
+          void reportSessionWorktree(job.sessionId).catch(() => {});
         }
       });
     }
@@ -1511,5 +1580,12 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
     }
   };
 
-  return { flushWorkReports, processWorkTurns, processShipJobs, retireWorkSessions, shutdownWork };
+  return {
+    flushWorkReports,
+    processWorkTurns,
+    processShipJobs,
+    retireWorkSessions,
+    reportWorktrees,
+    shutdownWork,
+  };
 }
