@@ -24,8 +24,66 @@ import {
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
-const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 const REPORT_CAP = 30;
+// ENDED sessions are the adoptable inventory, and the useful ones are FRESH:
+// "closed my laptop terminal, picking it up here". Claude Code prunes its own
+// history anyway, so a week-old row was a soon-to-be-dead offer — 48 hours,
+// newest per directory, few. (The first ship reported 7 days of everything
+// and the strip read as session history instead of presence.)
+const ENDED_WINDOW_MS = 48 * 60 * 60 * 1000;
+const ENDED_CAP = 5;
+
+/**
+ * The conversation's own title, off the transcript's `ai-title` records
+ * (the LAST one wins — titles get rewritten as a session evolves), falling
+ * back to the first real user message. Those records sit anywhere in the
+ * file (measured: line 81 to line 4457), so this reads the WHOLE transcript
+ * — behind an mtime cache, because the scan runs every minute and a title
+ * only changes when the file does: steady state is a stat, not a read.
+ */
+const titleCache = new Map(); // file → { mtimeMs, title }
+function transcriptTitle(file, mtimeMs) {
+  const hit = titleCache.get(file);
+  if (hit && hit.mtimeMs === mtimeMs) return hit.title;
+  let title = null;
+  try {
+    const stat = statSync(file);
+    // A transcript past this is not worth a read per minute of drift.
+    if (stat.size <= 64 * 1024 * 1024) {
+      let firstUser = null;
+      for (const line of readFileSync(file, 'utf8').split('\n')) {
+        if (line.includes('"type":"ai-title"')) {
+          try {
+            const t = JSON.parse(line)?.aiTitle;
+            if (typeof t === 'string' && t.trim()) title = t.trim(); // last wins
+          } catch {
+            /* torn line */
+          }
+        } else if (!firstUser && !title && line.includes('"type":"user"') && !line.includes('"isMeta":true')) {
+          try {
+            const content = JSON.parse(line)?.message?.content;
+            const text =
+              typeof content === 'string'
+                ? content
+                : Array.isArray(content)
+                  ? (content.find((b) => typeof b?.text === 'string')?.text ?? '')
+                  : '';
+            if (text.trim() && !text.startsWith('<')) firstUser = text.trim();
+          } catch {
+            /* torn line */
+          }
+        }
+      }
+      if (!title && firstUser) title = firstUser;
+      if (title) title = title.replace(/\s+/g, ' ').slice(0, 120);
+    }
+  } catch {
+    title = null;
+  }
+  if (titleCache.size > 400) titleCache.clear(); // a bound, not an LRU — refills in one scan
+  titleCache.set(file, { mtimeMs, title });
+  return title;
+}
 
 /** Path-prefix containment on already-realpath'd absolute paths. */
 const inside = (p, root) => p === root || p.startsWith(root.endsWith('/') ? root : `${root}/`);
@@ -182,12 +240,29 @@ export function scanLocalSessions({ repoRoot, excludeDirs = [] }) {
       }
       if (!ours(cwd)) continue;
       liveIds.add(rec.sessionId);
+      // A live session's title, off its own transcript (the registry `name`
+      // is a machine-y fallback like "flowviant-35").
+      let liveTitle = null;
+      try {
+        const liveFile = join(
+          homedir(),
+          '.claude',
+          'projects',
+          cwd.replace(/[/.]/g, '-'),
+          `${rec.sessionId}.jsonl`
+        );
+        liveTitle = transcriptTitle(liveFile, statSync(liveFile).mtimeMs);
+      } catch {
+        /* no transcript yet */
+      }
+      if (!liveTitle && typeof rec.name === 'string' && rec.name.trim()) liveTitle = rec.name.trim();
       live.push({
         id: rec.sessionId,
         cwd,
         live: true,
         lastActiveAt: nowIso,
         ...(typeof rec.gitBranch === 'string' && rec.gitBranch ? { branch: rec.gitBranch } : {}),
+        ...(liveTitle ? { title: liveTitle } : {}),
       });
     }
     live.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
@@ -207,7 +282,7 @@ export function scanLocalSessions({ repoRoot, excludeDirs = [] }) {
     } catch {
       /* no transcript store — live sessions still report */
     }
-    const cutoff = Date.now() - SEVEN_DAYS_MS;
+    const cutoff = Date.now() - ENDED_WINDOW_MS;
     const candidates = [];
     for (const dirName of projDirs) {
       if (dirName !== munged && !dirName.startsWith(`${munged}-`)) continue;
@@ -228,7 +303,7 @@ export function scanLocalSessions({ repoRoot, excludeDirs = [] }) {
         } catch {
           continue;
         }
-        if (mtimeMs < cutoff) continue; // week-old sessions are history, not presence
+        if (mtimeMs < cutoff) continue; // an aged session is history, not presence
         candidates.push({ id, file, mtimeMs });
       }
     }
@@ -236,8 +311,14 @@ export function scanLocalSessions({ repoRoot, excludeDirs = [] }) {
     // the verification read is the expensive step, so it is not spent on
     // sessions the report would drop anyway.
     candidates.sort((a, b) => b.mtimeMs - a.mtimeMs || (a.id < b.id ? -1 : 1));
-    const room = Math.max(0, REPORT_CAP - Math.min(live.length, REPORT_CAP));
+    // ONE row per DIRECTORY, newest first, few: twenty sessions in the repo
+    // root are one offer — the newest is the one `--resume`'s picker would
+    // reach for and the only one worth importing 95% of the time. The rest
+    // are scrollback, and the product's own law says scrollback doesn't
+    // matter.
+    const room = Math.min(ENDED_CAP, Math.max(0, REPORT_CAP - Math.min(live.length, REPORT_CAP)));
     const endedIds = new Set();
+    const seenCwds = new Set(live.map((s) => s.cwd));
     for (const cand of candidates) {
       if (ended.length >= room) break;
       if (endedIds.has(cand.id)) continue; // one row per session, whatever dir names it
@@ -251,12 +332,16 @@ export function scanLocalSessions({ repoRoot, excludeDirs = [] }) {
         continue;
       }
       if (!ours(cwd)) continue;
+      if (seenCwds.has(cwd)) continue; // newest per directory; a live one owns its cwd
+      seenCwds.add(cwd);
+      const title = transcriptTitle(cand.file, cand.mtimeMs);
       ended.push({
         id: cand.id,
         cwd,
         live: false,
         lastActiveAt: new Date(cand.mtimeMs).toISOString(),
         ...(typeof rec.gitBranch === 'string' && rec.gitBranch ? { branch: rec.gitBranch } : {}),
+        ...(title ? { title } : {}),
       });
     }
   } catch {
@@ -365,7 +450,7 @@ function scanAgyConversations({ repoRoot, excludeDirs = [] }) {
     const raw = readFileSync(join(AGY_DIR(), 'cache', 'last_conversations.json'), 'utf8');
     const map = JSON.parse(raw);
     if (!map || typeof map !== 'object') return out;
-    const cutoff = Date.now() - SEVEN_DAYS_MS;
+    const cutoff = Date.now() - ENDED_WINDOW_MS;
     const processUp = agyProcessAlive();
     for (const [cwd, id] of Object.entries(map)) {
       if (typeof id !== 'string' || !AGY_UUID_RE.test(id)) continue;

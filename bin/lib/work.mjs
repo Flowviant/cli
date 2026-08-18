@@ -869,6 +869,13 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
           // in the prompt, so the AGENT tells the user what stayed behind.
           let carryNote = '';
           if (adopting && dir.fresh && adoptSrc) carryNote = carryDirtyState(adoptSrc, dir.wt);
+          // The tab's transcript starts EMPTY on adoption (scrollback is
+          // disposable, the held context is the brain — never import an
+          // archive), so the first reply opens with a recap: the human sees
+          // the thread they are picking up without asking for it.
+          const adoptNote = adopting
+            ? '[ADOPTED SESSION — this conversation was brought in from a terminal. Begin your reply with a 2-3 sentence recap of where it left off and what state carried over, then answer the message.]'
+            : '';
           const mcp = plainTab
             ? { args: [], env: null, dir: null }
             : mcpFor(rt.id, mint.token, getMcpUrl());
@@ -879,7 +886,7 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
           let seenThreadId = null; // codex's conversation id, off thread.started
           const spawned = []; // this turn's children, for the teardown registry
           try {
-            const message = carryNote ? `${job.body}\n\n${carryNote}` : job.body;
+            const message = [job.body, adoptNote, carryNote].filter(Boolean).join('\n\n');
             const turnArgs = {
               // A plain tab has no tools to name and no session id to pass —
               // its kickoff asks for one complete report instead of a stream.
