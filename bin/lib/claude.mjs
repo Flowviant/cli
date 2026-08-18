@@ -191,7 +191,13 @@ const oneLine = (s, n = 160) => String(s).replace(/\s+/g, ' ').trim().slice(0, n
 // bursts before/between tools; emitting only tools left long silent gaps).
 // Assistant text is also folded into `out` so the WIKI_DONE/REGROUND_DONE
 // sentinels still match. A non-JSON line (a stray warning) is kept as raw text.
-function handleStreamLine(line, { cwd, emit, onActivity, appendText }) {
+//
+// `answerFromResult` narrows that last part for callers whose `out` IS the
+// answer rather than a haystack to match sentinels in (a Workbench tab's turn):
+// every intermediate text block still NARRATES, but only the final `result`
+// event contributes text — otherwise the same sentences arrive twice, once as
+// they stream and once in the result, and the tab posts the duplicate.
+function handleStreamLine(line, { cwd, emit, onActivity, appendText, answerFromResult }) {
   let ev;
   try {
     ev = JSON.parse(line);
@@ -212,15 +218,23 @@ function handleStreamLine(line, { cwd, emit, onActivity, appendText }) {
         // marker — enough to show Claude is actively reasoning, not hung.
         push({ kind: 'think', label: b.thinking ? `thinking: ${oneLine(b.thinking)}` : 'thinking…' });
       } else if (b.type === 'text' && b.text?.trim()) {
-        appendText(b.text + '\n');
+        if (!answerFromResult) appendText(b.text + '\n');
         push({ kind: 'say', label: oneLine(b.text) });
       } else if (b.type === 'tool_use') {
         push(humanizeToolUse(b.name, b.input || {}, cwd));
       }
     }
-  } else if (ev.type === 'result' && typeof ev.result === 'string') {
+  } else if (ev.type === 'result') {
     // The final assistant text (carries WIKI_DONE / REGROUND_DONE).
-    appendText(ev.result + '\n');
+    if (typeof ev.result === 'string') appendText(ev.result + '\n');
+    else if (ev.is_error || ev.subtype) {
+      // A result that carries no text is a FAILED turn (a limit, a refused
+      // permission, an aborted run). Under `answerFromResult` this is the only
+      // stdout that would have said so, and a caller whose `out` is the answer
+      // must not report "no output" for a turn that explained itself.
+      const msg = ev.error?.message ?? ev.error ?? ev.subtype;
+      appendText(`${typeof msg === 'string' ? msg : JSON.stringify(msg)}\n`);
+    }
   }
 }
 
@@ -233,7 +247,7 @@ function handleStreamLine(line, { cwd, emit, onActivity, appendText }) {
 // returned string for sentinel detection, and each activity is handed to
 // `onActivity` so the caller can forward progress. Build-agent turns leave it
 // off and keep the raw text passthrough + line sentinels.
-export function runTurn({ prompt, resume, system, cwd, mcpConfig, mcpArgs, mcpEnv, runtime = 'claude', label, onSpawn, streamJson, onActivity, onThreadId, wikiPerm, readOnly, planPerm, vaultDir, resultSchemaArgs, model, effort, adoptResumeId, resumeThreadId, resumeConversationId }) {
+export function runTurn({ prompt, resume, system, cwd, mcpConfig, mcpArgs, mcpEnv, runtime = 'claude', label, onSpawn, streamJson, answerFromResult, onActivity, onThreadId, wikiPerm, readOnly, planPerm, vaultDir, resultSchemaArgs, model, effort, adoptResumeId, resumeThreadId, resumeConversationId }) {
   return new Promise((resolve) => {
     const rt = runtimeById(runtime);
     if (!rt.args) {
@@ -344,7 +358,8 @@ export function runTurn({ prompt, resume, system, cwd, mcpConfig, mcpArgs, mcpEn
       };
       /** One line of the child's stdout, in whichever dialect it speaks. */
       const onLine = (line) => {
-        if (!rt.parse) return handleStreamLine(line, { cwd, emit, onActivity, appendText });
+        if (!rt.parse)
+          return handleStreamLine(line, { cwd, emit, onActivity, appendText, answerFromResult });
         const ev = rt.parse(line, cwd);
         if (!ev) return;
         // The conversation id, when the runtime announces one (codex's

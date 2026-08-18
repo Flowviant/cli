@@ -88,6 +88,7 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
   const WORK_TOKEN_URL = FLEET_URL.replace(/\/agents\/?$/, '/work-token');
   const WORK_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/work-turn-done');
   const SHIP_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/ship-done');
+  const ACTIVITY_URL = FLEET_URL.replace(/\/agents\/?$/, '/session-activity');
   const workAnswering = new Set(); // turn ids currently queued/running here
   const workAttempts = new Map(); // turn id -> completed runTurn attempts
   const MAX_WORK_TRIES = 3;
@@ -168,6 +169,83 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
     else pendingShipReports.delete(sessionId);
     return r;
   };
+  /**
+   * THE TAB'S LIVE NARRATION — the terminal's own stdout, relayed.
+   *
+   * A turn used to be a spinner: the tab said "working…" for minutes and the
+   * only thing that ever appeared was the finished reply. The CLI is printing
+   * the whole time (thinking, reads, greps, commands), so the honest fix is to
+   * FORWARD that, not to invent a progress model on the server. Flowviant
+   * relays; it does not narrate on its own behalf.
+   *
+   * Best-effort by construction: throttled to one POST per window (a turn can
+   * emit hundreds of lines), never awaited by the turn, and every failure is
+   * swallowed. A spinner must never be able to fail a build. The server clears
+   * the line at settle, so a daemon killed mid-turn cannot leave one stuck.
+   */
+  const ACTIVITY_MIN_MS = 1_500;
+  const ACTIVITY_KEEP = 4; // the last few lines — a tail, not a log
+  const makeNarrator = (sessionId) => {
+    const recent = [];
+    let lastSent = 0;
+    let dirty = false;
+    let timer = null;
+    let sending = false;
+    let stopped = false;
+    const send = async () => {
+      if (sending || stopped) return;
+      sending = true;
+      dirty = false;
+      lastSent = Date.now();
+      const lines = recent.slice(-ACTIVITY_KEEP);
+      try {
+        await fetch(ACTIVITY_URL, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${FLEET_TOKEN}`,
+            'User-Agent': USER_AGENT,
+            'Content-Type': 'application/json',
+          },
+          signal: AbortSignal.timeout(10_000),
+          body: JSON.stringify({ sessionId, lines }),
+        });
+      } catch {
+        /* narration is decoration — a dropped line is not an incident */
+      }
+      sending = false;
+      if (dirty && !stopped) schedule();
+    };
+    const schedule = () => {
+      if (timer || stopped) return;
+      const wait = Math.max(0, ACTIVITY_MIN_MS - (Date.now() - lastSent));
+      timer = setTimeout(() => {
+        timer = null;
+        void send();
+      }, wait);
+      timer.unref?.(); // never hold the process open for a spinner
+    };
+    return {
+      line(label) {
+        const s = String(label ?? '')
+          .replace(/\s+/g, ' ')
+          .trim()
+          .slice(0, 200);
+        if (!s || stopped) return;
+        recent.push(s);
+        if (recent.length > ACTIVITY_KEEP * 2) recent.shift();
+        dirty = true;
+        schedule();
+      },
+      stop() {
+        stopped = true;
+        if (timer) {
+          clearTimeout(timer);
+          timer = null;
+        }
+      },
+    };
+  };
+
   let flushingReports = false;
   const flushWorkReports = async () => {
     if (flushingReports) return;
@@ -928,6 +1006,7 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
           let out;
           let seenThreadId = null; // codex's conversation id, off thread.started
           const spawned = []; // this turn's children, for the teardown registry
+          const narrator = makeNarrator(job.sessionId);
           try {
             const message = [job.body, adoptNote, carryNote].filter(Boolean).join('\n\n');
             const turnArgs = {
@@ -953,6 +1032,14 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
               system: plainTab ? SYSTEM_WORK_PLAIN : SYSTEM_WORK,
               // Present only when the tab named one — see brainFor.
               ...brain,
+              // The tab watches the CLI work. Claude needs the flag to speak
+              // events at all (codex and agy always do); `answerFromResult`
+              // keeps `out` — which IS the reply posted to the transcript — to
+              // the final result, so streamed prose is narrated once and
+              // posted once. Every line goes to the narrator above, throttled.
+              streamJson: true,
+              answerFromResult: true,
+              onActivity: (a) => narrator.line(a?.label),
               cwd: dir.wt,
               mcpArgs: mcp.args,
               mcpEnv: mcp.env,
@@ -998,6 +1085,10 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
             if (!adopting && resume && !(out || '').trim())
               out = await runTurn({ ...turnArgs, resume: false });
           } finally {
+            // The CLI has stopped printing, so stop relaying. The LINE itself
+            // is cleared server-side at settle — clearing it here would race
+            // the settle and blank the tab a beat before the reply lands.
+            narrator.stop();
             for (const ch of spawned) workChildren.delete(ch);
             if (lockPath) {
               try {
