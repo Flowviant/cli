@@ -44,8 +44,10 @@ function countLines(buf) {
 /**
  * @param {string} wt   the worktree directory
  * @param {string} baseRef  the project's base ref (e.g. `origin/main`)
- * @returns {null | {branch:string, path:string, ahead:number, dirty:boolean,
- *   additions:number, deletions:number, fileCount:number, truncated:number,
+ * @returns {null | {branch:string, path:string, ahead:number, behind:number,
+ *   baseLabel:string, baseCommits:{sha:string, subject:string, author:string}[],
+ *   dirty:boolean, additions:number, deletions:number, fileCount:number,
+ *   truncated:number,
  *   files:{path:string, added:number, deleted:number, binary?:boolean}[]}}
  */
 export function worktreeDiff(wt, baseRef) {
@@ -121,6 +123,32 @@ export function worktreeDiff(wt, baseRef) {
   } catch {
     /* leave at 0 */
   }
+  // WHAT LANDED WHILE YOU WERE WORKING. Not the branch's own history — the
+  // commits on BASE that this worktree doesn't have, which is the thing a
+  // person cannot see from inside their own session and the reason they end up
+  // rebasing onto a surprise. Freshness is the caller's job: these are only as
+  // current as the last fetch (reportWorktrees throttles one).
+  let behind = 0;
+  const baseCommits = [];
+  try {
+    behind = Number(git(['rev-list', '--count', `HEAD..${baseRef}`], wt)) || 0;
+    if (behind > 0) {
+      // %x1f is the unit separator — a subject can contain anything a person
+      // can type, tabs and pipes included, so the delimiter must be one that
+      // cannot appear in it.
+      const raw = git(
+        ['log', '-n', '3', '--format=%h%x1f%s%x1f%an', `HEAD..${baseRef}`],
+        wt
+      );
+      for (const line of raw.split('\n')) {
+        if (!line.trim()) continue;
+        const [sha, subject, author] = line.split('\x1f');
+        if (sha) baseCommits.push({ sha, subject: subject ?? '', author: author ?? '' });
+      }
+    }
+  } catch {
+    /* an unfetched or missing base — say nothing rather than "you're current" */
+  }
   let dirty = false;
   try {
     dirty = git(['status', '--porcelain'], wt) !== '';
@@ -137,6 +165,9 @@ export function worktreeDiff(wt, baseRef) {
     branch,
     path: wt,
     ahead,
+    behind,
+    baseLabel: String(baseRef).replace(/^origin\//, ''),
+    baseCommits,
     dirty,
     additions,
     deletions,

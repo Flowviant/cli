@@ -259,7 +259,15 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
    * narrator: never awaited by a turn, every failure swallowed.
    */
   const WORKTREE_SWEEP_MS = 60_000;
+  /** How often the sweep refreshes `origin/<base>` before measuring. The
+   *  behind-count is the whole point of the readout — "someone pushed while you
+   *  were working" — and without a fetch it would only ever count what this
+   *  machine already happened to have. Rarer than the sweep because a fetch is
+   *  network, and a teammate's push being visible within three minutes is the
+   *  same promise the rest of the product makes. */
+  const WORKTREE_FETCH_MS = 3 * 60_000;
   let lastWorktreeSweep = 0;
+  let lastWorktreeFetch = 0;
   let sweepingWorktrees = false;
   const postWorktrees = async (reports) => {
     if (!reports.length) return;
@@ -297,6 +305,17 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
     lastWorktreeSweep = Date.now();
     void (async () => {
       try {
+        // Refresh the base before measuring, so "3 new on main" means what a
+        // person thinks it means. Throttled, best-effort, and never fatal: an
+        // offline machine reports the counts it can still compute.
+        if (Date.now() - lastWorktreeFetch >= WORKTREE_FETCH_MS) {
+          lastWorktreeFetch = Date.now();
+          try {
+            git(['fetch', 'origin', '--quiet'], repoRoot);
+          } catch {
+            /* offline, or no remote — the numbers just age */
+          }
+        }
         const reports = [];
         for (const id of activeIds.slice(0, 20)) {
           const r = sessionWorktreeReport(id);
