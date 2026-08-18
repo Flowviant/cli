@@ -68,6 +68,31 @@ Flowviant only stores the tunnel URL; your browser talks to it directly.
 | `FLOWVIANT_TOKENS=a,b,c` | a static fleet, one worktree each |
 | `FLOWVIANT_SAFE=1` | restrict the toolset instead of running unattended |
 
+## Security posture
+
+Every project member with edit access can run turns on this machine —
+Workbench tabs and @-dispatches both execute a coding agent with the daemon's
+own OS permissions. Membership is the consent boundary, the same trust plane
+as the shared repository: invite people you would give a shell to.
+
+Two knobs bound the blast radius, and both are worth setting on a shared box:
+
+- **Run the daemon under a dedicated OS user** that owns only the repository
+  checkout and `~/.flowviant`. This is the single biggest hardening available
+  — a session can then only touch that account's files, not your keys, your
+  home directory, or the rest of the machine. A plain separate account works;
+  a systemd unit with `ProtectHome=read-only` and `ReadWritePaths=` works
+  better.
+- **`FLOWVIANT_SAFE=1`** narrows the toolset: Claude to an allowlist
+  (edit/read/search plus `git`/`gh`/`npm`/`bun` — no arbitrary shell), Codex
+  to a workspace-write sandbox. Antigravity has no per-invocation narrowing —
+  its permission engine is machine-wide — which is surfaced in the app rather
+  than papered over.
+
+The posture is reported on every poll and shown in the project's
+Settings → Machine section, so the team can see whether the box runs the
+guarded toolset or full permissions.
+
 ## License
 
 MIT — see [LICENSE](./LICENSE).

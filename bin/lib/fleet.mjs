@@ -101,6 +101,12 @@ async function fetchRoster(haveIds) {
   // our own package.json). Older servers ignore unknown params, so sending it
   // unconditionally is always safe.
   url.searchParams.set('dv', VERSION);
+  // The permission posture this machine runs turns under — '1' when
+  // FLOWVIANT_SAFE narrows the toolset, '0' when everything is granted. A
+  // statement of configuration, not a request: the app SHOWS it in Settings
+  // so a team can see whether the shared box runs wide open, and enforces
+  // nothing (membership is the consent boundary). Older servers ignore it.
+  url.searchParams.set('safe', SAFE ? '1' : '0');
   // WHICH CLIs this machine actually has, so the app can stop guessing.
   //
   // Until now every surface that listed Gemini or Codex said "not wired up yet"
