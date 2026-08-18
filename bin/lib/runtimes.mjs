@@ -310,9 +310,18 @@ export const RUNTIMES = {
      * strongest form of it available anywhere: `--append-system-prompt` sits
      * above the conversation rather than inside it.
      */
-    args({ prompt, system, model, effort, resume, streamJson, perm, mcp = [], resultSchemaArgs = [] }) {
+    args({ prompt, system, model, effort, resume, streamJson, perm, mcp = [], resultSchemaArgs = [], adoptResumeId }) {
       const a = [];
-      if (resume) a.push('--continue');
+      // ADOPTION — the first turn of a tab born from a terminal session.
+      // `--resume <id> --fork-session` finds the session globally (any cwd),
+      // carries its full context, and writes the FORK natively into THIS cwd's
+      // own store, leaving the original transcript untouched (measured on
+      // 2.1.234). From turn 2 on the plain `--continue` below resumes the fork
+      // where it now lives, so nothing downstream knows the tab was adopted.
+      // INSTEAD of --continue, never alongside it: they are the same decision
+      // ("what conversation is this?") answered two different ways.
+      if (adoptResumeId) a.push('--resume', adoptResumeId, '--fork-session');
+      else if (resume) a.push('--continue');
       a.push('-p', prompt, '--append-system-prompt', system);
       a.push(...mcp, ...resultSchemaArgs);
       a.push('--model', model || MODEL);
@@ -371,7 +380,12 @@ export const RUNTIMES = {
      * placed before it. Appending them after the positional is the kind of argv
      * that parses today and stops parsing on some future clap upgrade.
      */
-    args({ prompt, system, model, effort, resume, profile = 'build', vaultDir, mcp = [], resultSchemaArgs = [] }) {
+    args({ prompt, system, model, effort, resume, profile = 'build', vaultDir, mcp = [], resultSchemaArgs = [], adoptResumeId }) {
+      // Adoption resumes a CLAUDE terminal session — its transcript store, its
+      // fork semantics. Reaching here with an adopt id is a wiring mistake
+      // upstream, and it fails loudly on purpose: quietly dropping the flag
+      // would answer that session's held context with a different brain.
+      if (adoptResumeId) throw new Error('adoption is Claude-only — codex cannot resume a Claude terminal session');
       const a = ['exec'];
       if (resume) a.push('resume', '--last');
       a.push('--json');
@@ -610,7 +624,10 @@ export const RUNTIMES = {
      */
     profiles: ['build', 'wiki', 'consult'],
     mcp: null,
-    args({ prompt, system, model, effort, resume, profile = 'build', vaultDir, resultSchemaArgs = [] }) {
+    args({ prompt, system, model, effort, resume, profile = 'build', vaultDir, resultSchemaArgs = [], adoptResumeId }) {
+      // Same loud refusal as Codex: an adopt id names a Claude session, and no
+      // other runtime can resume one — see the claude builder for the contract.
+      if (adoptResumeId) throw new Error('adoption is Claude-only — agy cannot resume a Claude terminal session');
       const a = [];
       if (resume) a.push('--continue');
       // No system-prompt flag, same weakening as Codex: the contract rides in

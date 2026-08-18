@@ -84,6 +84,7 @@ import { processDeployJobs, reportDeployConfig } from './deploy.mjs';
 import { machineSnapshot } from './resources.mjs';
 import { detectRuntimes, pickRuntimeFor, RUNTIMES } from './runtimes.mjs';
 import { createWorkManager } from './work.mjs';
+import { scanLocalSessions } from './localSessions.mjs';
 
 async function fetchRoster(haveIds) {
   const url = new URL(FLEET_URL);
@@ -220,6 +221,69 @@ function sampleDiffstat(cwd, baseRef, intentId, agentId) {
     clearInterval(t);
     clearTimeout(first);
   };
+}
+
+/**
+ * Terminal-session presence: tell the server which Claude sessions exist in
+ * this repo (localSessions.mjs reads them off Claude's own on-disk state), so
+ * the Workbench can offer "adopt this terminal session as a tab". Best-effort
+ * in exactly the way the env/runtimes blocks are — a presence report that can
+ * fail a poll is worse than no presence at all — with three quiet economies:
+ * the scan runs at most once a minute (the reconcile loop ticks far faster), a
+ * report identical to the last DELIVERED one is not re-sent, and a 404 means
+ * an older server that has never heard of the endpoint, after which this
+ * process stops asking (a deploy that adds it also restarts nothing on this
+ * machine, so silence-until-restart costs one daemon restart, not a feature).
+ */
+const LOCAL_SESSIONS_URL = FLEET_URL.replace(/\/agents\/?$/, '/local-sessions');
+const LOCAL_SESSIONS_SCAN_MS = 60_000;
+// The web hides a report older than 10 minutes (presence must not linger as
+// fact after the machine dies), so an UNCHANGED report is re-sent inside that
+// window anyway — the re-send is the machine's heartbeat on this fact, and
+// suppressing it entirely would blank the strip while everything still holds.
+const LOCAL_SESSIONS_RESEND_MS = 5 * 60_000;
+let localSessionsUnsupported = false; // the server 404'd — quiet until restart
+let localSessionsScanAt = 0;
+let localSessionsSent = null; // last payload the server ACCEPTED, stringified
+let localSessionsSentAt = 0;
+async function maybeReportLocalSessions({ repoRoot, excludeDirs }) {
+  if (localSessionsUnsupported) return;
+  if (Date.now() - localSessionsScanAt < LOCAL_SESSIONS_SCAN_MS) return;
+  localSessionsScanAt = Date.now();
+  let payload;
+  try {
+    // scanLocalSessions orders deterministically, so this string only changes
+    // when the facts on disk do — the dedup below compares whole payloads.
+    payload = JSON.stringify({ sessions: scanLocalSessions({ repoRoot, excludeDirs }) });
+  } catch {
+    return; // presence must never throw into the poll loop
+  }
+  if (payload === localSessionsSent && Date.now() - localSessionsSentAt < LOCAL_SESSIONS_RESEND_MS)
+    return;
+  try {
+    const res = await fetch(LOCAL_SESSIONS_URL, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${FLEET_TOKEN}`,
+        'User-Agent': USER_AGENT,
+        'Content-Type': 'application/json',
+      },
+      signal: AbortSignal.timeout(15_000),
+      body: payload,
+    });
+    if (res.status === 404) {
+      localSessionsUnsupported = true; // older server — it REPLACED nothing here
+      return;
+    }
+    // Only an accepted report counts as sent; anything else forgets the
+    // last-sent payload so the next pass retries instead of dedup-suppressing
+    // a report the server never received.
+    localSessionsSent = res.ok ? payload : null;
+    localSessionsSentAt = res.ok ? Date.now() : 0;
+  } catch {
+    localSessionsSent = null;
+    localSessionsSentAt = 0;
+  }
 }
 
 // One roster agent's loop: persistent worktree, one intent per turn, reset to
@@ -1754,6 +1818,10 @@ export async function runFleetDaemon() {
     // sessions are LIVE, and the guards above (chains, shipping) are populated
     // by the intake this same tick.
     retireWorkSessions(roster.activeWorkSessions);
+    // Terminal-session presence, throttled + dedup'd inside; never awaited —
+    // the daemon's own worktrees are carved out (a session the daemon spawned
+    // is already a tab, not something to offer adopting).
+    void maybeReportLocalSessions({ repoRoot, excludeDirs: [baseDir] });
     processJoinJobs(roster.joinJobs);
     processCleanupJobs(roster.cleanupJobs);
     const rosterIds = new Set(roster.agents.map((a) => a.agentId));

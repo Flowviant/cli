@@ -15,16 +15,28 @@
  * two getters (the MCP URL and the lease TTL can change with any poll).
  */
 
-import { existsSync, rmSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  rmSync,
+  readdirSync,
+  readFileSync,
+  writeFileSync,
+  realpathSync,
+  statSync,
+  lstatSync,
+  mkdirSync,
+  cpSync,
+} from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import { FLEET_URL, FLEET_TOKEN, USER_AGENT, REFRESH_BEFORE_SECONDS } from './config.mjs';
-import { git, baseBranchName, isSafePathSegment } from './git.mjs';
+import { git, gitRaw, splitNul, baseBranchName, isSafePathSegment } from './git.mjs';
 import { c, note, ok, warn } from './ui.mjs';
 import { mcpFor, runTurn } from './claude.mjs';
 import { SYSTEM_WORK, WORK_TURN_KICKOFF } from './prompts.mjs';
 import { materializeInto, scrub as envScrub } from './env.mjs';
-import { detectRuntimes, pickRuntimeFor, RUNTIMES } from './runtimes.mjs';
+import { detectRuntimes, canRun, RUNTIMES } from './runtimes.mjs';
+import { isTerminalSessionLive } from './localSessions.mjs';
 
 export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLeaseTtl }) {
   const WORK_TOKEN_URL = FLEET_URL.replace(/\/agents\/?$/, '/work-token');
@@ -178,14 +190,21 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
    * is the point. If the directory was retired but the branch survives, the
    * worktree re-attaches to the branch and the committed work is still there.
    */
-  const sessionWtFor = (sessionId) => {
+  const sessionWtFor = (sessionId, baseAt) => {
     if (!isSafePathSegment(sessionId)) return null;
     const wt = join(baseDir, 'sessions', sessionId);
     const fresh = !existsSync(wt);
     if (fresh) {
       const branch = `session/${sessionId}`;
+      // `baseAt` is the adoption override: a tab born from a terminal session
+      // branches from THAT checkout's HEAD, because the conversation being
+      // resumed was had against those commits — putting it on the project base
+      // would hand it a repo state it has never seen. Everything else is
+      // unchanged, the attach fallback included: a surviving branch already
+      // chose its base, and re-basing it here would move committed work.
+      const at = baseAt || baseRef;
       try {
-        git(['worktree', 'add', '-b', branch, wt, baseRef], repoRoot);
+        git(['worktree', 'add', '-b', branch, wt, at], repoRoot);
       } catch {
         git(['worktree', 'prune'], repoRoot);
         try {
@@ -193,7 +212,7 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
           git(['worktree', 'add', wt, branch], repoRoot);
         } catch {
           try {
-            git(['worktree', 'add', '-b', branch, wt, baseRef], repoRoot);
+            git(['worktree', 'add', '-b', branch, wt, at], repoRoot);
           } catch {
             return null;
           }
@@ -234,6 +253,84 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
   };
 
   /**
+   * Carry a terminal checkout's DIRTY state into a fresh adopt worktree. The
+   * source is strictly READ-ONLY — nothing here writes to it, because it is
+   * the human's own checkout and adoption promises to leave it exactly as the
+   * closed terminal did. Tracked changes travel as one binary patch staged
+   * through the worktree's PRIVATE git dir (invisible to status, dies with the
+   * tree); untracked files are copied one by one, skipping anything over 5MB.
+   *
+   * Returns '' or ONE bracketed line for the turn's prompt: a carry problem is
+   * the AGENT's to explain to the user, never a reason to fail the adoption —
+   * the conversation is the thing being adopted, and it resumes either way.
+   */
+  const carryDirtyState = (srcCwd, wt) => {
+    const problems = [];
+    try {
+      // A Buffer, not utf8: a `--binary` patch (and a hunk from a non-UTF-8
+      // text file) must round-trip byte-exact or the apply corrupts what it
+      // carries. 64MB of headroom — a dirtier tree than that fails the read
+      // here and is SAID, below, rather than half-applied.
+      const patch = execFileSync('git', ['diff', 'HEAD', '--binary'], {
+        cwd: srcCwd,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        maxBuffer: 64 * 1024 * 1024,
+      });
+      if (patch.length) {
+        const patchPath = sessionMetaPath(wt, 'flowviant-adopt.patch');
+        if (!patchPath) throw new Error('no private git dir to stage the patch in');
+        try {
+          writeFileSync(patchPath, patch);
+          git(['apply', '--whitespace=nowarn', patchPath], wt);
+        } finally {
+          try {
+            rmSync(patchPath, { force: true });
+          } catch {
+            /* best-effort — the private git dir dies with the worktree anyway */
+          }
+        }
+      }
+    } catch {
+      problems.push(
+        'their uncommitted TRACKED changes did not carry over (they are still in the terminal checkout, untouched)'
+      );
+    }
+    try {
+      const skipped = [];
+      for (const rel of splitNul(
+        gitRaw(['ls-files', '--others', '--exclude-standard', '-z'], srcCwd)
+      )) {
+        try {
+          const from = join(srcCwd, rel);
+          // lstat, not stat: a symlink is carried as itself, and its own size
+          // is what the 5MB budget judges — never the file it points at.
+          if (lstatSync(from).size > 5 * 1024 * 1024) {
+            skipped.push(rel);
+            continue;
+          }
+          const to = join(wt, rel);
+          mkdirSync(dirname(to), { recursive: true });
+          cpSync(from, to);
+        } catch {
+          skipped.push(rel);
+        }
+      }
+      if (skipped.length) {
+        problems.push(
+          `${skipped.length} untracked file${skipped.length === 1 ? '' : 's'} did not carry (over 5MB or unreadable): ${skipped.slice(0, 5).join(', ')}${skipped.length > 5 ? ', …' : ''}`
+        );
+      }
+    } catch {
+      problems.push(
+        'untracked files could not be listed in the terminal checkout, so none were carried'
+      );
+    }
+    return problems.length
+      ? `[ADOPTION NOTE from the daemon — tell the user plainly at the start of your reply: ${problems.join('; ')}.]`
+      : '';
+  };
+
+  /**
    * WHICH CLI drives this session — picked ONCE, on the first turn, and pinned
    * in the worktree's meta dir. The held context belongs to the CLI that made
    * it: `--continue` under a different binary is a different brain wearing the
@@ -241,8 +338,17 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
    * same reason). If the pinned CLI has left the machine, the turn settles
    * honestly instead of substituting. A retired-and-reattached directory has
    * no marker and no held context either, so re-picking there is correct.
-   * Returns { id } | { id: null } (nothing installed) | { missing: label }.
+   * Returns { id } | { id: null } (nothing installed) | { missing: label } |
+   * { unsupported: label } (pinned to a runtime no session can run on).
+   *
+   * SESSION-CAPABLE means rt.mcp is truthy, and the gate is not optional:
+   * a session turn hands its per-session token over a real MCP config, so
+   * `pickRuntimeFor('build')` is the WRONG question here — it also says yes
+   * to the MEDIATED build path (Antigravity, mcp: null), and a session pinned
+   * that way threw in mcpFor on every turn, failing the tab with an internal
+   * error instead of a sentence.
    */
+  const sessionCapable = (rid) => Boolean(RUNTIMES[rid]?.mcp) && canRun(RUNTIMES[rid], 'build');
   const sessionRuntime = (wt) => {
     const marker = sessionMetaPath(wt, 'flowviant-runtime');
     let pinned = null;
@@ -254,10 +360,19 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
       }
     }
     if (pinned && RUNTIMES[pinned]) {
+      // A pin that names a non-session-capable runtime is settled honestly by
+      // the caller, not silently re-picked: re-picking would hand the held
+      // context to a different brain, which is the exact substitution the pin
+      // exists to prevent.
+      if (!sessionCapable(pinned)) return { unsupported: RUNTIMES[pinned].label || pinned };
       const installed = detectRuntimes().find((r) => r.id === pinned)?.installed;
       return installed ? { id: pinned } : { missing: RUNTIMES[pinned].label || pinned };
     }
-    const id = pickRuntimeFor('build');
+    // The fresh pick, gated the same way — Claude first when it qualifies, for
+    // the reason pickRuntimeFor gives: the prompts were tuned against it.
+    const rows = detectRuntimes();
+    const okFor = (rid) => sessionCapable(rid) && Boolean(rows.find((r) => r.id === rid)?.installed);
+    const id = okFor('claude') ? 'claude' : (Object.keys(RUNTIMES).find(okFor) ?? null);
     if (!id) return { id: null };
     if (marker) {
       try {
@@ -394,7 +509,110 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
           note(
             `${c.cyan('tab')} ${c.dim(`— ${job.askedByName || 'the owner'} in "${job.sessionName || 'a session'}"`)}`
           );
-          const dir = sessionWtFor(job.sessionId);
+          // WHICH BRAIN the roster says this tab speaks (null/absent = Claude,
+          // which is what every tab ran on until now). The phase-2 hook: this
+          // daemon drives Claude tabs only, and a runtime it cannot honor is
+          // settled honestly — never answered by a different brain wearing the
+          // session's name.
+          if (job.runtime && job.runtime !== 'claude') {
+            await settleWorkTurn(job.id, {
+              ok: false,
+              answer: `This machine's daemon serves Claude tabs only for now — runtime '${job.runtime}' isn't supported yet.`,
+            });
+            return;
+          }
+          // ── ADOPTION: a tab born from a TERMINAL session ────────────────
+          // The server sends `adopt {id, cwd}` only while the session has no
+          // sessionRef — no turn has ever spoken from a worktree here — and
+          // the first turn resumes the terminal conversation by forking it
+          // into the tab's own worktree. Everything the server asserts is
+          // re-validated MACHINE-side: the id shape, the source directory,
+          // and — decisive — that the terminal is actually closed, because
+          // forking a session someone is still typing into puts two Claudes
+          // on one conversation.
+          const adopting = Boolean(job.adopt) && !job.sessionRef;
+          let srcHead = null;
+          let adoptSrc = null; // the validated, realpath'd source checkout
+          if (adopting) {
+            if (
+              typeof job.adopt.id !== 'string' ||
+              !/^[0-9a-f][0-9a-f-]{6,62}$/i.test(job.adopt.id)
+            ) {
+              await settleWorkTurn(job.id, {
+                ok: false,
+                answer: 'that terminal session id is not one this machine can resume',
+              });
+              return;
+            }
+            let srcCwd = null;
+            try {
+              srcCwd = realpathSync(String(job.adopt.cwd ?? ''));
+              if (!statSync(srcCwd).isDirectory()) srcCwd = null;
+            } catch {
+              srcCwd = null;
+            }
+            if (!srcCwd) {
+              await settleWorkTurn(job.id, {
+                ok: false,
+                answer: "the terminal session's directory no longer exists on the machine",
+              });
+              return;
+            }
+            // Inside the repo, outside the daemon's own worktrees: an adopt
+            // source is a HUMAN's checkout, and one of our directories showing
+            // up here means a stale or confused offer, not a session to fork.
+            const under = (p, root) =>
+              p === root || p.startsWith(root.endsWith('/') ? root : `${root}/`);
+            let realRoot = repoRoot;
+            let realBase = baseDir;
+            try {
+              realRoot = realpathSync(repoRoot);
+            } catch {
+              /* keep the literal path */
+            }
+            try {
+              realBase = realpathSync(baseDir);
+            } catch {
+              /* keep the literal path */
+            }
+            if (!under(srcCwd, realRoot)) {
+              await settleWorkTurn(job.id, {
+                ok: false,
+                answer: "the terminal session's directory is outside this project's repository",
+              });
+              return;
+            }
+            if (under(srcCwd, realBase)) {
+              await settleWorkTurn(job.id, {
+                ok: false,
+                answer:
+                  "that directory is one of the daemon's own worktrees — its session is already a tab, not something to adopt",
+              });
+              return;
+            }
+            try {
+              srcHead = git(['rev-parse', 'HEAD'], srcCwd);
+            } catch {
+              await settleWorkTurn(job.id, {
+                ok: false,
+                answer:
+                  "the terminal session's directory is not a usable git checkout (no HEAD to branch from)",
+              });
+              return;
+            }
+            if (isTerminalSessionLive(job.adopt.id)) {
+              await settleWorkTurn(job.id, {
+                ok: false,
+                answer:
+                  'That terminal session is still open on the machine — close it there first, then adopt.',
+              });
+              return;
+            }
+            adoptSrc = srcCwd;
+          }
+          // Based at the SOURCE's HEAD when adopting — the resumed
+          // conversation was had against those commits, not the project base.
+          const dir = sessionWtFor(job.sessionId, adopting ? srcHead : undefined);
           if (!dir) {
             await settleWorkTurn(job.id, {
               ok: false,
@@ -422,11 +640,33 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
             });
             return;
           }
+          if (rt.unsupported) {
+            // A pin from before the session-capable gate existed can name a
+            // runtime no tab can run on (Antigravity has no MCP config, and
+            // the session's whole control plane rides one). An honest sentence
+            // beats the mcpFor throw this used to crash into every turn.
+            await settleWorkTurn(job.id, {
+              ok: false,
+              answer: `this session is pinned to ${rt.unsupported}, which cannot drive a Workbench tab on this machine — open a new tab`,
+            });
+            return;
+          }
           if (!rt.id) {
             await settleWorkTurn(job.id, {
               ok: false,
               answer:
                 'No coding CLI is installed on the machine — install Claude Code (or another supported CLI), then send the message again',
+            });
+            return;
+          }
+          if (adopting && rt.id !== 'claude') {
+            // The adopt id names a CLAUDE conversation; only claude can fork
+            // it (--resume --fork-session). The runtimes registry backstops
+            // this with a loud throw, but a sentence here beats a stack there.
+            await settleWorkTurn(job.id, {
+              ok: false,
+              answer:
+                'adopting a terminal session needs Claude Code on the machine — install it, then try again',
             });
             return;
           }
@@ -454,6 +694,13 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
           // just opened. Anything else starts fresh IN the existing worktree —
           // never a reset; the dirty state is the session.
           const resume = !dir.fresh && Boolean(job.sessionRef) && job.sessionRef === dir.wt;
+          // The dirty carry, on the adopt worktree's FIRST life only: a
+          // re-attempted adoption (the directory already exists) carried what
+          // it could the first time, and re-applying would double it. A carry
+          // problem never fails the adoption — it becomes one bracketed line
+          // in the prompt, so the AGENT tells the user what stayed behind.
+          let carryNote = '';
+          if (adopting && dir.fresh && adoptSrc) carryNote = carryDirtyState(adoptSrc, dir.wt);
           const mcp = mcpFor(rt.id, mint.token, getMcpUrl());
           // Attempts count RUNS: the infra refusals above consumed nothing and
           // settled on their own terms.
@@ -465,9 +712,14 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
               prompt: WORK_TURN_KICKOFF({
                 sessionId: job.sessionId,
                 sessionName: job.sessionName,
-                message: job.body,
+                message: carryNote ? `${job.body}\n\n${carryNote}` : job.body,
                 askedByName: job.askedByName,
               }),
+              // The adopt turn resumes the TERMINAL conversation by forking it
+              // into this cwd (claude: --resume <id> --fork-session). After it
+              // speaks once, the fork lives natively here and turn 2+ is the
+              // ordinary --continue resume path, unchanged.
+              ...(adopting ? { adoptResumeId: job.adopt.id } : {}),
               system: SYSTEM_WORK,
               cwd: dir.wt,
               mcpArgs: mcp.args,
@@ -491,8 +743,13 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
             // A resume that produced NOTHING usually means the held
             // conversation is gone (a first turn that crashed before writing
             // state, a wiped CLI dir). Retry once fresh in the SAME worktree —
-            // never reset — instead of bricking the tab forever.
-            if (resume && !(out || '').trim()) out = await runTurn({ ...turnArgs, resume: false });
+            // never reset — instead of bricking the tab forever. NEVER on an
+            // adopt turn (`resume` is structurally false there, and the guard
+            // says so out loud): a fresh conversation would silently discard
+            // the adoption and answer as a new session wearing its name — the
+            // empty adopt turn settles failed below instead.
+            if (!adopting && resume && !(out || '').trim())
+              out = await runTurn({ ...turnArgs, resume: false });
           } finally {
             for (const ch of spawned) workChildren.delete(ch);
             if (lockPath) {
@@ -509,6 +766,18 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
           // workers' no-sentinel case) — drop the cached token so the next
           // turn re-mints instead of failing the same way forever.
           if (!answer) workTokens.delete(job.sessionId);
+          if (adopting && !answer) {
+            // The fork came back with nothing — the terminal session's
+            // transcript is most likely gone (cleaned, expired, deleted). Say
+            // exactly that; no sessionRef is recorded, so the server keeps
+            // offering the adoption and a retry after the user checks is cheap.
+            await settleWorkTurn(job.id, {
+              ok: false,
+              answer: "Couldn't resume the terminal session — it may have been removed.",
+            });
+            warn('adopt turn produced no output — settled as failed');
+            return;
+          }
           await settleWorkTurn(job.id, {
             ok: answer.length > 0,
             answer:
