@@ -87,6 +87,17 @@ export function runUpdateCommand() {
 
 // Nag at most once per target version, so a poll every ~10s doesn't spam.
 let naggedFor = null;
+/**
+ * When the last install ATTEMPT failed, so a failure can be retried instead of
+ * being final. It used to set `naggedFor` and stop: one unwritable global
+ * prefix, one npm blip, or one offline moment and the daemon stayed on its old
+ * version until the server announced a DIFFERENT one — which on a box nobody
+ * logs into means features silently missing for days (measured: a machine sat
+ * on 0.47.0 through two releases). A readout in the app now surfaces it too,
+ * but the machine should also just try again.
+ */
+let lastInstallFailAt = 0;
+const INSTALL_RETRY_MS = 15 * 60_000;
 
 /**
  * React to the server's {latest, min} signal from a roster poll.
@@ -130,6 +141,11 @@ export function handleVersionSignal({ latest, min, autoUpdate, safeToUpdate, tea
       }
       return false;
     }
+    // A failed install is retried on a cooldown, not abandoned: the common
+    // causes (an unwritable global prefix mid-fix, a registry blip, a network
+    // that came back) are all transient, and the poll runs every ~10s so
+    // without this a single failure is effectively permanent.
+    if (Date.now() - lastInstallFailAt < INSTALL_RETRY_MS) return false;
     try {
       note(`flowviant ${cur} → ${published}: self-updating…`);
       installLatest();
@@ -137,8 +153,10 @@ export function handleVersionSignal({ latest, min, autoUpdate, safeToUpdate, tea
       reexec(teardown);
       return true;
     } catch (e) {
-      warn(`self-update failed (${e?.message ?? e}) — update manually: npm i -g flowviant@latest`);
-      naggedFor = target; // don't retry-spam a failing install every poll
+      lastInstallFailAt = Date.now();
+      warn(
+        `self-update failed (${e?.message ?? e}) — retrying in 15m; to fix it now: npm i -g flowviant@latest`
+      );
       return false;
     }
   }

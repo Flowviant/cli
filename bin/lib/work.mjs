@@ -91,6 +91,7 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
   const SHIP_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/ship-done');
   const ACTIVITY_URL = FLEET_URL.replace(/\/agents\/?$/, '/session-activity');
   const WORKTREES_URL = FLEET_URL.replace(/\/agents\/?$/, '/session-worktrees');
+  const ATTACHMENT_URL = FLEET_URL.replace(/\/agents\/?$/, '/attachment');
   const workAnswering = new Set(); // turn ids currently queued/running here
   const workAttempts = new Map(); // turn id -> completed runTurn attempts
   const MAX_WORK_TRIES = 3;
@@ -326,6 +327,70 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
         sweepingWorktrees = false;
       }
     })();
+  };
+
+  /**
+   * FILES THE HUMAN ATTACHED, brought to where a CLI can read them.
+   *
+   * A screenshot in a chat bubble is useless to an agent; a path is not. So the
+   * turn's attachments are downloaded into `.flowviant/uploads/` inside the
+   * session's own worktree and the prompt is handed the relative paths.
+   *
+   * `.flowviant/` rather than the repo proper, and gitignored-or-not it is
+   * never committed by us: these are the human's inputs to a conversation, not
+   * project files. The name is re-sanitized HERE even though the server already
+   * did it — this string becomes a path on someone's machine, and one place
+   * doing that check is one deploy away from being zero places.
+   */
+  const UPLOAD_DIR = '.flowviant/uploads';
+  const ATTACHMENT_MAX_BYTES = 10 * 1024 * 1024;
+  const safeUploadName = (raw) => {
+    const base = String(raw ?? '')
+      .split(/[\\/]/)
+      .pop()
+      .replace(/[^A-Za-z0-9._-]/g, '_')
+      .replace(/^[.-]+/, '')
+      .slice(0, 80);
+    return base || 'attachment';
+  };
+  /** @returns relative paths written, in the order the human attached them. */
+  const fetchAttachments = async (wt, attachments) => {
+    if (!Array.isArray(attachments) || attachments.length === 0) return [];
+    const dir = join(wt, UPLOAD_DIR);
+    try {
+      mkdirSync(dir, { recursive: true });
+    } catch {
+      return [];
+    }
+    const written = [];
+    for (const a of attachments.slice(0, 8)) {
+      if (!a?.id || typeof a.id !== 'string' || !/^[0-9a-f-]{8,64}$/i.test(a.id)) continue;
+      if (Number(a.size) > ATTACHMENT_MAX_BYTES) continue;
+      try {
+        const res = await fetch(`${ATTACHMENT_URL}/${a.id}`, {
+          headers: { Authorization: `Bearer ${FLEET_TOKEN}`, 'User-Agent': USER_AGENT },
+          signal: AbortSignal.timeout(60_000),
+        });
+        if (!res.ok) continue;
+        const buf = Buffer.from(await res.arrayBuffer());
+        if (buf.byteLength === 0 || buf.byteLength > ATTACHMENT_MAX_BYTES) continue;
+        // Collisions are real (two screenshots both named Screenshot.png), and
+        // silently overwriting one with the other loses a file the human sent.
+        let name = safeUploadName(a.name);
+        if (existsSync(join(dir, name))) {
+          const dot = name.lastIndexOf('.');
+          const stem = dot > 0 ? name.slice(0, dot) : name;
+          const ext = dot > 0 ? name.slice(dot) : '';
+          name = `${stem}-${String(a.id).slice(0, 6)}${ext}`;
+        }
+        writeFileSync(join(dir, name), buf);
+        written.push(`${UPLOAD_DIR}/${name}`);
+      } catch {
+        /* one file failing must not fail the turn — the prompt lists what
+           actually arrived, so the agent never chases a path that isn't there */
+      }
+    }
+    return written;
   };
 
   let flushingReports = false;
@@ -1090,7 +1155,18 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
           const spawned = []; // this turn's children, for the teardown registry
           const narrator = makeNarrator(job.sessionId);
           try {
-            const message = [job.body, adoptNote, carryNote].filter(Boolean).join('\n\n');
+            // Files first, then the message that references them: the agent
+            // must be able to open what it is being told about. Only the ones
+            // that actually landed are named.
+            const files = await fetchAttachments(dir.wt, job.attachments);
+            const filesNote = files.length
+              ? `[FILES THE HUMAN ATTACHED TO THIS MESSAGE — already on disk in this worktree]\n${files
+                  .map((f) => `- ${f}`)
+                  .join('\n')}`
+              : '';
+            const message = [job.body, filesNote, adoptNote, carryNote]
+              .filter(Boolean)
+              .join('\n\n');
             const turnArgs = {
               // A plain tab has no tools to name and no session id to pass —
               // its kickoff asks for one complete report instead of a stream.
