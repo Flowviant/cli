@@ -123,9 +123,11 @@ function humanizeCodexItem(item = {}, cwd = '') {
 }
 
 /**
- * Codex `--json` emits JSONL of ThreadEvents. Returns `{ activity, text }` —
- * `text` accumulates the agent's own words, because the turn loop reads its
- * sentinels (NOTHING / BLOCKED:<id> / DONE) out of exactly that.
+ * Codex `--json` emits JSONL of ThreadEvents. Returns `{ activity, text,
+ * threadId }` — `text` accumulates the agent's own words, because the turn
+ * loop reads its sentinels (NOTHING / BLOCKED:<id> / DONE) out of exactly
+ * that; `threadId` surfaces once, off the lifecycle event, for callers that
+ * need to resume THIS conversation later (runTurn's onThreadId).
  */
 function parseCodexLine(line, cwd) {
   let ev;
@@ -135,6 +137,14 @@ function parseCodexLine(line, cwd) {
     return null; // not every line is JSON (warnings go to stderr, but be safe)
   }
   switch (ev.type) {
+    // The conversation's own id, announced before any item (`ThreadStarted` on
+    // the shipped 0.147 binary, like the measured events below). Surfaced so a
+    // SESSION turn can resume this exact thread next time: `resume --last` is
+    // a machine-global guess, and on a box running two tabs — or a tab plus a
+    // dispatch — it resumes someone else's conversation. No activity and no
+    // text: nothing here is the model speaking.
+    case 'thread.started':
+      return { activity: null, text: '', threadId: String(ev.thread_id ?? '') || null };
     case 'item.completed': {
       const item = ev.item ?? {};
       const activity = humanizeCodexItem(item, cwd);
@@ -165,7 +175,7 @@ function parseCodexLine(line, cwd) {
         text: `${ev.message ?? ''}\n`,
       };
     default:
-      return null; // thread.started / turn.started / item.started / item.updated
+      return null; // turn.started / item.started / item.updated
   }
 }
 
@@ -380,14 +390,21 @@ export const RUNTIMES = {
      * placed before it. Appending them after the positional is the kind of argv
      * that parses today and stops parsing on some future clap upgrade.
      */
-    args({ prompt, system, model, effort, resume, profile = 'build', vaultDir, mcp = [], resultSchemaArgs = [], adoptResumeId }) {
+    args({ prompt, system, model, effort, resume, resumeThreadId, profile = 'build', vaultDir, mcp = [], resultSchemaArgs = [], adoptResumeId }) {
       // Adoption resumes a CLAUDE terminal session — its transcript store, its
       // fork semantics. Reaching here with an adopt id is a wiring mistake
       // upstream, and it fails loudly on purpose: quietly dropping the flag
       // would answer that session's held context with a different brain.
       if (adoptResumeId) throw new Error('adoption is Claude-only — codex cannot resume a Claude terminal session');
       const a = ['exec'];
-      if (resume) a.push('resume', '--last');
+      // BY ID when the caller knows WHICH conversation this is — a Workbench
+      // tab's held context, captured off thread.started and stored with its
+      // worktree. `--last` resumes the machine's most recent codex conversation,
+      // which is only safe on the dispatch path (one lane, one turn at a time,
+      // in its own worktree); for a session it is a machine-global guess that
+      // two tabs — or a tab plus a dispatch — would cross-resume.
+      if (resumeThreadId) a.push('resume', resumeThreadId);
+      else if (resume) a.push('resume', '--last');
       a.push('--json');
       if (model) a.push('--model', model);
       // Effort is a config value on Codex rather than a flag.

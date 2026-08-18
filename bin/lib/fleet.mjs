@@ -94,6 +94,13 @@ async function fetchRoster(haveIds) {
   // machine knows its cores, its RAM and whose Claude quota is being spent.
   // Older servers ignore the param, so sending it is always safe.
   url.searchParams.set('capacity', String(MAX_CONCURRENT));
+  // WHICH DAEMON this machine runs, so the server can gate version-dependent
+  // work — codex Workbench tabs are only created for machines whose daemon can
+  // actually serve them (dv >= 0.46.0). The same source the self-update check
+  // compares against the roster's daemon.latest (config.mjs VERSION, read off
+  // our own package.json). Older servers ignore unknown params, so sending it
+  // unconditionally is always safe.
+  url.searchParams.set('dv', VERSION);
   // WHICH CLIs this machine actually has, so the app can stop guessing.
   //
   // Until now every surface that listed Gemini or Codex said "not wired up yet"

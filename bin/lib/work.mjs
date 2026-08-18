@@ -1,7 +1,8 @@
 /**
  * Work sessions — the Workbench tabs, daemon side.
  *
- * A tab is a held Claude session with BUILD permissions in a PERSISTENT
+ * A tab is a held coding-CLI session (Claude or codex — the server names the
+ * brain per tab, and the pin holds it) with BUILD permissions in a PERSISTENT
  * worktree on its own `session/<id>` branch. Nothing here is detached and
  * nothing is ever reset — uncommitted state between turns IS the session, and
  * blowing it away would be closing the human's editor mid-thought. (Plan
@@ -338,8 +339,19 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
    * same reason). If the pinned CLI has left the machine, the turn settles
    * honestly instead of substituting. A retired-and-reattached directory has
    * no marker and no held context either, so re-picking there is correct.
+   *
+   * THE SERVER'S WORD COMES FIRST. A tab is created AS a runtime's tab
+   * (`job.runtime`; null/absent = Claude, which is what every tab ran on until
+   * now), so on the first turn a named runtime IS the pick — never a
+   * preference the machine may override. And a named runtime that DISAGREES
+   * with an existing pin is an identity change mid-life: something upstream
+   * now calls this tab a different brain's, and the only honest move is to
+   * settle the turn and say so ({ mismatch }), because a held context must
+   * never be answered by a different brain.
+   *
    * Returns { id } | { id: null } (nothing installed) | { missing: label } |
-   * { unsupported: label } (pinned to a runtime no session can run on).
+   * { unsupported: label } (a runtime no session can run on) |
+   * { mismatch: { pin, runtime } } (labels, for the caller's sentence).
    *
    * SESSION-CAPABLE means rt.mcp is truthy, and the gate is not optional:
    * a session turn hands its per-session token over a real MCP config, so
@@ -349,7 +361,7 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
    * error instead of a sentence.
    */
   const sessionCapable = (rid) => Boolean(RUNTIMES[rid]?.mcp) && canRun(RUNTIMES[rid], 'build');
-  const sessionRuntime = (wt) => {
+  const sessionRuntime = (wt, jobRuntime) => {
     const marker = sessionMetaPath(wt, 'flowviant-runtime');
     let pinned = null;
     if (marker && existsSync(marker)) {
@@ -360,6 +372,14 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
       }
     }
     if (pinned && RUNTIMES[pinned]) {
+      if (jobRuntime && jobRuntime !== pinned) {
+        return {
+          mismatch: {
+            pin: RUNTIMES[pinned].label || pinned,
+            runtime: RUNTIMES[jobRuntime]?.label || jobRuntime,
+          },
+        };
+      }
       // A pin that names a non-session-capable runtime is settled honestly by
       // the caller, not silently re-picked: re-picking would hand the held
       // context to a different brain, which is the exact substitution the pin
@@ -367,6 +387,23 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
       if (!sessionCapable(pinned)) return { unsupported: RUNTIMES[pinned].label || pinned };
       const installed = detectRuntimes().find((r) => r.id === pinned)?.installed;
       return installed ? { id: pinned } : { missing: RUNTIMES[pinned].label || pinned };
+    }
+    // First turn, and the server named the brain: that IS the pick, gated the
+    // same two ways as a pin — not session-capable and not installed both
+    // settle honestly via the caller's existing paths, never substituted.
+    if (jobRuntime) {
+      if (!sessionCapable(jobRuntime))
+        return { unsupported: RUNTIMES[jobRuntime]?.label || jobRuntime };
+      const installed = detectRuntimes().find((r) => r.id === jobRuntime)?.installed;
+      if (!installed) return { missing: RUNTIMES[jobRuntime]?.label || jobRuntime };
+      if (marker) {
+        try {
+          writeFileSync(marker, jobRuntime);
+        } catch {
+          /* best-effort — an unpinnable session just re-picks next turn */
+        }
+      }
+      return { id: jobRuntime };
     }
     // The fresh pick, gated the same way — Claude first when it qualifies, for
     // the reason pickRuntimeFor gives: the prompts were tuned against it.
@@ -383,6 +420,15 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
     }
     return { id };
   };
+
+  /**
+   * The shape a codex thread id must have before it is written to disk or —
+   * decisive — pushed into argv as `resume <id>`. Conservative on purpose:
+   * alphanumeric plus dash/underscore, never a leading dash (an argv that
+   * parses as a flag), never whitespace. Anything else is dropped and the
+   * session simply runs fresh in its own worktree.
+   */
+  const CODEX_THREAD_RE = /^[0-9a-zA-Z][0-9a-zA-Z_-]{7,63}$/;
 
   /**
    * The spawn lock: the pid of the CLI currently live in this worktree. A
@@ -509,18 +555,6 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
           note(
             `${c.cyan('tab')} ${c.dim(`— ${job.askedByName || 'the owner'} in "${job.sessionName || 'a session'}"`)}`
           );
-          // WHICH BRAIN the roster says this tab speaks (null/absent = Claude,
-          // which is what every tab ran on until now). The phase-2 hook: this
-          // daemon drives Claude tabs only, and a runtime it cannot honor is
-          // settled honestly — never answered by a different brain wearing the
-          // session's name.
-          if (job.runtime && job.runtime !== 'claude') {
-            await settleWorkTurn(job.id, {
-              ok: false,
-              answer: `This machine's daemon serves Claude tabs only for now — runtime '${job.runtime}' isn't supported yet.`,
-            });
-            return;
-          }
           // ── ADOPTION: a tab born from a TERMINAL session ────────────────
           // The server sends `adopt {id, cwd}` only while the session has no
           // sessionRef — no turn has ever spoken from a worktree here — and
@@ -632,7 +666,20 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
             );
             return;
           }
-          const rt = sessionRuntime(dir.wt);
+          // WHICH BRAIN the roster says this tab speaks (null/absent = Claude,
+          // which is what every tab ran on until now) — honored by
+          // sessionRuntime: on a first turn a named runtime IS the pick, and a
+          // named runtime that disagrees with the pin settles below.
+          const rt = sessionRuntime(dir.wt, job.runtime || null);
+          if (rt.mismatch) {
+            // Something upstream changed this tab's identity mid-life. A held
+            // context must never be answered by a different brain — say so.
+            await settleWorkTurn(job.id, {
+              ok: false,
+              answer: `this tab is pinned to ${rt.mismatch.pin} but the server says it is a ${rt.mismatch.runtime} tab — reopen a new tab`,
+            });
+            return;
+          }
           if (rt.missing) {
             await settleWorkTurn(job.id, {
               ok: false,
@@ -641,13 +688,14 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
             return;
           }
           if (rt.unsupported) {
-            // A pin from before the session-capable gate existed can name a
-            // runtime no tab can run on (Antigravity has no MCP config, and
-            // the session's whole control plane rides one). An honest sentence
-            // beats the mcpFor throw this used to crash into every turn.
+            // A pin from before the session-capable gate existed — or a
+            // first-turn tab the server named for one — can carry a runtime no
+            // tab can run on (Antigravity has no MCP config, and the session's
+            // whole control plane rides one). An honest sentence beats the
+            // mcpFor throw this used to crash into every turn.
             await settleWorkTurn(job.id, {
               ok: false,
-              answer: `this session is pinned to ${rt.unsupported}, which cannot drive a Workbench tab on this machine — open a new tab`,
+              answer: `this session runs on ${rt.unsupported}, which cannot drive a Workbench tab on this machine — open a new tab`,
             });
             return;
           }
@@ -688,12 +736,36 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
             });
             return;
           }
-          // Resume iff a conversation is known to live in THIS directory: the
-          // server's sessionRef is only ever a path some turn actually SPOKE
-          // from (see the settle below), and it must match the directory we
-          // just opened. Anything else starts fresh IN the existing worktree —
-          // never a reset; the dirty state is the session.
-          const resume = !dir.fresh && Boolean(job.sessionRef) && job.sessionRef === dir.wt;
+          // CODEX RESUMES BY THREAD ID, never by `--last`: `resume --last` is
+          // the MACHINE's most recent codex conversation, and two codex tabs —
+          // or a tab plus a codex dispatch — would cross-resume each other's
+          // context. The id was captured off thread.started (runtimes.mjs) and
+          // persisted below, beside the runtime pin; absent, the turn runs
+          // FRESH in the same worktree — the dirty state is most of the held
+          // context, and a machine-global guess is someone else's conversation.
+          let codexResumeId = null;
+          if (rt.id === 'codex') {
+            const threadMarker = sessionMetaPath(dir.wt, 'flowviant-codex-thread');
+            if (threadMarker && existsSync(threadMarker)) {
+              try {
+                const v = readFileSync(threadMarker, 'utf8').trim();
+                if (CODEX_THREAD_RE.test(v)) codexResumeId = v;
+              } catch {
+                /* unreadable marker — run fresh */
+              }
+            }
+          }
+          // Resume iff a conversation is known to live in THIS directory. For
+          // Claude that proof is the server's sessionRef — only ever a path
+          // some turn actually SPOKE from (see the settle below), and it must
+          // match the directory we just opened. For codex it is the stored
+          // thread id, which lives IN the directory and is stronger. Anything
+          // else starts fresh IN the existing worktree — never a reset; the
+          // dirty state is the session.
+          const resume =
+            rt.id === 'codex'
+              ? Boolean(codexResumeId)
+              : !dir.fresh && Boolean(job.sessionRef) && job.sessionRef === dir.wt;
           // The dirty carry, on the adopt worktree's FIRST life only: a
           // re-attempted adoption (the directory already exists) carried what
           // it could the first time, and re-applying would double it. A carry
@@ -706,6 +778,7 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
           // settled on their own terms.
           workAttempts.set(job.id, tries + 1);
           let out;
+          let seenThreadId = null; // codex's conversation id, off thread.started
           const spawned = []; // this turn's children, for the teardown registry
           try {
             const turnArgs = {
@@ -726,6 +799,13 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
               mcpEnv: mcp.env,
               runtime: rt.id,
               label: c.cyan('[tab]'),
+              // Only codex announces one (thread.started); held here so the id
+              // this turn actually SPOKE under is what gets persisted after it
+              // ends. Last write wins on purpose: a failed resume that fell
+              // back to fresh reports the fresh run's id, healing the marker.
+              onThreadId: (id) => {
+                seenThreadId = String(id ?? '').trim() || seenThreadId;
+              },
               onSpawn: (ch) => {
                 if (!ch) return;
                 spawned.push(ch);
@@ -739,15 +819,18 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
                 }
               },
             };
-            out = await runTurn({ ...turnArgs, resume });
+            out = await runTurn({ ...turnArgs, resume, resumeThreadId: codexResumeId || undefined });
             // A resume that produced NOTHING usually means the held
             // conversation is gone (a first turn that crashed before writing
-            // state, a wiped CLI dir). Retry once fresh in the SAME worktree —
-            // never reset — instead of bricking the tab forever. NEVER on an
-            // adopt turn (`resume` is structurally false there, and the guard
-            // says so out loud): a fresh conversation would silently discard
-            // the adoption and answer as a new session wearing its name — the
-            // empty adopt turn settles failed below instead.
+            // state, a wiped CLI dir — or, on codex, a deleted thread). Retry
+            // once fresh in the SAME worktree — never reset — instead of
+            // bricking the tab forever; the retry carries no resumeThreadId,
+            // so codex genuinely starts over rather than re-asking for the
+            // thread that just came back empty. NEVER on an adopt turn
+            // (`resume` is structurally false there, and the guard says so out
+            // loud): a fresh conversation would silently discard the adoption
+            // and answer as a new session wearing its name — the empty adopt
+            // turn settles failed below instead.
             if (!adopting && resume && !(out || '').trim())
               out = await runTurn({ ...turnArgs, resume: false });
           } finally {
@@ -760,6 +843,21 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
               }
             }
             if (mcp.dir) rmSync(mcp.dir, { recursive: true, force: true });
+          }
+          // Persist the codex thread id AFTER the turn ends, so the next turn
+          // resumes exactly the conversation that just spoke. Shape-guarded
+          // before it ever touches disk — it later rides in argv as
+          // `resume <id>` — and best-effort, like the runtime pin: an
+          // unwritable marker just means the tab runs fresh next turn.
+          if (rt.id === 'codex' && seenThreadId && CODEX_THREAD_RE.test(seenThreadId)) {
+            const threadMarker = sessionMetaPath(dir.wt, 'flowviant-codex-thread');
+            if (threadMarker) {
+              try {
+                writeFileSync(threadMarker, seenThreadId);
+              } catch {
+                /* best-effort */
+              }
+            }
           }
           const answer = (out || '').trim();
           // No output at all smells like a dead MCP credential (the lane
