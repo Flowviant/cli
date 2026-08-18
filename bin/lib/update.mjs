@@ -121,6 +121,14 @@ export function handleVersionSignal({ latest, min, autoUpdate, safeToUpdate, tea
       }
       return false;
     }
+    // A failed install is retried on a cooldown, not abandoned: the common
+    // causes (an unwritable global prefix mid-fix, a registry blip, a network
+    // that came back) are all transient, and the poll runs every ~10s so
+    // without this a single failure is effectively permanent. Checked BEFORE
+    // the npm-view probe below, which is a SYNCHRONOUS network call — during
+    // backoff every ~10s poll would otherwise block the whole event loop on a
+    // question whose answer we already decided not to act on.
+    if (Date.now() - lastInstallFailAt < INSTALL_RETRY_MS) return false;
     // Loop guard: the server can announce a version before it's published. npm is
     // the source of truth — only install if npm ACTUALLY has something newer than
     // us, else `npm i -g @latest` reinstalls our own version and we'd re-exec
@@ -130,6 +138,9 @@ export function handleVersionSignal({ latest, min, autoUpdate, safeToUpdate, tea
       published = execFileSync('npm', ['view', 'flowviant', 'version'], {
         encoding: 'utf8',
         stdio: ['ignore', 'pipe', 'ignore'],
+        // Synchronous, so it holds the event loop hostage for however long it
+        // runs — a hung registry must not become a hung daemon.
+        timeout: 10_000,
       }).trim();
     } catch {
       /* offline / npm hiccup — treat as "can't confirm", skip this poll */
@@ -141,11 +152,6 @@ export function handleVersionSignal({ latest, min, autoUpdate, safeToUpdate, tea
       }
       return false;
     }
-    // A failed install is retried on a cooldown, not abandoned: the common
-    // causes (an unwritable global prefix mid-fix, a registry blip, a network
-    // that came back) are all transient, and the poll runs every ~10s so
-    // without this a single failure is effectively permanent.
-    if (Date.now() - lastInstallFailAt < INSTALL_RETRY_MS) return false;
     try {
       note(`flowviant ${cur} → ${published}: self-updating…`);
       installLatest();

@@ -13,6 +13,7 @@
  */
 
 import {
+  existsSync,
   readdirSync,
   readFileSync,
   realpathSync,
@@ -23,6 +24,7 @@ import {
 } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { execFileSync } from 'node:child_process';
 
 const REPORT_CAP = 30;
 // ENDED sessions are the adoptable inventory, and the useful ones are FRESH:
@@ -35,11 +37,14 @@ const ENDED_CAP = 5;
 
 /**
  * The conversation's own title, off the transcript's `ai-title` records
- * (the LAST one wins — titles get rewritten as a session evolves), falling
- * back to the first real user message. Those records sit anywhere in the
- * file (measured: line 81 to line 4457), so this reads the WHOLE transcript
- * — behind an mtime cache, because the scan runs every minute and a title
- * only changes when the file does: steady state is a stat, not a read.
+ * (the LAST one wins — titles get rewritten as a session evolves), and ONLY
+ * those records: this wire is presence METADATA, and the first user message
+ * — the fallback this used to relay — is transcript CONTENT wearing a
+ * title's clothes. An untitled row is honest presence; a quoted message is
+ * a leak. Those records sit anywhere in the file (measured: line 81 to line
+ * 4457), so this reads the WHOLE transcript — behind an mtime cache, because
+ * the scan runs every minute and a title only changes when the file does:
+ * steady state is a stat, not a read.
  */
 const titleCache = new Map(); // file → { mtimeMs, title }
 function transcriptTitle(file, mtimeMs) {
@@ -50,31 +55,15 @@ function transcriptTitle(file, mtimeMs) {
     const stat = statSync(file);
     // A transcript past this is not worth a read per minute of drift.
     if (stat.size <= 64 * 1024 * 1024) {
-      let firstUser = null;
       for (const line of readFileSync(file, 'utf8').split('\n')) {
-        if (line.includes('"type":"ai-title"')) {
-          try {
-            const t = JSON.parse(line)?.aiTitle;
-            if (typeof t === 'string' && t.trim()) title = t.trim(); // last wins
-          } catch {
-            /* torn line */
-          }
-        } else if (!firstUser && !title && line.includes('"type":"user"') && !line.includes('"isMeta":true')) {
-          try {
-            const content = JSON.parse(line)?.message?.content;
-            const text =
-              typeof content === 'string'
-                ? content
-                : Array.isArray(content)
-                  ? (content.find((b) => typeof b?.text === 'string')?.text ?? '')
-                  : '';
-            if (text.trim() && !text.startsWith('<')) firstUser = text.trim();
-          } catch {
-            /* torn line */
-          }
+        if (!line.includes('"type":"ai-title"')) continue;
+        try {
+          const t = JSON.parse(line)?.aiTitle;
+          if (typeof t === 'string' && t.trim()) title = t.trim(); // last wins
+        } catch {
+          /* torn line */
         }
       }
-      if (!title && firstUser) title = firstUser;
       if (title) title = title.replace(/\s+/g, ' ').slice(0, 120);
     }
   } catch {
@@ -104,7 +93,32 @@ function pidAlive(pid, procStart) {
   try {
     stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
   } catch {
-    return false; // no /proc entry — the process is gone
+    // No /proc ENTRY means the process is gone — but only where /proc exists
+    // at all. On macOS there is no /proc, so this read fails for EVERY pid,
+    // every session scans as dead, and live sessions become adoptable — the
+    // exact two-drivers-on-one-conversation outcome liveness exists to
+    // prevent. Probe by name instead: `ps -o comm=` on the pid, alive only if
+    // the surviving process still LOOKS like a coding-CLI process. A bare
+    // signal-0 probe was tried first and reads a RECYCLED pid as alive
+    // forever — a crashed session whose pid a launchd service inherited would
+    // report live for weeks, refuse adoption, and suppress its own ended row.
+    // The name check keeps the conservative direction (a transient race still
+    // errs live) without the permanent false-live.
+    if (!existsSync('/proc')) {
+      try {
+        const comm = execFileSync('ps', ['-o', 'comm=', '-p', String(pid)], {
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'ignore'],
+          timeout: 5_000,
+        })
+          .trim()
+          .toLowerCase();
+        return /\b(claude|node|bun|codex|agy)\b|\/(claude|node|bun|codex|agy)$/.test(comm);
+      } catch {
+        return false; // ps errored or the pid is gone — the process is dead
+      }
+    }
+    return false; // /proc is real and has no entry — the process is gone
   }
   if (procStart == null) return true; // nothing recorded to compare against
   const close = stat.lastIndexOf(')');
@@ -389,8 +403,28 @@ function agyLastWriteMs(id) {
 }
 
 /** Any agy process on the machine right now? /proc comm scan — cheap at the
- *  60s cadence, and the only liveness signal agy leaves (locks are inert). */
+ *  60s cadence, and the only liveness signal agy leaves (locks are inert).
+ *  Tri-state on purpose: true (an agy process exists), false (scanned /proc
+ *  and found none), null (no /proc to scan — macOS — so the question is
+ *  UNANSWERABLE here, which is a different fact from "no", and the adoption
+ *  path below treats it differently: unknowable refuses, absent permits). */
 function agyProcessAlive() {
+  if (!existsSync('/proc')) {
+    // No /proc (macOS): ask pgrep the same question. A MEASURED "none" here
+    // matters — answering null instead made every agy conversation on such a
+    // machine read live forever, which both invented a state ("live" when the
+    // truth was "unmeasured") and permanently killed agy adoption there.
+    try {
+      execFileSync('pgrep', ['-x', 'agy'], {
+        stdio: ['ignore', 'ignore', 'ignore'],
+        timeout: 5_000,
+      });
+      return true; // exit 0 — at least one agy process
+    } catch (e) {
+      if (e?.status === 1) return false; // pgrep ran and found none
+      return null; // pgrep itself unavailable/errored — genuinely unknowable
+    }
+  }
   try {
     for (const name of readdirSync('/proc')) {
       if (!/^\d+$/.test(name)) continue;
@@ -401,7 +435,7 @@ function agyProcessAlive() {
       }
     }
   } catch {
-    /* no /proc — call nothing live rather than everything */
+    return null; // /proc exists but won't read — still unknowable
   }
   return false;
 }
@@ -418,7 +452,15 @@ function agyProcessAlive() {
 const AGY_LIVE_WINDOW_MS = 10 * 60 * 1000;
 export function isAgyConversationLive(id) {
   try {
-    if (!agyProcessAlive()) return false;
+    const up = agyProcessAlive();
+    // Unknowable is NOT "ended". Without /proc the process half of the
+    // composite cannot be measured, and calling that "no process" would make
+    // every agy conversation on such a machine adoptable — the move-adoption
+    // then puts a second driver on a store someone may still be writing.
+    // "Live" here means "refuse adoption", and refusing what we cannot verify
+    // is the same conservatism as the composite itself.
+    if (up === null) return true;
+    if (!up) return false;
     const t = agyLastWriteMs(id);
     return t > 0 && Date.now() - t < AGY_LIVE_WINDOW_MS;
   } catch {
@@ -466,7 +508,11 @@ function scanAgyConversations({ repoRoot, excludeDirs = [] }) {
       out.push({
         id,
         cwd: real,
-        live: processUp && Date.now() - lastMs < AGY_LIVE_WINDOW_MS,
+        // Mirrors isAgyConversationLive exactly, unknowable (null) included:
+        // the report must never offer as adoptable a conversation the adopt
+        // path will then refuse — an offer wired to a refusal is the dead
+        // control this product keeps deleting.
+        live: processUp === null ? true : processUp && Date.now() - lastMs < AGY_LIVE_WINDOW_MS,
         lastActiveAt: new Date(lastMs).toISOString(),
         runtime: 'antigravity',
       });

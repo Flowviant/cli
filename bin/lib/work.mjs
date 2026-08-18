@@ -40,7 +40,7 @@ import {
   SYSTEM_WORK_PLAIN,
   WORK_TURN_KICKOFF_PLAIN,
 } from './prompts.mjs';
-import { materializeInto, scrub as envScrub } from './env.mjs';
+import { materializeInto, excludeInWorktree, scrub as envScrub } from './env.mjs';
 import { detectRuntimes, canRun, RUNTIMES } from './runtimes.mjs';
 import { isTerminalSessionLive, isAgyConversationLive } from './localSessions.mjs';
 import { worktreeDiff } from './worktreeDiff.mjs';
@@ -133,9 +133,23 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
    */
   const pendingWorkReports = new Map(); // turnId -> work-turn-done body
   const pendingShipReports = new Map(); // sessionId -> ship-done body
-  /** POST a settle body. 'ok' | 'terminal' (the server will never accept this
-   *  body — 403 not this fleet's session, 404 unknown turn, 409 ship already
-   *  settled — so retrying is spam, not delivery) | 'retry'. */
+  /** POST a settle body. Four outcomes, and the split between the last two is
+   *  load-bearing:
+   *   - 'ok' — delivered.
+   *   - 'terminal' — the EXPLICIT per-endpoint statuses under which the server
+   *     will never re-offer the job (403 not this fleet's session, 404 unknown
+   *     turn, 409 ship already settled). Only these may drop the report AND
+   *     the attempts counter: they are the statuses where forgetting is safe
+   *     because the job is gone server-side too.
+   *   - 'reject' — any OTHER 4xx (a 400 from deploy skew, an edge/WAF rule):
+   *     the server refused this BODY, but the job row may still be pending and
+   *     riding every poll. The report must stay QUEUED — it is the skip-guard
+   *     that stops the turn being re-run with all its side effects — but
+   *     re-POSTing a body the server just refused every poll is spam, so
+   *     delivery backs off. Treating this as terminal once re-ran whole
+   *     non-idempotent CLI turns in a loop; treating it as plain retry
+   *     hammered a refused body forever.
+   *   - 'retry' — network errors, 408, 429 and 5xx: nothing was decided. */
   const postSettle = async (url, body, terminalStatuses) => {
     try {
       const res = await fetch(url, {
@@ -150,26 +164,41 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
       });
       if (res.ok) return 'ok';
       if (terminalStatuses.includes(res.status)) return 'terminal';
+      if (res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429)
+        return 'reject';
       return 'retry';
     } catch {
       return 'retry';
     }
   };
+  /** How long a REJECTED report sits out before re-offering its body — long
+   *  enough that a deploy-skew 400 costs a handful of POSTs a day, short
+   *  enough that a server fix picks the report up the same morning. */
+  const REJECT_RETRY_MS = 10 * 60 * 1000;
+  const reportBackoff = new Map(); // turnId|sessionId -> earliest next attempt
   const settleWorkTurn = async (turnId, payload) => {
     const body = { turnId, ...payload };
     const r = await postSettle(WORK_DONE_URL, body, [403, 404]);
-    if (r === 'retry') pendingWorkReports.set(turnId, body);
-    else {
+    if (r === 'retry' || r === 'reject') {
+      pendingWorkReports.set(turnId, body);
+      if (r === 'reject') reportBackoff.set(turnId, Date.now() + REJECT_RETRY_MS);
+    } else {
       pendingWorkReports.delete(turnId);
       workAttempts.delete(turnId);
+      reportBackoff.delete(turnId);
     }
     return r;
   };
   const settleShip = async (sessionId, payload) => {
     const body = { sessionId, ...payload };
     const r = await postSettle(SHIP_DONE_URL, body, [403, 409]);
-    if (r === 'retry') pendingShipReports.set(sessionId, body);
-    else pendingShipReports.delete(sessionId);
+    if (r === 'retry' || r === 'reject') {
+      pendingShipReports.set(sessionId, body);
+      if (r === 'reject') reportBackoff.set(sessionId, Date.now() + REJECT_RETRY_MS);
+    } else {
+      pendingShipReports.delete(sessionId);
+      reportBackoff.delete(sessionId);
+    }
     return r;
   };
   /**
@@ -188,7 +217,12 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
    */
   const ACTIVITY_MIN_MS = 1_500;
   const ACTIVITY_KEEP = 4; // the last few lines — a tail, not a log
-  const makeNarrator = (sessionId) => {
+  /** `turnId` scopes the narration to the turn that produced it: a POST
+   *  already on the wire when the turn settles must not re-stamp a "working…"
+   *  line over the finished reply — the server drops narration for a turn
+   *  that is no longer pending. (A session-level pending count can't tell the
+   *  settled turn's stale line from the queued NEXT turn's fresh one.) */
+  const makeNarrator = (sessionId, turnId) => {
     const recent = [];
     let lastSent = 0;
     let dirty = false;
@@ -210,7 +244,7 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
             'Content-Type': 'application/json',
           },
           signal: AbortSignal.timeout(10_000),
-          body: JSON.stringify({ sessionId, lines }),
+          body: JSON.stringify({ sessionId, turnId, lines }),
         });
       } catch {
         /* narration is decoration — a dropped line is not an incident */
@@ -229,7 +263,10 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
     };
     return {
       line(label) {
-        const s = String(label ?? '')
+        // Scrub, like every string that leaves this machine: a narration line
+        // is the CLI's own stdout — a command echoing an env var, a read of a
+        // config file — and it rides the same uplink the final answer does.
+        const s = envScrub(String(label ?? ''))
           .replace(/\s+/g, ' ')
           .trim()
           .slice(0, 200);
@@ -362,6 +399,14 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
     } catch {
       return [];
     }
+    // "Never committed by us" has to be true for GIT, not just for this code:
+    // an untracked `.flowviant/` makes the whole worktree dirty, which refuses
+    // every ship, exempts the tree from closed-tab retirement forever, and
+    // shows the human's own uploads in the rail as session changes. Same
+    // mechanism as the materialized env files — the exclude file git actually
+    // reads (env.mjs), which already skips lines it has written before, so
+    // calling it per fetch is idempotent.
+    excludeInWorktree(wt, ['.flowviant/']);
     const written = [];
     for (const a of attachments.slice(0, 8)) {
       if (!a?.id || typeof a.id !== 'string' || !/^[0-9a-f-]{8,64}$/i.test(a.id)) continue;
@@ -400,15 +445,26 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
     flushingReports = true;
     try {
       for (const [id, body] of [...pendingWorkReports]) {
+        // A rejected body sits out its backoff; the queued entry itself stays
+        // — it is the skip-guard against re-running a turn whose side effects
+        // already happened.
+        if ((reportBackoff.get(id) ?? 0) > Date.now()) continue;
         const r = await postSettle(WORK_DONE_URL, body, [403, 404]);
-        if (r !== 'retry') {
+        if (r === 'reject') reportBackoff.set(id, Date.now() + REJECT_RETRY_MS);
+        else if (r !== 'retry') {
           pendingWorkReports.delete(id);
           workAttempts.delete(id);
+          reportBackoff.delete(id);
         }
       }
       for (const [id, body] of [...pendingShipReports]) {
+        if ((reportBackoff.get(id) ?? 0) > Date.now()) continue;
         const r = await postSettle(SHIP_DONE_URL, body, [403, 409]);
-        if (r !== 'retry') pendingShipReports.delete(id);
+        if (r === 'reject') reportBackoff.set(id, Date.now() + REJECT_RETRY_MS);
+        else if (r !== 'retry') {
+          pendingShipReports.delete(id);
+          reportBackoff.delete(id);
+        }
       }
     } finally {
       flushingReports = false;
@@ -1153,7 +1209,7 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
           let out;
           let seenThreadId = null; // codex's conversation id, off thread.started
           const spawned = []; // this turn's children, for the teardown registry
-          const narrator = makeNarrator(job.sessionId);
+          const narrator = makeNarrator(job.sessionId, job.id);
           try {
             // Files first, then the message that references them: the agent
             // must be able to open what it is being told about. Only the ones
@@ -1675,6 +1731,25 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
     }
   };
 
+  /**
+   * Is ANY session work in flight — the answer safeToUpdate needs. A self-
+   * update re-execs the process: a mid-turn CLI would be SIGTERM'd and its
+   * half-finished answer settled as the tab's reply, and a queued-but-
+   * undelivered settle report would die in memory — after which the skip-
+   * guard's protection is gone and the re-exec'd daemon re-runs a turn whose
+   * side effects (edits, commits, cards) already happened. `workChains` holds
+   * an entry for every queued-or-running turn and ship (entries self-delete
+   * when a chain drains); the other collections are belt over braces for the
+   * windows around it.
+   */
+  const workBusy = () =>
+    workChains.size > 0 ||
+    shipping.size > 0 ||
+    workChildren.size > 0 ||
+    workAnswering.size > 0 ||
+    pendingWorkReports.size > 0 ||
+    pendingShipReports.size > 0;
+
   return {
     flushWorkReports,
     processWorkTurns,
@@ -1682,5 +1757,6 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
     retireWorkSessions,
     reportWorktrees,
     shutdownWork,
+    workBusy,
   };
 }

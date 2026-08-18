@@ -232,7 +232,7 @@ export async function loadCachedEnv(projectId) {
  * verification in materializeInto, which refuses to write a secret that git can
  * still see.
  */
-function excludeInWorktree(wt, relPaths) {
+export function excludeInWorktree(wt, relPaths) {
   try {
     let gitdir;
     try {

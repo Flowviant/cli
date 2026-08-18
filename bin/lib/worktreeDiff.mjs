@@ -71,6 +71,10 @@ export function worktreeDiff(wt, baseRef) {
   let deletions = 0;
   const push = (path, added, deleted, binary = false) => {
     if (!path) return;
+    // Clamped to the server's zod cap (file path ≤ 300 — see the caps at the
+    // return, below): one over-cap string would 400 the whole report batch,
+    // and a readout must degrade to a shorter label, never to silence.
+    path = path.slice(0, 300);
     files.push(binary ? { path, added, deleted, binary } : { path, added, deleted });
     additions += added;
     deletions += deleted;
@@ -143,7 +147,14 @@ export function worktreeDiff(wt, baseRef) {
       for (const line of raw.split('\n')) {
         if (!line.trim()) continue;
         const [sha, subject, author] = line.split('\x1f');
-        if (sha) baseCommits.push({ sha, subject: subject ?? '', author: author ?? '' });
+        // Same clamp-to-the-server's-caps rule as the file paths: a subject or
+        // author name is whatever a person typed, and git puts no bound on it.
+        if (sha)
+          baseCommits.push({
+            sha,
+            subject: (subject ?? '').slice(0, 200),
+            author: (author ?? '').slice(0, 80),
+          });
       }
     }
   } catch {
@@ -161,12 +172,16 @@ export function worktreeDiff(wt, baseRef) {
   files.sort(
     (x, y) => y.added + y.deleted - (x.added + x.deleted) || (x.path < y.path ? -1 : 1)
   );
+  // Every string here is clamped to the server's own zod caps (branch ≤ 200,
+  // baseLabel ≤ 120, subject ≤ 200, author ≤ 80, file path ≤ 300): the report
+  // rides in a BATCH, so a single over-cap string — a generated branch name, a
+  // pathological commit subject — would 400 every session's readout at once.
   return {
-    branch,
+    branch: branch.slice(0, 200),
     path: wt,
     ahead,
     behind,
-    baseLabel: String(baseRef).replace(/^origin\//, ''),
+    baseLabel: String(baseRef).replace(/^origin\//, '').slice(0, 120),
     baseCommits,
     dirty,
     additions,

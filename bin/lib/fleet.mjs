@@ -1215,6 +1215,7 @@ export async function runFleetDaemon() {
     retireWorkSessions,
     reportWorktrees,
     shutdownWork,
+    workBusy,
   } = createWorkManager({
     repoRoot,
     baseDir,
@@ -1804,9 +1805,14 @@ export async function runFleetDaemon() {
     if (roster.daemon) {
       // "No worker mid-task" must include the wiki runner: updating mid-sweep
       // re-execs the daemon, orphans the wiki Claude, and the fresh process
-      // starts a second sweep racing it on the same vault.
+      // starts a second sweep racing it on the same vault. And it must include
+      // SESSION work (workBusy — turns, ships, undelivered settle reports):
+      // dispatch workers' children say nothing about the Workbench tabs, and a
+      // re-exec mid-turn SIGTERMs the tab's CLI and settles a partial answer.
       const safeToUpdate =
-        !wikiBusy && [...workers.values()].every((w) => w.state.child == null);
+        !wikiBusy &&
+        !workBusy() &&
+        [...workers.values()].every((w) => w.state.child == null);
       const updating = handleVersionSignal({
         latest: roster.daemon.latest,
         min: roster.daemon.min,
