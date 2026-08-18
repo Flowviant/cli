@@ -945,8 +945,12 @@ export function runTurn({ prompt, resume, system, cwd, mcpConfig, mcpArgs, mcpEn
     child.stderr.on('data', onChunk);
     child.on('error', (e) => {
       if (e.code === 'ENOENT') {
+        // A MISSING CLI FAILS THE TURN, NOT THE DAEMON — same fix as the
+        // line-parsed path above; this raw-output duplicate used to
+        // process.exit(1) and take every in-flight worker down with it.
         console.error(`\nerror: '${rt.bin}' CLI not found on PATH. Install ${rt.label} first: ${rt.install}`);
-        process.exit(1);
+        resolve('');
+        return;
       }
       console.error(e);
       resolve(out);
