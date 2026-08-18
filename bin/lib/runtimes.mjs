@@ -391,11 +391,12 @@ export const RUNTIMES = {
      * that parses today and stops parsing on some future clap upgrade.
      */
     args({ prompt, system, model, effort, resume, resumeThreadId, profile = 'build', vaultDir, mcp = [], resultSchemaArgs = [], adoptResumeId }) {
-      // Adoption resumes a CLAUDE terminal session — its transcript store, its
-      // fork semantics. Reaching here with an adopt id is a wiring mistake
-      // upstream, and it fails loudly on purpose: quietly dropping the flag
-      // would answer that session's held context with a different brain.
-      if (adoptResumeId) throw new Error('adoption is Claude-only — codex cannot resume a Claude terminal session');
+      // Adoption resumes a conversation in ITS OWN CLI's store (claude forks,
+      // agy moves) — codex has no adoptable store wired yet. Reaching here
+      // with an adopt id is a wiring mistake upstream, and it fails loudly on
+      // purpose: quietly dropping the flag would answer that session's held
+      // context with a different brain.
+      if (adoptResumeId) throw new Error("codex has no adoptable terminal store — an adopt id can't reach this builder");
       const a = ['exec'];
       // BY ID when the caller knows WHICH conversation this is — a Workbench
       // tab's held context, captured off thread.started and stored with its
@@ -641,12 +642,18 @@ export const RUNTIMES = {
      */
     profiles: ['build', 'wiki', 'consult'],
     mcp: null,
-    args({ prompt, system, model, effort, resume, profile = 'build', vaultDir, resultSchemaArgs = [], adoptResumeId }) {
-      // Same loud refusal as Codex: an adopt id names a Claude session, and no
-      // other runtime can resume one — see the claude builder for the contract.
-      if (adoptResumeId) throw new Error('adoption is Claude-only — agy cannot resume a Claude terminal session');
+    args({ prompt, system, model, effort, resume, resumeConversationId, profile = 'build', vaultDir, resultSchemaArgs = [], adoptResumeId }) {
       const a = [];
-      if (resume) a.push('--continue');
+      // WHICH CONVERSATION IS THIS — one decision, answered one way (the same
+      // rule as Claude's --resume/--continue). By id when the caller knows:
+      // `--conversation <id>` resumes globally, any cwd (measured on 1.1.12).
+      // Adoption is the SAME argv because agy has no fork — the id in the db
+      // is the identity (a renamed copy fails "trajectory not found",
+      // measured), so adopting MOVES the conversation: the tab continues the
+      // terminal session itself, appending to its one store. `--continue` is
+      // the cwd-keyed fallback for a session whose id was never learned.
+      if (adoptResumeId || resumeConversationId) a.push('--conversation', adoptResumeId || resumeConversationId);
+      else if (resume) a.push('--continue');
       // No system-prompt flag, same weakening as Codex: the contract rides in
       // the prompt, fenced and first.
       a.push('-p', `${system}\n\n---\n\n${prompt}`);

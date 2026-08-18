@@ -34,10 +34,16 @@ import { FLEET_URL, FLEET_TOKEN, USER_AGENT, REFRESH_BEFORE_SECONDS } from './co
 import { git, gitRaw, splitNul, baseBranchName, isSafePathSegment } from './git.mjs';
 import { c, note, ok, warn } from './ui.mjs';
 import { mcpFor, runTurn } from './claude.mjs';
-import { SYSTEM_WORK, WORK_TURN_KICKOFF } from './prompts.mjs';
+import {
+  SYSTEM_WORK,
+  WORK_TURN_KICKOFF,
+  SYSTEM_WORK_PLAIN,
+  WORK_TURN_KICKOFF_PLAIN,
+} from './prompts.mjs';
 import { materializeInto, scrub as envScrub } from './env.mjs';
 import { detectRuntimes, canRun, RUNTIMES } from './runtimes.mjs';
-import { isTerminalSessionLive } from './localSessions.mjs';
+import { isTerminalSessionLive, isAgyConversationLive } from './localSessions.mjs';
+import { homedir } from 'node:os';
 
 export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLeaseTtl }) {
   const WORK_TOKEN_URL = FLEET_URL.replace(/\/agents\/?$/, '/work-token');
@@ -353,14 +359,16 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
    * { unsupported: label } (a runtime no session can run on) |
    * { mismatch: { pin, runtime } } (labels, for the caller's sentence).
    *
-   * SESSION-CAPABLE means rt.mcp is truthy, and the gate is not optional:
-   * a session turn hands its per-session token over a real MCP config, so
-   * `pickRuntimeFor('build')` is the WRONG question here — it also says yes
-   * to the MEDIATED build path (Antigravity, mcp: null), and a session pinned
-   * that way threw in mcpFor on every turn, failing the tab with an internal
-   * error instead of a sentence.
+   * SESSION-CAPABLE means rt.mcp is truthy — the session tools ride a real
+   * per-invocation MCP config — OR the runtime runs tabs PLAIN (Antigravity):
+   * no MCP at all, no cards, no streaming; the final answer is delivered by
+   * the daemon's own report and ship-time reconciliation keeps the ledger
+   * whole. `pickRuntimeFor('build')` is still the WRONG question here — it
+   * says yes to the mediated DISPATCH path without saying how a tab would
+   * speak, and a session pinned by it once threw in mcpFor on every turn.
    */
-  const sessionCapable = (rid) => Boolean(RUNTIMES[rid]?.mcp) && canRun(RUNTIMES[rid], 'build');
+  const sessionCapable = (rid) =>
+    (Boolean(RUNTIMES[rid]?.mcp) || rid === 'antigravity') && canRun(RUNTIMES[rid], 'build');
   const sessionRuntime = (wt, jobRuntime) => {
     const marker = sessionMetaPath(wt, 'flowviant-runtime');
     let pinned = null;
@@ -405,10 +413,16 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
       }
       return { id: jobRuntime };
     }
-    // The fresh pick, gated the same way — Claude first when it qualifies, for
-    // the reason pickRuntimeFor gives: the prompts were tuned against it.
+    // The fresh pick — Claude first when it qualifies, for the reason
+    // pickRuntimeFor gives: the prompts were tuned against it. DELIBERATELY
+    // NARROWER than sessionCapable: a PLAIN tab (Antigravity — no cards, no
+    // streaming) is a degraded mode someone CHOOSES, so it is honored only
+    // when the server names it, never handed out as a default.
     const rows = detectRuntimes();
-    const okFor = (rid) => sessionCapable(rid) && Boolean(rows.find((r) => r.id === rid)?.installed);
+    const okFor = (rid) =>
+      Boolean(RUNTIMES[rid]?.mcp) &&
+      sessionCapable(rid) &&
+      Boolean(rows.find((r) => r.id === rid)?.installed);
     const id = okFor('claude') ? 'claude' : (Object.keys(RUNTIMES).find(okFor) ?? null);
     if (!id) return { id: null };
     if (marker) {
@@ -429,6 +443,42 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
    * session simply runs fresh in its own worktree.
    */
   const CODEX_THREAD_RE = /^[0-9a-zA-Z][0-9a-zA-Z_-]{7,63}$/;
+
+  /** agy conversation ids are plain UUIDs (the db filename IS the identity —
+   *  measured: a renamed copy fails "trajectory not found"). Guarded the same
+   *  way as the codex id: it rides in argv as `--conversation <id>`. */
+  const AGY_CONV_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+  /** agy's own cwd registry — {cwd → the conversation that ran there LAST}.
+   *  Read once, right after a fresh agy turn, to learn the id the turn just
+   *  created; from then on the tab's marker is the identity and this registry
+   *  is never consulted again (a dispatch sharing the machine may overwrite
+   *  the cwd's entry between turns). */
+  const agyRegistryLookup = (cwd) => {
+    try {
+      const raw = readFileSync(
+        join(homedir(), '.gemini', 'antigravity-cli', 'cache', 'last_conversations.json'),
+        'utf8'
+      );
+      const map = JSON.parse(raw);
+      if (!map || typeof map !== 'object') return null;
+      // agy keys by the cwd as IT resolved it — try our literal path and its
+      // realpath, so a symlinked home doesn't orphan the lookup.
+      let keys = [cwd];
+      try {
+        keys.push(realpathSync(cwd));
+      } catch {
+        /* the literal alone, then */
+      }
+      for (const k of keys) {
+        const id = map[k];
+        if (typeof id === 'string' && AGY_CONV_RE.test(id)) return id;
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  };
 
   /**
    * The spawn lock: the pid of the CLI currently live in this worktree. A
@@ -634,7 +684,16 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
               });
               return;
             }
-            if (isTerminalSessionLive(job.adopt.id)) {
+            // Liveness by the SESSION's own runtime: Claude has a real pid
+            // registry; agy only leaves store-write recency + a process check,
+            // and adoption there is a MOVE (no fork exists), so the composite
+            // errs toward refusing — a false "live" costs a retry in minutes,
+            // a false "ended" puts two drivers on one conversation store.
+            const adoptLive =
+              job.runtime === 'antigravity'
+                ? isAgyConversationLive(job.adopt.id)
+                : isTerminalSessionLive(job.adopt.id);
+            if (adoptLive) {
               await settleWorkTurn(job.id, {
                 ok: false,
                 answer:
@@ -707,34 +766,45 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
             });
             return;
           }
-          if (adopting && rt.id !== 'claude') {
-            // The adopt id names a CLAUDE conversation; only claude can fork
-            // it (--resume --fork-session). The runtimes registry backstops
-            // this with a loud throw, but a sentence here beats a stack there.
+          if (adopting && rt.id !== 'claude' && rt.id !== 'antigravity') {
+            // An adopt id names a conversation in ITS OWN CLI's store: claude
+            // forks it (--resume --fork-session), agy moves it
+            // (--conversation). Codex has no adoptable store yet, and its
+            // args builder backstops this with a loud throw — but a sentence
+            // here beats a stack there.
             await settleWorkTurn(job.id, {
               ok: false,
               answer:
-                'adopting a terminal session needs Claude Code on the machine — install it, then try again',
+                'adopting this terminal session needs its own CLI on the machine — install it, then try again',
             });
             return;
           }
-          let mint = await mintWorkToken(job.sessionId);
-          if (!mint) mint = await mintWorkToken(job.sessionId, true); // one transient blip ≠ a dead turn
-          if (mint?.gone) {
-            await settleWorkTurn(job.id, {
-              ok: false,
-              answer:
-                'Flowviant no longer offers this session to this machine — the tab may have been closed or moved',
-            });
-            return;
-          }
-          if (!mint?.token) {
-            await settleWorkTurn(job.id, {
-              ok: false,
-              answer:
-                'the machine could not mint a session credential from Flowviant — check its connection, then send the message again',
-            });
-            return;
+          // A PLAIN tab (agy) mounts no MCP: no credential to mint, no config
+          // to write. The trade is stated in SYSTEM_WORK_PLAIN — no cards, no
+          // streaming — and the honesty survives on the existing rails: the
+          // answer lands via work-turn-done, the rail says "no card yet", and
+          // ship-time reconciliation books every branch commit.
+          const plainTab = rt.id === 'antigravity';
+          let mint = null;
+          if (!plainTab) {
+            mint = await mintWorkToken(job.sessionId);
+            if (!mint) mint = await mintWorkToken(job.sessionId, true); // one transient blip ≠ a dead turn
+            if (mint?.gone) {
+              await settleWorkTurn(job.id, {
+                ok: false,
+                answer:
+                  'Flowviant no longer offers this session to this machine — the tab may have been closed or moved',
+              });
+              return;
+            }
+            if (!mint?.token) {
+              await settleWorkTurn(job.id, {
+                ok: false,
+                answer:
+                  'the machine could not mint a session credential from Flowviant — check its connection, then send the message again',
+              });
+              return;
+            }
           }
           // CODEX RESUMES BY THREAD ID, never by `--last`: `resume --last` is
           // the MACHINE's most recent codex conversation, and two codex tabs —
@@ -755,6 +825,24 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
               }
             }
           }
+          // AGY RESUMES BY CONVERSATION ID, learned once and pinned beside the
+          // runtime marker: an adopted tab knows it from the adopt hint; a new
+          // tab learns it from agy's own cwd registry after its first turn.
+          // The marker beats `--continue` because it is the tab's OWN identity
+          // — the registry maps a cwd to whatever ran there LAST, and a
+          // dispatch sharing the machine could overwrite that between turns.
+          let agyConvId = null;
+          if (rt.id === 'antigravity' && !adopting) {
+            const convMarker = sessionMetaPath(dir.wt, 'flowviant-agy-conversation');
+            if (convMarker && existsSync(convMarker)) {
+              try {
+                const v = readFileSync(convMarker, 'utf8').trim();
+                if (AGY_CONV_RE.test(v)) agyConvId = v;
+              } catch {
+                /* unreadable marker — run fresh */
+              }
+            }
+          }
           // Resume iff a conversation is known to live in THIS directory. For
           // Claude that proof is the server's sessionRef — only ever a path
           // some turn actually SPOKE from (see the settle below), and it must
@@ -762,10 +850,18 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
           // thread id, which lives IN the directory and is stronger. Anything
           // else starts fresh IN the existing worktree — never a reset; the
           // dirty state is the session.
+          // agy layers its two resumes: the pinned conversation id when the
+          // marker exists (deterministic, registry-proof), else the Claude
+          // rule — a tab that has SPOKEN from this directory may `--continue`
+          // it (cwd-keyed; measured safe), so a lost marker degrades to the
+          // weaker resume instead of silently starting over.
+          const spokeHere = !dir.fresh && Boolean(job.sessionRef) && job.sessionRef === dir.wt;
           const resume =
             rt.id === 'codex'
               ? Boolean(codexResumeId)
-              : !dir.fresh && Boolean(job.sessionRef) && job.sessionRef === dir.wt;
+              : rt.id === 'antigravity'
+                ? Boolean(agyConvId) || spokeHere
+                : spokeHere;
           // The dirty carry, on the adopt worktree's FIRST life only: a
           // re-attempted adoption (the directory already exists) carried what
           // it could the first time, and re-applying would double it. A carry
@@ -773,7 +869,9 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
           // in the prompt, so the AGENT tells the user what stayed behind.
           let carryNote = '';
           if (adopting && dir.fresh && adoptSrc) carryNote = carryDirtyState(adoptSrc, dir.wt);
-          const mcp = mcpFor(rt.id, mint.token, getMcpUrl());
+          const mcp = plainTab
+            ? { args: [], env: null, dir: null }
+            : mcpFor(rt.id, mint.token, getMcpUrl());
           // Attempts count RUNS: the infra refusals above consumed nothing and
           // settled on their own terms.
           workAttempts.set(job.id, tries + 1);
@@ -781,19 +879,28 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
           let seenThreadId = null; // codex's conversation id, off thread.started
           const spawned = []; // this turn's children, for the teardown registry
           try {
+            const message = carryNote ? `${job.body}\n\n${carryNote}` : job.body;
             const turnArgs = {
-              prompt: WORK_TURN_KICKOFF({
-                sessionId: job.sessionId,
-                sessionName: job.sessionName,
-                message: carryNote ? `${job.body}\n\n${carryNote}` : job.body,
-                askedByName: job.askedByName,
-              }),
+              // A plain tab has no tools to name and no session id to pass —
+              // its kickoff asks for one complete report instead of a stream.
+              prompt: plainTab
+                ? WORK_TURN_KICKOFF_PLAIN({
+                    sessionName: job.sessionName,
+                    message,
+                    askedByName: job.askedByName,
+                  })
+                : WORK_TURN_KICKOFF({
+                    sessionId: job.sessionId,
+                    sessionName: job.sessionName,
+                    message,
+                    askedByName: job.askedByName,
+                  }),
               // The adopt turn resumes the TERMINAL conversation by forking it
               // into this cwd (claude: --resume <id> --fork-session). After it
               // speaks once, the fork lives natively here and turn 2+ is the
               // ordinary --continue resume path, unchanged.
               ...(adopting ? { adoptResumeId: job.adopt.id } : {}),
-              system: SYSTEM_WORK,
+              system: plainTab ? SYSTEM_WORK_PLAIN : SYSTEM_WORK,
               cwd: dir.wt,
               mcpArgs: mcp.args,
               mcpEnv: mcp.env,
@@ -819,7 +926,12 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
                 }
               },
             };
-            out = await runTurn({ ...turnArgs, resume, resumeThreadId: codexResumeId || undefined });
+            out = await runTurn({
+              ...turnArgs,
+              resume,
+              resumeThreadId: codexResumeId || undefined,
+              resumeConversationId: agyConvId || undefined,
+            });
             // A resume that produced NOTHING usually means the held
             // conversation is gone (a first turn that crashed before writing
             // state, a wiped CLI dir — or, on codex, a deleted thread). Retry
@@ -875,6 +987,24 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
             });
             warn('adopt turn produced no output — settled as failed');
             return;
+          }
+          // Persist the agy conversation id once the turn actually SPOKE — an
+          // adopted tab pins the id it moved in (the adopt hint); a new tab
+          // learns the one its first fresh turn just created, from agy's own
+          // cwd registry. From here on the marker is the tab's identity and
+          // the registry is never trusted again.
+          if (rt.id === 'antigravity' && answer.length > 0) {
+            const convMarker = sessionMetaPath(dir.wt, 'flowviant-agy-conversation');
+            if (convMarker && !existsSync(convMarker)) {
+              const learned = adopting ? job.adopt.id : agyRegistryLookup(dir.wt);
+              if (learned && AGY_CONV_RE.test(learned)) {
+                try {
+                  writeFileSync(convMarker, learned);
+                } catch {
+                  /* best-effort — an unpinned tab resumes via --continue's cwd key */
+                }
+              }
+            }
           }
           await settleWorkTurn(job.id, {
             ok: answer.length > 0,

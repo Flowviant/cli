@@ -486,6 +486,41 @@ the way, say so — fixing it is allowed if it's small and obviously wanted.
 
 Write plain Markdown for a person watching a live session.`;
 
+/**
+ * The PLAIN tab — a work session on a runtime that cannot mount MCP
+ * (Antigravity: its server list is machine-wide, measured). No Flowviant
+ * tools means no streaming, no cards, no purpose line — and the product
+ * stays honest anyway: the final answer is delivered by the daemon's own
+ * report, an uncarded session's rail says "no card yet" (a readout, not a
+ * failure), and ship-time reconciliation turns every branch commit into the
+ * ledger's record. What this prompt must NOT do is pretend the tools exist,
+ * or apologize for their absence every turn.
+ */
+export const SYSTEM_WORK_PLAIN = `You are the human's own coding agent, working WITH them in their repository.
+This is a persistent session — a tab they keep open — and it should feel like
+working in a terminal: they talk, you work.
+
+MECHANICS OF THIS TAB:
+
+1. THIS WORKTREE IS THE SESSION. You are on this tab's own branch. Edit freely,
+   commit as coherent units complete — small, honest commits with real
+   messages. Uncommitted state survives between turns; this directory is yours.
+2. YOUR FINAL MESSAGE IS YOUR REPLY. It is delivered into the tab when the turn
+   ends — there is no live streaming from this runtime, so make the final
+   message the complete, self-contained report of what you did and found.
+3. YOU HAVE NO FLOWVIANT TOOLS in this session — no cards, no ledger calls.
+   Don't mention or simulate them. Your commits ARE your record: when this
+   tab's branch ships, every commit is reconciled onto the project ledger.
+4. NEVER merge to main, deploy, or force-push unless the human explicitly says
+   so in this conversation. Branch pushes are fine when asked. Shipping is
+   their word to say, not yours to infer.
+
+POSTURE: terminal, not ticket. Don't ask permission to look at things. Ground
+claims in files you opened. When they ask a question, answer it; when they ask
+for work, do it.
+
+Write plain Markdown for a person reading your reply in a chat tab.`;
+
 export const WORK_TURN_KICKOFF = ({ sessionId, sessionName, message, askedByName }) =>
   // The speaker is the tab's OWNER — the same person who owns this machine —
   // so this is the one prompt whose author is fully trusted. The fence stays
@@ -496,6 +531,14 @@ export const WORK_TURN_KICKOFF = ({ sessionId, sessionName, message, askedByName
   `${fence('WHO IS TALKING', askedByName || 'the tab owner')}\n\n` +
   `${fence('WHAT THEY SAID', message)}\n\n` +
   `Stream your reply with stream_session_turn as you work.`;
+
+/** The plain tab's kickoff: no session id (there is no tool to pass it to)
+ *  and no streaming instruction — the final message is the reply. */
+export const WORK_TURN_KICKOFF_PLAIN = ({ sessionName, message, askedByName }) =>
+  `Continue the session${sessionName ? ` "${sessionName}"` : ''}.\n\n` +
+  `${fence('WHO IS TALKING', askedByName || 'the tab owner')}\n\n` +
+  `${fence('WHAT THEY SAID', message)}\n\n` +
+  `Reply with your complete report when the work is done.`;
 
 /**
  * A quick edit running ALONGSIDE the task's own agent.

@@ -262,5 +262,137 @@ export function scanLocalSessions({ repoRoot, excludeDirs = [] }) {
   } catch {
     /* presence must never throw into the poll loop — report what was gathered */
   }
-  return [...live.slice(0, REPORT_CAP), ...ended];
+  const claude = [...live.slice(0, REPORT_CAP), ...ended];
+  // agy rides in whatever room the cap leaves — Claude sessions first, they
+  // are the ones adoption serves best (fork, never move).
+  const agy = scanAgyConversations({ repoRoot, excludeDirs }).slice(
+    0,
+    Math.max(0, REPORT_CAP - claude.length)
+  );
+  return [...claude, ...agy];
+}
+
+// ── Antigravity (agy) ──────────────────────────────────────────────────────
+//
+// agy's store is nothing like Claude's: one SQLite db per conversation at
+// ~/.gemini/antigravity-cli/conversations/<uuid>.db (global, not cwd-keyed),
+// no per-pid liveness registry that survives contact (the presence/*.lock
+// files sit untouched by real runs — measured), and the only cwd mapping is
+// cache/last_conversations.json: {cwd → the LAST conversation run there}.
+// So the honest agy report is a SUBSET — the last conversation per directory
+// inside this repo — and that is exactly the one `agy --continue` would give
+// the person at that keyboard, i.e. the one worth offering to adopt.
+
+const AGY_DIR = () => join(homedir(), '.gemini', 'antigravity-cli');
+const AGY_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Newest write to the conversation's store — the wal carries recent turns,
+ *  so its mtime (not the db's) is the real "last active" (measured: a resume
+ *  touched db+wal, and never the presence lock). 0 = no such conversation. */
+function agyLastWriteMs(id) {
+  if (!AGY_UUID_RE.test(id)) return 0;
+  let newest = 0;
+  for (const suffix of ['.db', '.db-wal']) {
+    try {
+      const t = statSync(join(AGY_DIR(), 'conversations', `${id}${suffix}`)).mtimeMs;
+      if (t > newest) newest = t;
+    } catch {
+      /* absent half is fine — the db alone still answers */
+    }
+  }
+  return newest;
+}
+
+/** Any agy process on the machine right now? /proc comm scan — cheap at the
+ *  60s cadence, and the only liveness signal agy leaves (locks are inert). */
+function agyProcessAlive() {
+  try {
+    for (const name of readdirSync('/proc')) {
+      if (!/^\d+$/.test(name)) continue;
+      try {
+        if (readFileSync(`/proc/${name}/comm`, 'utf8').trim() === 'agy') return true;
+      } catch {
+        /* raced exit — keep scanning */
+      }
+    }
+  } catch {
+    /* no /proc — call nothing live rather than everything */
+  }
+  return false;
+}
+
+/**
+ * Is this agy conversation being driven RIGHT NOW? agy cannot answer
+ * per-conversation, so this is the conservative composite: an agy process
+ * exists AND this conversation's store was written in the last 10 minutes.
+ * Adoption is a MOVE for agy (no fork exists — measured, "trajectory not
+ * found" on a renamed copy), so refusing a maybe-live conversation for a few
+ * minutes costs a retry; adopting an actually-live one puts two drivers on
+ * one store.
+ */
+const AGY_LIVE_WINDOW_MS = 10 * 60 * 1000;
+export function isAgyConversationLive(id) {
+  try {
+    if (!agyProcessAlive()) return false;
+    const t = agyLastWriteMs(id);
+    return t > 0 && Date.now() - t < AGY_LIVE_WINDOW_MS;
+  } catch {
+    return false;
+  }
+}
+
+/** The repo's agy conversations, via the cwd registry — see the section
+ *  comment for why this is deliberately a subset. */
+function scanAgyConversations({ repoRoot, excludeDirs = [] }) {
+  const out = [];
+  try {
+    let realRoot;
+    try {
+      realRoot = realpathSync(repoRoot);
+    } catch {
+      return out;
+    }
+    const excludes = [];
+    for (const d of excludeDirs) {
+      if (!d) continue;
+      try {
+        excludes.push(realpathSync(d));
+      } catch {
+        excludes.push(String(d));
+      }
+    }
+    const ours = (p) => inside(p, realRoot) && !excludes.some((e) => inside(p, e));
+    const raw = readFileSync(join(AGY_DIR(), 'cache', 'last_conversations.json'), 'utf8');
+    const map = JSON.parse(raw);
+    if (!map || typeof map !== 'object') return out;
+    const cutoff = Date.now() - SEVEN_DAYS_MS;
+    const processUp = agyProcessAlive();
+    for (const [cwd, id] of Object.entries(map)) {
+      if (typeof id !== 'string' || !AGY_UUID_RE.test(id)) continue;
+      let real;
+      try {
+        real = realpathSync(cwd);
+      } catch {
+        continue; // the directory is gone — nothing to point a tab at
+      }
+      if (!ours(real)) continue;
+      const lastMs = agyLastWriteMs(id);
+      if (!lastMs || lastMs < cutoff) continue;
+      out.push({
+        id,
+        cwd: real,
+        live: processUp && Date.now() - lastMs < AGY_LIVE_WINDOW_MS,
+        lastActiveAt: new Date(lastMs).toISOString(),
+        runtime: 'antigravity',
+      });
+    }
+    out.sort(
+      (a, b) =>
+        (b.lastActiveAt < a.lastActiveAt ? -1 : b.lastActiveAt > a.lastActiveAt ? 1 : 0) ||
+        (a.id < b.id ? -1 : 1)
+    );
+  } catch {
+    /* no agy on this machine, or an unreadable registry — nothing to report */
+  }
+  return out;
 }

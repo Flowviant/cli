@@ -233,7 +233,7 @@ function handleStreamLine(line, { cwd, emit, onActivity, appendText }) {
 // returned string for sentinel detection, and each activity is handed to
 // `onActivity` so the caller can forward progress. Build-agent turns leave it
 // off and keep the raw text passthrough + line sentinels.
-export function runTurn({ prompt, resume, system, cwd, mcpConfig, mcpArgs, mcpEnv, runtime = 'claude', label, onSpawn, streamJson, onActivity, onThreadId, wikiPerm, readOnly, planPerm, vaultDir, resultSchemaArgs, model, effort, adoptResumeId, resumeThreadId }) {
+export function runTurn({ prompt, resume, system, cwd, mcpConfig, mcpArgs, mcpEnv, runtime = 'claude', label, onSpawn, streamJson, onActivity, onThreadId, wikiPerm, readOnly, planPerm, vaultDir, resultSchemaArgs, model, effort, adoptResumeId, resumeThreadId, resumeConversationId }) {
   return new Promise((resolve) => {
     const rt = runtimeById(runtime);
     if (!rt.args) {
@@ -277,9 +277,11 @@ export function runTurn({ prompt, resume, system, cwd, mcpConfig, mcpArgs, mcpEn
       streamJson,
       profile,
       // Adopting a terminal session (work.mjs): Claude turns it into
-      // `--resume <id> --fork-session`; every other runtime THROWS on it, so a
-      // mis-wired adoption fails as a loud turn error rather than a silent
-      // fresh conversation wearing an adopted session's name.
+      // `--resume <id> --fork-session` (a FORK — the original is untouched);
+      // agy turns it into `--conversation <id>` (a MOVE — agy has no fork, the
+      // tab continues the terminal conversation itself). Codex THROWS on it,
+      // so a mis-wired adoption fails as a loud turn error rather than a
+      // silent fresh conversation wearing an adopted session's name.
       adoptResumeId,
       // Only the wiki profile uses it, but it is passed unconditionally: a
       // runtime that can path-scope its writes needs to know WHERE the vault is,
@@ -300,6 +302,9 @@ export function runTurn({ prompt, resume, system, cwd, mcpConfig, mcpArgs, mcpEn
       // sessions). Runtimes without a by-id resume ignore it and keep their
       // `resume` behavior unchanged.
       resumeThreadId,
+      // agy's by-id resume (work.mjs, antigravity sessions): the conversation
+      // id learned from the adopt hint or the cwd registry after a turn.
+      resumeConversationId,
     });
     // Whatever this machine is signed in with, we use. We do NOT pick.
     //
