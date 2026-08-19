@@ -58,10 +58,7 @@ import {
   WIKI_KICKOFF,
   SYSTEM_REGROUND,
   REGROUND_KICKOFF,
-  SYSTEM_QUICK_EDIT,
-  QUICK_EDIT_KICKOFF,
 } from './claude.mjs';
-import { readTaskMarker } from './live.mjs';
 import { reapOrphanPreviews } from './preview.mjs';
 import { preflight } from './preflight.mjs';
 import { connectStream } from './stream.mjs';
@@ -542,107 +539,6 @@ export async function runFleetDaemon() {
   const MACHINE_URL = FLEET_URL.replace(/\/agents\/?$/, '/machine');
 
 
-  // Quick edits — a SECOND Claude alongside a task this machine is already
-  // building. Unlike every other roster job it does not get a worktree of its
-  // own: the whole point is to work in the one the running task opened, on that
-  // branch, so the change rides along with the delivery instead of becoming a
-  // second thing to merge.
-  const JOIN_TAKE_URL = FLEET_URL.replace(/\/agents\/?$/, '/join-take');
-  const JOIN_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/join-done');
-  const joining = new Set();
-  /** ONE quick edit at a time, ACROSS worktrees. Two of them in the same tree
-   *  would fight over the index; two in different trees would still be two extra
-   *  Claudes on the owner's account on top of the tasks already running. */
-  let joinChain = Promise.resolve();
-
-  /** The worktree currently building this intent, or null if this machine isn't.
-   *  Now a direct lookup rather than a scan: a task's checkout is named after
-   *  the task, so there is exactly one place it could be. The marker is still
-   *  consulted, but for LIFECYCLE rather than identity — a directory that
-   *  outlived its run (finished, cleared its marker, kept for the review
-   *  preview) exists but is not building anything, and must not take an edit. */
-  const worktreeBuilding = (intentId) => {
-    const wt = taskWorktreePath(intentId);
-    try {
-      if (existsSync(wt) && readTaskMarker(wt) === intentId) return { wt };
-    } catch {
-      /* a worktree that vanished isn't building anything */
-    }
-    return null;
-  };
-
-  const processJoinJobs = (jobs) => {
-    for (const job of jobs ?? []) {
-      if (!job || typeof job.id !== 'string' || !job.instruction) continue;
-      if (joining.has(job.id)) continue;
-      joining.add(job.id);
-      joinChain = joinChain.then(async () => {
-        let settled = false;
-        try {
-          const target = worktreeBuilding(job.taskId ?? job.intentId);
-          if (!target) {
-            // The run ended (or moved) between the human pressing ⚡ and this
-            // poll. Settle rather than retry: there is no worktree to join, and
-            // an unsettled row holds the reset interlock open forever.
-            await reportMergeOutcome(JOIN_DONE_URL, {
-              joinId: job.id,
-              ok: false,
-              result: 'that task is no longer building on this machine',
-            });
-            settled = true;
-            return;
-          }
-          // Compare-and-set BEFORE spending a Claude turn: two lanes can wake on
-          // the same push, and running one instruction twice into one worktree
-          // is exactly the double-edit this is meant to avoid.
-          const quickRt = pickRuntimeFor('build');
-          if (!quickRt) return; // nothing here can edit code; leave the join unclaimed
-          const claim = await postForData(JOIN_TAKE_URL, { joinId: job.id });
-          if (!claim?.taken) return;
-          note(
-            `${c.cyan('quick')} ${c.dim(`— ${job.askedByName || 'someone'} on "${job.taskTitle || job.intentTitle || 'a task'}"`)}`
-          );
-          const out = await runTurn({
-            prompt: QUICK_EDIT_KICKOFF({
-              intentTitle: job.taskTitle ?? job.intentTitle,
-              instruction: job.instruction,
-              askedByName: job.askedByName,
-            }),
-            // Never resume: this is its own tiny turn, not a continuation of the
-            // task's session. Resuming would hand it the other agent's context
-            // and, with it, the other agent's job.
-            resume: false,
-            system: SYSTEM_QUICK_EDIT,
-            cwd: target.wt,
-            runtime: quickRt,
-            // No MCP: a join records no run, claims nothing, completes nothing.
-            // Its only report is the one this daemon posts below.
-            label: c.cyan('[quick]'),
-          });
-          const summary = (out || '').trim();
-          await reportMergeOutcome(JOIN_DONE_URL, {
-            joinId: job.id,
-            ok: summary.length > 0,
-            // Scrub: a summary can quote config or env-adjacent code.
-            result: envScrub(summary).slice(0, 4000) || 'no change reported',
-          });
-          settled = true;
-          ok(`${c.cyan('quick')} ${c.dim('— landed on the task branch')}`);
-        } catch (e) {
-          warn(`quick edit failed: ${e?.message ?? e}`);
-          if (!settled) {
-            await reportMergeOutcome(JOIN_DONE_URL, {
-              joinId: job.id,
-              ok: false,
-              result: e?.message ?? 'the change could not be applied',
-            }).catch(() => {});
-          }
-        } finally {
-          joining.delete(job.id);
-        }
-      });
-    }
-  };
 
 
   // ── Work sessions — the Workbench tabs ─────────────────────────────────────
@@ -1286,7 +1182,6 @@ export async function runFleetDaemon() {
     // the daemon's own worktrees are carved out (a session the daemon spawned
     // is already a tab, not something to offer adopting).
     void maybeReportLocalSessions({ repoRoot, excludeDirs: [baseDir] });
-    processJoinJobs(roster.joinJobs);
     processCleanupJobs(roster.cleanupJobs);
     const rosterIds = new Set(roster.agents.map((a) => a.agentId));
 
@@ -1295,8 +1190,12 @@ export async function runFleetDaemon() {
     if (sig !== rosterSig) {
       rosterSig = sig;
       if (rosterIds.size === 0) {
-        warn('No agents on your roster yet.');
-        info('Add agents in Flowviant → Cockpit → Fleet; they spin up here automatically.');
+        // `agents` is permanently [] — the lanes it counted died with dispatch
+        // and the array survives only as wire compat. So this branch is the one
+        // that always runs, and it used to point at the Cockpit, a surface
+        // deleted 2026-08-04 that now redirects to the Board. Say what is
+        // actually true instead: the machine is up, and work starts in a tab.
+        info('Machine online. Open a tab in Flowviant → Workbench to start working.');
       } else {
         note(`Roster: ${c.bold(String(rosterIds.size))} agent${rosterIds.size === 1 ? '' : 's'}.`);
       }
