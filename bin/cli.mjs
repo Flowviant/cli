@@ -2,11 +2,17 @@
 /**
  * flowviant — run your own Claude Code as headless Flowviant build agents.
  *
- * Three modes, picked by which env var is set:
+ * ONE mode, one credential:
  *
- *   FLOWVIANT_TOKEN=fva_…   npx flowviant@latest  # 1 worker, current checkout
- *   FLOWVIANT_TOKENS=a,b,c  npx flowviant@latest  # static fleet, 1 worktree each
- *   FLOWVIANT_FLEET=fft_…   npx flowviant@latest  # FLEET DAEMON (recommended)
+ *   FLOWVIANT_FLEET=fft_…   npx flowviant@latest  # the fleet daemon
+ *
+ * `FLOWVIANT_TOKEN` (one worker, current checkout) and `FLOWVIANT_TOKENS` (a
+ * comma list, one worktree each) stood beside it until 2026-08-19. Both ran the
+ * pre-daemon WORKER loop, whose first move was `claim_next_task` — a tool on the
+ * `worker` MCP principal, which was deleted with dispatch and now owns nothing.
+ * A worker token cannot be minted any more either, so those vars could only
+ * ever hold a credential issued before that. They authenticated fine and then
+ * sat against an empty tool list, which is a worse failure than not starting.
  *
  * Launch with `@latest` so each start pulls the newest published version (bare
  * `npx flowviant` can reuse a stale cache). A running daemon also self-updates
@@ -36,11 +42,9 @@
  *
  * Implementation lives in ./lib/: config, ui, claude, git, fleet, single.
  */
-import { FLEET_TOKEN, tokens, SAFE, MCP_URL } from './lib/config.mjs';
+import { FLEET_TOKEN } from './lib/config.mjs';
 import { runFleetDaemon } from './lib/fleet.mjs';
-import { runWorker, runStaticFleet } from './lib/single.mjs';
 import { runLogin } from './lib/login.mjs';
-import { preflight } from './lib/preflight.mjs';
 
 // `flowviant login` — device auth (recommended): approve a code in the app, the
 // credential is stored locally, and then we KEEP GOING into the daemon.
@@ -155,35 +159,14 @@ if (process.argv[2] === 'env') {
   process.exit(0);
 }
 
-if (!FLEET_TOKEN && tokens.length === 0) {
+if (!FLEET_TOKEN) {
   console.error(
     'error: no credential found. Easiest:\n' +
       '  flowviant login      (approve in the app — recommended)\n' +
-      'Or set one of:\n' +
-      '  FLOWVIANT_FLEET=fva_…   (fleet token, manage agents in Flowviant)\n' +
-      '  FLOWVIANT_TOKEN=fva_…   (one agent, current checkout)\n' +
-      '  FLOWVIANT_TOKENS=a,b,…  (static fleet)'
+      'Or set:\n' +
+      '  FLOWVIANT_FLEET=fft_…   (fleet token, manage machines in Flowviant)'
   );
   process.exit(1);
 }
 
-async function main() {
-  if (FLEET_TOKEN) {
-    await runFleetDaemon();
-    return;
-  }
-  console.log(
-    SAFE
-      ? '» safe mode: restricted toolset (unset FLOWVIANT_SAFE for full autonomy).'
-      : '» unattended mode: permission prompts skipped so the agent runs hands-off.'
-  );
-  await preflight({ needGit: tokens.length > 1 });
-  if (tokens.length === 1) {
-    console.log(`» flowviant → ${MCP_URL}  (1 worker · token fva_…${tokens[0].slice(-4)})`);
-    await runWorker({ token: tokens[0], cwd: process.cwd(), label: '' });
-    return;
-  }
-  await runStaticFleet();
-}
-
-await main();
+await runFleetDaemon();

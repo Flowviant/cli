@@ -46,7 +46,7 @@ import {
   isSafePathSegment,
   worktreeDiffstat,
 } from './git.mjs';
-import { c, LABEL_COLORS, info, note, ok, warn, fail } from './ui.mjs';
+import { c, info, note, ok, warn, fail } from './ui.mjs';
 import { revertPatch, withPatchLock } from './patch.mjs';
 import {
   sleep,
@@ -54,21 +54,14 @@ import {
   runTurn,
   sawSentinel,
   blockedId,
-  SYSTEM_SINGLE,
-  SINGLE_KICKOFF,
-  SINGLE_RESUME,
   SYSTEM_WIKI,
   WIKI_KICKOFF,
   SYSTEM_REGROUND,
-  SYSTEM_PLAN_CHECK,
-  PLAN_CHECK_KICKOFF,
   REGROUND_KICKOFF,
-  SYSTEM_PLAN,
-  PLAN_TURN_KICKOFF,
   SYSTEM_QUICK_EDIT,
   QUICK_EDIT_KICKOFF,
 } from './claude.mjs';
-import { runLiveWorker, readTaskMarker } from './live.mjs';
+import { readTaskMarker } from './live.mjs';
 import { reapOrphanPreviews } from './preview.mjs';
 import { preflight } from './preflight.mjs';
 import { connectStream } from './stream.mjs';
@@ -186,55 +179,6 @@ const RUN_DIFFSTAT_URL = FLEET_URL.replace(/\/agents\/?$/, '/run-diffstat');
  */
 const DIFFSTAT_REFRESH_MS = 120_000;
 
-function sampleDiffstat(cwd, baseRef, intentId, agentId) {
-  let last = '';
-  let lastSentAt = 0;
-  let alive = true;
-  const post = async () => {
-    if (!alive) return;
-    let stat = null;
-    try {
-      stat = worktreeDiffstat(cwd, baseRef);
-    } catch {
-      return; // a worktree mid-reset is not an error worth reporting
-    }
-    if (!stat) return;
-    const key = JSON.stringify(stat);
-    if (key === last && Date.now() - lastSentAt < DIFFSTAT_REFRESH_MS) return;
-    try {
-      const res = await fetch(RUN_DIFFSTAT_URL, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${FLEET_TOKEN}`,
-          'User-Agent': USER_AGENT,
-          'Content-Type': 'application/json',
-        },
-        signal: AbortSignal.timeout(15_000),
-        // The lane, not just the task: the server matches the run on both, so a
-        // sample can only ever overwrite the diffstat of THIS lane's own run.
-        body: JSON.stringify({ taskId: intentId, agentId, diffstat: stat }),
-      });
-      // Only a sample the server ACCEPTED counts as sent. Marking it delivered
-      // before the round-trip meant a dropped request suppressed every retry
-      // for as long as the numbers held still — which is precisely when the
-      // reader is about to expire the panel.
-      if (res.ok) {
-        last = key;
-        lastSentAt = Date.now();
-      }
-    } catch {
-      /* best-effort: `last` is untouched, so the next tick tries again */
-    }
-  };
-  const t = setInterval(() => void post(), 20_000);
-  // Kick once after a beat so a fast task still reports something before it ends.
-  const first = setTimeout(() => void post(), 5_000);
-  return () => {
-    alive = false;
-    clearInterval(t);
-    clearTimeout(first);
-  };
-}
 
 /**
  * Terminal-session presence: tell the server which Claude sessions exist in
@@ -301,134 +245,6 @@ async function maybeReportLocalSessions({ repoRoot, excludeDirs }) {
 
 // One roster agent's loop: persistent worktree, one intent per turn, reset to
 // base between tasks (fresh conversation), resume in place while on a blocker.
-async function runFleetWorker({ agentId, label, cwd, baseRef, getToken, getHasWork, getNext, getMcpUrl, isAlive, onChild, onTokenSuspect }) {
-  let resuming = false;
-  let needsReset = true; // reset to base before a FRESH task, not on idle polls
-  // The task this lane is currently holding. `next` only arrives on a FRESH
-  // turn, but a run that comes back from a blocker is still building the same
-  // intent — without remembering it here, the entire post-blocker half of a run
-  // reports no diffstat and the tray blanks mid-build.
-  let heldIntentId = null;
-  // The CLI the task in flight is being built by — held across a resume for
-  // the reason documented at the assignment below.
-  let heldRuntime = 'claude';
-  let phase = ''; // '', 'idle', 'blocked' — log each transition once, not per poll
-  const enter = (p, fn, msg) => {
-    if (phase !== p) {
-      phase = p;
-      fn(`${label} ${msg}`);
-    }
-  };
-  while (isAlive()) {
-    const token = getToken(agentId);
-    if (!token) {
-      await sleep(IDLE_SECONDS);
-      continue;
-    }
-    // Idle = no claimable work (the server tells us via the roster poll). Don't
-    // spawn Claude just to find nothing — that's a wasted API call. A blocked
-    // task (resuming) still polls, so its resolution gets picked up.
-    if (!resuming && !getHasWork(agentId)) {
-      enter('idle', info, 'idle — no work assigned');
-      await sleep(IDLE_SECONDS);
-      continue;
-    }
-    if (!resuming && needsReset) {
-      resetWorktree(cwd, baseRef); // clean slate for a new task
-      materializeInto(cwd); // reset wiped the env files (git clean -fd) — rewrite
-      needsReset = false;
-    }
-    // The task the server says is next for this lane, read ONCE per turn: the
-    // runtime, model and effort below become process flags, so they must
-    // describe the same task the kickoff tells the agent to claim. Re-reading
-    // the map mid-turn could pair one task's flags with another's work.
-    const next = resuming ? null : getNext?.(agentId) || null;
-    if (next?.intentId) heldIntentId = next.intentId;
-    // WHICH CLI builds this one. Chosen in the app by @mentioning it and carried
-    // on the roster hint; absent (older server, or a task captured before there
-    // was a choice) it is Claude, which is what every task ran on until now.
-    //
-    // A resume must keep the runtime it started on — the session, the worktree
-    // and the branch all belong to that CLI, and handing its half-finished work
-    // to a different one mid-task is not a fallback, it is a second author.
-    if (!resuming) heldRuntime = next?.runtime || 'claude';
-    const { dir, args: mcpArgs, env: mcpEnv } = mcpFor(heldRuntime, token, getMcpUrl());
-    let out = '';
-    // Report what this run is changing, while it is changing it. The commits
-    // endpoint can only describe work that has already reached the provider, so
-    // without this the app has nothing to say about a task for the whole time it
-    // is being built. Only when we know WHICH task this turn is for — the same
-    // hint that carries its model and effort — because a diffstat attributed to
-    // the wrong run is worse than none. On a resume that is the intent this
-    // lane already holds; the worktree it is about to keep editing is the same
-    // one, so the samples describe the same run.
-    const stopDiffstat = heldIntentId
-      ? sampleDiffstat(cwd, baseRef, heldIntentId, agentId)
-      : null;
-    try {
-      out = await runTurn({
-        prompt: resuming ? SINGLE_RESUME : SINGLE_KICKOFF(next?.intentId),
-        resume: resuming,
-        system: SYSTEM_SINGLE,
-        cwd,
-        runtime: heldRuntime,
-        mcpArgs,
-        mcpEnv,
-        label,
-        // Per-task overrides — null/absent means this machine's own defaults
-        // (FLOWVIANT_MODEL, and the CLI's own effort). A resume keeps the
-        // session it already has, so there is nothing to re-pick there.
-        model: next?.model || undefined,
-        effort: next?.effort || undefined,
-        onSpawn: (ch) => onChild?.(ch),
-      });
-    } finally {
-      stopDiffstat?.();
-      // `dir` is null for a runtime that needed no file on disk (Codex reads its
-      // token from the environment) — rmSync would throw on undefined.
-      if (dir) rmSync(dir, { recursive: true, force: true });
-      onChild?.(null);
-    }
-    if (!isAlive()) break;
-    if (blockedId(out)) {
-      enter('blocked', warn, `${c.yellow('paused')}${c.dim(' — waiting on your review/answer in Flowviant')}`);
-      resuming = true;
-      await sleep(POLL_SECONDS);
-      continue;
-    }
-    if (sawSentinel(out, 'NOTHING')) {
-      enter('idle', info, 'idle — no work assigned');
-      resuming = false;
-      heldIntentId = null; // let go of the task, and of its diffstat
-      await sleep(IDLE_SECONDS);
-      continue;
-    }
-    if (sawSentinel(out, 'DONE')) {
-      ok(`${label} ${c.dim('finished a task — PR opened for your review')}`);
-      phase = '';
-      resuming = false;
-      needsReset = true;
-      heldIntentId = null;
-      continue;
-    }
-    // No sentinel — the turn didn't complete the protocol. Almost always the
-    // flowviant MCP failed to surface its tools (usually a stale worker token).
-    // Drop the cached token so the next poll re-mints a fresh one, then retry —
-    // don't fake a blocker or a completion.
-    enter('reconnect', warn, `${c.yellow('no result')}${c.dim(' — refreshing token, retrying')}`);
-    onTokenSuspect?.(agentId);
-    // A no-sentinel turn while RESUMING a blocked task is a transient MCP/token
-    // failure, not completion — retry in place and KEEP the worktree. Resetting
-    // here would wipe the blocked task's uncommitted changes. Only a fresh-task
-    // turn (not resuming) warrants a clean slate next time.
-    if (!resuming) {
-      needsReset = true;
-      heldIntentId = null; // fresh slate next turn — nothing held to sample
-    }
-    await sleep(IDLE_SECONDS);
-  }
-  info(`${label} stopped`);
-}
 
 export async function runFleetDaemon() {
   console.log('');
@@ -466,19 +282,6 @@ export async function runFleetDaemon() {
   // can hand any lane any task, and two tasks can never be in each other's
   // files even when one is mid-edit.
   const taskWorktreePath = (intentId) => join(baseDir, `task-${intentId}`);
-  const worktreeFor = (intentId) => {
-    const r = ensureWorktree(repoRoot, taskWorktreePath(intentId), baseRef);
-    // Only on creation: a resumed tree already has its env, and rewriting it
-    // mid-task would clobber anything the agent changed.
-    if (r.fresh) {
-      try {
-        materializeInto(r.path);
-      } catch {
-        /* best-effort — the task still builds, secrets-backed paths may 500 */
-      }
-    }
-    return r;
-  };
   try {
     const kb = Number(execFileSync('du', ['-sk', baseDir], { encoding: 'utf8' }).split('\t')[0]);
     if (kb > 1024)
@@ -688,60 +491,6 @@ export async function runFleetDaemon() {
     }
   };
 
-  // Plan checks: the ground-truth pass. Generation drafted these against a
-  // module manifest and wiki summaries — proxies for the repo. This runs where
-  // the checkout is, opens the real files, and reports corrections back into the
-  // thread. Read-only by construction; it never edits.
-  /**
-   * Pull the plan-check JSON off the tail of a Claude turn.
-   *
-   * The model is told to end with a bare JSON object, but a turn can trail
-   * prose, a fence, or a stray newline. Scan backwards for the last balanced
-   * object and validate it hard: anything shaped wrong is dropped rather than
-   * written into someone's plan. Returns null when nothing usable was found.
-   */
-  const parsePlanChecks = (out, intents) => {
-    const text = String(out ?? '');
-    const known = new Set(intents.map((i) => i.id));
-    const end = text.lastIndexOf('}');
-    if (end === -1) return null;
-    // NOTE: `lastIndexOf(x, -1)` returns 0, NOT -1 — the position argument is
-    // clamped, so the obvious `start = lastIndexOf('{', start - 1)` loop spins
-    // forever once it reaches index 0 and the parse fails. That hangs the
-    // daemon's event loop, not just this job. Walk with an explicit stop, and
-    // cap the attempts so a pathological turn can't burn the poll cycle either.
-    let start = text.lastIndexOf('{', end);
-    for (let attempts = 0; start !== -1 && attempts < 200; attempts++) {
-      let parsed = null;
-      try {
-        parsed = JSON.parse(text.slice(start, end + 1));
-      } catch {
-        /* not a complete object at this offset — step back and retry */
-      }
-      if (!parsed || !Array.isArray(parsed.checks)) {
-        if (start === 0) break;
-        start = text.lastIndexOf('{', start - 1);
-        continue;
-      }
-      return parsed.checks
-        .filter((ch) => ch && typeof ch.id === 'string' && known.has(ch.id))
-        .map((ch) => ({
-          id: ch.id,
-          alreadyBuilt: ch.alreadyBuilt === true,
-          evidence: typeof ch.evidence === 'string' ? ch.evidence.slice(0, 300) : '',
-          anchors: Array.isArray(ch.anchors)
-            ? ch.anchors.filter((a) => typeof a === 'string' && a.length < 200).slice(0, 6)
-            : [],
-          points:
-            typeof ch.points === 'number' && Number.isFinite(ch.points)
-              ? Math.max(0, Math.min(13, Math.round(ch.points)))
-              : null,
-          note: typeof ch.note === 'string' ? ch.note.slice(0, 400) : '',
-        }))
-        .slice(0, 30);
-    }
-    return null;
-  };
 
   /**
    * Everything that reads or rewrites the shared `wikiWt` worktree takes this:
@@ -789,215 +538,9 @@ export async function runFleetDaemon() {
     }
   };
 
-  const PLAN_CHECK_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/plan-check-done');
   // Machine telemetry — what the box is doing with itself, for the admin view.
   const MACHINE_URL = FLEET_URL.replace(/\/agents\/?$/, '/machine');
-  const checkingPlans = new Set();
-  const processPlanCheckJobs = (jobs) => {
-    for (const job of jobs ?? []) {
-      // New name first; the roster mirrors `intents` off `tasks` for exactly
-      // this fallback window.
-      const planTasks = Array.isArray(job?.tasks) ? job.tasks : job?.intents;
-      if (!job || typeof job.id !== 'string' || !Array.isArray(planTasks)) continue;
-      if (checkingPlans.has(job.id)) continue;
-      if (planTasks.length === 0) continue;
-      checkingPlans.add(job.id);
-      (async () => {
-        try {
-          // WHICH CLI answers a turn nobody @mentioned. Resolved per job rather
-          // than once at startup: a CLI can be installed while the daemon runs.
-          const planRt = pickRuntimeFor('consult');
-          if (!planRt) {
-            warn(`plan check for "${job.title}" skipped — no installed CLI can run a read-only turn`);
-            checkingPlans.delete(job.id);
-            return;
-          }
-          note(`${c.cyan('plan')} ${c.dim(`— checking "${job.title}" against your code…`)}`);
-          const out = await withWikiLock(async () => {
-            ensureWikiWorktree();
-            return runTurn({
-              prompt: PLAN_CHECK_KICKOFF({ title: job.title, intents: planTasks }),
-              resume: false,
-              system: SYSTEM_PLAN_CHECK,
-              cwd: wikiWt,
-              // Reads the repo and reports JSON — it authors nothing either.
-              readOnly: true,
-              runtime: planRt,
-              label: c.cyan('[plan]'),
-            });
-          });
-          const checks = parsePlanChecks(out, planTasks);
-          if (checks === null) {
-            warn(`plan check for "${job.title}": no usable JSON — leaving the plan as drafted`);
-          }
-          await reportMergeOutcome(PLAN_CHECK_DONE_URL, {
-            taskId: job.id,
-            checks: checks ?? [],
-          });
-          if (checks?.length) {
-            ok(`${c.cyan('plan')} ${c.dim(`— ${checks.length} correction${checks.length === 1 ? '' : 's'} for "${job.title}"`)}`);
-          } else {
-            ok(`${c.cyan('plan')} ${c.dim(`— "${job.title}" checks out against your code`)}`);
-          }
-        } catch (e) {
-          warn(`plan check failed for "${job.title}": ${e?.message ?? e}`);
-          // Clear the flag anyway — a stuck job would re-run every poll forever.
-          await reportMergeOutcome(PLAN_CHECK_DONE_URL, { taskId: job.id, checks: [] });
-        } finally {
-          checkingPlans.delete(job.id);
-        }
-      })();
-    }
-  };
 
-  // ── Planning sessions ────────────────────────────────────────────────────
-  //
-  // A turn in a plan thread, answered inside a HELD session. This was the
-  // consult, which answered one question in prose and kept nothing: it existed
-  // because the planner was a different, weaker brain and this turn's only job
-  // was to correct it from the real code. That planner is gone, so the session
-  // reads the repo AND writes the plan, over many turns, in one context.
-  //
-  // Two things changed shape as a result.
-  //
-  // ONE WORKTREE PER PLAN, not the shared `wikiWt`. Every CLI here resumes with
-  // "continue the last session in this directory" (`--continue`, `resume
-  // --last`) rather than by session id, so the WORKING DIRECTORY *is* the
-  // session handle. A shared directory would have made two plans on one machine
-  // take turns wearing each other's context — and the wiki queue hard-resets
-  // that directory between tasks, which would pull the files out from under a
-  // session mid-argument. A private detached checkout per plan also means plan
-  // turns no longer queue behind the wiki lock.
-  //
-  // IT CARRIES MCP. A consult passed none — nothing to write. A session spawns
-  // slices, re-shapes them, drops them and maintains the spec, all of which are
-  // control-plane calls. The token is the fleet's PLAN principal, whose entire
-  // tool set is those five: it cannot claim, cannot open a worktree, cannot
-  // commit. That absence is the product rule, not a hardening measure — it is
-  // what makes "add a dark mode toggle" typed at a plan add a slice instead of
-  // building one, with nothing reading the sentence to decide.
-  const CONSULT_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/consult-done');
-  const PLAN_TOKEN_URL = FLEET_URL.replace(/\/agents\/?$/, '/plan-token');
-  const answering = new Set();
-  const consultAttempts = new Map(); // turn id -> tries
-  /** Give up after this many turns on one message. A /consult-done that never
-   *  reaches the server (offline, 500) would otherwise re-run the whole Claude
-   *  turn every poll, forever, on the owner's quota. */
-  const MAX_CONSULT_TRIES = 3;
-  /** ONE planning turn at a time on this machine. Sessions are per-plan so they
-   *  no longer collide on a directory, but the roster can hand back a batch, and
-   *  un-awaited spawns would put N concurrent CLI processes on someone's laptop
-   *  for what is, on the human's side, a chat. */
-  let consultChain = Promise.resolve();
-
-  /**
-   * The plan credential, cached until it stops working.
-   *
-   * Minted lazily rather than at startup: most daemons never host a planning
-   * session, and a token nobody uses is a credential sitting on disk for no
-   * reason. Rotated by the server on every mint, so a re-mint after a 401 is the
-   * recovery path.
-   */
-  let planToken = null;
-  const mintPlanToken = async (force = false) => {
-    if (planToken && !force) return planToken;
-    try {
-      const res = await fetch(PLAN_TOKEN_URL, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${FLEET_TOKEN}`, 'User-Agent': USER_AGENT },
-      });
-      if (!res.ok) return null;
-      const data = await res.json().catch(() => null);
-      planToken = data?.data?.token ?? null;
-      return planToken;
-    } catch {
-      return null;
-    }
-  };
-
-  /**
-   * This plan's session directory — its context, expressed as a place.
-   *
-   * A detached checkout at base, like a consult's, but PRIVATE and PERSISTENT:
-   * private so `--continue` resumes this argument rather than whichever ran last
-   * on the box, persistent so it survives the daemon restarting or updating
-   * under it. Re-pointed at the current base each turn, because "reads your
-   * code" has to mean the code as it is now — a plan that runs for days would
-   * otherwise keep answering from the commit it was opened at.
-   *
-   * Returns null when the id is not a safe path segment: it comes off the wire.
-   */
-  const planWtFor = (planId) => {
-    if (!isSafePathSegment(planId)) return null;
-    const wt = join(baseDir, 'plans', planId);
-    const fresh = !existsSync(wt);
-    if (fresh) {
-      try {
-        git(['worktree', 'add', '--detach', wt, baseRef], repoRoot);
-      } catch {
-        git(['worktree', 'prune'], repoRoot);
-        try {
-          git(['worktree', 'add', '--detach', wt, baseRef], repoRoot);
-        } catch {
-          return null;
-        }
-      }
-    } else {
-      try {
-        git(['fetch', 'origin', '--quiet'], repoRoot);
-        git(['checkout', '--detach', baseRef], wt);
-        git(['reset', '--hard', baseRef], wt);
-        git(['clean', '-fd'], wt);
-      } catch {
-        /* offline, or a turn left it dirty — read what we have */
-      }
-    }
-    return { wt, fresh };
-  };
-
-  /**
-   * Retire the least-recently-touched session directories.
-   *
-   * The bound belongs HERE, in the machine, and never in the interface: ten
-   * plans open across a team is ten checkouts on one box, which is a resource
-   * question. Announcing a session limit in the app would be advertising
-   * capacity, which this product does not do. A retired session simply rebuilds
-   * from the spec next time it is asked for — the fallback the server already
-   * expects, and which the thread says out loud when it happens.
-   */
-  const MAX_PLAN_SESSIONS = 8;
-  const planTouched = new Map(); // planId -> ms
-  const retireIdlePlanSessions = () => {
-    const dir = join(baseDir, 'plans');
-    if (!existsSync(dir)) return;
-    let ids;
-    try {
-      ids = readdirSync(dir);
-    } catch {
-      return;
-    }
-    if (ids.length <= MAX_PLAN_SESSIONS) return;
-    const oldestFirst = ids.sort(
-      (a, b) => (planTouched.get(a) ?? 0) - (planTouched.get(b) ?? 0)
-    );
-    for (const id of oldestFirst.slice(0, ids.length - MAX_PLAN_SESSIONS)) {
-      try {
-        git(['worktree', 'remove', '--force', join(dir, id)], repoRoot);
-      } catch {
-        try {
-          rmSync(join(dir, id), { recursive: true, force: true });
-        } catch {
-          /* it is a directory we will overwrite next time; not worth failing a turn */
-        }
-      }
-      planTouched.delete(id);
-    }
-    try {
-      git(['worktree', 'prune'], repoRoot);
-    } catch {
-      /* best effort */
-    }
-  };
 
   // Quick edits — a SECOND Claude alongside a task this machine is already
   // building. Unlike every other roster job it does not get a worktree of its
@@ -1101,107 +644,6 @@ export async function runFleetDaemon() {
     }
   };
 
-  const processConsultJobs = (jobs) => {
-    for (const job of jobs ?? []) {
-      if (!job || typeof job.id !== 'string' || !job.question) continue;
-      if (answering.has(job.id)) continue;
-      const tries = (consultAttempts.get(job.id) ?? 0) + 1;
-      if (tries > MAX_CONSULT_TRIES) continue;
-      consultAttempts.set(job.id, tries);
-      answering.add(job.id);
-      consultChain = consultChain.then(async () => {
-        try {
-          note(`${c.cyan('plan')} ${c.dim(`— ${job.askedByName || 'someone'} on "${job.planTitle || 'a plan'}"`)}`);
-          // The profile is the enforcement, not the prompt: this turn is steered
-          // by anything a project editor can type, and it holds write tools. A
-          // runtime that cannot express `plan` does not get the job rather than
-          // getting it with guarantees nobody wrote down — which today excludes
-          // Antigravity, whose mediated shape fits a build and not an argument.
-          const planRt = pickRuntimeFor('plan');
-          if (!planRt) {
-            warn('a planning turn is waiting, but no installed CLI can run a planning session');
-            return;
-          }
-          const token = await mintPlanToken();
-          if (!token) {
-            warn('a planning turn is waiting, but the plan credential could not be minted');
-            return;
-          }
-          const dir = planWtFor(job.taskId);
-          if (!dir) {
-            warn(`a planning turn is waiting, but its session directory could not be opened`);
-            return;
-          }
-          planTouched.set(job.taskId, Date.now());
-          // Resume only when this plan already HAS a session here. A fresh
-          // directory means either the first turn or a session we retired, and
-          // both want the same thing: start over from the spec, which the
-          // kickoff carries. `--continue` against an empty directory is not an
-          // error on every CLI, so asking `fresh` is what keeps it honest.
-          const resume = !dir.fresh && Boolean(job.sessionRef);
-          const mcp = mcpFor(planRt, token, mcpUrl);
-          let out;
-          try {
-            out = await runTurn({
-              prompt: PLAN_TURN_KICKOFF({
-                planId: job.taskId,
-                planTitle: job.planTitle,
-                question: job.question,
-                askedByName: job.askedByName,
-                // Sent only when we are NOT resuming: a live session already has
-                // the argument in its context, and re-stating the spec every
-                // turn would spend tokens telling it what it just wrote. On a
-                // rebuild it is the whole inheritance.
-                spec: resume ? null : job.spec,
-              }),
-              resume,
-              system: SYSTEM_PLAN,
-              cwd: dir.wt,
-              // Read the repo, write the PLAN. No Edit/Write/commit anywhere in
-              // the toolset — the prompt says so too, but the prompt is what an
-              // injected message competes with.
-              planPerm: true,
-              mcpArgs: mcp.args,
-              mcpEnv: mcp.env,
-              runtime: planRt,
-              label: c.cyan('[plan]'),
-            });
-          } finally {
-            if (mcp.dir) rmSync(mcp.dir, { recursive: true, force: true });
-          }
-          const answer = (out || '').trim();
-          const posted = await reportMergeOutcome(CONSULT_DONE_URL, {
-            consultId: job.id,
-            ok: answer.length > 0,
-            // Scrub: a reply can quote config or env-adjacent code.
-            answer: envScrub(answer).slice(0, 8000),
-            // The handle the server stores, reported on EVERY turn: a session we
-            // had to rebuild comes back under a new directory state, and a
-            // stored handle that does not follow it leaves later turns trying to
-            // resume something that is gone.
-            sessionRef: dir.wt,
-          });
-          if (posted) consultAttempts.delete(job.id);
-          ok(`${c.cyan('plan')} ${c.dim('— replied in the plan thread')}`);
-          retireIdlePlanSessions();
-        } catch (e) {
-          // Settle it. A turn that cannot be answered must not re-burn quota
-          // every poll, and silence would leave the human waiting on a machine
-          // that already gave up.
-          await reportMergeOutcome(CONSULT_DONE_URL, {
-            consultId: job.id,
-            ok: false,
-            // Scrub, like the success path: an exception routinely quotes
-            // command output, and command output can quote a synced secret.
-            answer: envScrub(String(e?.message ?? 'the planning turn failed')).slice(0, 2000),
-          });
-          warn(`planning turn failed: ${e?.message ?? e}`);
-        } finally {
-          answering.delete(job.id);
-        }
-      });
-    }
-  };
 
   // ── Work sessions — the Workbench tabs ─────────────────────────────────────
   //
@@ -1723,7 +1165,6 @@ export async function runFleetDaemon() {
   let rosterSig = null; // last roster membership, to log changes only
   let idleBeatAt = 0; // throttle the "still alive" idle heartbeat
   let cappedWarned = false; // say once, not every reconcile, why extra lanes idle
-  let joinCount = 0; // for stable per-agent label colours
 
   // ── Push channel: a server wake short-circuits the reconcile sleep so a job is
   // picked up in ~a round trip instead of on the next poll. The socket only
@@ -1828,8 +1269,6 @@ export async function runFleetDaemon() {
     void flushWorkReports();
     processMergeJobs(roster.mergeJobs);
     processPatchRevertJobs(roster.patchRevertJobs);
-    processPlanCheckJobs(roster.planCheckJobs);
-    processConsultJobs(roster.consultJobs);
     processWorkTurns(roster.workTurnJobs);
     // The roster's live-session list rides along: an ENDED session's ship
     // must not be refused by checks whose remedies need a live tab.
@@ -1868,104 +1307,6 @@ export async function runFleetDaemon() {
       info('idle — waiting for agents…');
     }
 
-    for (const a of roster.agents) {
-      if (a.token) {
-        tokenByAgent.set(a.agentId, a.token);
-        mintedAt.set(a.agentId, Date.now());
-      }
-      hasWorkByAgent.set(a.agentId, !!a.hasWork);
-      // The hint's task id, new name first. Normalized ONTO `intentId` here so
-      // every downstream read (poll worker, kickoff, diffstat attribution)
-      // keeps its one spelling — intent is still the daemon's internal word,
-      // taskId is the wire's.
-      const nextId = a.next && (a.next.taskId ?? a.next.intentId);
-      if (a.next && typeof nextId === 'string')
-        nextByAgent.set(a.agentId, { ...a.next, intentId: nextId });
-      else nextByAgent.delete(a.agentId);
-      if (!workers.has(a.agentId)) {
-        // Local ceiling, enforced and not merely requested. The roster can carry
-        // more lanes than this machine asked for — someone added capacity by
-        // hand, or a second machine shares the fleet — and each extra worker is
-        // another Claude session, another worktree and another dev server on
-        // somebody's laptop. Skipping the spawn does NOT strand the work: an
-        // @mention addresses the FLEET, so any running lane can claim it; the
-        // tasks queue behind the ones we did start.
-        if (workers.size >= MAX_CONCURRENT) {
-          if (!cappedWarned) {
-            cappedWarned = true;
-            info(
-              `running ${MAX_CONCURRENT} task${MAX_CONCURRENT === 1 ? '' : 's'} at a time on this machine — ` +
-                `more will queue (FLOWVIANT_MAX_CONCURRENT to change)`
-            );
-          }
-          continue;
-        }
-        // LIVE lanes get NO checkout of their own — they ask for one per task,
-        // once they know which task. Poll mode is the legacy escape hatch and
-        // keeps its per-lane tree; it predates per-task sandboxes and isn't
-        // worth restructuring for a path nobody runs by default.
-        let wt = null;
-        if (!LIVE) {
-          try {
-            ensureWorktree(repoRoot, (wt = join(baseDir, `agent-${a.agentId}`)), baseRef);
-          } catch (e) {
-            fail(`could not create worktree for "${a.name}": ${e.message}`);
-            continue;
-          }
-          try {
-            materializeInto(wt); // synced env into the fresh worktree
-          } catch {
-            /* best-effort */
-          }
-        }
-        const colorFn = LABEL_COLORS[joinCount++ % LABEL_COLORS.length];
-        const label = colorFn(`[${a.name}]`);
-        const state = { alive: true, child: null };
-        ok(`${label} ${c.dim(LIVE ? 'online — live session' : 'online — worktree ready')}`);
-        const workerFn = LIVE ? runLiveWorker : runFleetWorker;
-        const promise = workerFn({
-          agentId: a.agentId,
-          label,
-          ...(LIVE ? { worktreeFor } : { cwd: wt }),
-          baseRef,
-          repoRoot, // for copying the repo's local env into the preview worktree
-
-          getToken: (id) => tokenByAgent.get(id),
-          getHasWork: (id) => hasWorkByAgent.get(id) ?? false,
-          getNext: (id) => nextByAgent.get(id) ?? null,
-          getMcpUrl: () => mcpUrl,
-          // Injected rather than imported: fleet.mjs imports live.mjs, so live
-          // cannot import back. The live worker is the DEFAULT one, and until
-          // this was passed down the whole run-diffstat pipeline was reachable
-          // only under FLOWVIANT_POLL=1 — the app's live-changes panel had no
-          // data source at all for the path everybody actually runs.
-          sampleDiffstat,
-          isAlive: () => state.alive,
-          onChild: (ch) => {
-            state.child = ch;
-          },
-          // Which task this lane is holding, so per-process memory can be
-          // attributed to a task rather than to an anonymous pid. "The box is
-          // full" is not actionable; "this task is holding 9GB" is.
-          onIntent: (id) => {
-            state.intentId = id;
-          },
-          // Hold the preview's stop fn so teardown/removal can kill the detached
-          // dev-server + tunnel (they survive our exit otherwise).
-          onPreview: (stop) => {
-            state.stopPreview = stop;
-          },
-          // A turn that couldn't reach the MCP server: forget the cached token so
-          // the next reconcile poll re-mints a fresh one (self-heals a token that
-          // was rotated/expired out from under a running session).
-          onTokenSuspect: (id) => {
-            tokenByAgent.delete(id);
-            mintedAt.delete(id);
-          },
-        });
-        workers.set(a.agentId, { state, promise, wt, label });
-      }
-    }
 
     // Living-wiki work (runs under its own minted wiki token — no agent
     // needed). enqueueSweep queues a Regenerate; regroundJobs re-offers merged

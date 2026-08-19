@@ -168,13 +168,9 @@ export const ALLOW_PATCHES =
 // them (Node's default UA is treated as a bot). Claude Code sends its own UA.
 export const USER_AGENT = `flowviant/${VERSION}`;
 
-// One of: a fleet credential (recommended), one worker token, or a comma list.
+// The ONE credential. `tokens` (FLOWVIANT_TOKEN / FLOWVIANT_TOKENS / --token /
+// --tokens) stood beside it and carried WORKER tokens into the pre-daemon loop;
+// that principal owns zero tools since dispatch was deleted, and the kind can no
+// longer be minted, so the plumbing went with the entrypoint (2026-08-19).
 export const FLEET_TOKEN =
   argFlag('--fleet') || process.env.FLOWVIANT_FLEET || stored?.fleetToken || '';
-const rawTokens =
-  argFlag('--tokens') ||
-  process.env.FLOWVIANT_TOKENS ||
-  argFlag('--token') ||
-  process.env.FLOWVIANT_TOKEN ||
-  '';
-export const tokens = rawTokens.split(',').map((t) => t.trim()).filter(Boolean);
