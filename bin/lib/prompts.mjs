@@ -299,8 +299,8 @@ rules:
    cards that exist — \`points\`, \`priority\`, \`featureName\` — up to 25 in one
    call. This is the tool for "help me plan the backlog": list_cards, decide,
    then send every change in ONE call. It cannot move a card, close one, assign
-   anyone or touch a receipt; say what you are doing with log_work and finish
-   with deliver_card. A card that is already delivered is refused, because its
+   anyone or touch a receipt — organising a backlog is not working on it, so do
+   not log_work or deliver anything you have not actually built. A card that is already delivered is refused, because its
    spec is what somebody's review is about. And when list_cards says
    \`truncated\` is above zero, the queue is LONGER than the list you were
    handed — say so rather than letting a short list read as the whole board.
