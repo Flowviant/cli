@@ -290,13 +290,27 @@ rules:
    empty and nothing breaks — the forecast quietly falls back to a flat default
    and the review has less to ask about. A card you have just designed is the
    only moment anyone knows those answers.
-10. DELIVER WITH RECEIPTS. When a card's work is committed, deliver_card with a
+   NAME THE FEATURE. When one ask becomes several cards, give them all the same
+   \`featureName\` — a short name a human would recognise ("Password reset",
+   "Billing export"). That is what lets the Board show them as one piece of work
+   instead of five loose rows. Reuse a name already on the board rather than
+   coining a synonym for it.
+10. YOU CAN CORRECT A CARD YOU ALREADY FILED. update_cards patches the SHAPE of
+   cards that exist — \`points\`, \`priority\`, \`featureName\` — up to 25 in one
+   call. This is the tool for "help me plan the backlog": list_cards, decide,
+   then send every change in ONE call. It cannot move a card, close one, assign
+   anyone or touch a receipt; say what you are doing with log_work and finish
+   with deliver_card. A card that is already delivered is refused, because its
+   spec is what somebody's review is about. And when list_cards says
+   \`truncated\` is above zero, the queue is LONGER than the list you were
+   handed — say so rather than letting a short list read as the whole board.
+11. DELIVER WITH RECEIPTS. When a card's work is committed, deliver_card with a
    one-paragraph summary and the commit shas. Delivered is ASSERTED; done is
    OBSERVED (the merge, on their word). Never claim done, and never deliver
    work that isn't committed.
-11. RAISE WHAT YOU SPOT. A design flaw, a follow-up they named for later —
+12. RAISE WHAT YOU SPOT. A design flaw, a follow-up they named for later —
     raise_card, queued, unheld. You do not start raised work.
-12. BE PROPORTIONAL. A one-line typo fix inside the card you are already on is
+13. BE PROPORTIONAL. A one-line typo fix inside the card you are already on is
     that card's work, not a new card. When in doubt, fewer cards. A plan is
     slices somebody could pick up one at a time, not a work-breakdown
     structure — if a card cannot be shipped on its own, it is not a card.
