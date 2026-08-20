@@ -13,6 +13,12 @@
  * uncommitted work in the same total. Untracked files count too: git calls them
  * nothing until they are added, and a human calls them new work.
  *
+ * It also carries THIS BRANCH'S OWN COMMITS and the cards they name — see
+ * `branchCommits` below. That rides here rather than on a route of its own
+ * because this sweep is already standing in the right directory on the right
+ * beat, and a second endpoint would be a second poll for a fact this one is
+ * next to.
+ *
  * Everything here is best-effort and read-only. A worktree mid-rebase, a
  * deleted directory, a file that vanished between listing and reading — each
  * degrades to a smaller answer, never to a thrown error. Nothing about a
@@ -30,6 +36,109 @@ const MAX_FILES = 20;
 const MAX_UNTRACKED_SCAN = 200;
 /** Past this we call a file binary rather than counting its lines. */
 const MAX_COUNT_BYTES = 512 * 1024;
+/** Commits reported per sweep. The server caps each CARD at 50; this is the
+ *  branch-wide bound, and a session branch past it is carrying an afternoon
+ *  nobody is going to read commit-by-commit. */
+const MAX_COMMITS = 50;
+
+/**
+ * WHICH CARDS A COMMIT NAMES.
+ *
+ * The convention is a git TRAILER — `Flowviant-Task: <id>` on its own line at
+ * the foot of the message, the same shape as `Co-authored-by:` and `Signed-off-
+ * by:`. Chosen over another MCP call for three reasons: it costs no write
+ * budget, it works on agy tabs which cannot mount MCP at all, and the commit IS
+ * the evidence rather than an assertion about it.
+ *
+ * Case-insensitive on the key and tolerant of several ids on one line, because
+ * a person or an agent writing this by hand will do both. Anything that is not
+ * a plausible id is dropped here rather than shipped: the server drops unknown
+ * ids too, but a readout should not spend a request on obvious noise.
+ */
+function taskIdsFromMessage(body) {
+  const ids = [];
+  for (const line of String(body || '').split('\n')) {
+    const m = line.match(/^\s*Flowviant-Task\s*:\s*(.+?)\s*$/i);
+    if (!m) continue;
+    for (const raw of m[1].split(/[\s,]+/)) {
+      const id = raw.replace(/^[#<]+|[>,.]+$/g, '');
+      if (id && id.length <= 64 && /^[A-Za-z0-9_-]+$/.test(id) && !ids.includes(id)) {
+        ids.push(id);
+      }
+    }
+  }
+  return ids;
+}
+
+/**
+ * The commits this branch has that base does not, with the cards they name.
+ *
+ * Only commits carrying a trailer are RETURNED: an untrailered commit belongs
+ * to no card, and ship-time reconciliation already turns those into a bundle so
+ * nothing shipped is invisible. Sending them anyway would be a payload the
+ * server drops on every sweep.
+ *
+ * `--no-merges`, because a merge commit describes a range rather than doing
+ * work, and its trailer (if it has one) would double-book the range's own
+ * commits.
+ */
+function branchCommits(wt, base) {
+  if (!base) return [];
+  const out = [];
+  try {
+    // %x1e between records, %x1f between fields — a subject and a body can
+    // contain anything a person can type, so the delimiters must be bytes they
+    // cannot.
+    const raw = git(
+      [
+        'log',
+        '--no-merges',
+        '-n',
+        String(MAX_COMMITS),
+        '--format=%H%x1f%s%x1f%an%x1f%aI%x1f%B%x1e',
+        `${base}..HEAD`,
+      ],
+      wt
+    );
+    for (const rec of raw.split('\x1e')) {
+      const line = rec.replace(/^\n+/, '');
+      if (!line.trim()) continue;
+      const [sha, subject, author, at, body] = line.split('\x1f');
+      if (!sha) continue;
+      const taskIds = taskIdsFromMessage(body);
+      if (taskIds.length === 0) continue;
+      let additions = 0;
+      let deletions = 0;
+      try {
+        const stat = git(['show', '--numstat', '--format=', sha], wt);
+        for (const l of stat.split('\n')) {
+          if (!l.trim()) continue;
+          const [a, d] = l.split('\t');
+          if (a === '-' || d === '-') continue; // binary
+          additions += Number(a) || 0;
+          deletions += Number(d) || 0;
+        }
+      } catch {
+        /* a commit we cannot stat still names its cards — send it anyway */
+      }
+      out.push({
+        // Clamped to the server's zod caps, same rule as everything else in
+        // this file: one over-cap string 400s the whole batch.
+        sha: sha.slice(0, 64),
+        subject: (subject ?? '').slice(0, 200),
+        author: (author ?? '').slice(0, 80),
+        at: (at ?? '').slice(0, 40),
+        additions,
+        deletions,
+        taskIds: taskIds.slice(0, 8),
+      });
+    }
+  } catch {
+    /* no base, unborn branch, or a repo mid-rebase — report no commits */
+  }
+  // Oldest first, so a card's list reads in the order the work happened.
+  return out.reverse();
+}
 
 /** Lines in a buffer, the way a diff counts them: a trailing newline does not
  *  add a line, and a NUL byte anywhere means we are not looking at text. */
@@ -48,7 +157,9 @@ function countLines(buf) {
  *   baseLabel:string, baseCommits:{sha:string, subject:string, author:string}[],
  *   dirty:boolean, additions:number, deletions:number, fileCount:number,
  *   truncated:number,
- *   files:{path:string, added:number, deleted:number, binary?:boolean}[]}}
+ *   files:{path:string, added:number, deleted:number, binary?:boolean}[],
+ *   commits:{sha:string, subject:string, author:string, at:string,
+ *     additions:number, deletions:number, taskIds:string[]}[]}}
  */
 export function worktreeDiff(wt, baseRef) {
   if (!wt || !existsSync(wt)) return null;
@@ -189,5 +300,6 @@ export function worktreeDiff(wt, baseRef) {
     fileCount: files.length,
     truncated: Math.max(0, files.length - MAX_FILES),
     files: files.slice(0, MAX_FILES),
+    commits: branchCommits(wt, base),
   };
 }

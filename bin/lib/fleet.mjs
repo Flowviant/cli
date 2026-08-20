@@ -550,6 +550,7 @@ export async function runFleetDaemon() {
     flushWorkReports,
     processWorkTurns,
     processShipJobs,
+    processDiffJobs,
     retireWorkSessions,
     reportWorktrees,
     shutdownWork,
@@ -1173,6 +1174,10 @@ export async function runFleetDaemon() {
     // sessions are LIVE, and the guards above (chains, shipping) are populated
     // by the intake this same tick.
     retireWorkSessions(roster.activeWorkSessions);
+    // Diffs somebody has open and is waiting on. Project-scoped rather than
+    // per-session: `git show` runs from the repo ROOT, which can see a closed
+    // tab's branch and a shipped commit on main alike.
+    processDiffJobs(roster.diffJobs);
     // …and what the SURVIVING ones hold: branch, ahead-of-base, diffstat.
     // Throttled inside, never awaited — a `git status` the human cannot run
     // themselves from a browser, relayed. After retirement so a directory that
