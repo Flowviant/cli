@@ -41,7 +41,7 @@ import {
   WORK_TURN_KICKOFF_PLAIN,
 } from './prompts.mjs';
 import { materializeInto, excludeInWorktree, scrub as envScrub } from './env.mjs';
-import { detectRuntimes, canRun, RUNTIMES } from './runtimes.mjs';
+import { detectRuntimes, canRun, recordSkills, RUNTIMES } from './runtimes.mjs';
 import { isTerminalSessionLive, isAgyConversationLive } from './localSessions.mjs';
 import { worktreeDiff } from './worktreeDiff.mjs';
 import { homedir } from 'node:os';
@@ -1353,6 +1353,12 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
               streamJson: true,
               answerFromResult: true,
               onActivity: (a) => narrator.line(a?.label),
+              // What this CLI says it can be asked for by name. Harvested off
+              // the init event the stream already carries — no probe, no scan,
+              // no extra spawn — and reported on the next roster poll so the
+              // composer can autocomplete a `/`. See runtimes.mjs for why it is
+              // learned from a turn rather than looked up.
+              onInit: (i) => recordSkills(i.skills),
               cwd: dir.wt,
               mcpArgs: mcp.args,
               mcpEnv: mcp.env,

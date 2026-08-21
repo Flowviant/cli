@@ -903,3 +903,50 @@ export function detectRuntimes({ refresh = false } = {}) {
   });
   return detectedCache;
 }
+
+/**
+ * WHAT THE CLI SAID IT CAN BE ASKED FOR BY NAME — the machine's skills.
+ *
+ * Learned, never scanned. Claude Code's `system.init` event names its own
+ * resolved skill set on every stream-json turn, and the daemon already parses
+ * that stream (claude.mjs), so this costs nothing and is authoritative: it has
+ * plugins, this repo's `.claude/skills`, and whatever project settings enabled
+ * or disabled already folded in. A `~/.claude/skills` scan of our own would be
+ * a second implementation of the CLI's resolution rules, and would drift.
+ *
+ * THE PRICE OF LEARNING RATHER THAN PROBING is that a machine which has not run
+ * a turn yet knows nothing, and says nothing. That is the honest answer: the
+ * app renders no menu rather than an empty one, and a slash typed into a tab
+ * still reaches the CLI either way — the menu is an autocomplete, never a gate.
+ * We do NOT probe for it: a `claude -p` run purely to populate a dropdown would
+ * spend the operator's quota on a UI affordance.
+ *
+ * PER MACHINE, not per session. Every session worktree is a checkout of the one
+ * repo this daemon serves, so project skills are identical across tabs and
+ * personal skills are machine-wide. Last turn wins, which is what makes a skill
+ * added mid-run show up on the next poll.
+ */
+let skillsCache = null;
+
+/** Claude Code's own names: letters, digits, dash, underscore, and the colon a
+ *  plugin skill wears (`plugin:skill`). Anything else is not a name we could
+ *  put after a `/` anyway, so it is dropped rather than relayed as garbage. */
+const SKILL_NAME = /^[A-Za-z0-9][A-Za-z0-9_:-]{0,63}$/;
+
+/** Record what a turn's init event reported. Bounded and sorted so the poll's
+ *  query param has a stable length and a stable order — an unstable order would
+ *  make the server write a "change" on every single poll. */
+export function recordSkills(names) {
+  if (!Array.isArray(names)) return;
+  const clean = [...new Set(names.map((n) => String(n).trim()).filter((n) => SKILL_NAME.test(n)))]
+    .sort()
+    .slice(0, 100);
+  // An empty report is a FACT (a machine with no skills installed), so it is
+  // recorded as []. Never conflated with null, which stays "no turn has run".
+  skillsCache = clean;
+}
+
+/** What to send on the roster poll — null until a turn has taught us. */
+export function knownSkills() {
+  return skillsCache;
+}

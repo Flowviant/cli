@@ -197,7 +197,7 @@ const oneLine = (s, n = 160) => String(s).replace(/\s+/g, ' ').trim().slice(0, n
 // every intermediate text block still NARRATES, but only the final `result`
 // event contributes text — otherwise the same sentences arrive twice, once as
 // they stream and once in the result, and the tab posts the duplicate.
-function handleStreamLine(line, { cwd, emit, onActivity, appendText, answerFromResult }) {
+function handleStreamLine(line, { cwd, emit, onActivity, appendText, answerFromResult, onInit }) {
   let ev;
   try {
     ev = JSON.parse(line);
@@ -224,6 +224,19 @@ function handleStreamLine(line, { cwd, emit, onActivity, appendText, answerFromR
         push(humanizeToolUse(b.name, b.input || {}, cwd));
       }
     }
+  } else if (ev.type === 'system' && ev.subtype === 'init') {
+    // WHAT THIS MACHINE'S CLI CAN BE ASKED FOR BY NAME. The init event is the
+    // CLI's OWN answer — it has already resolved personal skills, this repo's
+    // skills, plugins and whatever the project settings enable or disable — so
+    // reading it costs nothing and cannot drift the way a `~/.claude/skills`
+    // scan of our own would. `skills` (rather than `slash_commands`) is the
+    // deliberate narrowing: the 50-odd commands beside it are the CLI's own
+    // interactive furniture (/clear, /model, /compact), and offering those in a
+    // relayed tab would be an offer wired to nothing.
+    //
+    // Only ever REPORTED, never enforced. Flowviant does not decide what your
+    // Claude can do; it relays what your Claude said it has.
+    if (Array.isArray(ev.skills)) onInit?.({ skills: ev.skills.map(String) });
   } else if (ev.type === 'result') {
     // The final assistant text (carries WIKI_DONE / REGROUND_DONE).
     if (typeof ev.result === 'string') appendText(ev.result + '\n');
@@ -247,7 +260,7 @@ function handleStreamLine(line, { cwd, emit, onActivity, appendText, answerFromR
 // returned string for sentinel detection, and each activity is handed to
 // `onActivity` so the caller can forward progress. Build-agent turns leave it
 // off and keep the raw text passthrough + line sentinels.
-export function runTurn({ prompt, resume, system, cwd, mcpConfig, mcpArgs, mcpEnv, runtime = 'claude', label, onSpawn, streamJson, answerFromResult, onActivity, onThreadId, wikiPerm, readOnly, planPerm, vaultDir, resultSchemaArgs, model, effort, adoptResumeId, resumeThreadId, resumeConversationId }) {
+export function runTurn({ prompt, resume, system, cwd, mcpConfig, mcpArgs, mcpEnv, runtime = 'claude', label, onSpawn, streamJson, answerFromResult, onActivity, onInit, onThreadId, wikiPerm, readOnly, planPerm, vaultDir, resultSchemaArgs, model, effort, adoptResumeId, resumeThreadId, resumeConversationId }) {
   return new Promise((resolve) => {
     const rt = runtimeById(runtime);
     if (!rt.args) {
@@ -359,7 +372,7 @@ export function runTurn({ prompt, resume, system, cwd, mcpConfig, mcpArgs, mcpEn
       /** One line of the child's stdout, in whichever dialect it speaks. */
       const onLine = (line) => {
         if (!rt.parse)
-          return handleStreamLine(line, { cwd, emit, onActivity, appendText, answerFromResult });
+          return handleStreamLine(line, { cwd, emit, onActivity, appendText, answerFromResult, onInit });
         const ev = rt.parse(line, cwd);
         if (!ev) return;
         // The conversation id, when the runtime announces one (codex's

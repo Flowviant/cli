@@ -73,7 +73,7 @@ import {
 } from './env.mjs';
 import { processDeployJobs, reportDeployConfig } from './deploy.mjs';
 import { machineSnapshot } from './resources.mjs';
-import { detectRuntimes, pickRuntimeFor, RUNTIMES } from './runtimes.mjs';
+import { detectRuntimes, knownSkills, pickRuntimeFor, RUNTIMES } from './runtimes.mjs';
 import { createWorkManager } from './work.mjs';
 import { scanLocalSessions } from './localSessions.mjs';
 
@@ -117,6 +117,21 @@ async function fetchRoster(haveIds) {
     if (drivable.length) url.searchParams.set('runtimes', drivable.join(','));
   } catch {
     /* detection is best-effort — a probe must never fail the poll */
+  }
+  // WHAT THE CLI CAN BE ASKED FOR BY NAME, so the composer can autocomplete a
+  // `/` the way the terminal does. Learned from the init event of a turn we
+  // already ran (runtimes.mjs) — never probed, because spawning a CLI to fill a
+  // dropdown would spend the operator's quota on an affordance.
+  //
+  // NOT SENT until a turn has taught us: absent means "no turn has run here
+  // yet", and the app renders no menu rather than asserting this machine has no
+  // skills. An empty report, though, IS a fact and is sent as such — hence the
+  // null check rather than a truthiness check on the array.
+  try {
+    const skills = knownSkills();
+    if (skills !== null) url.searchParams.set('skills', skills.join(','));
+  } catch {
+    /* best-effort — the poll must never fail on a readout */
   }
   // Env-sync identity + materialized version (the Settings "env vN" chip).
   try {

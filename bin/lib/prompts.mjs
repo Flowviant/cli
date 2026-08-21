@@ -397,24 +397,73 @@ for work, do it.
 
 Write plain Markdown for a person reading your reply in a chat tab.`;
 
+/**
+ * A LEADING SLASH COMMAND, which the CLI will only expand at position 0.
+ *
+ * Claude Code parses `/name …` as a command ONLY when it opens the prompt. Every
+ * turn here wraps the human's words in the scaffolding below, so a `/code-review`
+ * typed into a tab used to arrive on line 6 of a fenced block — inert text that
+ * looked like it should have worked. That is the product telling you no for
+ * bookkeeping reasons, which is the one thing it never does.
+ *
+ * SHAPE, NOT MEMBERSHIP. We do not check the name against the machine's skill
+ * list: that list is only learned after a turn has run (runtimes.mjs), so
+ * gating on it would make the first `/foo` of a machine's life behave
+ * differently from the second. Instead this matches what a command can LOOK
+ * like — one segment, no second slash — which leaves `/home/user/x.ts is
+ * broken` fenced as the prose it is. Measured on 2.1.238: an unknown command
+ * is treated as ordinary text, so a false positive costs nothing anyway.
+ */
+const LEADING_SLASH_COMMAND = /^\/[A-Za-z0-9][A-Za-z0-9_:-]*(?=\s|$)/;
+
+/**
+ * The kickoff, in the two orders it can be written.
+ *
+ * ORDINARY: scaffolding first, the human's words fenced inside it. The speaker
+ * is the tab's OWNER — the same person who owns this machine — so this is the
+ * one prompt whose author is fully trusted. The fence stays anyway: it costs
+ * nothing and keeps the shape identical everywhere, and repo content this turn
+ * READS is as untrusted as ever.
+ *
+ * SLASH: the human's words go FIRST, verbatim and unfenced, because that is the
+ * only position the CLI expands a command from — and the scaffolding follows,
+ * LABELLED as ours so the trailing lines cannot read as more of what the person
+ * typed. The fence is what is traded away, and only for the one author already
+ * trusted above; nothing else about the turn changes.
+ */
+const kickoff = ({ message, askedByName, head, tail }) => {
+  const scaffold =
+    `${head}\n\n` +
+    `${fence('WHO IS TALKING', askedByName || 'the tab owner')}\n\n`;
+  if (LEADING_SLASH_COMMAND.test(message.trim()))
+    return (
+      `${message.trim()}\n\n` +
+      `---\n` +
+      `[FLOWVIANT SESSION CONTEXT — written by Flowviant, not typed by the person above]\n` +
+      `${scaffold}${tail}`
+    );
+  return `${scaffold}${fence('WHAT THEY SAID', message)}\n\n${tail}`;
+};
+
 export const WORK_TURN_KICKOFF = ({ sessionId, sessionName, message, askedByName }) =>
-  // The speaker is the tab's OWNER — the same person who owns this machine —
-  // so this is the one prompt whose author is fully trusted. The fence stays
-  // anyway: it costs nothing and keeps the shape identical everywhere, and repo
-  // content this turn READS is as untrusted as ever.
-  `Continue the session${sessionName ? ` "${sessionName}"` : ''}.\n\n` +
-  `SESSION ID (pass this to stream_session_turn / update_session): ${sessionId}\n\n` +
-  `${fence('WHO IS TALKING', askedByName || 'the tab owner')}\n\n` +
-  `${fence('WHAT THEY SAID', message)}\n\n` +
-  `Stream your reply with stream_session_turn as you work.`;
+  kickoff({
+    message,
+    askedByName,
+    head:
+      `Continue the session${sessionName ? ` "${sessionName}"` : ''}.\n\n` +
+      `SESSION ID (pass this to stream_session_turn / update_session): ${sessionId}`,
+    tail: `Stream your reply with stream_session_turn as you work.`,
+  });
 
 /** The plain tab's kickoff: no session id (there is no tool to pass it to)
  *  and no streaming instruction — the final message is the reply. */
 export const WORK_TURN_KICKOFF_PLAIN = ({ sessionName, message, askedByName }) =>
-  `Continue the session${sessionName ? ` "${sessionName}"` : ''}.\n\n` +
-  `${fence('WHO IS TALKING', askedByName || 'the tab owner')}\n\n` +
-  `${fence('WHAT THEY SAID', message)}\n\n` +
-  `Reply with your complete report when the work is done.`;
+  kickoff({
+    message,
+    askedByName,
+    head: `Continue the session${sessionName ? ` "${sessionName}"` : ''}.`,
+    tail: `Reply with your complete report when the work is done.`,
+  });
 
 
 export const REGROUND_KICKOFF = ({ sha, title, files, vaultDir, predictedPages = [] }) =>
