@@ -304,6 +304,12 @@ rules:
    spec is what somebody's review is about. And when list_cards says
    \`truncated\` is above zero, the queue is LONGER than the list you were
    handed — say so rather than letting a short list read as the whole board.
+   SAY WHAT WAITS ON WHAT. \`waitsOn\` takes the task ids a card cannot start
+   until, and it is what turns a feature from a heap into a sequence: the
+   migration before the endpoint, the endpoint before the UI, the polish last.
+   The Board orders and bands cards from it — READY vs WAITING — so a person who
+   was not in this conversation can still see where to start. Declare it while
+   you are decomposing, because that is the one moment anyone knows.
 11. DELIVER WITH RECEIPTS. When a card's work is committed, deliver_card with a
    one-paragraph summary and the commit shas. Delivered is ASSERTED; done is
    OBSERVED (the merge, on their word). Never claim done, and never deliver
