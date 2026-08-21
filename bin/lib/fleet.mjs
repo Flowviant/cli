@@ -60,6 +60,7 @@ import {
   REGROUND_KICKOFF,
 } from './claude.mjs';
 import { reapOrphanPreviews } from './preview.mjs';
+import { acquireInstanceLock } from './instance.mjs';
 import { preflight } from './preflight.mjs';
 import { connectStream } from './stream.mjs';
 import { ensureVault, syncVault } from './vault.mjs';
@@ -261,6 +262,32 @@ export async function runFleetDaemon() {
   );
   info(`server · ${FLEET_URL}`);
   console.log('');
+
+  // ONE DAEMON PER CREDENTIAL. Before preflight, before the preview reap,
+  // before anything with a side effect — a second daemon must not so much as
+  // install a CLI or clear a registry on its way to being refused. Keyed on the
+  // credential rather than the repo, because two checkouts on one credential is
+  // the SAME project served twice, and the worst version of this: their session
+  // worktrees are in different directories, so the per-turn lock cannot even see
+  // across them. See instance.mjs for why that lock is not enough on its own.
+  const instance = acquireInstanceLock(FLEET_TOKEN, repoRoot);
+  if (!instance.ok) {
+    const h = instance.holder;
+    console.log('');
+    fail('a flowviant daemon is already running for this credential.');
+    if (h?.pid) info(`holder · pid ${h.pid}${h.repoRoot ? ` in ${h.repoRoot}` : ''}`);
+    // The two-checkouts case is the one nobody spots on their own: both tabs
+    // look healthy, and the damage is doubled cards and doubled edits in a repo
+    // you are not looking at. Name the other repo when it is a different one.
+    if (h?.repoRoot && h.repoRoot !== repoRoot)
+      warn('that is a DIFFERENT checkout — one credential serves one project, so both would answer the same tabs.');
+    note('stop the other one first, or run this one with FLOWVIANT_ALLOW_MULTI=1 if you know what you are doing.');
+    console.log('');
+    process.exit(1);
+  }
+  if (instance.unguarded)
+    warn('could not take the single-instance lock (unwritable ~/.flowviant) — running unguarded');
+
   await preflight({ needGit: true });
   // Kill any preview dev-server/tunnel groups a previously-crashed daemon left
   // running (detached children survive an ungraceful exit) before we start fresh.
