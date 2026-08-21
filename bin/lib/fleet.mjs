@@ -23,6 +23,7 @@ import {
   USER_AGENT,
   MCP_URL,
   SAFE,
+  DAEMON_INSTANCE,
   POLL_SECONDS,
   MAX_CONCURRENT,
   IDLE_SECONDS,
@@ -77,7 +78,7 @@ import { detectRuntimes, knownSkills, pickRuntimeFor, RUNTIMES } from './runtime
 import { createWorkManager } from './work.mjs';
 import { scanLocalSessions } from './localSessions.mjs';
 
-async function fetchRoster(haveIds) {
+async function fetchRoster(haveIds, livePreviewSessionIds = []) {
   const url = new URL(FLEET_URL);
   if (haveIds.length) url.searchParams.set('have', haveIds.join(','));
   // What this machine will run at once. The server grows lanes to meet waiting
@@ -98,6 +99,15 @@ async function fetchRoster(haveIds) {
   // so a team can see whether the shared box runs wide open, and enforces
   // nothing (membership is the consent boundary). Older servers ignore it.
   url.searchParams.set('safe', SAFE ? '1' : '0');
+  // WHICH PROCESS, so the server can lease preview work to exactly one of two
+  // daemons on one credential. Older servers ignore unknown params.
+  url.searchParams.set('di', DAEMON_INSTANCE);
+  // Which shares this machine is still serving. It rides the poll rather than
+  // taking an endpoint of its own: one beat, no floor, and the stale window is
+  // the reconcile interval instead of minutes — which matters, because a share
+  // the server still calls live is a 530 on somebody's phone. Always set, even
+  // empty: '' means "serving none", absent would mean "an older daemon".
+  url.searchParams.set('pv', livePreviewSessionIds.join(','));
   // WHICH CLIs this machine actually has, so the app can stop guessing.
   //
   // Until now every surface that listed Gemini or Codex said "not wired up yet"
@@ -374,6 +384,14 @@ export async function runFleetDaemon() {
   const nextByAgent = new Map();
   let leaseTtlSeconds = 24 * 60 * 60; // updated from each roster response
   let mcpUrl = MCP_URL;
+  // DEAD, and kept only because unpicking it is a rewire rather than a
+  // deletion: nothing calls `workers.set` anywhere in this tree. It held
+  // DISPATCH lanes, and the server has sent `agents: []` permanently since
+  // 2026-08-19, so every loop below iterates nothing. Two `stopPreview` calls
+  // hung off it until 2026-08-21 and read as live preview wiring; they were
+  // deleted, not rewired. When the Workbench preview lands, its teardown is
+  // keyed on sessionId and belongs beside retireWorkSessions in work.mjs —
+  // NOT here.
   const workers = new Map(); // agentId -> { state, promise, wt, label }
   let daemonAlive = true; // flipped false on shutdown so the stream stops reconnecting
   let stream = null; // push channel handle (set once the loop is set up)
@@ -413,15 +431,10 @@ export async function runFleetDaemon() {
       } catch {
         /* best-effort */
       }
-      // Stop the detached preview (dev server + cloudflared tunnel) — it's its
-      // own process group and survives our exit, otherwise leaking a port-bound
-      // server + a live tunnel serving a stale branch until reboot.
-      try {
-        w.state.stopPreview?.();
-      } catch {
-        /* best-effort */
-      }
     }
+    // Detached tunnels survive our exit by design, so leaving them would strand
+    // a public hostname until the box rebooted.
+    shutdownPreviews();
   };
   process.on('SIGINT', () => {
     console.log('');
@@ -593,6 +606,10 @@ export async function runFleetDaemon() {
     processWorkTurns,
     processShipJobs,
     processDiffJobs,
+    processPreviewJobs,
+    livePreviewIds,
+    retirePreviews,
+    shutdownPreviews,
     retireWorkSessions,
     reportWorktrees,
     shutdownWork,
@@ -1153,7 +1170,7 @@ export async function runFleetDaemon() {
   for (;;) {
     let roster;
     try {
-      roster = await fetchRoster(buildHave());
+      roster = await fetchRoster(buildHave(), livePreviewIds());
     } catch (e) {
       if (e.auth) {
         fail(`${e.message} — credential revoked or invalid. Shutting down.`);
@@ -1215,11 +1232,20 @@ export async function runFleetDaemon() {
     // AFTER the work/ship intake: retirement is the server saying which
     // sessions are LIVE, and the guards above (chains, shipping) are populated
     // by the intake this same tick.
+    // BEFORE retirement, and the order is load-bearing: `git worktree remove`
+    // under a running dev server leaves it serving bytes from open file handles
+    // in a directory that no longer exists — a human is shown the wrong thing
+    // and nothing errors anywhere.
+    retirePreviews(roster.activeWorkSessions);
     retireWorkSessions(roster.activeWorkSessions);
     // Diffs somebody has open and is waiting on. Project-scoped rather than
     // per-session: `git show` runs from the repo ROOT, which can see a closed
     // tab's branch and a shipped commit on main alike.
     processDiffJobs(roster.diffJobs);
+    // Shares to open or tear down. CLAIMED before acted on — two daemons on one
+    // credential are both handed this array, and both opening a tunnel strands
+    // a public hostname nobody can settle.
+    processPreviewJobs(roster.previewJobs);
     // …and what the SURVIVING ones hold: branch, ahead-of-base, diffstat.
     // Throttled inside, never awaited — a `git status` the human cannot run
     // themselves from a browser, relayed. After retirement so a directory that
@@ -1320,11 +1346,6 @@ export async function runFleetDaemon() {
         // task was already requeued server-side on removal.
         try {
           w.state.child?.kill('SIGKILL');
-        } catch {
-          /* best-effort */
-        }
-        try {
-          w.state.stopPreview?.();
         } catch {
           /* best-effort */
         }

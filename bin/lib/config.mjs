@@ -1,5 +1,6 @@
 /** Parsed configuration: env vars, CLI flags, and the chosen credentials. */
 
+import { randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -167,6 +168,21 @@ export const ALLOW_PATCHES =
 // Sent on the daemon's own HTTP calls so Cloudflare Bot Fight Mode doesn't 403
 // them (Node's default UA is treated as a bot). Claude Code sends its own UA.
 export const USER_AGENT = `flowviant/${VERSION}`;
+
+/**
+ * WHICH DAEMON PROCESS this is — not which credential.
+ *
+ * Two daemons legitimately share one fleet token (that is exactly what
+ * `machineDaemonsDisagree` reports, and the instance lock added in 0.51.2
+ * cannot see a peer OLDER than itself). So the token cannot identify a lease
+ * holder, and anything that must be done exactly once needs this instead.
+ *
+ * Regenerated every start, deliberately: a daemon that restarted is a daemon
+ * that lost whatever it was holding, and a stale lease should not follow it
+ * back. Sent on the poll as `di`; its ABSENCE is what an older daemon looks
+ * like, and the server hands preview work to nobody who cannot name themselves.
+ */
+export const DAEMON_INSTANCE = randomBytes(12).toString('hex');
 
 // The ONE credential. `tokens` (FLOWVIANT_TOKEN / FLOWVIANT_TOKENS / --token /
 // --tokens) stood beside it and carried WORKER tokens into the pre-daemon loop;

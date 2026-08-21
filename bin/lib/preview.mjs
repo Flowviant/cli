@@ -1,163 +1,68 @@
 /**
- * Live preview (live mode). When a task opens its PR and parks for review, the
- * daemon starts the branch's dev server IN THE AGENT'S WORKTREE and opens a
- * cloudflared quick tunnel to it, so the reviewer can drive the real running
- * change in Flowviant (broker-not-host: Flowviant only stores the tunnel URL;
- * the reviewer's browser talks to it directly).
+ * Put a password-gated public URL in front of a dev server the DRIVER is
+ * already running in their own worktree.
  *
- * Zero-config where possible: the preview config is read from
- * `.flowviant/preview.json` if present, otherwise INFERRED from package.json
- * (framework → port). cloudflared is AUTO-FETCHED if it isn't installed. No
- * cloudflared / no inferable config → no live preview, and review falls back to
- * the captured evidence the agent attached (never a hard failure).
+ * This file used to be the other half of a deleted feature: a dispatch run
+ * parked for review, and the daemon started the branch's dev server from a
+ * repo-declared command and tunnelled it. That whole start path is GONE
+ * (2026-08-21) and is not coming back. What it did, stated plainly so nobody
+ * rebuilds it: read `.flowviant/preview.json` — a file the BRANCH controls —
+ * or infer a command from package.json, then `spawn(cmd, {shell: true})` with
+ * `env: {...process.env}`, which ran `npm install` and its lifecycle scripts
+ * and handed the resulting internet-exposed process the daemon's own
+ * FLOWVIANT_FLEET credential. One click behind a button, and a hostile branch
+ * owns the machine.
  *
- * Config shape (the escape hatch for any setup the defaults don't handle — the
- * repo declares its own recipe, so the daemon never needs per-framework code):
- *   { "ui": {
- *       "cmd": "<start dev server>",   // required
- *       "port": 5173,                  // required
- *       "env": { "FOO": "bar" },       // optional — extra env for the dev server
- *       "hostHeader": "localhost",     // optional — Host sent to the origin;
- *                                      //   false disables the rewrite (for apps
- *                                      //   that need their real public Host)
- *       "auth": true                   // optional — gate the public tunnel
- *                                      //   behind a generated password (shown
- *                                      //   in the app); off by default
- *     },
- *     "api": { "cmd": "<start api>", "port": 8787 } }
+ * The replacement inverts the direction. The human runs their dev server
+ * themselves, exactly as they would in a terminal; `listeners.mjs` NOTICES it;
+ * and this file only ever wraps a port that has already been measured inside
+ * that session's worktree. Flowviant executes nothing the repo wrote.
+ *
+ * Two invariants that must survive any edit here:
+ *  - THE GATE IS MANDATORY. `startAuthProxy` returning null aborts the share.
+ *    There is no un-gated path, no config key that disables it, and no log line
+ *    that shrugs and tunnels anyway.
+ *  - WE ONLY EXECUTE WHAT WE VERIFIED. An auto-fetched cloudflared is pinned to
+ *    a version and checked against a hardcoded SHA-256 before it is made
+ *    executable. TLS alone is not integrity for a binary that runs on the
+ *    machine holding the repo, the git credentials and the decrypted env vault.
  */
 
 import { spawn, execFileSync } from 'node:child_process';
-import { createServer } from 'node:net';
-import { readFileSync, writeFileSync, existsSync, mkdirSync, chmodSync, readdirSync, rmSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import {
+  readFileSync,
+  writeFileSync,
+  renameSync,
+  existsSync,
+  mkdirSync,
+  chmodSync,
+  openSync,
+  closeSync,
+  statSync,
+  rmSync,
+  unlinkSync,
+} from 'node:fs';
 import { join } from 'node:path';
 import { homedir, platform, arch } from 'node:os';
 import { startAuthProxy } from './authproxy.mjs';
+import { isListening } from './listeners.mjs';
 
-// ── Config: explicit file, else infer from package.json ────────────────────
+// ── cloudflared: pinned, verified, or not fetched at all ───────────────────
 
-function readPreviewConfig(repoRoot) {
-  const p = join(repoRoot, '.flowviant', 'preview.json');
-  if (!existsSync(p)) return null;
-  try {
-    return JSON.parse(readFileSync(p, 'utf8'));
-  } catch {
-    return null;
-  }
-}
-
-// Framework → conventional dev-server port. If we can't identify one, we don't
-// guess — an explicit .flowviant/preview.json is the escape hatch.
-const FRAMEWORK_PORTS = [
-  { re: /\bvite\b/, port: 5173 },
-  { re: /\bnext\b/, port: 3000 },
-  { re: /react-scripts/, port: 3000 },
-  { re: /\bastro\b/, port: 4321 },
-  { re: /\bnuxt\b/, port: 3000 },
-  { re: /\bremix\b/, port: 3000 },
-  { re: /\bsvelte/, port: 5173 },
-  { re: /\bgatsby\b/, port: 8000 },
-  { re: /\bexpo\b/, port: 8081 },
-  { re: /@angular\/|\bng serve\b/, port: 4200 },
-  { re: /vue-cli-service/, port: 8080 },
-];
-
-// A repo whose ROOT is a library/monorepo often keeps its web app in a subdir,
-// so the root package.json has no dev server at all. Search these (plus every
-// child of apps/ and packages/) so a nested frontend previews with ZERO config.
-const SUBDIR_CANDIDATES = [
-  'web', 'webapp', 'frontend', 'client', 'ui', 'site', 'www', 'app', 'dashboard',
-];
-const SUBDIR_PARENTS = ['apps', 'packages'];
-
-function pkgManager(dir) {
-  if (existsSync(join(dir, 'bun.lock')) || existsSync(join(dir, 'bun.lockb'))) return 'bun';
-  if (existsSync(join(dir, 'pnpm-lock.yaml'))) return 'pnpm';
-  if (existsSync(join(dir, 'yarn.lock'))) return 'yarn';
-  return 'npm';
-}
-
-// An explicit port baked into the dev script (PORT=3005 …, -p 3005, --port 3005,
-// --port=3005) overrides the framework default — otherwise the tunnel would
-// target the wrong port and never connect.
-function portFromScript(s) {
-  const m = String(s).match(/(?:PORT=|(?:^|\s)-p[=\s]+|--port[=\s]+)(\d{2,5})\b/);
-  return m ? Number(m[1]) : null;
-}
-
-// Infer {script, port} from one directory's package.json, or null if it has no
-// dev/start script or no framework we can map to a port.
-function inferFromDir(absDir) {
-  const pkgPath = join(absDir, 'package.json');
-  if (!existsSync(pkgPath)) return null;
-  let pkg;
-  try {
-    pkg = JSON.parse(readFileSync(pkgPath, 'utf8'));
-  } catch {
-    return null;
-  }
-  const scripts = pkg.scripts || {};
-  const script = scripts.dev ? 'dev' : scripts.start ? 'start' : null;
-  if (!script) return null;
-  const deps = { ...pkg.dependencies, ...pkg.devDependencies };
-  const hay = `${scripts[script]} ${Object.keys(deps).join(' ')}`.toLowerCase();
-  const fw = FRAMEWORK_PORTS.find((f) => f.re.test(hay));
-  if (!fw) return null; // can't safely guess the port
-  return { script, port: portFromScript(scripts[script]) ?? fw.port };
-}
-
-// The ordered dirs to probe: root, then the common frontend names, then every
-// child of apps/ and packages/. Relative to repoRoot ('' = root).
-function candidateDirs(repoRoot) {
-  const dirs = ['', ...SUBDIR_CANDIDATES];
-  for (const parent of SUBDIR_PARENTS) {
-    const p = join(repoRoot, parent);
-    try {
-      for (const e of readdirSync(p, { withFileTypes: true })) {
-        if (e.isDirectory()) dirs.push(`${parent}/${e.name}`);
-      }
-    } catch {
-      /* no such parent dir */
-    }
-  }
-  return dirs;
-}
-
-function buildConfig(repoRoot, rel, hit) {
-  // Prefer the app dir's own package manager if it has a lockfile, else the repo
-  // root's (monorepos install from the root).
-  const abs = rel ? join(repoRoot, rel) : repoRoot;
-  const hasOwnLock = ['bun.lock', 'bun.lockb', 'pnpm-lock.yaml', 'yarn.lock', 'package-lock.json'].some(
-    (f) => existsSync(join(abs, f)),
-  );
-  const pm = pkgManager(hasOwnLock ? abs : repoRoot);
-  const install = pm === 'npm' ? 'npm install' : `${pm} install`;
-  const run = pm === 'yarn' ? `yarn ${hit.script}` : `${pm} run ${hit.script}`;
-  const inner = `${install} && ${run}`;
-  // Subdir apps run from their own folder (shell:true honors the cd prefix).
-  const cmd = rel ? `cd ${rel} && ${inner}` : inner;
-  return { ui: { cmd, port: hit.port }, dir: rel || '.' };
-}
-
-// Infer a preview config by probing the root and likely frontend subdirs.
-function inferPreviewConfig(repoRoot) {
-  for (const rel of candidateDirs(repoRoot)) {
-    const hit = inferFromDir(rel ? join(repoRoot, rel) : repoRoot);
-    if (hit) return buildConfig(repoRoot, rel, hit);
-  }
-  return null;
-}
-
-/** The preview config for a repo — explicit file wins, else inferred from the
- *  root or a nested frontend. Carries `dir` (relative) so callers can say where
- *  it found the app. */
-export function loadPreviewConfig(repoRoot) {
-  const explicit = readPreviewConfig(repoRoot);
-  if (explicit) return explicit;
-  return inferPreviewConfig(repoRoot);
-}
-
-// ── cloudflared: use if installed, else auto-fetch ─────────────────────────
+/**
+ * Pinned deliberately. `releases/latest/download/...` meant every machine
+ * fetched whatever was newest at the moment it happened to need one, which is
+ * both unverifiable and irreproducible. Bumping this is a release act: download
+ * the assets, hash them, replace both the tag and the digests.
+ */
+const CF_VERSION = '2026.8.2';
+const CF_SHA256 = {
+  'linux-amd64': 'fcfb02b575a52ca1af2e3267af4e1517bcdeb30ac48c834c69abaed3c0576ad2',
+  'linux-arm64': '7747d94570fb390cf47dcb4f9555c193c6355cda9793f0d878d9049e5d6a7790',
+  'darwin-amd64': 'f1727723c586500e2092368ae21871b3df7ddfd2cb097f22d81bee4a9c458bb4',
+  'darwin-arm64': '9042c2c5d8b2de78e60f313d5fb31b6c5c1cebde787a3caf1f2c9588084ac442',
+};
 
 function onPath() {
   try {
@@ -168,88 +73,130 @@ function onPath() {
   }
 }
 
-/** Resolve a cloudflared binary: PATH → cached fetch → download. Returns the
- *  command/path to run, or null if unavailable (Windows/macOS auto-fetch is
- *  skipped — those install cleanly via brew/winget). */
+/**
+ * Resolve a cloudflared binary: PATH → previously fetched → download.
+ *
+ * A cloudflared already on PATH is used as-is and NOT checksummed: the operator
+ * installed it (brew, apt, winget) and that is their trust decision, not ours.
+ * What we verify is what WE fetch and chmod +x, which is the only case where
+ * Flowviant is the one introducing an executable to the machine.
+ *
+ * Returns { bin } or { error } — the error is the machine's own sentence, meant
+ * to be relayed verbatim rather than replaced with a Flowviant-authored one.
+ */
 async function ensureCloudflared(log) {
-  if (onPath()) return 'cloudflared';
+  if (onPath()) return { bin: 'cloudflared' };
+
   const os = platform();
-  const dir = join(homedir(), '.flowviant', 'bin');
-  const bin = join(dir, os === 'win32' ? 'cloudflared.exe' : 'cloudflared');
-  if (existsSync(bin)) return bin;
   const a = arch() === 'arm64' ? 'arm64' : 'amd64';
+  const key = `${os === 'darwin' ? 'darwin' : 'linux'}-${a}`;
+  const dir = join(homedir(), '.flowviant', 'bin');
+  // Version-stamped, so a pin bump fetches rather than reusing the old binary.
+  const bin = join(dir, `cloudflared-${CF_VERSION}${os === 'win32' ? '.exe' : ''}`);
+  if (existsSync(bin)) return { bin };
+
+  const want = CF_SHA256[key];
+  if (!want) {
+    return {
+      error: `cloudflared is not installed, and this machine (${os}/${a}) has no pinned build to fetch. Install cloudflared and try again.`,
+    };
+  }
+
   try {
     mkdirSync(dir, { recursive: true });
-    if (os === 'darwin') {
-      // macOS ships a .tgz (not a raw binary) — download it and extract the
-      // single `cloudflared` executable with the system tar (always on macOS).
-      const url = `https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-${a}.tgz`;
-      log?.(`fetching cloudflared (darwin-${a}) to enable live previews…`);
-      const res = await fetch(url, { redirect: 'follow' });
-      if (!res.ok) throw new Error(`http ${res.status}`);
-      const tgz = join(dir, 'cloudflared.tgz');
-      writeFileSync(tgz, Buffer.from(await res.arrayBuffer()));
-      execFileSync('tar', ['-xzf', tgz, '-C', dir], { stdio: 'ignore' });
-      rmSync(tgz, { force: true });
-      if (!existsSync(bin)) throw new Error('archive did not contain cloudflared');
-      chmodSync(bin, 0o755);
-      return bin;
-    }
-    // linux + windows ship a raw single-file binary.
-    const osName = os === 'win32' ? 'windows' : 'linux';
-    const url = `https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-${osName}-${a}${
-      os === 'win32' ? '.exe' : ''
-    }`;
-    log?.(`fetching cloudflared (${osName}-${a}) to enable live previews…`);
+    const asset = os === 'darwin' ? `cloudflared-darwin-${a}.tgz` : `cloudflared-linux-${a}`;
+    const url = `https://github.com/cloudflare/cloudflared/releases/download/${CF_VERSION}/${asset}`;
+    log?.(`fetching cloudflared ${CF_VERSION} (${key})…`);
     const res = await fetch(url, { redirect: 'follow' });
     if (!res.ok) throw new Error(`http ${res.status}`);
-    writeFileSync(bin, Buffer.from(await res.arrayBuffer()));
-    if (os !== 'win32') chmodSync(bin, 0o755);
-    return bin;
+    const buf = Buffer.from(await res.arrayBuffer());
+
+    // Verify BEFORE anything becomes executable, and before extraction — a
+    // tarball is code too.
+    const got = createHash('sha256').update(buf).digest('hex');
+    if (got !== want) {
+      return {
+        error: `refused to install cloudflared ${CF_VERSION}: the download did not match its pinned checksum (expected ${want.slice(0, 12)}…, got ${got.slice(0, 12)}…). Install cloudflared yourself if you trust this network.`,
+      };
+    }
+
+    if (os === 'darwin') {
+      const tgz = join(dir, `cloudflared-${CF_VERSION}.tgz`);
+      writeFileSync(tgz, buf);
+      execFileSync('tar', ['-xzf', tgz, '-C', dir], { stdio: 'ignore' });
+      rmSync(tgz, { force: true });
+      const extracted = join(dir, 'cloudflared');
+      if (!existsSync(extracted)) throw new Error('archive did not contain cloudflared');
+      renameSync(extracted, bin);
+    } else {
+      writeFileSync(bin, buf);
+    }
+    chmodSync(bin, 0o755);
+    return { bin };
   } catch (e) {
-    const hint = os === 'darwin' ? ' (or `brew install cloudflared`)' : '';
-    log?.(`could not fetch cloudflared (${e.message}) — install it manually${hint} to enable live previews.`);
-    return null;
+    return { error: `could not fetch cloudflared (${e.message}). Install it and try again.` };
   }
 }
 
 const TUNNEL_RE = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/i;
-// Where a dev server announces it bound — "Local: http://localhost:3001/".
-const BIND_RE = /https?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0):(\d+)/i;
-
-/**
- * A port nobody is on right now — bind :0, read what the kernel handed us, let
- * it go. Inherently a RACE (someone could take it in the gap), which is fine:
- * this is a hint passed as $PORT, and the tunnel still aims at whatever the
- * server ACTUALLY announces. Worst case we lose the hint and land back on
- * today's behaviour.
- *
- * Why this exists: previews only survived concurrency by luck. vite/next hop to
- * the next free port when theirs is taken, so two tasks in one repo happened to
- * work. Anything that binds a FIXED port and exits on EADDRINUSE — the `api`
- * preview kind, an explicit `port` in preview.json, a plain app.listen(3000) —
- * had its second preview die outright, reported as "dev server exited before it
- * was reachable" with the real cause buried in the tail. That's not an edge
- * case on a machine running up to MAX_CONCURRENT tasks, and it stops being one
- * at all once the box is shared.
- */
-async function freePort() {
-  return new Promise((resolve) => {
-    const srv = createServer();
-    srv.once('error', () => resolve(null)); // no port to be had — fall through
-    srv.listen(0, '127.0.0.1', () => {
-      const p = srv.address()?.port ?? null;
-      srv.close(() => resolve(p));
-    });
-  });
-}
 
 // ── Orphan reaping ─────────────────────────────────────────────────────────
-// Preview children (dev server + tunnel) are detached so we can kill the whole
-// group — but that also means they SURVIVE an ungraceful daemon death (SIGKILL,
-// crash, box sleep), leaking ports/memory. We record each spawned group's pid +
-// a signature; on the next daemon start we reap any that are still ours.
-const PREVIEW_REGISTRY = join(homedir(), '.flowviant', 'previews.json');
+// cloudflared is detached so we can kill its whole group — which also means it
+// SURVIVES an ungraceful daemon death (SIGKILL, crash, box sleep), leaving a
+// public hostname pointed at a worktree with nobody minding it. We record each
+// group's pid + a signature and reap ours at the next start.
+//
+// The registry is a read-modify-write over one file in a directory that TWO
+// daemons can legitimately share (the 0.51.2 instance lock is keyed on a
+// CREDENTIAL, so two daemons serving two different projects are fine and both
+// write here). It was unlocked, written back when previews were serial. A lost
+// entry is precisely the case reaping exists for.
+
+const FLOWVIANT_DIR = join(homedir(), '.flowviant');
+const PREVIEW_REGISTRY = join(FLOWVIANT_DIR, 'previews.json');
+const REGISTRY_LOCK = join(FLOWVIANT_DIR, 'previews.lock');
+const LOCK_STALE_MS = 15_000;
+
+/** Best-effort exclusive lock. Returns a release function; on failure returns
+ *  null and the caller proceeds unlocked — losing an entry is bad, but refusing
+ *  to record one at all is worse. */
+function acquireLock() {
+  try {
+    mkdirSync(FLOWVIANT_DIR, { recursive: true });
+  } catch {
+    return null;
+  }
+  for (let i = 0; i < 30; i++) {
+    try {
+      const fd = openSync(REGISTRY_LOCK, 'wx');
+      closeSync(fd);
+      return () => {
+        try {
+          unlinkSync(REGISTRY_LOCK);
+        } catch {
+          /* already released */
+        }
+      };
+    } catch {
+      // Held — unless it was left behind by something that died holding it.
+      try {
+        if (Date.now() - statSync(REGISTRY_LOCK).mtimeMs > LOCK_STALE_MS) {
+          unlinkSync(REGISTRY_LOCK);
+          continue;
+        }
+      } catch {
+        continue;
+      }
+      // Spin briefly. This lock is held for one file write.
+      const until = Date.now() + 20;
+      while (Date.now() < until) {
+        /* busy-wait: 20ms, 30 times, then give up entirely */
+      }
+    }
+  }
+  return null;
+}
+
 function readRegistry() {
   try {
     const v = JSON.parse(readFileSync(PREVIEW_REGISTRY, 'utf8'));
@@ -258,25 +205,42 @@ function readRegistry() {
     return [];
   }
 }
+
+/** Atomic: write a sibling temp file and rename over the target, so a reader
+ *  never sees a half-written array. */
 function writeRegistry(list) {
   try {
-    mkdirSync(join(homedir(), '.flowviant'), { recursive: true });
-    writeFileSync(PREVIEW_REGISTRY, JSON.stringify(list));
+    mkdirSync(FLOWVIANT_DIR, { recursive: true });
+    const tmp = `${PREVIEW_REGISTRY}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify(list));
+    renameSync(tmp, PREVIEW_REGISTRY);
   } catch {
     /* best-effort */
   }
 }
+
+function mutateRegistry(fn) {
+  const release = acquireLock();
+  try {
+    writeRegistry(fn(readRegistry()));
+  } finally {
+    release?.();
+  }
+}
+
 function recordPreviewPid(pid, sig) {
   if (!pid) return;
-  writeRegistry([...readRegistry(), { pid, sig }]);
+  mutateRegistry((list) => [...list, { pid, sig }]);
 }
+
 function forgetPreviewPid(pid) {
   if (!pid) return;
-  writeRegistry(readRegistry().filter((e) => e.pid !== pid));
+  mutateRegistry((list) => list.filter((e) => e.pid !== pid));
 }
+
 // Only kill a pid we can VERIFY is still one of ours — its /proc cmdline must
-// still contain the signature we stored. A reused pid (belonging to something
-// unrelated) won't match, so we never kill a stranger. Linux-only (that's where
+// still contain the signature we stored. A reused pid belonging to something
+// unrelated won't match, so we never kill a stranger. Linux-only (that's where
 // /proc + process groups work); elsewhere we just clear the registry.
 function stillOurs(pid, sig) {
   if (platform() !== 'linux') return false;
@@ -288,8 +252,8 @@ function stillOurs(pid, sig) {
   }
 }
 
-/** Reap preview process groups left behind by a previously-crashed daemon.
- *  Call once at daemon startup, before spawning workers. */
+/** Reap tunnel process groups left behind by a previously-crashed daemon.
+ *  Call once at daemon startup, before any work begins. */
 export function reapOrphanPreviews(log) {
   const list = readRegistry();
   if (list.length === 0) return;
@@ -308,194 +272,134 @@ export function reapOrphanPreviews(log) {
       }
     }
   }
-  writeRegistry([]);
-  if (killed) log?.(`reaped ${killed} orphaned preview process${killed === 1 ? '' : 'es'} from a previous run.`);
+  mutateRegistry(() => []);
+  if (killed) log?.(`reaped ${killed} orphaned preview tunnel${killed === 1 ? '' : 's'} from a previous run.`);
 }
 
-/**
- * Start the dev server + tunnel for one worktree. Resolves { url, kind, stop }
- * once the tunnel URL is captured, or null if it can't come up. stop() kills
- * both the server and the tunnel.
- *
- * The tunnel target is the port the server ACTUALLY bound (read from its
- * output), not the guessed one — vite/vinext/next hop to the next free port when
- * theirs is taken, and tunneling to the guess then 502s. We fall back to the
- * configured port only if the server never announces one.
- */
-export async function startPreview({
-  worktree,
-  kind,
-  cmd,
-  port,
-  env: extraEnv,
-  hostHeader,
-  auth,
-  log,
-  timeoutMs = 180_000,
-}) {
-  const cf = await ensureCloudflared(log);
-  if (!cf) return null; // fall back to captured evidence
-  // Ask for a port nobody's on, and TELL the dev server about it (below) rather
-  // than hoping its framework hops. Null if we couldn't get one — everything
-  // downstream then behaves exactly as before.
-  const bindPort = await freePort();
-  // Host the origin sees. Default 'localhost' (what a local browser sends) so
-  // dev servers that validate Host — Vite server.allowedHosts, webpack, Next's
-  // allowedDevOrigins — accept the tunnel. `hostHeader: false` in preview.json
-  // disables the rewrite for apps that route on their real public Host.
-  const hostRewrite =
-    hostHeader === false ? null : typeof hostHeader === 'string' && hostHeader ? hostHeader : 'localhost';
-  return new Promise((resolve) => {
-    // We SIGKILL the dev server's whole group on teardown, which skips a tool's
-    // graceful cleanup — some dev servers (e.g. vinext) leave a singleton
-    // dev-lock behind and then REFUSE to start next time. Disable known locks so
-    // a reused/uncleaned worktree still previews. Harmless to tools that ignore
-    // these vars; BROWSER=none stops any auto-open. A repo's preview.json `env`
-    // is layered last, so it can override any of these.
-    // PORT is a HINT, deliberately: honoured by Next, Remix, Nuxt, CRA and any
-    // conventional `app.listen(process.env.PORT)`, ignored by Vite (which uses
-    // server.port and hops on its own) and overridden by an explicit --port in
-    // the dev script. All three outcomes are fine — the tunnel aims at the port
-    // the server ANNOUNCES, not at what we asked for, so a disregarded hint
-    // costs nothing and an honoured one is what makes two concurrent previews
-    // of one repo possible. Placed BEFORE extraEnv so preview.json still wins.
-    const env = {
-      ...process.env,
-      VINEXT_NO_DEV_LOCK: '1',
-      BROWSER: 'none',
-      ...(bindPort ? { PORT: String(bindPort) } : null),
-      ...(extraEnv && typeof extraEnv === 'object' ? extraEnv : {}),
-    };
-    // detached so each gets its own process group — `bun run dev` via a shell
-    // spawns a grandchild dev server that would otherwise SURVIVE a kill of the
-    // shell. We kill the whole group instead. stdout/stderr piped so we can read
-    // the bound port and surface failures.
-    const server = spawn(cmd, {
-      cwd: worktree,
-      shell: true,
-      detached: true,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env,
-    });
-    // Track for orphan reaping: the shell's cmdline stays `sh -c <cmd>`, so `cmd`
-    // is a safe signature to re-verify against later.
-    recordPreviewPid(server.pid, cmd);
+// ── The one thing this file does ───────────────────────────────────────────
 
-    let settled = false;
-    let tunnel = null;
-    let tunnelStarted = false;
-    let authProxy = null; // opt-in basic-auth proxy in front of the dev server
-    let out = '';
-    const tail = () => out.trim().split('\n').slice(-15).join('\n');
-    const killGroup = (child) => {
-      if (!child?.pid) return;
+/** How long we wait for cloudflared to hand us a hostname. */
+const TUNNEL_TIMEOUT_MS = 60_000;
+/** Bytes of cloudflared output kept for the failure sentence. */
+const TAIL_BYTES = 2000;
+
+/**
+ * Gate `port` behind a password and publish it on a quick tunnel.
+ *
+ * Resolves { url, user, password, stop } on success, or { error } — a sentence
+ * from this machine, to be relayed as-is. It never resolves a URL without a
+ * password, and it never returns a tunnel whose origin was not listening when
+ * we checked.
+ *
+ * `onDead` fires if the ORIGIN stops answering while the tunnel is up:
+ * cloudflared happily outlives a dead dev server and the gate answers a dead
+ * origin with 502, so without this the product would report "live" over a 502 —
+ * Flowviant asserting a state it never measured.
+ */
+export async function openTunnel({ port, log, onDead, probeMs = 20_000 }) {
+  // Re-validate at the machine. The server checked this port against the last
+  // report; reports are up to a minute old and a dev server is a process a
+  // human can stop at any moment.
+  if (!(await isListening(port))) {
+    return { error: `nothing is listening on port ${port} in this worktree any more.` };
+  }
+
+  const cf = await ensureCloudflared(log);
+  if (cf.error) return { error: cf.error };
+
+  let stopped = false;
+  let gate = null;
+  let tunnel = null;
+  let probe = null;
+
+  const stop = () => {
+    if (stopped) return;
+    stopped = true;
+    if (probe) clearInterval(probe);
+    try {
+      gate?.stop();
+    } catch {
+      /* best-effort */
+    }
+    if (tunnel?.pid) {
       try {
-        process.kill(-child.pid, 'SIGKILL'); // negative pid = the whole group
+        process.kill(-tunnel.pid, 'SIGKILL'); // the whole detached group
       } catch {
         try {
-          child.kill('SIGKILL');
+          tunnel.kill('SIGKILL');
         } catch {
-          /* gone */
+          /* already gone */
         }
       }
-    };
-    const stop = () => {
-      forgetPreviewPid(server.pid);
-      forgetPreviewPid(tunnel?.pid);
-      try {
-        authProxy?.stop();
-      } catch {
-        /* already closed */
-      }
-      killGroup(server);
-      killGroup(tunnel);
-    };
-    let bindTimer;
-    let timer;
-    const finish = (val) => {
+      forgetPreviewPid(tunnel.pid);
+    }
+  };
+
+  // The gate comes up FIRST and the tunnel points at it, never at the origin —
+  // so there is no window in which the public hostname is un-gated.
+  gate = await startAuthProxy({ targetPort: port, log, onAbuse: () => stop() });
+  if (!gate) {
+    return { error: 'could not start the password gate for this preview, so nothing was published.' };
+  }
+
+  const args = ['tunnel', '--url', `http://localhost:${gate.port}`];
+  // Send the origin the Host it expects. Vite and Next reject a Host they do
+  // not recognise, so without this the tunnel resolves and then 403s.
+  args.push('--http-host-header', 'localhost');
+
+  tunnel = spawn(cf.bin, args, { detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+  recordPreviewPid(tunnel.pid, 'cloudflared');
+
+  return new Promise((resolve) => {
+    let settled = false;
+    let tail = '';
+    const finish = (v) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      clearTimeout(bindTimer);
-      if (!val) stop();
-      resolve(val);
+      if (v.error) stop();
+      resolve(v);
     };
 
-    // Open the tunnel once we know the real port (detected or fallback). When
-    // auth is opted in, put the password proxy in front and tunnel to THAT.
-    const openTunnel = async (p) => {
-      if (tunnelStarted || settled) return;
-      tunnelStarted = true;
-      clearTimeout(bindTimer);
-      let tunnelPort = p;
-      if (auth) {
-        authProxy = await startAuthProxy({ targetPort: p, log });
-        if (settled) {
-          authProxy?.stop(); // torn down while the proxy was coming up — don't leak it
-          return;
-        }
-        if (authProxy) tunnelPort = authProxy.port;
-        else log?.('auth proxy failed to start — tunneling WITHOUT a password.');
-      }
-      log?.(`preview: dev server on :${p} — opening the tunnel…`);
-      // --http-host-header: send the origin the Host it expects (default
-      // localhost — see hostRewrite above). Passes Vite/webpack/Next host checks
-      // with zero repo config; skipped when preview.json sets hostHeader:false.
-      const args = ['tunnel', '--url', `http://localhost:${tunnelPort}`];
-      if (hostRewrite) args.push('--http-host-header', hostRewrite);
-      tunnel = spawn(cf, args, { detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
-      recordPreviewPid(tunnel.pid, 'cloudflared'); // signature for orphan reaping
-      const onTunnel = (d) => {
-        const m = TUNNEL_RE.exec(d.toString());
-        if (m) {
-          finish({
-            url: m[0],
-            kind,
-            stop,
-            auth: authProxy ? { user: authProxy.user, password: authProxy.password } : undefined,
-          });
-        }
-      };
-      tunnel.stdout.on('data', onTunnel);
-      tunnel.stderr.on('data', onTunnel);
-      tunnel.on('error', () => finish(null));
-      tunnel.on('close', () => finish(null));
-    };
+    const timer = setTimeout(
+      () => finish({ error: `cloudflared did not return a URL within ${TUNNEL_TIMEOUT_MS / 1000}s.${tailSentence()}` }),
+      TUNNEL_TIMEOUT_MS,
+    );
 
-    const onServer = (d) => {
+    // cloudflared's own words. Both `error` and `close` used to resolve null
+    // with nothing captured, which made a throttled or blocked tunnel
+    // indistinguishable from silence — and silence is the one thing this
+    // product is not allowed to turn into a state.
+    const tailSentence = () => (tail.trim() ? ` cloudflared said: ${tail.trim().split('\n').slice(-3).join(' ')}` : '');
+
+    const onOut = (d) => {
       const s = d.toString();
-      out = (out + s).slice(-4000);
-      if (!tunnelStarted) {
-        const m = BIND_RE.exec(s);
-        if (m) void openTunnel(Number(m[1]));
-      }
-    };
-    server.stdout.on('data', onServer);
-    server.stderr.on('data', onServer);
-    // A dev server that exits before it's reachable (crash on boot, a singleton
-    // lock refusing to start) is the loud failure mode — surface its output.
-    server.on('exit', (code) => {
-      if (settled) return;
-      log?.(
-        `preview dev server exited (code ${code}) before it was reachable — no preview.${
-          tail() ? `\n  dev server said:\n${tail()}` : ''
-        }`,
-      );
-      finish(null);
-    });
+      tail = (tail + s).slice(-TAIL_BYTES);
+      const m = TUNNEL_RE.exec(s);
+      if (!m) return;
 
-    // If the server never prints a URL we recognize (quiet server), guess. Prefer
-    // the port we HANDED it over the one we inferred from its framework: a server
-    // quiet enough to reach this line is usually a plain node/express one, and
-    // those are exactly the ones that read $PORT.
-    bindTimer = setTimeout(() => void openTunnel(bindPort ?? port), 30_000);
-    timer = setTimeout(() => {
-      log?.(
-        `preview tunnel did not come up in ${Math.round(timeoutMs / 1000)}s — skipping.${
-          tail() ? `\n  last dev-server output:\n${tail()}` : ''
-        }`,
-      );
-      finish(null);
-    }, timeoutMs);
+      // Watch the ORIGIN, not the tunnel. A dead dev server behind a live
+      // hostname is the failure a viewer cannot diagnose.
+      probe = setInterval(async () => {
+        if (stopped) return;
+        if (!(await isListening(port))) {
+          const dead = onDead;
+          stop();
+          try {
+            dead?.();
+          } catch {
+            /* the caller's teardown is best-effort */
+          }
+        }
+      }, probeMs);
+      if (probe.unref) probe.unref();
+
+      finish({ url: m[0], user: gate.user, password: gate.password, stop });
+    };
+
+    tunnel.stdout.on('data', onOut);
+    tunnel.stderr.on('data', onOut);
+    tunnel.on('error', (e) => finish({ error: `could not run cloudflared (${e.message}).` }));
+    tunnel.on('close', () => finish({ error: `cloudflared exited before publishing a URL.${tailSentence()}` }));
   });
 }

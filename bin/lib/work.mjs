@@ -30,8 +30,16 @@ import {
 } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join, dirname } from 'node:path';
-import { FLEET_URL, FLEET_TOKEN, USER_AGENT, REFRESH_BEFORE_SECONDS } from './config.mjs';
+import {
+  FLEET_URL,
+  FLEET_TOKEN,
+  USER_AGENT,
+  REFRESH_BEFORE_SECONDS,
+  DAEMON_INSTANCE,
+} from './config.mjs';
 import { git, gitRaw, splitNul, baseBranchName, isSafePathSegment } from './git.mjs';
+import { listenersIn } from './listeners.mjs';
+import { openTunnel } from './preview.mjs';
 import { c, note, ok, warn } from './ui.mjs';
 import { mcpFor, runTurn } from './claude.mjs';
 import {
@@ -92,6 +100,8 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
   const ACTIVITY_URL = FLEET_URL.replace(/\/agents\/?$/, '/session-activity');
   const WORKTREES_URL = FLEET_URL.replace(/\/agents\/?$/, '/session-worktrees');
   const DIFF_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/diff-done');
+  const PREVIEW_CLAIM_URL = FLEET_URL.replace(/\/agents\/?$/, '/preview-claim');
+  const PREVIEW_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/preview-done');
   const ATTACHMENT_URL = FLEET_URL.replace(/\/agents\/?$/, '/attachment');
   const workAnswering = new Set(); // turn ids currently queued/running here
   const workAttempts = new Map(); // turn id -> completed runTurn attempts
@@ -327,8 +337,19 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
   };
   const sessionWorktreeReport = (sessionId) => {
     if (!isSafePathSegment(sessionId)) return null;
-    const d = worktreeDiff(join(baseDir, 'sessions', sessionId), baseRef);
-    return d ? { sessionId, ...d } : null;
+    const wt = join(baseDir, 'sessions', sessionId);
+    const d = worktreeDiff(wt, baseRef);
+    if (!d) return null;
+    // WHAT IS LISTENING in this worktree, attributed by the CWD of the process
+    // holding the socket. It rides the sweep the daemon already makes rather
+    // than taking a beat of its own, exactly as the commit trailers do — and
+    // like them it needs no version floor, because it is a daemon→server report
+    // on an endpoint that already exists. An older server ignores the key.
+    //
+    // The browser NEVER names a directory and never names a port this did not
+    // report: ports are global to a box and a worktree is not, so this
+    // measurement is the security boundary for the whole preview feature.
+    return { sessionId, ...d, listening: listenersIn(wt) };
   };
   /** One session, now — called after its turn settles. */
   const reportSessionWorktree = async (sessionId) => {
@@ -403,6 +424,189 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
       /* the row stays pending and expires; the next click re-requests */
     }
   };
+  // ── SESSION PREVIEWS ──────────────────────────────────────────────────────
+  //
+  // Share the dev server the DRIVER is already running in their tab, behind a
+  // generated password, on a quick tunnel. This daemon never starts an app: the
+  // deleted live-preview feature ran a repo-declared command through a shell,
+  // and that is the reason it is deleted. Here the human runs their own server,
+  // `listenersIn` notices it, and this only ever wraps a port that measurement
+  // already named for that session.
+  //
+  // CLAIM BEFORE ACTING. Two daemons legitimately share one fleet credential —
+  // the case `machineDaemonsDisagree` exists because it happens, and the 0.51.2
+  // instance lock is blind to an OLDER peer — so both are handed the same job
+  // array. Both opening a tunnel leaves a public hostname alive that nobody
+  // owns and nobody can tear down, because only the lease holder can settle the
+  // row. `processDiffJobs` gets away without this because running `git show`
+  // twice costs nothing.
+  const livePreviews = new Map(); // sessionId -> { port, url, stop }
+  const previewClaiming = new Set(); // sessionIds mid-claim on this tick
+
+  const postPreview = async (body) => {
+    try {
+      await fetch(PREVIEW_DONE_URL, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${FLEET_TOKEN}`,
+          'User-Agent': USER_AGENT,
+          'Content-Type': 'application/json',
+        },
+        signal: AbortSignal.timeout(30_000),
+        body: JSON.stringify({ ...body, instance: DAEMON_INSTANCE }),
+      });
+    } catch {
+      /* the row stops being confirmed and reads as ended — which is true */
+    }
+  };
+
+  const claimPreview = async (sessionId) => {
+    try {
+      const res = await fetch(PREVIEW_CLAIM_URL, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${FLEET_TOKEN}`,
+          'User-Agent': USER_AGENT,
+          'Content-Type': 'application/json',
+        },
+        signal: AbortSignal.timeout(15_000),
+        body: JSON.stringify({ sessionId, instance: DAEMON_INSTANCE }),
+      });
+      const j = await res.json().catch(() => null);
+      return j?.data?.claimed === true;
+    } catch {
+      return false; // could not claim → do nothing at all. The other daemon may have.
+    }
+  };
+
+  /** Tear one down here, and say so. `reason` is why, stored server-side rather
+   *  than inferred: "the origin stopped listening" and "the owner pressed Stop"
+   *  are different sentences to a teammate holding a phone. */
+  const stopPreview = async (sessionId, reason) => {
+    const live = livePreviews.get(sessionId);
+    livePreviews.delete(sessionId);
+    if (live) {
+      try {
+        live.stop();
+      } catch {
+        /* best-effort */
+      }
+    }
+    await postPreview({ sessionId, ended: true, endedReason: reason });
+  };
+
+  const processPreviewJobs = (jobs) => {
+    if (!Array.isArray(jobs) || jobs.length === 0) return;
+    for (const job of jobs.slice(0, 5)) {
+      const sessionId = String(job?.sessionId || '');
+      const port = Number(job?.port);
+      if (!isSafePathSegment(sessionId)) continue;
+
+      if (job?.action === 'stop') {
+        if (previewClaiming.has(sessionId)) continue;
+        previewClaiming.add(sessionId);
+        void stopPreview(sessionId, 'stopped').finally(() => previewClaiming.delete(sessionId));
+        continue;
+      }
+
+      if (!Number.isInteger(port) || port <= 0 || port > 65535) continue;
+      // Already serving exactly this. Re-opening would replace a working URL
+      // somebody may be looking at right now.
+      if (livePreviews.get(sessionId)?.port === port) continue;
+      if (previewClaiming.has(sessionId)) continue;
+      previewClaiming.add(sessionId);
+
+      void (async () => {
+        try {
+          if (!(await claimPreview(sessionId))) return; // somebody else has it
+          const wt = join(baseDir, 'sessions', sessionId);
+          // RE-VALIDATE the attribution here, not just the liveness. The server
+          // checked this port against a report up to a minute old; more
+          // importantly, checking `listenersIn` again is what keeps the answer
+          // to "whose port is this" on the machine that can actually see it.
+          const measured = listenersIn(wt).some((l) => l.port === port);
+          if (!measured) {
+            await postPreview({
+              sessionId,
+              error: `nothing is listening on port ${port} in this worktree.`,
+            });
+            return;
+          }
+          // Replace anything this session already had — one tab, one door.
+          const prev = livePreviews.get(sessionId);
+          if (prev) {
+            try {
+              prev.stop();
+            } catch {
+              /* best-effort */
+            }
+            livePreviews.delete(sessionId);
+          }
+          const t = await openTunnel({
+            port,
+            log: (m) => note(`preview ${sessionId.slice(0, 8)}: ${m}`),
+            // The origin died under a live tunnel. cloudflared happily outlives
+            // a dead dev server and the gate answers a dead origin with 502, so
+            // without this the app would print "live" over a 502.
+            onDead: () => {
+              livePreviews.delete(sessionId);
+              void postPreview({ sessionId, ended: true, endedReason: 'origin_gone' });
+            },
+          });
+          if (t.error) {
+            await postPreview({ sessionId, error: t.error });
+            return;
+          }
+          livePreviews.set(sessionId, { port, url: t.url, stop: t.stop });
+          await postPreview({ sessionId, url: t.url, user: t.user, password: t.password });
+        } finally {
+          previewClaiming.delete(sessionId);
+        }
+      })();
+    }
+  };
+
+  /** The sessionIds this machine is still serving — sent on the poll so the
+   *  server can tell a live share from one whose machine went away. Silence
+   *  must never read as "live". */
+  const livePreviewIds = () => [...livePreviews.keys()];
+
+  /**
+   * The tab closed (or the server stopped listing it). Ordered BEFORE
+   * `retireWorkSessions`, and that ordering is load-bearing: `git worktree
+   * remove` under a running dev server reintroduces the stale-server bug — on
+   * Linux the process keeps serving bytes from open file handles in a directory
+   * that no longer exists, which shows a human the wrong thing without erroring
+   * anywhere.
+   */
+  const retirePreviews = (activeIds) => {
+    // Same guard `retireWorkSessions` keeps: a roster response missing the
+    // field is an older server, not a close, and must not tear down every live
+    // share at once.
+    if (!Array.isArray(activeIds)) return;
+    const live = new Set(activeIds);
+    for (const sessionId of [...livePreviews.keys()]) {
+      if (live.has(sessionId)) continue;
+      if (previewClaiming.has(sessionId)) continue;
+      previewClaiming.add(sessionId);
+      void stopPreview(sessionId, 'tab_closed').finally(() => previewClaiming.delete(sessionId));
+    }
+  };
+
+  /** Daemon shutdown. Detached tunnels survive our exit by design, so leaving
+   *  them would strand a public hostname until the box rebooted — the exact
+   *  case `reapOrphanPreviews` exists to clean up after an UNgraceful death. */
+  const shutdownPreviews = () => {
+    for (const [, live] of livePreviews) {
+      try {
+        live.stop();
+      } catch {
+        /* best-effort */
+      }
+    }
+    livePreviews.clear();
+  };
+
   const processDiffJobs = (jobs) => {
     if (!Array.isArray(jobs) || jobs.length === 0) return;
     for (const job of jobs.slice(0, 5)) {
@@ -1860,6 +2064,10 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
     processWorkTurns,
     processShipJobs,
     processDiffJobs,
+    processPreviewJobs,
+    livePreviewIds,
+    retirePreviews,
+    shutdownPreviews,
     retireWorkSessions,
     reportWorktrees,
     shutdownWork,
