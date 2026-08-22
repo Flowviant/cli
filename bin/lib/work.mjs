@@ -799,9 +799,17 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
           'Content-Type': 'application/json',
         },
         signal: AbortSignal.timeout(30_000),
-        body: JSON.stringify({ sessionId }),
+        // The instance is what CLAIMS the session lease server-side. Two
+        // daemons share one fleet credential, so the token cannot say which of
+        // us is serving this tab — and the mint is the moment that matters:
+        // there is one work-token row per session and minting ROTATES it, so a
+        // second mint revokes the first daemon's live secret mid-turn.
+        body: JSON.stringify({ sessionId, instance: DAEMON_INSTANCE }),
       });
       if (res.status === 404) return { gone: true };
+      // 409 — another daemon on this credential holds the session. Not ours to
+      // serve and not a retry: stand down and let the holder answer.
+      if (res.status === 409) return { heldElsewhere: true };
       if (!res.ok) return null;
       const token = (await res.json().catch(() => null))?.data?.token ?? null;
       if (!token) return null;
@@ -1168,8 +1176,25 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
    * machines. When the roster omits the field entirely (older server),
    * absence of signal is not a close — retire nothing.
    */
-  const retireWorkSessions = (activeIds) => {
+  /** Every session this daemon currently has a worktree for — what renews our
+   *  lease on the poll. Read off the directory rather than a map, so it is the
+   *  same fact retirement acts on. */
+  const heldSessionIds = () => {
+    const dir = join(baseDir, 'sessions');
+    try {
+      return readdirSync(dir).filter(isSafePathSegment).slice(0, 50);
+    } catch {
+      return [];
+    }
+  };
+
+  const retireWorkSessions = (activeIds, heldElsewhere) => {
     if (!Array.isArray(activeIds)) return;
+    // Sessions ANOTHER daemon on this credential is serving. They are absent
+    // from activeWorkSessions for us and present for them, and removing their
+    // worktree would pull the directory out from under a running turn. Absence
+    // means "the tab closed"; this is the one other thing it can mean.
+    const peers = new Set(Array.isArray(heldElsewhere) ? heldElsewhere : []);
     const dir = join(baseDir, 'sessions');
     if (!existsSync(dir)) return;
     let ids;
@@ -1182,6 +1207,7 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
     let removed = 0;
     for (const id of ids) {
       if (live.has(id)) continue;
+      if (peers.has(id)) continue; // another daemon's tab — not ours to retire
       if (workChains.has(id) || shipping.has(id)) continue; // still draining here
       const wt = join(dir, id);
       try {
@@ -1412,6 +1438,15 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
           if (!plainTab) {
             mint = await mintWorkToken(job.sessionId);
             if (!mint) mint = await mintWorkToken(job.sessionId, true); // one transient blip ≠ a dead turn
+            // Another daemon on this credential holds the session. Return
+            // WITHOUT settling: the holder is answering this same turn, and
+            // settling it here — even as a failure — would race the real
+            // answer and could win. Dropping it means the turn stays pending
+            // and the holder's answer lands, which is the whole point.
+            if (mint?.heldElsewhere) {
+              workAnswering.delete(job.id);
+              return;
+            }
             if (mint?.gone) {
               await settleWorkTurn(job.id, {
                 ok: false,
@@ -2064,6 +2099,7 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
     processWorkTurns,
     processShipJobs,
     processDiffJobs,
+    heldSessionIds,
     processPreviewJobs,
     livePreviewIds,
     retirePreviews,

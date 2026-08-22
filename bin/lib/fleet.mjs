@@ -78,7 +78,7 @@ import { detectRuntimes, knownSkills, pickRuntimeFor, RUNTIMES } from './runtime
 import { createWorkManager } from './work.mjs';
 import { scanLocalSessions } from './localSessions.mjs';
 
-async function fetchRoster(haveIds, livePreviewSessionIds = []) {
+async function fetchRoster(haveIds, livePreviewSessionIds = [], heldSessionIds = []) {
   const url = new URL(FLEET_URL);
   if (haveIds.length) url.searchParams.set('have', haveIds.join(','));
   // What this machine will run at once. The server grows lanes to meet waiting
@@ -108,6 +108,11 @@ async function fetchRoster(haveIds, livePreviewSessionIds = []) {
   // the server still calls live is a 530 on somebody's phone. Always set, even
   // empty: '' means "serving none", absent would mean "an older daemon".
   url.searchParams.set('pv', livePreviewSessionIds.join(','));
+  // The sessions this daemon holds a worktree for. Its LEASE on each renews
+  // here — one beat, no extra endpoint, and the server can tell "this daemon is
+  // still serving that tab" from "it went away" within a reconcile interval
+  // instead of minutes. Always set, even empty: '' means "holding none".
+  url.searchParams.set('ws', heldSessionIds.join(','));
   // WHICH CLIs this machine actually has, so the app can stop guessing.
   //
   // Until now every surface that listed Gemini or Codex said "not wired up yet"
@@ -295,18 +300,42 @@ export async function runFleetDaemon() {
   // the SAME project served twice, and the worst version of this: their session
   // worktrees are in different directories, so the per-turn lock cannot even see
   // across them. See instance.mjs for why that lock is not enough on its own.
-  const instance = acquireInstanceLock(FLEET_TOKEN, repoRoot);
+  // Same repo -> this run replaces whatever was serving it. Different repo ->
+  // refused, and nothing is signalled. See instance.mjs's header for the rule.
+  const instance = acquireInstanceLock(FLEET_TOKEN, repoRoot, {
+    takeover:
+      process.argv.includes('--takeover') || process.argv.includes('--takeover-downgrade'),
+    noTakeover:
+      process.argv.includes('--no-takeover') || process.env.FLOWVIANT_NO_TAKEOVER === '1',
+    allowDowngrade: process.argv.includes('--takeover-downgrade'),
+    log: (m) => info(m),
+  });
   if (!instance.ok) {
     const h = instance.holder;
     console.log('');
-    fail('a flowviant daemon is already running for this credential.');
+    // Two different refusals, because they are two different mistakes and the
+    // fix is not the same. Same CREDENTIAL: one project is being served twice.
+    // Same REPO under another credential: two daemons in one working tree,
+    // which the credential-keyed lock cannot see on its own.
+    if (instance.takeoverFailed) {
+      fail(`could not replace the running daemon: ${instance.takeoverFailed}`);
+    } else if (instance.sameRepo) {
+      fail('a flowviant daemon is already running in this repo.');
+    } else {
+      fail('a flowviant daemon is already running for this credential.');
+    }
     if (h?.pid) info(`holder · pid ${h.pid}${h.repoRoot ? ` in ${h.repoRoot}` : ''}`);
     // The two-checkouts case is the one nobody spots on their own: both tabs
     // look healthy, and the damage is doubled cards and doubled edits in a repo
     // you are not looking at. Name the other repo when it is a different one.
-    if (h?.repoRoot && h.repoRoot !== repoRoot)
+    if (!instance.sameRepo && h?.repoRoot && h.repoRoot !== repoRoot) {
       warn('that is a DIFFERENT checkout — one credential serves one project, so both would answer the same tabs.');
-    note('stop the other one first, or run this one with FLOWVIANT_ALLOW_MULTI=1 if you know what you are doing.');
+      // Not offered lightly: that daemon is serving other work, and this
+      // command was run somewhere else. Replacing it is a decision, not a
+      // restart, so it takes a word.
+      note('run with --takeover to stop it and serve this repo instead.');
+    }
+    note('or run this one with FLOWVIANT_ALLOW_MULTI=1 if you know what you are doing.');
     console.log('');
     process.exit(1);
   }
@@ -1170,7 +1199,7 @@ export async function runFleetDaemon() {
   for (;;) {
     let roster;
     try {
-      roster = await fetchRoster(buildHave(), livePreviewIds());
+      roster = await fetchRoster(buildHave(), livePreviewIds(), heldSessionIds());
     } catch (e) {
       if (e.auth) {
         fail(`${e.message} — credential revoked or invalid. Shutting down.`);
@@ -1237,7 +1266,16 @@ export async function runFleetDaemon() {
     // in a directory that no longer exists — a human is shown the wrong thing
     // and nothing errors anywhere.
     retirePreviews(roster.activeWorkSessions);
-    retireWorkSessions(roster.activeWorkSessions);
+    // A session another daemon on this credential is serving is NOT a closed
+    // tab. Without this the daemon that lost the lease removes the worktree the
+    // winner is working in — absence would mean "somebody else won" instead of
+    // "the tab closed".
+    retireWorkSessions(
+      Array.isArray(roster.activeWorkSessions)
+        ? roster.activeWorkSessions
+        : roster.activeWorkSessions,
+      roster.sessionsHeldElsewhere
+    );
     // Diffs somebody has open and is waiting on. Project-scoped rather than
     // per-session: `git show` runs from the repo ROOT, which can see a closed
     // tab's branch and a shipped commit on main alike.
