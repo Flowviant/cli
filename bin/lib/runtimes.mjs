@@ -687,9 +687,18 @@ export const RUNTIMES = {
         // turn reports failure having touched nothing. Caught only because an
         // end-to-end test had to add the flag by hand to work.
         //
-        // NOT `--sandbox` here, unlike wiki: a build has to `git push` and run
-        // `gh pr create`, so it needs the network by definition. The containment
-        // is the worktree, as it is for every runtime.
+        // NOT `--sandbox` here, unlike wiki: a build has to `git push`, so it
+        // needs the network by definition.
+        //
+        // AND NOTHING ELSE CONTAINS IT EITHER. This comment used to end "the
+        // containment is the worktree, as it is for every runtime", which was
+        // false and is the kind of false that stops people looking: `cwd` is a
+        // starting directory, not a jail. A build turn runs with the operator's
+        // full user permissions — it can write outside the worktree, to their
+        // home directory, to their other checkouts. Claude gets
+        // --dangerously-skip-permissions, codex gets --sandbox
+        // danger-full-access, and agy gets no sandbox flag at all. The only
+        // real boundary today is that the person driving the tab is trusted.
         //
         // FLOWVIANT_SAFE HAS NO EXPRESSION ON THIS RUNTIME. Claude narrows to an
         // allowlist and Codex to `workspace-write`; agy's only per-invocation

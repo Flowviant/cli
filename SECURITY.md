@@ -10,9 +10,16 @@ The daemon **never sees, stores, or transmits** your Claude or GitHub logins. It
 drives CLIs *you* authenticated yourself by shelling out to them:
 
 - **Claude** — it invokes your locally signed-in `claude` (via the Claude Agent
-  SDK / CLI). Your Claude subscription pays for the work; no API key is handled
-  by this daemon, and `ANTHROPIC_API_KEY` is explicitly stripped from the child
-  environment so a key in your shell can't divert usage.
+  SDK / CLI). Whatever that machine is signed in with is what pays for the work,
+  and the daemon does not pick: the child inherits your environment as-is,
+  `ANTHROPIC_API_KEY` included. It used to be stripped, to force the
+  subscription path — right when the daemon ran on one developer's laptop and a
+  stray key would silently bill every turn as raw API usage. On a machine the
+  whole project shares, an inherited org key is the POINT, and deleting it would
+  be the daemon overriding the credential its operator deliberately configured.
+  Which credential is correct, and whether an account may be shared, is between
+  the operator and the vendor (see `bin/lib/claude.mjs`, the comment above the
+  spawn).
 - **GitHub** — it uses your authenticated `gh` and `git` for branches and PRs.
 
 The only credential the daemon holds is a **Flowviant fleet token**, scoped to a
