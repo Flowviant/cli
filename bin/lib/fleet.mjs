@@ -270,6 +270,48 @@ async function maybeReportLocalSessions({ repoRoot, excludeDirs }) {
   }
 }
 
+/**
+ * A STOP COMMANDED BY FLOWVIANT, read off the roster poll.
+ *
+ * The daemon is a PULL client — the /fleet/stream socket is a one-way wake
+ * nudge with no server→daemon request path — so "stop this machine" can never
+ * be a request the server makes of us. It rides the roster RESPONSE instead, on
+ * the same `daemon` object the version signal already travels on, which is why
+ * it needs no new endpoint and no version floor: an older daemon reads an
+ * unknown key as nothing and keeps running, and fail-open is the safe direction
+ * for a switch whose failure mode is "your machine went dark".
+ *
+ * The server decides whether a stop is LIVE — it stamps the credential and only
+ * sends the key inside a short honor window — and the daemon does NOT re-derive
+ * that. The key's PRESENCE is the command. Evaluating the same TTL on both
+ * sides would make clock skew the arbiter of whether a machine may run, and get
+ * it wrong in the direction that bricks the box: a relaunch that re-reads an
+ * old timestamp and stops itself again, forever.
+ *
+ * Pure and exported so the decision can be proved without a credential or a
+ * live server. `null` means keep running.
+ */
+export function shouldStop(rosterDaemon) {
+  const stop = rosterDaemon?.stop;
+  // An OBJECT, and not an array: `typeof [] === 'object'`, so the plain typeof
+  // guard let `stop: []` — an empty list, which is how this codebase spells "no
+  // jobs" on every other roster key — read as a live stop with no reason. A
+  // switch that kills a machine gets the narrow test.
+  if (!stop || typeof stop !== 'object' || Array.isArray(stop)) return null;
+  // Re-sanitized HERE even though the server wrote it: this string is operator
+  // prose typed into a SQL UPDATE and then printed straight to a terminal, so
+  // control bytes would let a stop reason repaint the console it is being read
+  // on, and an unbounded one would bury the line that matters. The WORDING is
+  // untouched — the operator's own sentence is the whole point of the field,
+  // and paraphrasing it would leave the person at the keyboard guessing.
+  const reason = String(stop.reason ?? '')
+    .replace(/[\u0000-\u001f\u007f]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 300);
+  return { stop: true, reason };
+}
+
 // One roster agent's loop: persistent worktree, one intent per turn, reset to
 // base between tasks (fresh conversation), resume in place while on a blocker.
 
@@ -327,7 +369,15 @@ export async function runFleetDaemon() {
       // restart, so it takes a word.
       note('run with --takeover to stop it and serve this repo instead.');
     }
-    note('or run this one with FLOWVIANT_ALLOW_MULTI=1 if you know what you are doing.');
+    // WITHHELD when we could not identify the holder. ALLOW_MULTI runs this
+    // daemon unguarded beside one we just admitted we cannot see, and in the
+    // same repo that is two `git fetch`, two worktree sweeps, and one
+    // `retireWorkSessions` deleting directories the other is serving. Offering
+    // it as the way out of "I don't know what that process is" would be handing
+    // someone the worst option at the moment they have the least information.
+    if (!instance.unidentified) {
+      note('or run this one with FLOWVIANT_ALLOW_MULTI=1 if you know what you are doing.');
+    }
     console.log('');
     process.exit(1);
   }
@@ -1240,6 +1290,36 @@ export async function runFleetDaemon() {
     if (roster.mcpUrl) mcpUrl = roster.mcpUrl;
     if (roster.project?.id) wikiProjectId = roster.project.id; // keys the vault dir
     if (roster.leaseTtlSeconds) leaseTtlSeconds = roster.leaseTtlSeconds;
+    // A COMMANDED STOP OUTRANKS AN UPDATE, and that ordering is the whole reason
+    // this sits ABOVE the version signal rather than inside it. Both read the
+    // same `roster.daemon` object, but `handleVersionSignal` can re-exec this
+    // process into a newer build — so checked second, a machine somebody just
+    // told to stop would come back up wearing a different version instead of
+    // going away.
+    const stopSignal = shouldStop(roster.daemon);
+    if (stopSignal) {
+      warn(
+        stopSignal.reason
+          ? `stopped by Flowviant — ${stopSignal.reason}`
+          : 'stopped by Flowviant — no reason given.'
+      );
+      note('shutting down — stopping workers. Worktrees are kept: in-flight work resumes next run.');
+      // teardown() is NOT optional on this path. Detached preview tunnels
+      // survive this process BY DESIGN, so exiting without it strands a public
+      // hostname pointed into a worktree until somebody reboots the box — which
+      // is precisely the state a remote stop is usually being used to end. It
+      // also kills the session CLIs and the wiki Claude, which would otherwise
+      // keep editing worktrees and burning quota for a machine nobody is
+      // watching any more.
+      teardown();
+      // EXIT 0, and this is load-bearing: the stop was ASKED FOR, so it is not
+      // a failure. Under `Restart=on-failure` a nonzero code has systemd
+      // relaunch the daemon immediately, fighting the very command that stopped
+      // it; exit 0 reads as "the job is done" and leaves it down. The server's
+      // honor window is what makes the other half work — a deliberate relaunch
+      // minutes later comes up clean instead of stopping itself forever.
+      process.exit(0);
+    }
     // Keep the daemon current. Safe = no worker mid-task (true at startup, since
     // no workers are spawned yet). If it self-updates it re-execs into the new
     // version and this process becomes a proxy — stop the loop.

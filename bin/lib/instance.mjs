@@ -140,6 +140,9 @@ const record = (repoRoot) =>
     // The script we were started from, and what we are. A takeover matches the
     // live command line against `entry` before signalling anything — a lock
     // records a PID, and a crashed daemon's PID can be reused by anything.
+    // Locks written before this field existed (0.51.2 through 0.53.0) are
+    // matched on the holder's process START TIME instead; stillTheHolder says
+    // why that is the weaker of the two claims and still strong enough.
     entry: process.argv[1] || '',
     version: VERSION,
   });
@@ -197,6 +200,175 @@ export function daemonInSameRepo(repoRoot, ownPath) {
   return null;
 }
 
+/** How far a holder's actual start may sit BEFORE the `startedAt` line it wrote
+ *  and still be the same process. Measured on this exact path: node boot to the
+ *  first line of JS is 20ms, and the whole way through importing this module,
+ *  `git rev-parse --show-toplevel` and base-ref detection to record() is 29-32ms.
+ *  The worst realistic run is a start that had to take over a NEIGHBOUR's lock
+ *  first (a 20s grace, then 600ms) and then its own (another 20s), which lands
+ *  around 41s. 120s is ~3x that worst path and ~4000x the typical one, and it is
+ *  still short enough that pid reuse cannot reach into it: reuse means cycling
+ *  the entire pid space (4194304 by default), which no machine does inside two
+ *  minutes. */
+const TAKEOVER_START_WINDOW_MS = 120_000;
+
+/** ...and how far the OTHER way, which is a unit problem rather than a real
+ *  possibility. `starttime` is quantised to clock ticks and `ps -o etime=` to
+ *  whole seconds, so a process that genuinely started a moment before its own
+ *  lock line can compute a hair after it. 5s covers that granularity and
+ *  nothing else. The window is deliberately asymmetric and BACKWARD-looking: it
+ *  brackets the daemon's own startup, not "recently", so a freshly forked
+ *  impostor that inherited a recycled pid lands on this side and is refused. */
+const TAKEOVER_START_SLACK_MS = 5_000;
+
+/** USER_HZ — the unit `/proc` publishes `starttime` in. NOT the kernel's internal
+ *  CONFIG_HZ (250/300/1000): the kernel converts before writing, and USER_HZ is a
+ *  fixed ABI constant, 100 on every architecture that matters. So the fallback
+ *  below is the ABI and not a guess, and `getconf` is only belt and braces.
+ *
+ *  A wrong value here fails SAFE in BOTH directions, which is why it is allowed
+ *  to be a guess at all: too low and the process computes as far older than its
+ *  lock (refused by the 120s window), too high and it computes as newer than a
+ *  lock it supposedly wrote (refused by the 5s slack). */
+function userHz() {
+  try {
+    const n = Number.parseInt(
+      execFileSync('getconf', ['CLK_TCK'], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        timeout: 3000,
+      }).trim(),
+      10,
+    );
+    if (Number.isInteger(n) && n > 0 && n <= 1_000_000) return n;
+  } catch {
+    /* no getconf — the constant below IS the ABI */
+  }
+  return 100;
+}
+
+/**
+ * Wall-clock milliseconds at which `pid` started, or null.
+ *
+ * NULL IS NOT "UNKNOWN, PROBABLY FINE". Every caller must read it as refuse —
+ * this feeds a check that gates a SIGTERM and then a SIGKILL, and there is no
+ * such thing as a harmless guess about which process to kill.
+ */
+function processStartedAt(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  try {
+    if (platform() === 'linux') {
+      // FIELD 22 OF /proc/<pid>/stat, and the parse is the whole trap. Field 2
+      // is `comm`, which the kernel wraps in parens and which may contain BOTH
+      // spaces and parens — it is the first 15 bytes of the executable's name,
+      // and a name is not a token. A naive split on whitespace taking $22 then
+      // lands on `nice` for any such process, and `nice` is a small integer, so
+      // the answer is not a parse error but a plausible-looking "started at
+      // boot" that sails past any isFinite guard. Measured: a binary named
+      // `ev (i l) x` read 28308s too old that way.
+      //
+      // Every field after `comm` is a number or a single-character state, so no
+      // ')' can appear later: the LAST ')' in the line is always the kernel's
+      // own closing paren, even when comm itself ends in one.
+      const raw = readFileSync(`/proc/${pid}/stat`, 'utf8');
+      const close = raw.lastIndexOf(')');
+      if (close < 0) return null;
+      const fields = raw.slice(close + 1).trim().split(/\s+/); // fields[0] IS field 3
+      const ticks = Number.parseInt(fields[19], 10); // field 22 => 22 - 3
+      if (!Number.isFinite(ticks) || ticks < 0) return null;
+      // `/proc/uptime` rather than `/proc/stat`'s btime, and not for precision
+      // alone (measured 6ms out against 162ms). Date.now() and uptime are read
+      // at the same instant, so a realtime clock stepped since boot cancels
+      // out of the subtraction; btime bakes in a boot-realtime estimate that a
+      // later NTP step silently invalidates. `starttime` is in ticks either
+      // way — uptime gives seconds-since-boot, so the division by USER_HZ is
+      // not optional.
+      const up = Number.parseFloat(readFileSync('/proc/uptime', 'utf8').split(/\s+/)[0]);
+      if (!Number.isFinite(up) || up < 0) return null;
+      const ageMs = (up - ticks / userHz()) * 1000;
+      if (!Number.isFinite(ageMs) || ageMs < 0) return null;
+      return Date.now() - ageMs;
+    }
+    if (platform() === 'darwin') {
+      // `etime`, not `lstart`. A DURATION has no locale, no timezone, and no
+      // ambiguous repeated hour at the DST fall-back — where `lstart` is an
+      // hour out and would refuse a genuine holder twice a year. It also dodges
+      // Date.parse being LENIENT rather than strict: a localized `lstart` can
+      // parse to a wrong-but-finite instant instead of failing honestly.
+      // (`etimes`, the seconds-only form, is procps-only and not a BSD keyword.)
+      // Both derive from the same kinfo_proc.p_starttime, so 1s resolution
+      // against a 120s window costs nothing. LC_ALL is pinned anyway, since a
+      // localized number format would be a wrong answer rather than no answer.
+      const out = execFileSync('ps', ['-o', 'etime=', '-p', String(pid)], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        timeout: 3000,
+        env: { ...process.env, LC_ALL: 'C', LC_TIME: 'C' },
+      });
+      const m = /^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$/.exec(out.trim()); // [[dd-]hh:]mm:ss
+      if (!m) return null;
+      const age =
+        Number(m[1] || 0) * 86400 + Number(m[2] || 0) * 3600 + Number(m[3]) * 60 + Number(m[4]);
+      if (!Number.isFinite(age) || age < 0) return null;
+      return Date.now() - age * 1000;
+    }
+    return null; // win32, and anything else — never signalled rather than guessed at
+  } catch {
+    return null; // no /proc (hidepid=2, a pid namespace, a stripped container), no ps
+  }
+}
+
+/**
+ * THE FALLBACK, for a lock that carries no `entry`.
+ *
+ * `entry` arrived after the lock did. Every daemon from 0.51.2 through 0.53.0
+ * wrote `{pid, repoRoot, startedAt}` and nothing else, and stillTheHolder used
+ * to refuse those outright. Refusing was right in spirit and useless in fact:
+ * it made takeover impossible on precisely the locks takeover exists for, since
+ * the daemon you are replacing is by definition the OLD one. `--takeover` did
+ * nothing, and re-running `flowviant` in the repo you were working in printed a
+ * refusal and sent you hunting for a pid — the exact ceremony the same-repo rule
+ * was written to abolish. (Those locks carry no `version` either, so a legacy
+ * takeover also skips takeOverFrom's downgrade guard, which short-circuits on
+ * `holder.version &&`. Separate hole, not this function's to close.)
+ *
+ * WHY START TIME PROVES IDENTITY, which is the only question worth asking here,
+ * because what this gates is a SIGTERM and then a SIGKILL. A pid alone proves
+ * nothing: pids are recycled, and a crashed daemon's number goes to whatever
+ * forks next. The PAIR (pid, start time) is the standard POSIX process
+ * identity — pidfd, systemd and procps all key on it — because the kernel
+ * stamps a start time at fork and it is immutable for the life of the process,
+ * unforgeable by anything that started later. And `startedAt` was written BY
+ * the process being identified, measured 29-32ms after its own fork, so the
+ * lock is that process's own witness to when it began.
+ *
+ * It is a WEAKER statement than `entry`, which says what the process IS rather
+ * than when it started, and that is why `entry` stays the primary path. What
+ * makes this one acceptable anyway is that a false positive needs two things at
+ * once that are close to mutually exclusive: the pid space must have wrapped
+ * back to this exact number, AND the new occupant must have started inside a
+ * 2-minute window that ENDS at the lock write. Wrapping takes millions of
+ * forks; the window ends before the impostor could have been born.
+ *
+ * EVERY ERROR MODE HERE PUSHES TOWARD REFUSAL, never toward signalling — an
+ * unreadable /proc, a pid namespace, a kernel before 5.5 whose starttime drifts
+ * across suspend, a realtime clock stepped in either direction, a locale that
+ * mangles `ps`, Windows. All of them return false, and false costs a person a
+ * manual kill. The other direction costs somebody else's process.
+ */
+function startedAroundLockWrite(holder) {
+  try {
+    const written = Date.parse(holder?.startedAt ?? '');
+    if (!Number.isFinite(written)) return null; // no witness — nothing was measured
+    const started = processStartedAt(holder.pid);
+    if (started === null) return null; // could not measure — see the tri-state note
+    const delta = written - started; // >0: the process predates its own lock line, as it must
+    return delta >= -TAKEOVER_START_SLACK_MS && delta <= TAKEOVER_START_WINDOW_MS;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * IS THIS PID STILL THE DAEMON THAT TOOK THE LOCK?
  *
@@ -207,11 +379,30 @@ export function daemonInSameRepo(repoRoot, ownPath) {
  * runner living under a `…-flowviant/` directory. That last one is not
  * hypothetical — a looser version of this check SIGTERMed one.
  *
- * A lock with no `entry` predates this and is never signalled.
+ * A lock with no `entry` is no longer refused outright. Those locks are real
+ * and current — every daemon 0.51.2 through 0.53.0 wrote one — so refusing
+ * them meant takeover never worked on the upgrade it was built for. They fall
+ * back to the holder's PROCESS START TIME, which is the same claim made a
+ * weaker way; startedAroundLockWrite above argues why that is a proof rather
+ * than a guess, and why every way it can go wrong ends in a refusal.
+ *
+ * TRI-STATE, and the third value is the point: `true` identified, `false`
+ * measured-and-it-is-someone-else, `null` COULD NOT MEASURE. Both `false` and
+ * `null` refuse — that never changes — but they are not the same sentence, and
+ * collapsing them made the refusal assert a fact nobody had established: on a
+ * `hidepid=2` host (ordinary Debian/Ubuntu hardening) the daemon told the user
+ * their live holder "is no longer the daemon that took this lock", i.e. that
+ * the lock was stale. Acting on that — deleting the lock, or taking the
+ * ALLOW_MULTI escape printed underneath it — lands them in two daemons in one
+ * working tree, which this module's header says no server lease can arbitrate.
+ * Ignorance is not a state this product renders as fact.
  */
 function stillTheHolder(holder) {
   const want = typeof holder?.entry === 'string' ? holder.entry : null;
-  if (!want) return false;
+  // An `entry` of '' is a field with nothing in it — record() writes
+  // `process.argv[1] || ''` — and matching on '' would match every process
+  // alive, so it takes the same road as a missing one.
+  if (!want) return startedAroundLockWrite(holder);
   try {
     if (platform() === 'linux') {
       return readFileSync(`/proc/${holder.pid}/cmdline`, 'utf8').replace(/\0/g, ' ').includes(want);
@@ -222,7 +413,11 @@ function stillTheHolder(holder) {
       timeout: 3000,
     }).includes(want);
   } catch {
-    return false; // gone, or unreadable — not something we signal
+    // NOT `false`. takeOverFrom already returned early if the pid were gone, so
+    // reaching here means the process is alive and we could not READ it —
+    // hidepid=2, a pid namespace, a stripped image with no `ps`. Saying `false`
+    // here is what made the refusal claim the pid belonged to somebody else.
+    return null;
   }
 }
 
@@ -262,7 +457,18 @@ const TAKEOVER_GRACE_MS = 20_000;
  */
 function takeOverFrom(holder, path, log, { allowDowngrade = false } = {}) {
   if (!holder?.pid || !alive(holder.pid)) return null; // already gone
-  if (!stillTheHolder(holder)) {
+  const identified = stillTheHolder(holder);
+  if (identified === null) {
+    // We know nothing about this pid, and said so. The remedy is a human
+    // stopping it, NOT running a second daemon alongside it.
+    return {
+      failed:
+        `cannot confirm what pid ${holder.pid} is on this host — no readable /proc or ps — ` +
+        `so it will not be signalled. Stop that process yourself and start this one again.`,
+      unidentified: true,
+    };
+  }
+  if (identified === false) {
     return { failed: `pid ${holder.pid} is no longer the daemon that took this lock — refusing to signal it` };
   }
   if (!allowDowngrade && holder.version && cmpVersion(VERSION, holder.version) < 0) {
@@ -351,7 +557,8 @@ export function acquireInstanceLock(fleetToken, repoRoot, opts = {}) {
     if (noTakeover) return { ok: false, holder: neighbour, sameRepo: true };
     log?.(`another project's daemon is serving this repo (pid ${neighbour.pid}).`);
     const bad = takeOverFrom(neighbour, neighbourLockPath(neighbour, path), log);
-    if (bad) return { ok: false, holder: neighbour, sameRepo: true, takeoverFailed: bad.failed };
+    if (bad)
+      return { ok: false, holder: neighbour, sameRepo: true, takeoverFailed: bad.failed, unidentified: bad.unidentified };
   }
 
   // Two passes at most: one to clear a stale holder, one to take the lock. A
@@ -394,7 +601,8 @@ export function acquireInstanceLock(fleetToken, repoRoot, opts = {}) {
       const wanted = force || (here && !noTakeover);
       if (wanted) {
         const bad = takeOverFrom(holder, path, log, { allowDowngrade });
-        if (bad) return { ok: false, holder, takeoverFailed: bad.failed, sameRepo: here };
+        if (bad)
+          return { ok: false, holder, takeoverFailed: bad.failed, sameRepo: here, unidentified: bad.unidentified };
         continue; // the file is gone — the next pass takes it
       }
       return { ok: false, holder, sameRepo: here };
