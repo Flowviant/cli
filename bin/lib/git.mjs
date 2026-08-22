@@ -35,7 +35,7 @@ export function repoRootOrDie() {
   try {
     return git(['rev-parse', '--show-toplevel'], process.cwd());
   } catch {
-    console.error('error: fleet mode must run inside a git repo.');
+    console.error('error: the flowviant daemon must run inside a git repo.');
     process.exit(1);
   }
 }

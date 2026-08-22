@@ -56,7 +56,11 @@ export async function runLogin({ thenStart = false } = {}) {
   }
   const { deviceCode, userCode, intervalSeconds = 5, expiresInSeconds = 600 } = start;
   const pretty = `${userCode.slice(0, 4)}-${userCode.slice(4)}`;
-  console.log(`  1. Open ${c.cyan(APP_URL)} → your project → the ${c.bold('Agents')} panel → ${c.bold('Connect a machine')}.`);
+  // Where the control ACTUALLY is. It was "the Agents panel", a settings
+  // section deleted 2026-08-17; connecting a machine is offered on the surface
+  // you are on when it matters, and for a new operator that is the Workbench —
+  // the project's empty state says so before it can show you any sessions.
+  console.log(`  1. Open ${c.cyan(APP_URL)} → your project → the ${c.bold('Workbench')} → ${c.bold('Connect a machine')}.`);
   console.log(`  2. Enter this code:   ${c.bold(c.green(pretty))}\n`);
   info('waiting for you to approve…');
 

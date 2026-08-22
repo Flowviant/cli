@@ -20,21 +20,35 @@ drives CLIs *you* authenticated yourself by shelling out to them:
   Which credential is correct, and whether an account may be shared, is between
   the operator and the vendor (see `bin/lib/claude.mjs`, the comment above the
   spawn).
-- **GitHub** — it uses your authenticated `gh` and `git` for branches and PRs.
+- **GitHub** — it uses your `git` (and your authenticated `gh`, where it is
+  installed) for branches, commits and pushes.
 
-The only credential the daemon holds is a **Flowviant fleet token**, scoped to a
-single project, stored locally at `~/.flowviant/credentials.json` (mode `600`)
+The only credential the daemon holds is a **Flowviant machine token**, scoped to
+a single project, stored locally at `~/.flowviant/credentials.json` (mode `600`)
 after `flowviant login`. It authenticates *to Flowviant*, never to Anthropic or
 GitHub.
 
 ## What it sends to Flowviant
 
-Over HTTPS to the Flowviant API only: which task it claimed, progress notes, PR
-links, acceptance-evidence you can review, blocker questions, and (in live mode)
-the agent's streamed output for the task conversation. It talks to no third party
-except the CLIs above and, for optional live previews, a `cloudflared` tunnel it
-opens to your own dev server (Flowviant stores only the tunnel URL string; your
-browser connects to it directly).
+Over HTTPS to the Flowviant API only:
+
+- **session activity** — the humanized tail of what the CLI is printing during a
+  turn (thinking, reads, commands), relayed so the tab reads like the terminal
+- **work-turn results** — the agent's reply for the session that asked for it
+- **card writes** — the ledger the agent keeps as it works (tasks filed, work
+  logged, deliveries with their commit shas)
+- **ship results** — what the merge did, and the branch's commits, when you ship
+- **worktree diffstats** — branch, commits ahead of base, and per-file +/− counts
+- **commit diffs** — the patch for one commit, fetched only when somebody clicks
+  that sha in the app
+- **local-session presence metadata** — that a Claude Code session is held at
+  this machine's own keyboard in this repo, and its title. Never its transcript
+- **wiki vault syncs** — the generated codebase notes
+
+It talks to no third party except the CLIs above and, for a shared preview, a
+`cloudflared` tunnel it opens in front of a dev server *you* started (Flowviant
+stores only the tunnel URL string; your browser connects to it directly, through
+a mandatory password gate).
 
 ## Permissions
 
@@ -42,6 +56,14 @@ By default the agent runs unattended (`claude --dangerously-skip-permissions`) s
 it doesn't stall with no terminal. Set `FLOWVIANT_SAFE=1` to restrict it to a
 curated toolset instead. Run it only inside a repository you intend agents to
 work.
+
+**Every project member with edit access executes code on this machine, with the
+daemon's own OS permissions.** A project has ONE machine serving the whole team's
+sessions, so opening a Workbench tab runs a coding agent here as whichever OS
+user started the daemon. Membership is the consent boundary — the same trust
+plane as the shared repository. Invite people you would give a shell to, and see
+[README.md](./README.md#security-posture) for the two knobs that bound the blast
+radius (a dedicated OS user, and `FLOWVIANT_SAFE=1`).
 
 ## Reporting a vulnerability
 

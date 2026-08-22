@@ -91,20 +91,23 @@ export async function preflight({ needGit = true } = {}) {
     }
   }
 
-  // gh — needed to open PRs. Offer to fetch the isolated binary (yes-default:
-  // low-risk, no login carried by the install itself).
+  // gh — OPTIONAL. The daemon pushes and merges with plain `git`; nothing in
+  // the product opens a pull request any more, so gh is a convenience for the
+  // agent, not a requirement. Hence the offer no longer defaults to yes: an
+  // install nobody asked for, defaulted on, is how a preflight installs
+  // software on a machine whose operator only wanted a status line.
   if (gh && ghAuthed()) {
     ok('gh authenticated');
   } else if (gh) {
     warn('gh not signed in — run: gh auth login');
   } else {
-    warn('gh NOT found — needed to open PRs.');
-    if (await promptYesNo('Install GitHub CLI (gh) now?', true)) {
+    info('gh not found (optional).');
+    if (await promptYesNo('Install GitHub CLI (gh) now?', false)) {
       if (await installGh((m) => info(m))) gh = present('gh');
     }
     gh
       ? ok('gh installed to ~/.flowviant/bin — authenticate with: flowviant gh-auth')
-      : warn('install gh manually: https://cli.github.com, then run: gh auth login');
+      : info(c.dim('or install it later: https://cli.github.com, then: gh auth login'));
   }
 
   if (needGit) (git ? ok('git installed') : warn('git NOT found — install git'));

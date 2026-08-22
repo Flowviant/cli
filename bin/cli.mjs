@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 /**
- * flowviant — run your own Claude Code as headless Flowviant build agents.
+ * flowviant — run your own coding CLI (Claude Code, Codex, Antigravity) as the
+ * machine behind a Flowviant project.
  *
  * ONE mode, one credential:
  *
- *   FLOWVIANT_FLEET=fft_…   npx flowviant@latest  # the fleet daemon
+ *   FLOWVIANT_FLEET=fva_…   npx flowviant@latest  # the machine daemon
  *
  * `FLOWVIANT_TOKEN` (one worker, current checkout) and `FLOWVIANT_TOKENS` (a
  * comma list, one worktree each) stood beside it until 2026-08-19. Both ran the
@@ -19,28 +20,32 @@
  * on its own — at startup and when idle — so it stays current without restarts
  * (FLOWVIANT_NO_UPDATE=1 makes it nag-only; `flowviant update` updates now).
  *
- * Fleet daemon: install ONCE with a fleet credential, then manage everything
- * from Flowviant. The daemon polls GET /api/v2/fleet/agents, reconciles one
- * persistent git worktree + worker loop per roster agent, rotates each worker's
- * short-lived MCP token, and only spawns Claude when an agent has work. Add/remove
- * agents in the app — the daemon picks up the change on its next poll. Each worker
- * claims its work, resets its worktree to base per task (fresh Claude conversation),
- * opens one PR per intent, and routes questions back as blockers.
+ * The daemon: install ONCE with a machine credential, then work entirely from
+ * Flowviant. It polls GET /api/v2/fleet/agents, and the roster hands it the
+ * project's SESSIONS — the Workbench's tabs. Each session gets one persistent
+ * git worktree on its own `session/<id>` branch, held across turns (never reset
+ * to base: the branch outlives the tab). A turn spawns the session's CLI with a
+ * short-lived per-session MCP token, relays what it prints back to the tab,
+ * reports the worktree's branch and diffstat when it settles, and answers the
+ * odd side job the roster carries — a commit's patch, a preview share, a wiki
+ * regen. When you say ship, the daemon merges that branch into base `--no-ff`.
  *
  * Env:
- *   FLOWVIANT_TOKEN / FLOWVIANT_TOKENS / FLOWVIANT_FLEET  (one of) credentials.
+ *   FLOWVIANT_FLEET     the machine credential (or use `flowviant login`).
  *   FLOWVIANT_API_URL   default https://api.flowviant.com/api/v2
  *   FLOWVIANT_MCP_URL   default <API_URL>/mcp
  *   FLOWVIANT_FLEET_URL default <API_URL>/fleet/agents
- *   POLL_SECONDS        gap between turns while waiting on a blocker (default 20)
- *   IDLE_SECONDS        gap between work checks when idle (default 30)
- *   RECONCILE_SECONDS   fleet roster poll cadence (default 10)
+ *   RECONCILE_SECONDS   roster poll cadence (default 10)
  *   FLOWVIANT_SAFE=1    restrict the toolset instead of running unattended.
  *
- * Requires the `claude` CLI (and `gh` for PRs) on PATH; run from inside the git
- * repo you want worked. Fleet & static-fleet modes also require `git`.
+ * Requires one of `claude` / `codex` / `agy` on PATH, plus `git`; run from
+ * inside the git repo you want worked. `gh` is optional.
  *
- * Implementation lives in ./lib/: config, ui, claude, git, fleet, single.
+ * Implementation lives in ./lib/: config, ui, preflight, install, update,
+ * instance, login, mcp-cli; fleet (the roster loop) and work (session turns);
+ * claude + runtimes + prompts + stream (spawning a CLI and reading its events);
+ * git + worktreeDiff + patch; localSessions, listeners, preview + authproxy;
+ * env + env-cli + vault, resources, deploy, shot.
  */
 import { FLEET_TOKEN } from './lib/config.mjs';
 import { runFleetDaemon } from './lib/fleet.mjs';
@@ -132,9 +137,9 @@ if (process.argv[2] === 'clean') {
 }
 
 // `flowviant shot <url>` — capture a headless-browser screenshot of a running
-// page. Build agents shell out to this to attach REAL visual evidence to the
-// delivery card. Self-contained + graceful (no browser → exit 1, agent falls
-// back to text evidence); needs no credential, so it runs before the auth gate.
+// page. A session's agent shells out to this to SEE the change it just made.
+// Self-contained + graceful (no browser → exit 1, and the agent carries on in
+// text); needs no credential, so it runs before the auth gate.
 if (process.argv[2] === 'shot') {
   const { runShot } = await import('./lib/shot.mjs');
   await runShot(process.argv.slice(3));
@@ -145,8 +150,9 @@ if (process.argv[2] === 'shot') {
 // are sealed to the project pubkey ON THIS MACHINE (same write-only crypto as
 // the browser); `show` decrypts locally — it only works on an ENROLLED machine.
 // `flowviant mcp` — connect YOUR Claude to Flowviant so you can file work from
-// the terminal. Mints a `cli` credential: a separate principal from the build
-// workers, with only the management tools and no way to claim or ship work.
+// the terminal. Mints a `cli` credential: a separate principal from the
+// per-session tokens, with only the management tools and no way to work or ship
+// a card.
 if (process.argv[2] === 'mcp') {
   const { runMcpCommand } = await import('./lib/mcp-cli.mjs');
   await runMcpCommand(process.argv.slice(3));
@@ -164,7 +170,7 @@ if (!FLEET_TOKEN) {
     'error: no credential found. Easiest:\n' +
       '  flowviant login      (approve in the app — recommended)\n' +
       'Or set:\n' +
-      '  FLOWVIANT_FLEET=fft_…   (fleet token, manage machines in Flowviant)'
+      '  FLOWVIANT_FLEET=fva_…   (machine token, from the app)'
   );
   process.exit(1);
 }

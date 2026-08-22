@@ -31,7 +31,6 @@ import {
   REFRESH_BEFORE_SECONDS,
   LIVE,
   AUTO_UPDATE,
-  ALLOW_PATCHES,
 } from './config.mjs';
 import { handleVersionSignal } from './update.mjs';
 import {
@@ -276,20 +275,13 @@ async function maybeReportLocalSessions({ repoRoot, excludeDirs }) {
 
 export async function runFleetDaemon() {
   console.log('');
-  console.log(`  ${c.bold(c.cyan('◣ flowviant'))}  ${c.dim(`fleet daemon · v${VERSION}`)}`);
+  console.log(`  ${c.bold(c.cyan('◣ flowviant'))}  ${c.dim(`machine daemon · v${VERSION}`)}`);
   console.log(`  ${c.dim('──────────────────────────────────────────────')}`);
   const repoRoot = repoRootOrDie();
   const baseRef = detectBaseRef(repoRoot);
   info(SAFE ? 'mode   · safe (restricted toolset)' : 'mode   · unattended (skips permission prompts)');
   info(`repo   · ${repoRoot}`);
   info(`base   · ${baseRef}`);
-  // Stated out loud because it is the one setting that lets something else write
-  // into the checkout you are sitting in.
-  info(
-    ALLOW_PATCHES
-      ? 'patches· accepted — small changes land in your checkout for Keep/Revert (--no-patches to refuse)'
-      : 'patches· refused — everything arrives as a branch + PR'
-  );
   info(`server · ${FLEET_URL}`);
   console.log('');
 
@@ -635,6 +627,7 @@ export async function runFleetDaemon() {
     processWorkTurns,
     processShipJobs,
     processDiffJobs,
+    heldSessionIds,
     processPreviewJobs,
     livePreviewIds,
     retirePreviews,
@@ -902,20 +895,42 @@ export async function runFleetDaemon() {
 
   // Changed files of a (merged) PR, for the re-ground prompt. Capped so a huge
   // PR can't blow up the prompt. prUrl was already validated before the merge.
-  // Returns null on a gh FAILURE (network/auth) — distinct from a PR that
-  // genuinely changed nothing — so the caller can retry instead of silently
-  // consuming the durable job with no re-ground run.
-  const changedFilesForPr = (prUrl) => {
-    try {
-      const out = execFileSync('gh', ['pr', 'view', prUrl, '--json', 'files'], {
-        cwd: repoRoot,
-        encoding: 'utf8',
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
-      return (JSON.parse(out).files ?? []).map((f) => f.path).filter(Boolean).slice(0, 60);
-    } catch {
-      return null;
+  // WHICH FILES A SHIP CHANGED, read from the commits it landed.
+  //
+  // This asked `gh pr view <prUrl> --json files` until 2026-08-22, and `prUrl`
+  // has been null by construction since dispatch was deleted on 2026-08-19 —
+  // the server writes null and says so in a comment. Node threw on the null
+  // argument, the catch below read it as "gh failed", and the re-ground retried
+  // three times and gave up. Every post-ship re-ground for three months did
+  // that silently, while the spec said ship re-grounds the wiki.
+  //
+  // Returns null when it learned NOTHING (no shas, or none of them resolvable),
+  // which the caller still treats as retryable — distinct from a ship that
+  // genuinely changed no files.
+  const changedFilesForShas = (shas) => {
+    if (!Array.isArray(shas) || shas.length === 0) return null;
+    const files = new Set();
+    for (const sha of shas.slice(0, 50)) {
+      if (!/^[0-9a-f]{7,40}$/i.test(String(sha))) continue;
+      try {
+        const out = execFileSync(
+          'git',
+          ['show', '--name-only', '--pretty=format:', String(sha)],
+          { cwd: repoRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }
+        );
+        for (const line of out.split('\n')) {
+          const f = line.trim();
+          if (f) files.add(f);
+          if (files.size >= 60) break;
+        }
+      } catch {
+        // One unreachable commit is not a failed re-ground — the ship merged
+        // to main and the rest of the shas still name real files. Only an
+        // EMPTY result is treated as "we learned nothing".
+      }
+      if (files.size >= 60) break;
     }
+    return files.size ? [...files] : null;
   };
   const regroundAttempts = new Map(); // intentId -> gh-failure count
 
@@ -1071,7 +1086,7 @@ export async function runFleetDaemon() {
               warn('wiki sweep ended without WIKI_DONE — partial pages synced; retry from the app.');
             await runSync(complete);
           } else {
-            const files = changedFilesForPr(task.prUrl);
+            const files = changedFilesForShas(task.shas);
             if (files === null) {
               // gh failed (network/auth) — retry via the durable job a couple
               // of times before consuming it, so a transient outage doesn't
@@ -1079,11 +1094,11 @@ export async function runFleetDaemon() {
               const n = (regroundAttempts.get(task.intentId) ?? 0) + 1;
               regroundAttempts.set(task.intentId, n);
               if (n < 3) {
-                warn(`wiki re-ground for "${task.title}": gh failed — will retry (${n}/3)`);
+                warn(`wiki re-ground for "${task.title}": no changed files resolved — will retry (${n}/3)`);
                 groundedIntents.delete(task.intentId); // let the roster re-offer it
                 continue;
               }
-              warn(`wiki re-ground for "${task.title}": gh failed ${n} times — giving up (heals on the next full sweep)`);
+              warn(`wiki re-ground for "${task.title}": could not resolve changed files ${n} times — giving up (heals on the next full sweep)`);
             } else if (files.length === 0) {
               note(`${c.cyan('wiki')} ${c.dim(`— "${task.title}": no changed files to re-ground`)}`);
             } else {
@@ -1300,23 +1315,22 @@ export async function runFleetDaemon() {
     const sig = [...rosterIds].sort().join(',');
     if (sig !== rosterSig) {
       rosterSig = sig;
-      if (rosterIds.size === 0) {
-        // `agents` is permanently [] — the lanes it counted died with dispatch
-        // and the array survives only as wire compat. So this branch is the one
-        // that always runs, and it used to point at the Cockpit, a surface
-        // deleted 2026-08-04 that now redirects to the Board. Say what is
-        // actually true instead: the machine is up, and work starts in a tab.
-        info('Machine online. Open a tab in Flowviant → Workbench to start working.');
-      } else {
-        note(`Roster: ${c.bold(String(rosterIds.size))} agent${rosterIds.size === 1 ? '' : 's'}.`);
-      }
+      // `agents` is permanently [] — the lanes it counted died with dispatch
+      // and the array survives only as wire compat, so this runs once, on the
+      // first poll. It used to point at the Cockpit, a surface deleted
+      // 2026-08-04 that now redirects to the Board. Say what is actually true
+      // instead: the machine is up, and work starts in a tab.
+      info('Machine online. Open a tab in Flowviant → Workbench to start working.');
     }
-    // Heartbeat so a quiet/empty daemon visibly stays alive.
-    if (rosterIds.size === 0 && Date.now() - idleBeatAt > 60_000) {
+    // Heartbeat so a quiet daemon visibly stays alive. Gated on REAL work —
+    // `rosterIds` is built from `roster.agents`, which the server sends
+    // permanently empty, so gating on it printed "waiting" once a minute even
+    // while a tab's turn was running. `workBusy()` is the honest question: are
+    // there session turns, ships or unsettled reports in flight?
+    if (!workBusy() && Date.now() - idleBeatAt > 60_000) {
       idleBeatAt = Date.now();
-      info('idle — waiting for agents…');
+      info('machine online — nothing running right now.');
     }
-
 
     // Living-wiki work (runs under its own minted wiki token — no agent
     // needed). enqueueSweep queues a Regenerate; regroundJobs re-offers merged
@@ -1333,13 +1347,18 @@ export async function runFleetDaemon() {
 
     // Env sync tick: register/bootstrap/wrap/rotate/sync as the roster block
     // dictates (self-guarded — one operation at a time, errors retry next
-    // poll). A fresh bundle rematerializes every AGENT worktree; the wiki
-    // worktree NEVER gets env (the cartographer doesn't need secrets).
+    // poll). A fresh bundle rematerializes every SESSION worktree this daemon
+    // holds — read off the sessions directory, the same fact retirement acts
+    // on; the wiki worktree NEVER gets env (the cartographer doesn't need
+    // secrets). This used to iterate the dispatch-era `workers` map, which
+    // nothing has ever `.set()`, so a rotation reached no worktree at all.
+    // Safe mid-turn by construction: materializeInto refuses to write anything
+    // git does not ignore, so it cannot dirty a tree and block a ship.
     void handleRosterEnv(roster.env, { projectId: roster.project?.id }).then(({ changed }) => {
       if (!changed) return;
-      for (const [, w] of workers) {
+      for (const id of heldSessionIds()) {
         try {
-          materializeInto(w.wt);
+          materializeInto(join(baseDir, 'sessions', id));
         } catch {
           /* best-effort */
         }

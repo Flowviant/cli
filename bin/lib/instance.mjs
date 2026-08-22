@@ -1,11 +1,24 @@
 /**
- * ONE DAEMON PER CREDENTIAL, refused at startup.
+ * ONE DAEMON PER REPO (and per credential), ARBITRATED at startup — a second
+ * run in the same repo takes the first one's place rather than being turned
+ * away. See "WHAT A SECOND RUN DOES" below for the whole rule.
  *
- * WHY THIS EXISTS. Nothing stopped two daemons before, and the server hands
- * work out by READING, never claiming: `listWorkTurnJobs` selects every pending
- * turn for the fleet token, `listShipJobs` reads a flag. So two daemons on one
- * credential are offered the SAME turn — and the ProjectRoom nudges every
- * connected daemon socket at once, so they do not even drift out of phase.
+ * WHY THIS EXISTS. Nothing stopped two daemons before, and the server USED to
+ * hand work out by READING, never claiming: `listWorkTurnJobs` selected every
+ * pending turn for the machine credential, `listShipJobs` read a flag. So two
+ * daemons on one credential were offered the SAME turn — and the ProjectRoom
+ * nudges every connected daemon socket at once, so they did not even drift out
+ * of phase.
+ *
+ * That half is fixed on the server now: since 0.53.0 each SESSION is leased to
+ * one daemon INSTANCE nonce — `di`, regenerated every start (config.mjs) and
+ * sent on every poll beside `ws`, the list of sessions this daemon holds a
+ * worktree for — so a turn is handed to the instance holding that session and
+ * to no one else. It does NOT retire this lock. The lease fails OPEN when no
+ * instance is reported (an older daemon cannot name itself), and it arbitrates
+ * only what rides a session: the wiki sweep, env materialization, previews,
+ * deploys and every worktree operation the server never sees are still first
+ * come, first served.
  *
  * The per-worktree `flowviant-turn.lock` cannot save it. That lock is written
  * AFTER the work token is minted and the attachments are fetched — a window
@@ -14,13 +27,16 @@
  * (its own comment says so, work.mjs), where the holder is already live when
  * the successor looks; it was never a concurrency primitive.
  *
- * What the duplicate run costs, all of it invisible in the tab: two Claudes
- * editing one worktree, two cards from one `file_card` (no idempotency key),
- * the session write budget spent twice, quota spent twice — and then exactly
- * ONE answer survives, because `settleWorkTurn` is atomic. The side effects
- * land twice and the transcript shows one turn.
+ * What a duplicate run cost before the session lease, all of it invisible in
+ * the tab: two Claudes editing one worktree, two cards from one `file_card` (no
+ * idempotency key), the session write budget spent twice, quota spent twice —
+ * and then exactly ONE answer surviving, because `settleWorkTurn` is atomic.
+ * The side effects landed twice and the transcript showed one turn. Two daemons
+ * in one checkout still cost the un-leased half of that: two `git fetch`, two
+ * worktree sweeps, and the collisions listed under ONE DAEMON PER REPO below.
  *
- * KEYED ON THE CREDENTIAL, NOT THE REPO. The credential is stored once, at
+ * KEYED ON THE CREDENTIAL — and, as the next paragraph adds, on the REPO as
+ * well; both checks run, and either one is enough. The credential is stored once, at
  * ~/.flowviant/credentials.json, so `flowviant` in two DIFFERENT checkouts is
  * still one project served twice — and that case is strictly worse, because the
  * two daemons have different worktree roots and the turn lock cannot even see

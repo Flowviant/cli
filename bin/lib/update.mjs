@@ -114,10 +114,11 @@ export function handleVersionSignal({ latest, min, autoUpdate, safeToUpdate, tea
 
   if (wantInstall && !npx) {
     if (!safeToUpdate) {
-      // Outdated but an agent is mid-task — wait for idle. Nag once meanwhile.
+      // Outdated but a turn is running — wait until the machine is quiet. Nag
+      // once meanwhile.
       if (naggedFor !== target) {
         naggedFor = target;
-        note(`flowviant ${cur} → ${target} available — self-updating once agents go idle.`);
+        note(`flowviant ${cur} → ${target} available — self-updating once no turn is running.`);
       }
       return false;
     }

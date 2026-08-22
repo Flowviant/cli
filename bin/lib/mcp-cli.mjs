@@ -2,17 +2,18 @@
  * `flowviant mcp` — connect YOUR Claude to Flowviant so you can file work from
  * the terminal ("stick that on the board", "file a task for this TODO").
  *
- * This mints a `cli` credential, which is a different principal from the worker
- * tokens the daemon rotates for builds. That separation is the point, not
- * bookkeeping: a worker reads untrusted repo, PR and issue text all day, so
- * giving THAT principal tools that write to your workspace would mean a hostile
- * string in a README could file work as you. The cli credential sees only the
- * management tools and can never claim or complete work; the worker can never
- * reach create_task.
+ * This mints a `cli` credential, which is a different principal from the
+ * per-session `work` tokens the daemon mints for Workbench tabs. That
+ * separation is the point, not bookkeeping: a session's agent reads untrusted
+ * repo and issue text all day, so giving THAT principal tools that write to
+ * your workspace would mean a hostile string in a README could file work as
+ * you. The cli credential sees only the management tools and can never work or
+ * ship a card; a session token can never reach create_task.
  *
  * There is deliberately no invite capability on it. Invites grant access to a
- * paid workspace and are guarded by a human browser session; you ask Flowvy in
- * the app for those, and approve the card.
+ * paid workspace and are guarded by a human browser session — they are sent
+ * from the workspace card's gear menu in the app, and never from a CLI
+ * credential sitting on a shared machine.
  */
 
 import { FLEET_TOKEN, USER_AGENT, MCP_URL, FLEET_URL } from './config.mjs';
@@ -77,7 +78,7 @@ export async function runMcpCommand(args = []) {
   console.log(`  ${cmd}`);
   console.log('');
   console.log('Then, in any Claude session: "file a task in Flowviant for …".');
-  console.log('Tasks land as drafts — nothing runs until you open one in the');
-  console.log('app and @mention an agent.');
+  console.log('Tasks land as drafts on the board — nothing runs until you open');
+  console.log('a session tab in the Workbench and type in it.');
   console.log('');
 }

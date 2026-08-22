@@ -1,15 +1,18 @@
 # flowviant
 
-Run your own [Claude Code](https://claude.com/claude-code) as headless build agents for [Flowviant](https://flowviant.com). You manage a team of agents in the app; this daemon runs them on your machine, on your own credentials — Flowviant never sees your Claude or GitHub logins.
+Run your own coding CLIs as build agents for [Flowviant](https://flowviant.com) — [Claude Code](https://claude.com/claude-code), Codex or Antigravity, on your own credentials. This daemon holds your sessions, keeps a worktree per tab, and ships branches on your word. Flowviant never sees your Claude, Codex or GitHub logins.
 
 ```bash
-npx flowviant login      # approve the code in Flowviant → connected
-npx flowviant            # run your fleet
+npx flowviant@latest login   # approve the code in Flowviant → connected
 ```
+
+Login keeps going straight into the daemon — there is no second command to run.
 
 ## What it does
 
-You create named agents in Flowviant and dispatch work to them. This daemon, running on a machine you control, gives each agent its own git worktree and drives **your** locally-authenticated `claude` to do the work — it claims a task, works it, captures evidence for each acceptance criterion, opens a pull request, and routes any question it can't answer back to you as a blocker. You review and merge in the app.
+A Flowviant project has ONE machine, and this is it: one box, running one Claude (or Codex, or Antigravity) account, serving the whole team's sessions so nobody has to set up their own. Solo and team are the same architecture at N=1 and N>1.
+
+You work in the **Workbench**, where your sessions are TABS — each one a held context plus a persistent git worktree on its own `session/<id>` branch. The browser is a terminal projected onto this machine, so you reach the same session from any device. When you say ship, the tab merges its own branch into base with `--no-ff` — no squash, so the commit shas the work reported still exist on main.
 
 Because it drives the CLIs you're already logged into, **the cost is yours** (your Claude subscription, your GitHub) and **the daemon never handles a credential** — it shells out to tools you authenticated yourself.
 
@@ -17,9 +20,9 @@ Because it drives the CLIs you're already logged into, **the cost is yours** (yo
 
 On the machine that runs the daemon:
 
-- **[Claude Code](https://claude.com/claude-code)** installed and signed in (`claude`)
-- **[GitHub CLI](https://cli.github.com)** authenticated (`gh auth login`) — for opening PRs
+- **at least one coding CLI** installed and signed in — [Claude Code](https://claude.com/claude-code) (`claude`), Codex (`codex`) or Antigravity (`agy`)
 - **git**, and **Node 20+**
+- **[GitHub CLI](https://cli.github.com)** (`gh`) — optional; the daemon offers to fetch an isolated copy, and `flowviant gh-auth` signs it in
 - run it from inside the git repository you want worked
 
 ## Connecting
@@ -27,53 +30,44 @@ On the machine that runs the daemon:
 The easy way — device login, like `gh auth login`:
 
 ```bash
-npx flowviant login
+npx flowviant@latest login
 ```
 
-It shows a short code; enter it in Flowviant under **Agents → Connect a machine**. The credential is stored at `~/.flowviant/credentials.json`, and from then on `npx flowviant` just runs.
+It shows a short code. Open your project's **Workbench** in Flowviant and enter the code where it offers to connect a machine. The credential is stored at `~/.flowviant/credentials.json`, and from then on `npx flowviant@latest` just runs.
 
-Prefer an explicit token? Create a fleet credential in the app and pass it directly:
+Prefer an explicit token? Create a machine credential in the app and pass it directly:
 
 ```bash
-FLOWVIANT_FLEET=fva_… npx flowviant
+FLOWVIANT_FLEET=fva_… npx flowviant@latest
 ```
 
-## Live mode (the default)
+Launch with `@latest` so each start pulls the newest published version — a bare `npx flowviant` can reuse a stale cache. A running daemon also self-updates at startup and when idle (`FLOWVIANT_NO_UPDATE=1` makes it nag-only; `flowviant update` updates now).
 
-Each task runs a **persistent** Claude session you can talk to mid-task from the app: the agent streams its work into the task's conversation, you `@`-mention it to steer or answer questions, and it resumes in place. Blockers park the session at zero cost until you answer. When it finishes, it posts a delivery card (summary + checklist self-report) in the thread — a human confirms done by merging there.
+## Sessions
 
-Prefer the legacy one-shot poll mode (no streaming, no previews)? Escape hatch:
+Each tab in the Workbench is a persistent Claude session with its own worktree, and it stays where you left it — the branch outlives the tab. The daemon runs each turn in event mode and relays what the CLI is printing (thinking, reads, greps, commands) back to the tab, reports the worktree's branch and diffstat after every turn, and fetches a commit's patch when you click a sha in the app.
 
-```bash
-FLOWVIANT_POLL=1 npx flowviant
-```
+Nothing starts work except you opening a tab and typing in it.
 
-### Live previews
+## Sharing a preview
 
-For UI/API tasks, the daemon can start the branch's dev server in the agent's worktree and open a [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/) quick tunnel so you can drive the real running change during review — no Cloudflare account needed (it's auto-fetched if missing). Configure it once per repo, or let it infer common setups:
+You run your dev server yourself, in the session's own worktree, exactly as you would in any terminal. The daemon NOTICES the listening port; ask for a share in the app and it puts a [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/) quick tunnel in front of it (auto-fetched if missing, pinned and checksummed) behind a **mandatory password gate**. Flowviant stores only the tunnel URL; your browser talks to it directly.
 
-```json
-// .flowviant/preview.json
-{ "ui": { "cmd": "npm run dev", "port": 5173 } }
-```
-
-Flowviant only stores the tunnel URL; your browser talks to it directly.
+The daemon never executes anything the repository declares. An earlier version read a `.flowviant/preview.json` from the branch and spawned the command it named — that start path was removed in 0.53.0 and is not coming back; see the header of `bin/lib/preview.mjs` for exactly what it did, so nobody rebuilds it.
 
 ## Modes
 
 | Env | What runs |
 | --- | --- |
-| _(stored login)_ or `FLOWVIANT_FLEET` | **Fleet daemon** — one worktree + worker per agent on your roster, managed in the app |
-| `FLOWVIANT_TOKEN` | a single agent in the current checkout |
-| `FLOWVIANT_TOKENS=a,b,c` | a static fleet, one worktree each |
+| _(stored login)_ or `FLOWVIANT_FLEET` | **the daemon** — the project's machine, serving its sessions |
 | `FLOWVIANT_SAFE=1` | restrict the toolset instead of running unattended |
 
 ## Security posture
 
-Every project member with edit access can run turns on this machine —
-Workbench tabs and @-dispatches both execute a coding agent with the daemon's
-own OS permissions. Membership is the consent boundary, the same trust plane
-as the shared repository: invite people you would give a shell to.
+Every project member with edit access can run turns on this machine — a
+Workbench tab executes a coding agent with the daemon's own OS permissions.
+Membership is the consent boundary, the same trust plane as the shared
+repository: invite people you would give a shell to.
 
 Two knobs bound the blast radius, and both are worth setting on a shared box:
 

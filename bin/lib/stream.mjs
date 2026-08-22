@@ -1,11 +1,13 @@
 /**
- * Fleet daemon push channel — the best-practice endgame for dispatch latency.
+ * Machine daemon push channel — the best-practice endgame for pickup latency.
  *
- * Holds a hibernatable WebSocket open to the server. When a job lands (a wiki
- * regen, a dispatch, a merge request, an @mention), the server pushes a
- * `{type:'wake'}` frame and the daemon reconciles IMMEDIATELY — its normal
- * roster fetch — instead of waiting out the poll. That collapses pickup latency
- * from ≤RECONCILE_SECONDS to ~a round trip.
+ * Holds a hibernatable WebSocket open to the server. When a job lands — a
+ * session turn typed into a tab, a diff request, a preview, an env sync, a
+ * deploy, a wiki regen — the server pushes a `{type:'wake'}` frame and the
+ * daemon reconciles IMMEDIATELY — its normal roster fetch — instead of waiting
+ * out the poll. That collapses pickup latency from ≤RECONCILE_SECONDS to ~a
+ * round trip, which is what makes a message typed in the browser start on the
+ * machine at once.
  *
  * The socket carries NO authority: it's a dumb nudge, the roster HTTP fetch is
  * the source of truth (notify-then-reconcile, à la k8s watch). So a dropped or
@@ -74,9 +76,9 @@ export function connectStream({ onWake, isAlive }) {
       lastRxAt = Date.now();
       if (announcedDown) {
         announcedDown = false;
-        info(c.dim('push channel reconnected — instant dispatch back on'));
+        info(c.dim('push channel reconnected — turns start instantly again'));
       } else {
-        note(c.dim('push channel connected — instant dispatch on'));
+        note(c.dim('push channel connected — turns start instantly'));
       }
       clearPing();
       pingTimer = setInterval(() => {
