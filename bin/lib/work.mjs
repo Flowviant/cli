@@ -492,7 +492,15 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
         /* best-effort */
       }
     }
-    await postPreview({ sessionId, ended: true, endedReason: reason });
+    // Confirm only a teardown we actually PERFORMED. The stop job is a
+    // broadcast — every daemon on the credential gets it — and the one holding
+    // nothing used to answer instantly, flipping the row to 'ended' so the
+    // real holder was never told to stop and its tunnel outlived every
+    // surface. (The server drops mismatched confirms too; this is the copy on
+    // the component that can be published ahead of a deploy.) A stop for a
+    // tunnel whose daemon crashed resolves server-side: an unanswered 'ending'
+    // row reads as over once it goes stale.
+    if (live) await postPreview({ sessionId, ended: true, endedReason: reason });
   };
 
   const processPreviewJobs = (jobs) => {
@@ -551,6 +559,27 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
             onDead: () => {
               livePreviews.delete(sessionId);
               void postPreview({ sessionId, ended: true, endedReason: 'origin_gone' });
+            },
+            // ATTRIBUTION rides the probe, not just the open: a freed default
+            // port (5173…) rebound by any other process on the box would keep
+            // a bare TCP probe green, and the share's URL+password would serve
+            // a worktree nobody consented to publish.
+            stillServing: async () => listenersIn(wt).some((l) => l.port === port),
+            // The gate closed itself after repeated failed passwords. Stored,
+            // so the incident is visible — and the entry is dropped so the
+            // owner can re-share the port without restarting the daemon.
+            onAbuse: () => {
+              livePreviews.delete(sessionId);
+              void postPreview({ sessionId, ended: true, endedReason: 'abuse' });
+            },
+            // cloudflared died AFTER publishing (quick tunnels get dropped).
+            // Without this the daemon kept heartbeating a hostname that 530s.
+            onTunnelGone: () => {
+              livePreviews.delete(sessionId);
+              void postPreview({
+                sessionId,
+                error: 'the tunnel dropped — share it again to reopen.',
+              });
             },
           });
           if (t.error) {
@@ -1195,6 +1224,13 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
     // worktree would pull the directory out from under a running turn. Absence
     // means "the tab closed"; this is the one other thing it can mean.
     const peers = new Set(Array.isArray(heldElsewhere) ? heldElsewhere : []);
+    // A peer-held session's CACHED work token is a claim-bypass: the mint is
+    // the one place the session lease 409s a non-holder, and a token younger
+    // than ~23h skips the mint entirely — so a daemon that lost a lease would
+    // run the next turn anyway, editing the worktree while every MCP call
+    // 401s (the peer's mint rotated the secret). Dropping the cache forces
+    // the next turn through the mint, where the 409 stands it down.
+    for (const id of peers) workTokens.delete(id);
     const dir = join(baseDir, 'sessions');
     if (!existsSync(dir)) return;
     let ids;

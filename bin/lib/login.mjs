@@ -74,7 +74,11 @@ export async function runLogin({ thenStart = false } = {}) {
       continue; // transient — keep polling
     }
     if (poll.status === 'approved') {
-      store({ fleetToken: poll.fleetToken, projectId: poll.projectId, mcpUrl: poll.mcpUrl });
+      // `machineToken` is the wire's new name; `fleetToken` is the one every
+      // published daemon reads. The server dual-sends until DAEMON_MIN clears
+      // THIS release (0.54.2) — reading both here is what makes retiring the
+      // old key possible at all.
+      store({ fleetToken: poll.machineToken ?? poll.fleetToken, projectId: poll.projectId, mcpUrl: poll.mcpUrl });
       ok('connected — credential saved to ~/.flowviant/credentials.json');
       // The daemon starts right here unless the caller opted out; telling
       // someone to run a second command was the step that got missed, since by

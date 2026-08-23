@@ -782,7 +782,7 @@ export async function runFleetDaemon() {
             // Direct enqueue = immediacy; the server's durable regroundJobs list
             // (created by merge-done above, cleared by our reground-done report)
             // is the restart-safe backstop — dedup'd here by groundedIntents.
-            enqueueReground(job.id, job.prUrl, job.title, job.dirtiesPages);
+            enqueueReground(job.id, job.prUrl, job.title, job.dirtiesPages, job.shas);
           } else if (failedReason) {
             // Report into the thread (server narrates + re-arms the merge
             // button + notifies) — the job disappears from the roster.
@@ -926,7 +926,7 @@ export async function runFleetDaemon() {
     wikiQueue.push({ type: 'sweep' });
     void drainWiki();
   };
-  const enqueueReground = (intentId, prUrl, title, dirtiesPages) => {
+  const enqueueReground = (intentId, prUrl, title, dirtiesPages, shas) => {
     if (!intentId || groundedIntents.has(intentId)) return;
     groundedIntents.add(intentId);
     wikiQueue.push({
@@ -939,6 +939,13 @@ export async function runFleetDaemon() {
       // frontmatter file list has drifted, or that document a concept rather
       // than a directory.
       dirtiesPages: Array.isArray(dirtiesPages) ? dirtiesPages : [],
+      // THE COMMITS THAT SHIPPED — what changedFilesForShas resolves against.
+      // Dropping this here was the whole 0.54.0/0.54.1 defect: the server sent
+      // shas on every reground job, this function never stored them, and the
+      // drain's `task.shas` was undefined on every job — so the re-ground
+      // "revived" on 2026-08-22 retried three times against nothing and gave
+      // up, on a console nobody reads, on every single ship.
+      shas: Array.isArray(shas) ? shas : [],
     });
     void drainWiki();
   };
@@ -1185,6 +1192,13 @@ export async function runFleetDaemon() {
             // crash BEFORE this line leaves the job listed for a retry.
             regroundAttempts.delete(task.intentId);
             await reportMergeOutcome(REGROUND_DONE_URL, { taskId: task.intentId });
+            // The dedup was DAEMON-LIFETIME, which wedged a reopened card: its
+            // second ship writes a fresh durable job, this Set still holds the
+            // taskId, enqueueReground refuses it on every poll forever, and
+            // the never-consumed job churns the wiki-writer lease until a
+            // restart. The job is consumed now, so the guard has done its work;
+            // a FUTURE ship of the same card is new work, not a duplicate.
+            groundedIntents.delete(task.intentId);
           }
         } catch (e) {
           warn(`wiki ${task.type} failed: ${e.message}`);
@@ -1269,7 +1283,13 @@ export async function runFleetDaemon() {
       if (e.auth) {
         fail(`${e.message} — credential revoked or invalid. Shutting down.`);
         teardown();
-        process.exit(1);
+        // EXIT 0, for the same reason the commanded-stop path does: a revoked
+        // credential is a terminal, asked-for-by-someone state, and a relaunch
+        // can never fix it. Under `Restart=on-failure` a nonzero code has
+        // systemd relaunch the daemon immediately — a restart loop hammering
+        // dead-credential polls, fighting the Disconnect that revoked it, and
+        // ending in a unit that reads as a crash rather than a kill.
+        process.exit(0);
       }
       warn(`roster poll failed: ${e.message} — retrying in ${RECONCILE_SECONDS}s`);
       await sleep(RECONCILE_SECONDS);
@@ -1304,6 +1324,17 @@ export async function runFleetDaemon() {
           : 'stopped by Flowviant — no reason given.'
       );
       note('shutting down — stopping workers. Worktrees are kept: in-flight work resumes next run.');
+      // FLUSH the settle queue first, bounded: a queued-but-undelivered report
+      // is a COMPLETED turn whose side effects already happened, and dropping
+      // it re-runs the whole turn on the next start — quota spent twice and
+      // every card write doubled. This path is async (unlike the signal
+      // handlers, which cannot await), so the stop can afford five seconds of
+      // delivery before it obeys.
+      try {
+        await Promise.race([flushWorkReports(), sleep(5)]);
+      } catch {
+        /* undelivered reports re-run; delivering them was best-effort */
+      }
       // teardown() is NOT optional on this path. Detached preview tunnels
       // survive this process BY DESIGN, so exiting without it strands a public
       // hostname pointed into a worktree until somebody reboots the box — which
@@ -1421,7 +1452,7 @@ export async function runFleetDaemon() {
     for (const j of roster.regroundJobs ?? []) {
       const rid = j && (j.taskId ?? j.intentId); // new name first, old as fallback
       if (!j || typeof rid !== 'string') continue; // a null element would throw + wedge the loop
-      enqueueReground(rid, j.prUrl, j.title, j.dirtiesPages);
+      enqueueReground(rid, j.prUrl, j.title, j.dirtiesPages, j.shas);
     }
     void drainWiki();
 

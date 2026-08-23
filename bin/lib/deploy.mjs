@@ -13,7 +13,7 @@
 import { readFileSync, existsSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { join } from 'node:path';
-import { FLEET_URL, FLEET_TOKEN, USER_AGENT } from './config.mjs';
+import { FLEET_URL, FLEET_TOKEN, USER_AGENT, DAEMON_INSTANCE } from './config.mjs';
 import { c, note, ok, warn } from './ui.mjs';
 import { deployCreds, appSecretsFor, scrub, myPubB64 } from './env.mjs';
 
@@ -167,7 +167,15 @@ export function processDeployJobs(jobs, ctx) {
     void (async () => {
       let beat = null;
       try {
-        const claimed = await post('deploy-claim', { jobId: job.id, pubkey: ctx.myPubB64() }).catch(() => null);
+        // `instance` names THIS PROCESS. The pubkey cannot: it is the env
+        // keypair read from one file per home directory, so two daemons on one
+        // box share it and a pubkey-only read-back let both "win" the claim
+        // and run the same deploy twice concurrently.
+        const claimed = await post('deploy-claim', {
+          jobId: job.id,
+          pubkey: ctx.myPubB64(),
+          instance: DAEMON_INSTANCE,
+        }).catch(() => null);
         if (!claimed?.claimed) return; // another daemon won the claim
         // Keep the claim fresh while we run — a long deploy must never be
         // re-queued out from under us (that would double-deploy). The async

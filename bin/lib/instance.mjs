@@ -413,15 +413,16 @@ function stillTheHolder(holder) {
   // `process.argv[1] || ''` — and matching on '' would match every process
   // alive, so it takes the same road as a missing one.
   if (!want) return startedAroundLockWrite(holder);
+  let cmdline;
   try {
-    if (platform() === 'linux') {
-      return readFileSync(`/proc/${holder.pid}/cmdline`, 'utf8').replace(/\0/g, ' ').includes(want);
-    }
-    return execFileSync('ps', ['-o', 'command=', '-p', String(holder.pid)], {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-      timeout: 3000,
-    }).includes(want);
+    cmdline =
+      platform() === 'linux'
+        ? readFileSync(`/proc/${holder.pid}/cmdline`, 'utf8').replace(/\0/g, ' ')
+        : execFileSync('ps', ['-o', 'command=', '-p', String(holder.pid)], {
+            encoding: 'utf8',
+            stdio: ['ignore', 'pipe', 'ignore'],
+            timeout: 3000,
+          });
   } catch {
     // NOT `false`. takeOverFrom already returned early if the pid were gone, so
     // reaching here means the process is alive and we could not READ it —
@@ -429,6 +430,45 @@ function stillTheHolder(holder) {
     // here is what made the refusal claim the pid belonged to somebody else.
     return null;
   }
+  if (!cmdline.includes(want)) return false;
+  // AN ENTRY MATCH ALONE IS NOT IDENTITY. Every daemon on the box shares one
+  // entry path under a global install, so "cmdline contains this cli.mjs"
+  // proves "is SOME flowviant daemon", not "is the daemon that wrote THIS
+  // lock" — and a crashed daemon's pid recycled to a SIBLING project's live
+  // daemon passed it, which let a same-repo takeover SIGTERM a different
+  // project's machine. Every 0.54.0+ lock also carries `startedAt`, the
+  // process's own witness to when it began, so when it is present the start
+  // time must agree too. `null` (could not measure — hidepid, no ps, a lock
+  // with no startedAt) falls back to the entry match alone, exactly the
+  // pre-check behaviour: refusing on ignorance here would re-brick takeover
+  // on the hosts that hide /proc.
+  const around = startedAroundLockWrite(holder);
+  return around === false ? false : true;
+}
+
+/**
+ * Unlink a lock file ONLY while it still names the pid the caller decided
+ * about (or nothing readable). Every rmSync of a lock outside the ppid-adopt
+ * path goes through this: between "I proved pid N is dead/stale" and the
+ * unlink, a concurrently starting daemon can clear the file itself and
+ * wx-create its own — and an unconditional rm then deletes a LIVE daemon's
+ * lock, leaving it running unguarded, which is the one condition this module
+ * exists to prevent. The read-then-rm gap that remains is microseconds against
+ * the seconds-wide window it closes.
+ *
+ * Returns false when the file now names a DIFFERENT pid — a handover the
+ * caller must treat as "not mine to clear" — true otherwise (removed, already
+ * gone, or best-effort failed into acquire's next pass).
+ */
+function rmLockIfStill(path, pid) {
+  const cur = readHolder(path);
+  if (cur && cur.pid !== pid) return false;
+  try {
+    rmSync(path, { force: true });
+  } catch {
+    /* best-effort; a stale file is cleared by the next acquire */
+  }
+  return true;
 }
 
 /** Blocking, because this runs before there is an event loop worth yielding to
@@ -530,11 +570,11 @@ function standDown(holder, path, log) {
     sleep(400);
   }
 
-  // A SIGKILLed daemon never ran its release(), so clear what it left.
-  try {
-    rmSync(path, { force: true });
-  } catch {
-    return { failed: 'could not clear the lock file' };
+  // A SIGKILLed daemon never ran its release(), so clear what it left — but
+  // only if the file still names the pid we stood down: in the gap since the
+  // last read a fresh daemon may have cleared it and taken the lock itself.
+  if (!rmLockIfStill(path, holder.pid)) {
+    return { failed: 'another daemon took the lock while it was being cleared — try again in a moment' };
   }
   return null;
 }
@@ -564,7 +604,13 @@ function takeOverFrom(holder, path, log, { allowDowngrade = false } = {}) {
     };
   }
   if (identified === false) {
-    return { failed: `pid ${holder.pid} is no longer the daemon that took this lock — refusing to signal it` };
+    // MEASURED: the lock's writer is gone and the pid now belongs to something
+    // else. That is a STALE LOCK, not an unremovable holder — refusing here
+    // used to brick every start after an OOM-kill or reboot recycled the pid
+    // to any live process, until a human deleted ~/.flowviant/daemon-*.lock by
+    // hand. Nothing is signalled (the process is a stranger); the caller
+    // clears the corpse the same way it clears a dead pid's.
+    return { stale: true };
   }
   if (!allowDowngrade && holder.version && cmpVersion(VERSION, holder.version) < 0) {
     return {
@@ -608,9 +654,19 @@ export function acquireInstanceLock(fleetToken, repoRoot, opts = {}) {
     // quietly.
     if (noTakeover) return { ok: false, holder: neighbour, sameRepo: true };
     log?.(`another project's daemon is serving this repo (pid ${neighbour.pid}).`);
-    const bad = takeOverFrom(neighbour, neighbourLockPath(neighbour, path), log);
-    if (bad)
+    // The OPTIONS ride along — this call used to drop them, so a deliberate
+    // `flowviant --takeover-downgrade` against a newer neighbour printed
+    // "--takeover-downgrade if you mean it" at somebody who had already
+    // typed it.
+    const bad = takeOverFrom(neighbour, neighbourLockPath(neighbour, path), log, { allowDowngrade });
+    if (bad?.stale) {
+      // The neighbour's lock is a corpse wearing a recycled pid — clear it (if
+      // it still names that pid) and carry on to our own lock.
+      log?.(`pid ${neighbour.pid} is no longer a daemon — clearing its stale lock.`);
+      rmLockIfStill(neighbourLockPath(neighbour, path), neighbour.pid);
+    } else if (bad) {
       return { ok: false, holder: neighbour, sameRepo: true, takeoverFailed: bad.failed, unidentified: bad.unidentified };
+    }
   }
 
   // Two passes at most: one to clear a stale holder, one to take the lock. A
@@ -623,11 +679,20 @@ export function acquireInstanceLock(fleetToken, repoRoot, opts = {}) {
       if (e.code !== 'EEXIST') return { ok: true, release: () => {}, unguarded: true };
       const holder = readHolder(path);
       if (!holder || !alive(holder.pid)) {
-        // A crashed daemon's leftover. Clear it and take it on the next pass.
-        try {
-          rmSync(path, { force: true });
-        } catch {
-          return { ok: true, release: () => {}, unguarded: true };
+        // A crashed daemon's leftover. Clear it and take it on the next pass —
+        // ownership-verified, because a concurrent start may have cleared and
+        // re-created it in the gap since our read.
+        if (holder) rmLockIfStill(path, holder.pid);
+        else {
+          // Unreadable content: re-read before clearing, so a half-written
+          // record a peer is writing RIGHT NOW is not deleted mid-write.
+          const again = readHolder(path);
+          if (again && alive(again.pid)) continue; // it finished writing — a real holder now
+          try {
+            rmSync(path, { force: true });
+          } catch {
+            return { ok: true, release: () => {}, unguarded: true };
+          }
         }
         continue;
       }
@@ -653,9 +718,27 @@ export function acquireInstanceLock(fleetToken, repoRoot, opts = {}) {
       const wanted = force || (here && !noTakeover);
       if (wanted) {
         const bad = takeOverFrom(holder, path, log, { allowDowngrade });
+        if (bad?.stale) {
+          // Measured: the lock's writer is gone and its pid was recycled to a
+          // stranger. A corpse is cleared, never "refused" — refusing bricked
+          // every start after a reboot handed the pid to any live process.
+          log?.(`pid ${holder.pid} is no longer a daemon — clearing its stale lock.`);
+          rmLockIfStill(path, holder.pid);
+          continue;
+        }
         if (bad)
           return { ok: false, holder, takeoverFailed: bad.failed, sameRepo: here, unidentified: bad.unidentified };
         continue; // the file is gone — the next pass takes it
+      }
+      // Before refusing on a different-repo holder, make sure it IS one: a
+      // stale lock whose pid was recycled to any live process would otherwise
+      // refuse this credential's start forever, naming a "daemon" that is a
+      // stranger. Only the MEASURED verdict clears; null (could not look)
+      // still refuses, because ignorance must not delete a lock.
+      if (stillTheHolder(holder) === false) {
+        log?.(`pid ${holder.pid} is no longer a daemon — clearing its stale lock.`);
+        rmLockIfStill(path, holder.pid);
+        continue;
       }
       return { ok: false, holder, sameRepo: here };
     }

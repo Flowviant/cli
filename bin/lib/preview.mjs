@@ -228,9 +228,25 @@ function mutateRegistry(fn) {
   }
 }
 
+/** Signal-0 liveness (EPERM = alive and not ours), for the OWNER check below. */
+function processAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return e.code === 'EPERM';
+  }
+}
+
 function recordPreviewPid(pid, sig) {
   if (!pid) return;
-  mutateRegistry((list) => [...list, { pid, sig }]);
+  // `owner` is the DAEMON that spawned it. The registry is shared by design —
+  // two daemons serving two projects both write here — so without an owner a
+  // starting daemon reaped its PEER's live tunnels: killed them, wiped their
+  // entries, and the peer kept heartbeating a URL that 530s (its probe watches
+  // the origin port, which was still alive).
+  mutateRegistry((list) => [...list, { pid, sig, owner: process.pid }]);
 }
 
 function forgetPreviewPid(pid) {
@@ -253,12 +269,21 @@ function stillOurs(pid, sig) {
 }
 
 /** Reap tunnel process groups left behind by a previously-crashed daemon.
- *  Call once at daemon startup, before any work begins. */
+ *  Call once at daemon startup, before any work begins.
+ *
+ *  ORPHANS ONLY: an entry whose owning daemon is STILL ALIVE belongs to a
+ *  peer serving another project (or to the process we are replacing, whose
+ *  own teardown handles it) — killing those and wiping their entries was a
+ *  peer daemon's startup silently breaking every live share on the box. Only
+ *  the entries this pass handled are removed; a peer's records survive. */
 export function reapOrphanPreviews(log) {
   const list = readRegistry();
   if (list.length === 0) return;
   let killed = 0;
-  for (const { pid, sig } of list) {
+  const handled = new Set();
+  for (const { pid, sig, owner } of list) {
+    if (Number.isInteger(owner) && owner !== process.pid && processAlive(owner)) continue;
+    handled.add(pid);
     if (!stillOurs(pid, sig)) continue;
     try {
       process.kill(-pid, 'SIGKILL'); // whole group
@@ -272,7 +297,7 @@ export function reapOrphanPreviews(log) {
       }
     }
   }
-  mutateRegistry(() => []);
+  if (handled.size) mutateRegistry((cur) => cur.filter((e) => !handled.has(e.pid)));
   if (killed) log?.(`reaped ${killed} orphaned preview tunnel${killed === 1 ? '' : 's'} from a previous run.`);
 }
 
@@ -295,8 +320,35 @@ const TAIL_BYTES = 2000;
  * cloudflared happily outlives a dead dev server and the gate answers a dead
  * origin with 502, so without this the product would report "live" over a 502 —
  * Flowviant asserting a state it never measured.
+ *
+ * `stillServing` (optional, async → boolean) is the ATTRIBUTION re-check the
+ * probe runs instead of a bare TCP connect. Ports are global to a box and a
+ * worktree is not: when the driver's dev server dies and anything else — a
+ * teammate's worktree, a database — binds the same number, a bare
+ * `isListening` keeps the probe green and the existing URL+password serve the
+ * NEW process, outside every consent gate. The caller passes the same
+ * `listenersIn(worktree)` check the open path uses, so "the origin is alive"
+ * keeps meaning "THIS session's origin".
+ *
+ * `onAbuse` fires when the gate closes itself after repeated failed password
+ * attempts — AFTER the share is torn down locally — so the caller can report
+ * the incident. Without it the abuse close was invisible: the row kept
+ * reading "live" until staleness, and endedReason 'abuse' was unreachable.
+ *
+ * `onTunnelGone` fires when cloudflared exits AFTER the URL was published
+ * (quick tunnels are best-effort and do get dropped). The probe cannot see
+ * this — it watches the origin — and a daemon that keeps heartbeating a dead
+ * hostname confirms "live" over a 530 for up to 8 hours.
  */
-export async function openTunnel({ port, log, onDead, probeMs = 20_000 }) {
+export async function openTunnel({
+  port,
+  log,
+  onDead,
+  onAbuse,
+  onTunnelGone,
+  stillServing,
+  probeMs = 20_000,
+}) {
   // Re-validate at the machine. The server checked this port against the last
   // report; reports are up to a minute old and a dev server is a process a
   // human can stop at any moment.
@@ -337,7 +389,18 @@ export async function openTunnel({ port, log, onDead, probeMs = 20_000 }) {
 
   // The gate comes up FIRST and the tunnel points at it, never at the origin —
   // so there is no window in which the public hostname is un-gated.
-  gate = await startAuthProxy({ targetPort: port, log, onAbuse: () => stop() });
+  gate = await startAuthProxy({
+    targetPort: port,
+    log,
+    onAbuse: () => {
+      stop();
+      try {
+        onAbuse?.();
+      } catch {
+        /* the caller's report is best-effort */
+      }
+    },
+  });
   if (!gate) {
     return { error: 'could not start the password gate for this preview, so nothing was published.' };
   }
@@ -348,7 +411,11 @@ export async function openTunnel({ port, log, onDead, probeMs = 20_000 }) {
   args.push('--http-host-header', 'localhost');
 
   tunnel = spawn(cf.bin, args, { detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
-  recordPreviewPid(tunnel.pid, 'cloudflared');
+  // The signature names THIS tunnel's gate port, not the bare word
+  // 'cloudflared': the reap matches cmdline.includes(sig), and the generic
+  // word would let a recycled pid land on an operator's own unrelated
+  // cloudflared and group-SIGKILL it.
+  recordPreviewPid(tunnel.pid, `--url http://localhost:${gate.port}`);
 
   return new Promise((resolve) => {
     let settled = false;
@@ -378,11 +445,19 @@ export async function openTunnel({ port, log, onDead, probeMs = 20_000 }) {
       const m = TUNNEL_RE.exec(s);
       if (!m) return;
 
-      // Watch the ORIGIN, not the tunnel. A dead dev server behind a live
-      // hostname is the failure a viewer cannot diagnose.
+      // Watch the ORIGIN — with the caller's ATTRIBUTION check when it gave
+      // one, never a bare port probe: a freed port rebound by another
+      // worktree answers a TCP connect exactly like the origin did, and the
+      // share would keep serving a process nobody consented to publish.
       probe = setInterval(async () => {
         if (stopped) return;
-        if (!(await isListening(port))) {
+        let serving;
+        try {
+          serving = stillServing ? await stillServing() : await isListening(port);
+        } catch {
+          serving = false; // an attribution check that errors is not a "yes"
+        }
+        if (!serving) {
           const dead = onDead;
           stop();
           try {
@@ -393,6 +468,20 @@ export async function openTunnel({ port, log, onDead, probeMs = 20_000 }) {
         }
       }, probeMs);
       if (probe.unref) probe.unref();
+
+      // The TUNNEL dying after publish (quick tunnels get dropped) is the one
+      // exit the probe cannot see. `stopped` guards our own kill: stop() sets
+      // it before signalling, so this only fires for a death nobody asked for.
+      tunnel.once('close', () => {
+        if (stopped) return;
+        const gone = onTunnelGone;
+        stop();
+        try {
+          gone?.();
+        } catch {
+          /* the caller's report is best-effort */
+        }
+      });
 
       finish({ url: m[0], user: gate.user, password: gate.password, stop });
     };
