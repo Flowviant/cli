@@ -19,6 +19,8 @@
  * `npx flowviant` can reuse a stale cache). A running daemon also self-updates
  * on its own — at startup and when idle — so it stays current without restarts
  * (FLOWVIANT_NO_UPDATE=1 makes it nag-only; `flowviant update` updates now).
+ * `flowviant stop` stops every daemon on this box — the answer to "is one even
+ * running?", which otherwise ends in a pid hunt through `ps`.
  *
  * The daemon: install ONCE with a machine credential, then work entirely from
  * Flowviant. It polls GET /api/v2/fleet/agents, and the roster hands it the
@@ -144,6 +146,30 @@ if (process.argv[2] === 'shot') {
   const { runShot } = await import('./lib/shot.mjs');
   await runShot(process.argv.slice(3));
   process.exit(0);
+}
+
+// `flowviant stop` — stop every flowviant daemon on this machine.
+//
+// THE FRICTION IT REMOVES is not knowing whether one is running. So you run
+// `flowviant`, get a refusal naming a pid in a directory you do not recognise,
+// and go hunting through `ps`. This asks no question and takes no argument: it
+// sweeps every credential's lock file, not just the one this checkout keys to,
+// because a stop command with a scope is one you have to be sure about before
+// you can use it — and being unsure is the whole reason you typed it.
+//
+// It identifies each holder before signalling it and says so when it cannot
+// (see stopAllDaemons); it needs NO credential and NO network — it reads lock
+// files under ~/.flowviant and signals pids — so it runs BEFORE the auth gate,
+// like `shot`. "I don't know what is running" is not a state in which we should
+// also be asking someone to log in.
+//
+// EXIT 0 when it stopped something AND when it found nothing: "no flowviant
+// daemon is running on this machine." is the answer the asker came for, not an
+// error. Non-zero only when something was alive and could not be stopped.
+if (process.argv[2] === 'stop') {
+  const { stopAllDaemons } = await import('./lib/instance.mjs');
+  const { failed } = stopAllDaemons({ log: (m) => console.log(m) });
+  process.exit(failed > 0 ? 1 : 0);
 }
 
 // `flowviant env <import|set|show>` — the CLI half of team env sync. Values
