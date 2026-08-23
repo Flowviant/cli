@@ -102,6 +102,7 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
   const DIFF_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/diff-done');
   const PREVIEW_CLAIM_URL = FLEET_URL.replace(/\/agents\/?$/, '/preview-claim');
   const PREVIEW_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/preview-done');
+  const SESSION_COMMANDS_URL = FLEET_URL.replace(/\/agents\/?$/, '/session-commands');
   const ATTACHMENT_URL = FLEET_URL.replace(/\/agents\/?$/, '/attachment');
   const workAnswering = new Set(); // turn ids currently queued/running here
   const workAttempts = new Map(); // turn id -> completed runTurn attempts
@@ -1584,6 +1585,45 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
           let seenThreadId = null; // codex's conversation id, off thread.started
           const spawned = []; // this turn's children, for the teardown registry
           const narrator = makeNarrator(job.sessionId, job.id);
+
+          // THE COMMAND AUDIT — every `$ …` the CLI's stream reports, batched
+          // to the server verbatim so an admin can read what actually ran on
+          // this box. Same events the narrator renders and forgets; this is
+          // the durable copy, and it carries ONLY commands — no prose, no
+          // thinking, no file reads (the session stays private; what executed
+          // on the shared machine is the machine's own fact to relay).
+          // Flushed mid-turn every 25 so a long turn is not one giant loss on
+          // a kill, and again at settle. Best-effort: a failed post drops the
+          // batch rather than blocking the turn — the surface says it is the
+          // machine's report, not a syscall trace.
+          const auditBatch = [];
+          const flushAudit = () => {
+            if (auditBatch.length === 0) return;
+            const commands = auditBatch.splice(0, auditBatch.length);
+            void fetch(SESSION_COMMANDS_URL, {
+              method: 'POST',
+              headers: {
+                Authorization: `Bearer ${FLEET_TOKEN}`,
+                'User-Agent': USER_AGENT,
+                'Content-Type': 'application/json',
+              },
+              signal: AbortSignal.timeout(30_000),
+              body: JSON.stringify({
+                sessionId: job.sessionId,
+                turnId: job.id,
+                runtime: rt.id,
+                cwd: dir.wt,
+                commands,
+              }),
+            }).catch(() => {
+              /* best-effort — the audit records what reached it */
+            });
+          };
+          const auditCommand = (a) => {
+            if (a?.kind !== 'bash' || !a.command) return;
+            auditBatch.push({ command: a.command, at: new Date().toISOString() });
+            if (auditBatch.length >= 25) flushAudit();
+          };
           try {
             // Files first, then the message that references them: the agent
             // must be able to open what it is being told about. Only the ones
@@ -1627,7 +1667,10 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
               // posted once. Every line goes to the narrator above, throttled.
               streamJson: true,
               answerFromResult: true,
-              onActivity: (a) => narrator.line(a?.label),
+              onActivity: (a) => {
+                narrator.line(a?.label);
+                auditCommand(a);
+              },
               // What this CLI says it can be asked for by name. Harvested off
               // the init event the stream already carries — no probe, no scan,
               // no extra spawn — and reported on the next roster poll so the
@@ -1683,6 +1726,7 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
             // is cleared server-side at settle — clearing it here would race
             // the settle and blank the tab a beat before the reply lands.
             narrator.stop();
+            flushAudit();
             for (const ch of spawned) workChildren.delete(ch);
             if (lockPath) {
               try {

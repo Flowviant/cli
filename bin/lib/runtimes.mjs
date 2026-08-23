@@ -79,7 +79,16 @@ export function humanizeClaudeTool(name, input = {}, cwd = '') {
     case 'LS':
       return { kind: 'list', label: `ls ${shortPath(input.path ?? '.', cwd)}` };
     case 'Bash':
-      return { kind: 'bash', label: `$ ${oneLine(input.command, 60)}` };
+      // `command` rides beside the display label, VERBATIM (capped): the label
+      // is a 60-char readout for a console and the rail, and truncation is
+      // fine there — but the admin's command audit exists to answer "what
+      // actually ran on our box", and an ellipsis is exactly where the part
+      // that matters would hide.
+      return {
+        kind: 'bash',
+        command: String(input.command ?? '').slice(0, 2000),
+        label: `$ ${oneLine(input.command, 60)}`,
+      };
     default:
       return null; // other tools: silent
   }
@@ -103,7 +112,11 @@ function humanizeCodexItem(item = {}, cwd = '') {
     case 'reasoning':
       return { kind: 'think', label: oneLine(item.text) || 'thinking…' };
     case 'command_execution':
-      return { kind: 'bash', label: `$ ${oneLine(item.command, 60)}` };
+      return {
+        kind: 'bash',
+        command: String(item.command ?? '').slice(0, 2000),
+        label: `$ ${oneLine(item.command, 60)}`,
+      };
     case 'file_change': {
       // `changes` is a list of touched paths; the daemon counts distinct files,
       // so emit one activity per path rather than one for the batch.
@@ -207,7 +220,11 @@ function humanizeAgyTool(name, p = {}, cwd = '') {
     case 'list_dir':
       return { kind: 'list', label: `ls ${shortPath(path, cwd)}` };
     case 'run_command':
-      return { kind: 'bash', label: `$ ${oneLine(p.CommandLine, 60)}` };
+      return {
+        kind: 'bash',
+        command: String(p.CommandLine ?? '').slice(0, 2000),
+        label: `$ ${oneLine(p.CommandLine, 60)}`,
+      };
     case 'call_mcp_tool':
       return { kind: 'tool', label: `mcp.${p.ToolName ?? ''}` };
     default:
