@@ -23,8 +23,9 @@ const CLI_TOKEN_URL = FLEET_URL.replace(/\/agents\/?$/, '/cli-token');
 export async function runMcpCommand(args = []) {
   if (!FLEET_TOKEN) {
     console.error(
-      'error: no credential. Run `flowviant login` first — this needs the\n' +
-        'fleet credential the daemon uses, so it knows which project to connect.'
+      'error: no credential resolves here. Run `flowviant login` first — or, with\n' +
+        'several projects connected on this box, run this inside the project\'s own\n' +
+        'repo or pass `--project <name|id>` (`flowviant projects` lists them).'
     );
     process.exit(1);
   }

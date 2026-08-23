@@ -31,7 +31,9 @@ import {
   REFRESH_BEFORE_SECONDS,
   LIVE,
   AUTO_UPDATE,
+  CREDENTIAL,
 } from './config.mjs';
+import { projectLabel, setStoredProjectName } from './credentials.mjs';
 import { handleVersionSignal } from './update.mjs';
 import {
   git,
@@ -322,6 +324,14 @@ export async function runFleetDaemon() {
   const repoRoot = repoRootOrDie();
   const baseRef = detectBaseRef(repoRoot);
   info(SAFE ? 'mode   · safe (restricted toolset)' : 'mode   · unattended (skips permission prompts)');
+  // WHICH PROJECT, before anything connects — the roster names it again a few
+  // seconds later with the server's word, but "which project is this daemon
+  // about to serve" must not require a network round trip to answer. Only when
+  // the credential came from the STORE: a --fleet/env token names no project
+  // until the roster does.
+  if (CREDENTIAL?.entry) {
+    info(`serves · ${projectLabel(CREDENTIAL.entry)} ${c.dim(`(${CREDENTIAL.entry.projectId.slice(0, 8)}…)`)}`);
+  }
   info(`repo   · ${repoRoot}`);
   info(`base   · ${baseRef}`);
   info(`server · ${FLEET_URL}`);
@@ -1305,6 +1315,11 @@ export async function runFleetDaemon() {
           `${c.cyan('project')} · ${c.bold(roster.project.name)} ${c.dim(`(${roster.project.id})`)}`
         );
         note(c.dim('  wiki + agents stream to THIS project — view its Code canvas in Flowviant.'));
+        // Remember the NAME beside the stored credential, so the picker and
+        // `flowviant projects` can say "skadooble" instead of an id — a
+        // credential saved before the server sent names backfills here. No-op
+        // for a --fleet/env token (nothing stored to annotate).
+        setStoredProjectName(roster.project.id, roster.project.name);
       }
     }
     if (roster.mcpUrl) mcpUrl = roster.mcpUrl;

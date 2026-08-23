@@ -105,7 +105,11 @@ async function readSecretFromStdin(promptText) {
 }
 
 export async function runEnvCommand(args) {
-  if (!FLEET_TOKEN) die('no fleet credential — run `flowviant login` first.');
+  if (!FLEET_TOKEN)
+    die(
+      'no credential resolves here — run `flowviant login`, or run this inside the ' +
+        "project's own repo / pass `--project <name|id>` (`flowviant projects` lists them)."
+    );
   await sodium.ready;
   await ensureKeypair();
   const cmd = args[0];

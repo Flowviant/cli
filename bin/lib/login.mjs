@@ -6,32 +6,14 @@
  * plain `flowviant` just runs — no token, no env var.
  */
 
-import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
-import { join } from 'node:path';
-import { homedir } from 'node:os';
 import { FLEET_URL, USER_AGENT, VERSION } from './config.mjs';
+import { saveLogin, detectRepoRoot, projectLabel } from './credentials.mjs';
 import { c, info, ok, warn, fail } from './ui.mjs';
 import { sleep } from './claude.mjs';
 
-const CRED_DIR = join(homedir(), '.flowviant');
-const CRED_FILE = join(CRED_DIR, 'credentials.json');
 const DEVICE_START = FLEET_URL.replace(/\/agents\/?$/, '/device/start');
 const DEVICE_POLL = FLEET_URL.replace(/\/agents\/?$/, '/device/poll');
 const APP_URL = process.env.FLOWVIANT_APP_URL || 'https://app.flowviant.com';
-
-/** The locally-stored credential from a prior `login`, or null. Read by config. */
-export function readStoredCredential() {
-  try {
-    return JSON.parse(readFileSync(CRED_FILE, 'utf8'));
-  } catch {
-    return null;
-  }
-}
-
-function store(cred) {
-  mkdirSync(CRED_DIR, { recursive: true });
-  writeFileSync(CRED_FILE, JSON.stringify(cred, null, 2), { mode: 0o600 });
-}
 
 async function post(url, body) {
   const res = await fetch(url, {
@@ -76,10 +58,26 @@ export async function runLogin({ thenStart = false } = {}) {
     if (poll.status === 'approved') {
       // `machineToken` is the wire's new name; `fleetToken` is the one every
       // published daemon reads. The server dual-sends until DAEMON_MIN clears
-      // THIS release (0.54.2) — reading both here is what makes retiring the
-      // old key possible at all.
-      store({ fleetToken: poll.machineToken ?? poll.fleetToken, projectId: poll.projectId, mcpUrl: poll.mcpUrl });
-      ok('connected — credential saved to ~/.flowviant/credentials.json');
+      // the release that reads the new one (0.54.2+) — reading both here is
+      // what makes retiring the old key possible at all.
+      //
+      // BOUND to the repo the login was run in: a login is the one moment we
+      // know for certain which checkout this project means, and the binding is
+      // what lets a multi-project VM resolve `npx flowviant` by DIRECTORY
+      // instead of by whichever login happened last.
+      const repoRoot = detectRepoRoot();
+      const entry = {
+        fleetToken: poll.machineToken ?? poll.fleetToken,
+        projectId: poll.projectId,
+        mcpUrl: poll.mcpUrl,
+        name: typeof poll.projectName === 'string' && poll.projectName ? poll.projectName : null,
+        repoRoot,
+      };
+      saveLogin(entry);
+      ok(
+        `connected to ${c.bold(projectLabel(entry))}` +
+          `${repoRoot ? ` for ${c.dim(repoRoot)}` : ''} — saved to ~/.flowviant/credentials.json`
+      );
       // The daemon starts right here unless the caller opted out; telling
       // someone to run a second command was the step that got missed, since by
       // this point they are looking at the browser, not this terminal.

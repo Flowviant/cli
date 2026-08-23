@@ -4,7 +4,7 @@ import { randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { homedir, cpus, totalmem } from 'node:os';
+import { cpus, totalmem } from 'node:os';
 
 // Read the daemon's version from its OWN package.json (always shipped in the npm
 // tarball) — never hardcode it. The hardcoded constant drifted: it sat at
@@ -30,14 +30,11 @@ export const MODEL = process.env.FLOWVIANT_MODEL || 'opus';
 
 // Credential stored by `flowviant login` (device auth) — the no-token,
 // no-env-var path. An explicit --fleet flag or FLOWVIANT_FLEET env still wins.
-function readStoredCredential() {
-  try {
-    return JSON.parse(readFileSync(join(homedir(), '.flowviant', 'credentials.json'), 'utf8'));
-  } catch {
-    return null;
-  }
-}
-const stored = readStoredCredential();
+// Since 0.55.0 the store holds MANY projects and resolution is BY REPO — see
+// credentials.mjs for the whole rule. `CREDENTIAL` carries the resolution so
+// cli.mjs can turn an ambiguity into a picker instead of a guess.
+import { resolveStoredCredential } from './credentials.mjs';
+export const CREDENTIAL = resolveStoredCredential();
 
 function argFlag(name) {
   const i = process.argv.indexOf(name);
@@ -167,5 +164,15 @@ export const DAEMON_INSTANCE = randomBytes(12).toString('hex');
 // --tokens) stood beside it and carried WORKER tokens into the pre-daemon loop;
 // that principal owns zero tools since dispatch was deleted, and the kind can no
 // longer be minted, so the plumbing went with the entrypoint (2026-08-19).
-export const FLEET_TOKEN =
-  argFlag('--fleet') || process.env.FLOWVIANT_FLEET || stored?.fleetToken || '';
+// `let`, because ES named imports are LIVE bindings: when cli.mjs answers an
+// ambiguous store with a picker, adoptStoredCredential updates every importer
+// before the daemon touches the network. Everything before that point (the
+// resolution, the flags) is settled synchronously at import, as it always was.
+export let FLEET_TOKEN =
+  argFlag('--fleet') || process.env.FLOWVIANT_FLEET || CREDENTIAL.entry?.fleetToken || '';
+
+/** cli.mjs's picker chose. Must run BEFORE runFleetDaemon — nothing here
+ *  re-authenticates a connection already made. */
+export function adoptStoredCredential(entry) {
+  if (entry?.fleetToken) FLEET_TOKEN = entry.fleetToken;
+}

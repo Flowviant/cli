@@ -32,6 +32,13 @@
  * odd side job the roster carries — a commit's patch, a preview share, a wiki
  * regen. When you say ship, the daemon merges that branch into base `--no-ff`.
  *
+ * MANY PROJECTS, ONE BOX (0.55.0): `flowviant login` in each repo stores one
+ * credential per project (~/.flowviant/credentials.json holds a map), and a
+ * bare `npx flowviant` serves the project BOUND to the repo it is started in.
+ * Ambiguity is a picker on a TTY and a worded refusal headless — never a
+ * guess. `flowviant projects` lists what is stored; `--project <name|id>`
+ * picks without a prompt.
+ *
  * Env:
  *   FLOWVIANT_FLEET     the machine credential (or use `flowviant login`).
  *   FLOWVIANT_API_URL   default https://api.flowviant.com/api/v2
@@ -49,7 +56,7 @@
  * git + worktreeDiff + patch; localSessions, listeners, preview + authproxy;
  * env + env-cli + vault, resources, deploy, shot.
  */
-import { FLEET_TOKEN } from './lib/config.mjs';
+import { FLEET_TOKEN, CREDENTIAL, adoptStoredCredential } from './lib/config.mjs';
 import { runFleetDaemon } from './lib/fleet.mjs';
 import { runLogin } from './lib/login.mjs';
 
@@ -172,6 +179,32 @@ if (process.argv[2] === 'stop') {
   process.exit(failed > 0 ? 1 : 0);
 }
 
+// `flowviant projects` — every project this box has a credential for, which
+// repo each is bound to, and which the legacy mirror points at. Needs no
+// network: it reads the store, which is the exact thing a confused person is
+// trying to see. The remedies are named because this listing IS the moment of
+// confusion ("why did it say skadooble?"), not documentation.
+if (process.argv[2] === 'projects') {
+  const { listStoredProjects, projectLabel } = await import('./lib/credentials.mjs');
+  const entries = listStoredProjects();
+  if (entries.length === 0) {
+    console.log('no projects connected on this machine yet — run `flowviant login` inside a repo.');
+    process.exit(0);
+  }
+  for (const e of entries) {
+    console.log(
+      `  ${projectLabel(e)}  (${e.projectId.slice(0, 8)}…)` +
+        `${e.repoRoot ? `\n      repo · ${e.repoRoot}` : '\n      repo · not bound yet — first start or login in its repo binds it'}` +
+        `${e.active ? '\n      what a pre-0.55.0 flowviant on this box would serve (the legacy mirror)' : ''}`
+    );
+  }
+  console.log(
+    '\n  `npx flowviant` picks by the repo it is started in; `--project <name|id>` overrides;\n' +
+      '  `flowviant login` in a new repo connects another project.'
+  );
+  process.exit(0);
+}
+
 // `flowviant env <import|set|show>` — the CLI half of team env sync. Values
 // are sealed to the project pubkey ON THIS MACHINE (same write-only crypto as
 // the browser); `show` decrypts locally — it only works on an ENROLLED machine.
@@ -191,14 +224,117 @@ if (process.argv[2] === 'env') {
   process.exit(0);
 }
 
+// ── WHICH PROJECT THIS START SERVES — said, asked, or refused; never guessed.
+//
+// The store holds many projects since 0.55.0 and resolution is BY REPO
+// (credentials.mjs). What is left here is the human half: an ambiguous store
+// on a TTY becomes a PICKER, a single unbound credential gets ONE confirm that
+// binds it, and a headless start with no unambiguous answer refuses in words
+// that name every stored project and every way out. The one thing this block
+// must never do is serve a project the resolution did not name — "it said
+// skadooble in my calendar repo" is the confusion this exists to end.
+const interactive = Boolean(process.stdin.isTTY && process.stdout.isTTY);
+const externalToken = process.argv.includes('--fleet') || Boolean(process.env.FLOWVIANT_FLEET);
+
+/** Re-exec a plain `flowviant` after an inline login — the login command's own
+ *  pattern: config.mjs read the store at IMPORT time, before the credential
+ *  existed, so this process cannot serve; the child can. */
+async function reexecAfterLogin() {
+  await runLogin({ thenStart: false });
+  const { spawn } = await import('node:child_process');
+  const child = spawn(process.execPath, [process.argv[1]], { stdio: 'inherit', env: process.env });
+  process.exit(await new Promise((resolve) => child.on('exit', (code) => resolve(code ?? 0))));
+}
+
+function listLines(entries, { projectLabel }) {
+  return entries
+    .map(
+      (e, i) =>
+        `  ${i + 1}. ${projectLabel(e)}` +
+        (e.repoRoot ? `  — connected for ${e.repoRoot}` : '  — not tied to a repo yet')
+    )
+    .join('\n');
+}
+
 if (!FLEET_TOKEN) {
-  console.error(
-    'error: no credential found. Easiest:\n' +
-      '  flowviant login      (approve in the app — recommended)\n' +
-      'Or set:\n' +
-      '  FLOWVIANT_FLEET=fva_…   (machine token, from the app)'
-  );
-  process.exit(1);
+  if (CREDENTIAL.error) {
+    console.error(`error: ${CREDENTIAL.error}. \`flowviant projects\` lists what is stored.`);
+    process.exit(1);
+  }
+  if (CREDENTIAL.choices?.length && interactive) {
+    const creds = await import('./lib/credentials.mjs');
+    const { choices, repoRoot } = CREDENTIAL;
+    console.log(
+      CREDENTIAL.reason === 'outside-repo'
+        ? 'flowviant is not inside a git repo, and more than one project is connected here.'
+        : CREDENTIAL.reason === 'multiple-bound'
+          ? `More than one connected project names this repo (${repoRoot}) — pick which one this daemon serves:`
+          : `This repo (${repoRoot}) is not connected to any project yet. Connected on this machine:`
+    );
+    console.log(listLines(choices, creds));
+    console.log(`  ${choices.length + 1}. connect ${repoRoot ? 'this repo' : 'a repo'} to a different project (flowviant login)`);
+    const rl = (await import('node:readline/promises')).createInterface({
+      input: process.stdin,
+      output: process.stdout,
+    });
+    const raw = (await rl.question(`Which project should this daemon serve? [1-${choices.length + 1}] `)).trim();
+    rl.close();
+    const n = Number.parseInt(raw, 10);
+    if (n === choices.length + 1) await reexecAfterLogin();
+    const picked = Number.isInteger(n) ? choices[n - 1] : undefined;
+    if (!picked) {
+      console.error('nothing chosen — nothing started.');
+      process.exit(1);
+    }
+    // An answered question is consent: adopt it, and BIND it to this repo so
+    // the next start needs no prompt. Repointing is legitimate and said aloud.
+    if (repoRoot && picked.repoRoot && picked.repoRoot !== repoRoot) {
+      console.log(`note: ${creds.projectLabel(picked)} was connected for ${picked.repoRoot} — now serving ${repoRoot} instead.`);
+    }
+    adoptStoredCredential(picked);
+    creds.selectStoredProject(picked.projectId, { bindRepoRoot: repoRoot ?? undefined });
+    console.log(`serving ${creds.projectLabel(picked)}${repoRoot ? ` from ${repoRoot}` : ''}.`);
+  } else if (CREDENTIAL.choices?.length) {
+    const creds = await import('./lib/credentials.mjs');
+    console.error(
+      'error: more than one project is connected on this machine and this repo is not bound to any of them:\n' +
+        listLines(CREDENTIAL.choices, creds) +
+        '\nPick one with `--project <name|id>`, bind this repo by running `flowviant` here in a terminal once,\n' +
+        'or connect this repo to its own project with `flowviant login`.'
+    );
+    process.exit(1);
+  } else {
+    console.error(
+      'error: no credential found. Easiest:\n' +
+        '  flowviant login      (approve in the app — recommended)\n' +
+        'Or set:\n' +
+        '  FLOWVIANT_FLEET=fva_…   (machine token, from the app)'
+    );
+    process.exit(1);
+  }
+} else if (!externalToken && CREDENTIAL.needsConfirm && interactive) {
+  // ONE stored project, never tied to a repo — the pre-0.55.0 world. Ask once;
+  // yes binds and every later start is silent. This is the exact question
+  // whose absence had a calendar checkout serving skadooble.
+  const creds = await import('./lib/credentials.mjs');
+  const label = creds.projectLabel(CREDENTIAL.entry);
+  const rl = (await import('node:readline/promises')).createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+  const raw = (
+    await rl.question(`This machine's one connected project is ${label}. Serve this repo (${CREDENTIAL.repoRoot}) as ${label}? [Y/n] `)
+  ).trim().toLowerCase();
+  rl.close();
+  if (raw === '' || raw === 'y' || raw === 'yes') {
+    creds.bindStoredRepo(CREDENTIAL.entry.projectId, CREDENTIAL.repoRoot);
+  } else {
+    console.error(
+      `nothing started. Connect this repo to its own project with \`flowviant login\`, ` +
+        `or see what is stored with \`flowviant projects\`.`
+    );
+    process.exit(1);
+  }
 }
 
 await runFleetDaemon();
