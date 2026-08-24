@@ -38,8 +38,9 @@ import {
   DAEMON_INSTANCE,
 } from './config.mjs';
 import { git, gitRaw, splitNul, baseBranchName, isSafePathSegment } from './git.mjs';
-import { listenersIn } from './listeners.mjs';
+import { listenersIn, listenersSupported } from './listeners.mjs';
 import { openTunnel } from './preview.mjs';
+import { startDevServer, reapOrphanDevRuns, killDevRunEntry } from './devServer.mjs';
 import { c, note, ok, warn } from './ui.mjs';
 import { mcpFor, runTurn } from './claude.mjs';
 import {
@@ -102,6 +103,8 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
   const DIFF_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/diff-done');
   const PREVIEW_CLAIM_URL = FLEET_URL.replace(/\/agents\/?$/, '/preview-claim');
   const PREVIEW_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/preview-done');
+  const DEV_RUN_CLAIM_URL = FLEET_URL.replace(/\/agents\/?$/, '/dev-run-claim');
+  const DEV_RUN_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/dev-run-done');
   const SESSION_COMMANDS_URL = FLEET_URL.replace(/\/agents\/?$/, '/session-commands');
   const ATTACHMENT_URL = FLEET_URL.replace(/\/agents\/?$/, '/attachment');
   const workAnswering = new Set(); // turn ids currently queued/running here
@@ -350,7 +353,17 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
     // The browser NEVER names a directory and never names a port this did not
     // report: ports are global to a box and a worktree is not, so this
     // measurement is the security boundary for the whole preview feature.
-    return { sessionId, ...d, listening: listenersIn(wt) };
+    // `listeningSupported` says whether this machine can measure AT ALL, which
+    // is a different fact from finding nothing. Windows reports nothing and a
+    // failed scan reports nothing, and both were indistinguishable from an idle
+    // worktree — harmless while the only consumer needed a NON-empty array, and
+    // a permanent `Starting…` the moment a Run dev offer hangs off an empty one.
+    return {
+      sessionId,
+      ...d,
+      listening: listenersIn(wt),
+      listeningSupported: listenersSupported(),
+    };
   };
   /** One session, now — called after its turn settles. */
   const reportSessionWorktree = async (sessionId) => {
@@ -634,6 +647,259 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
   /** The sessionIds this machine is still serving — sent on the poll so the
    *  server can tell a live share from one whose machine went away. Silence
    *  must never read as "live". */
+  /**
+   * The daemon's own shape check on an argv the server parsed.
+   *
+   * Deliberately a SHAPE check and not a re-parse: the server owns the policy
+   * (which argv[0] are allowed, the install refusal, the length caps) and the
+   * machine owns the refusal to EXECUTE something malformed. It is duplicated
+   * rather than imported because this package ships standalone and cannot
+   * depend on the monorepo — the mirror is small, and `devCommand.ts` is where
+   * the real rules live.
+   */
+  const isPlausibleDevArgv = (argv) =>
+    Array.isArray(argv) &&
+    argv.length > 0 &&
+    argv.length <= 8 &&
+    argv.every((a) => typeof a === 'string' && a.length > 0 && a.length <= 200) &&
+    !argv.some((a) => /[&|;<>`$(){}*?~\\]/.test(a));
+
+  // ── DEV RUNS ──────────────────────────────────────────────────────────
+  //
+  // The web asks for the PROJECT'S STORED command to run in a tab's worktree.
+  // The argv arrives on the job, already parsed from a string a human approved;
+  // nothing here reads a repo file to decide what executes. See devServer.mjs.
+  const liveDevRuns = new Map(); // sessionId -> { stop, pid }
+  const devRunClaiming = new Set();
+
+  const postDevRun = async (body) => {
+    try {
+      await fetch(DEV_RUN_DONE_URL, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${FLEET_TOKEN}`,
+          'User-Agent': USER_AGENT,
+          'Content-Type': 'application/json',
+        },
+        signal: AbortSignal.timeout(30_000),
+        body: JSON.stringify({ ...body, instance: DAEMON_INSTANCE }),
+      });
+    } catch {
+      /* the row stops being confirmed and reads as stopped — which is true */
+    }
+  };
+
+  const claimDevRun = async (sessionId) => {
+    try {
+      const res = await fetch(DEV_RUN_CLAIM_URL, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${FLEET_TOKEN}`,
+          'User-Agent': USER_AGENT,
+          'Content-Type': 'application/json',
+        },
+        signal: AbortSignal.timeout(30_000),
+        body: JSON.stringify({ sessionId, instance: DAEMON_INSTANCE }),
+      });
+      const j = await res.json().catch(() => ({}));
+      return Boolean(j?.data?.claimed);
+    } catch {
+      return false;
+    }
+  };
+
+  const stopDevRun = async (sessionId, reason) => {
+    const live = liveDevRuns.get(sessionId);
+    liveDevRuns.delete(sessionId);
+    try {
+      live?.stop?.();
+    } catch {
+      /* best-effort */
+    }
+    await postDevRun({ sessionId, ended: true, endedReason: reason });
+  };
+
+  const processDevRunJobs = (jobs) => {
+    if (!Array.isArray(jobs) || jobs.length === 0) return;
+    for (const job of jobs.slice(0, 5)) {
+      const sessionId = String(job?.sessionId || '');
+      if (!isSafePathSegment(sessionId)) continue;
+
+      if (job?.action === 'stop') {
+        if (devRunClaiming.has(sessionId)) continue;
+        devRunClaiming.add(sessionId);
+        void stopDevRun(sessionId, 'stopped').finally(() => devRunClaiming.delete(sessionId));
+        continue;
+      }
+
+      // RE-VALIDATE THE SHAPE at this boundary. The server parsed the string
+      // and owns the policy; the machine owns the refusal to execute something
+      // malformed, because one place doing a check is one deploy away from
+      // being zero places.
+      const argv = Array.isArray(job?.argv) ? job.argv.map(String) : [];
+      if (!isPlausibleDevArgv(argv)) {
+        void postDevRun({
+          sessionId,
+          started: false,
+          endedReason: 'refused',
+          error: 'the machine did not recognise that command',
+        });
+        continue;
+      }
+      // Already serving this tab. Re-starting would kill a server somebody is
+      // looking at right now.
+      if (liveDevRuns.has(sessionId)) continue;
+      if (devRunClaiming.has(sessionId)) continue;
+      devRunClaiming.add(sessionId);
+
+      void (async () => {
+        try {
+          if (!(await claimDevRun(sessionId))) return; // somebody else has it
+          const wt = join(baseDir, 'sessions', sessionId);
+          const r = await startDevServer({
+            sessionId,
+            worktree: wt,
+            argv,
+            log: (m) => note(`dev ${sessionId.slice(0, 8)}: ${m}`),
+            onState: (st) => {
+              void postDevRun({ sessionId, ...st });
+              // Re-report the worktree at once so the chip flips within a
+              // second instead of waiting up to 60s for the sweep.
+              void reportSessionWorktree(sessionId).catch(() => undefined);
+            },
+            onExit: (ex) => {
+              liveDevRuns.delete(sessionId);
+              void postDevRun({ sessionId, ended: true, ...ex });
+            },
+          });
+          if (!r.ok) {
+            await postDevRun({
+              sessionId,
+              started: false,
+              endedReason: r.endedReason ?? 'spawn_failed',
+              error: r.error ?? 'the machine could not start it',
+            });
+            return;
+          }
+          liveDevRuns.set(sessionId, { stop: r.stop, pid: r.pid });
+          // THE AUDIT ROW. Without it a daemon-spawned dev server would be the
+          // ONLY execution on this box with no entry in the very surface built
+          // so an admin can answer "what ran on this machine" — and it would be
+          // missing precisely the execution whose provenance is most worth
+          // checking. `runtime: null` because no CLI ran it: the daemon did.
+          void fetch(SESSION_COMMANDS_URL, {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${FLEET_TOKEN}`,
+              'User-Agent': USER_AGENT,
+              'Content-Type': 'application/json',
+            },
+            signal: AbortSignal.timeout(30_000),
+            body: JSON.stringify({
+              sessionId,
+              cwd: wt,
+              commands: [{ command: argv.join(' '), at: new Date().toISOString() }],
+            }),
+          }).catch(() => {
+            /* best-effort — the audit records what reached it */
+          });
+        } finally {
+          devRunClaiming.delete(sessionId);
+        }
+      })();
+    }
+  };
+
+  /**
+   * ADOPT what the previous process left behind.
+   *
+   * This is the half of "consistently running" that actually delivers it. A
+   * self-update re-execs, and a same-repo takeover replaces this process — both
+   * leave dev servers alive on purpose (see `shutdownDevRuns`), and without
+   * adoption the successor would neither supervise them nor be able to stop
+   * them, so the row would say running while nothing owned the process.
+   *
+   * Identity is the CWD plus liveness, never the command string: `npm run dev`
+   * is identical across two tabs, two worktrees, and the driver's own
+   * hand-started server, so a cmdline match would be indistinguishable from a
+   * coincidence. A could-not-measure is NOT a match and kills nothing.
+   */
+  const adoptDevRuns = (activeIds) => {
+    let adopted = 0;
+    for (const entry of reapOrphanDevRuns(activeIds, note)) {
+      const wt = join(baseDir, 'sessions', entry.sessionId);
+      // The recorded cwd must still be this session's worktree. A recycled pid
+      // pointing anywhere else is somebody else's process.
+      if (entry.cwd !== wt) continue;
+      if (liveDevRuns.has(entry.sessionId)) continue;
+      liveDevRuns.set(entry.sessionId, {
+        pid: entry.pid,
+        stop: () => killDevRunEntry(entry),
+      });
+      adopted += 1;
+      // The output ring is EMPTY for an adopted run and the row says so rather
+      // than pretending to a tail it does not have.
+      void postDevRun({
+        sessionId: entry.sessionId,
+        started: true,
+        pid: entry.pid,
+        port: listenersIn(wt)[0]?.port ?? null,
+        logTail: '[reattached after the machine restarted — earlier output is not kept]',
+      });
+    }
+    if (adopted > 0) note(`re-attached ${adopted} dev server${adopted === 1 ? '' : 's'}`);
+  };
+
+  /** The sessionIds this machine is still running, sent on the poll so the
+   *  server can tell a live run from one whose machine went away. */
+  const liveDevRunIds = () => [...liveDevRuns.keys()];
+
+  /** A tab closed. ORDER MATTERS and the caller keeps it: the tunnel is retired
+   *  BEFORE the process it points at, so a viewer sees a dead link rather than
+   *  a 502 from a gate whose origin vanished — and both happen before
+   *  `retireWorkSessions` can `git worktree remove` the directory out from
+   *  under a running node process, which it would do without complaint because
+   *  its dirty check inspects only TRACKED files and node_modules is not one. */
+  const retireDevRuns = (activeIds) => {
+    if (!Array.isArray(activeIds)) return; // an older server, not a close
+    const live = new Set(activeIds);
+    for (const sessionId of [...liveDevRuns.keys()]) {
+      if (live.has(sessionId)) continue;
+      if (devRunClaiming.has(sessionId)) continue;
+      devRunClaiming.add(sessionId);
+      void stopDevRun(sessionId, 'tab_closed').finally(() => devRunClaiming.delete(sessionId));
+    }
+  };
+
+  /**
+   * Daemon shutdown, and the SPLIT is what delivers "consistently running".
+   *
+   * `kill: true` — a human hit Ctrl-C, the credential was revoked, or a stop was
+   * commanded. All three mean THIS MACHINE IS STANDING DOWN, and leaving dev
+   * servers behind would strand them.
+   *
+   * `kill: false` — a same-repo takeover, or a self-update re-exec. Both mean
+   * ANOTHER DAEMON IS ABOUT TO SERVE THIS REPO IN ONE SECOND, and killing would
+   * mean `flowviant` re-run in your own directory restarts the app you were
+   * watching, and a routine auto-update silently kills every dev server with
+   * nothing to bring them back — precisely the goal defeated. The registry rows
+   * are left for the successor to adopt.
+   */
+  const shutdownDevRuns = (kill) => {
+    if (!kill) {
+      liveDevRuns.clear();
+      return;
+    }
+    for (const [, live] of liveDevRuns) {
+      try {
+        live.stop?.();
+      } catch {
+        /* best-effort */
+      }
+    }
+    liveDevRuns.clear();
+  };
+
   const livePreviewIds = () => [...livePreviews.keys()];
 
   /**
@@ -2238,6 +2504,11 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
     livePreviewIds,
     retirePreviews,
     shutdownPreviews,
+    processDevRunJobs,
+    liveDevRunIds,
+    retireDevRuns,
+    shutdownDevRuns,
+    adoptDevRuns,
     retireWorkSessions,
     reportWorktrees,
     shutdownWork,

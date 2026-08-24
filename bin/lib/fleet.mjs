@@ -80,7 +80,12 @@ import { detectRuntimes, knownSkills, pickRuntimeFor, RUNTIMES } from './runtime
 import { createWorkManager } from './work.mjs';
 import { scanLocalSessions } from './localSessions.mjs';
 
-async function fetchRoster(haveIds, livePreviewSessionIds = [], heldSessionIds = []) {
+async function fetchRoster(
+  haveIds,
+  livePreviewSessionIds = [],
+  heldSessionIds = [],
+  liveDevRunSessionIds = []
+) {
   const url = new URL(FLEET_URL);
   if (haveIds.length) url.searchParams.set('have', haveIds.join(','));
   // What this machine will run at once. The server grows lanes to meet waiting
@@ -110,6 +115,11 @@ async function fetchRoster(haveIds, livePreviewSessionIds = [], heldSessionIds =
   // the server still calls live is a 530 on somebody's phone. Always set, even
   // empty: '' means "serving none", absent would mean "an older daemon".
   url.searchParams.set('pv', livePreviewSessionIds.join(','));
+  // The dev runs this machine is still carrying. Same rule as `pv`: always set,
+  // even empty — '' means "running none", absent would mean "an older daemon",
+  // and a run the server still calls running with nothing behind it is a chip
+  // that says Serving over a dead port.
+  url.searchParams.set('dr', liveDevRunSessionIds.join(','));
   // The sessions this daemon holds a worktree for. Its LEASE on each renews
   // here — one beat, no extra endpoint, and the server can tell "this daemon is
   // still serving that tab" from "it went away" within a reconcile interval
@@ -440,6 +450,11 @@ export async function runFleetDaemon() {
   // Kill any preview dev-server/tunnel groups a previously-crashed daemon left
   // running (detached children survive an ungraceful exit) before we start fresh.
   reapOrphanPreviews((m) => info(m));
+  // Dev servers are ADOPTED rather than reaped when their session is still
+  // live: a self-update or a same-repo takeover leaves them running on purpose,
+  // and the successor must supervise them or the row says running while nothing
+  // owns the process. The activeWorkSessions list is not known yet at startup,
+  // so the first reconcile does the adopting — see `adoptDevRuns`.
 
   // Persistent worktree home (0.9.0) — survives daemon restarts AND reboots,
   // so Ctrl+C mid-task never loses local work. Keyed per repo path.
@@ -558,6 +573,25 @@ export async function runFleetDaemon() {
     // Detached tunnels survive our exit by design, so leaving them would strand
     // a public hostname until the box rebooted.
     shutdownPreviews();
+    // AND THE DEV SERVERS, on every path that reaches here — all four are a
+    // stand-down: Ctrl-C, a service manager's SIGTERM, a revoked credential, a
+    // commanded stop.
+    //
+    // A SAME-REPO TAKEOVER IS DELIBERATELY NOT DISTINGUISHED, and that is a
+    // stated limitation rather than an oversight. The takeover asks the holder
+    // to stand down with SIGTERM, which is byte-for-byte what `systemctl stop`
+    // sends, so this handler cannot tell "another daemon is about to serve this
+    // repo in one second" from "this box is going down". Killing is the safe
+    // reading: the wrong guess in the other direction leaves dev servers
+    // running with nothing supervising them until a reboot. The cost is that
+    // re-running `flowviant` in your own repo restarts the app you were
+    // watching, and the successor's `adoptDevRuns` finds nothing.
+    //
+    // The SELF-UPDATE re-exec — the common unattended case — does NOT reach
+    // teardown, so its runs survive and are adopted, which is the half of
+    // "consistently running" this delivers today. Distinguishing a takeover
+    // would need the successor to mark the lock before it signals.
+    shutdownDevRuns(true);
   };
   process.on('SIGINT', () => {
     console.log('');
@@ -734,6 +768,11 @@ export async function runFleetDaemon() {
     livePreviewIds,
     retirePreviews,
     shutdownPreviews,
+    processDevRunJobs,
+    liveDevRunIds,
+    retireDevRuns,
+    shutdownDevRuns,
+    adoptDevRuns,
     retireWorkSessions,
     reportWorktrees,
     shutdownWork,
@@ -1330,7 +1369,7 @@ export async function runFleetDaemon() {
   for (;;) {
     let roster;
     try {
-      roster = await fetchRoster(buildHave(), livePreviewIds(), heldSessionIds());
+      roster = await fetchRoster(buildHave(), livePreviewIds(), heldSessionIds(), liveDevRunIds());
     } catch (e) {
       if (e.auth) {
         fail(`${e.message} — credential revoked or invalid. Shutting down.`);
@@ -1449,6 +1488,18 @@ export async function runFleetDaemon() {
     // in a directory that no longer exists — a human is shown the wrong thing
     // and nothing errors anywhere.
     retirePreviews(roster.activeWorkSessions);
+    // THEN the process the tunnel pointed at, and only then the worktree. A
+    // viewer must not see a 502 from a gate whose origin vanished, and
+    // `retireWorkSessions`'s dirty check inspects only TRACKED files — so
+    // `git worktree remove` would happily pull the directory out from under a
+    // running node process, which then serves bytes from open file handles in
+    // a directory that no longer exists, with no error anywhere.
+    // ADOPT BEFORE RETIRING. A run left alive by a self-update or a takeover
+    // must be re-attached before the retire pass can decide it is unowned;
+    // doing it the other way round would kill exactly the processes this
+    // feature exists to keep.
+    adoptDevRuns(roster.activeWorkSessions);
+    retireDevRuns(roster.activeWorkSessions);
     // A session another daemon on this credential is serving is NOT a closed
     // tab. Without this the daemon that lost the lease removes the worktree the
     // winner is working in — absence would mean "somebody else won" instead of
@@ -1467,6 +1518,7 @@ export async function runFleetDaemon() {
     // credential are both handed this array, and both opening a tunnel strands
     // a public hostname nobody can settle.
     processPreviewJobs(roster.previewJobs);
+    processDevRunJobs(roster.devRunJobs);
     // …and what the SURVIVING ones hold: branch, ahead-of-base, diffstat.
     // Throttled inside, never awaited — a `git status` the human cannot run
     // themselves from a browser, relayed. After retirement so a directory that
