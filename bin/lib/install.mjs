@@ -27,17 +27,23 @@ export function addLocalBinToPath() {
   }
 }
 
-/** TTY-guarded y/N. Non-interactive (no TTY) never auto-installs → returns false
- *  so a headless/cron run just prints the manual instructions instead. */
+/** TTY-guarded y/N. Non-interactive never auto-installs → returns false so a
+ *  headless/cron run just prints the manual instructions instead.
+ *
+ *  `canPrompt()` rather than `stdin.isTTY`, and BOUNDED: preflight runs before
+ *  the daemon serves anything, so a question here that cannot be answered is a
+ *  machine that never starts. A backgrounded job has a TTY and cannot be asked
+ *  — the read raises SIGTTIN and the kernel stops the process. Silence is `no`,
+ *  which is already what this returns when nobody is there. */
 export async function promptYesNo(question, defaultYes) {
-  if (!process.stdin.isTTY) return false;
-  const { createInterface } = await import('node:readline');
-  const rl = createInterface({ input: process.stdin, output: process.stdout });
-  const answer = await new Promise((res) =>
-    rl.question(`${question} ${defaultYes ? '[Y/n]' : '[y/N]'} `, res),
+  const { canPrompt, askWithTimeout } = await import('./tty.mjs');
+  if (!canPrompt()) return false;
+  const answer = await askWithTimeout(
+    `${question} ${defaultYes ? '[Y/n]' : '[y/N]'} `,
+    30_000
   );
-  rl.close();
-  const a = answer.trim().toLowerCase();
+  if (answer === null) return false;
+  const a = answer.toLowerCase();
   if (!a) return defaultYes;
   return a === 'y' || a === 'yes';
 }

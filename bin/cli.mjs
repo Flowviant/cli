@@ -237,13 +237,22 @@ if (process.argv[2] === 'env') {
 // auto-updated daemon's child sees two TTYs; without this it would stop on the
 // binding confirm below and the machine would stay dark until somebody typed a
 // key. Same reasoning as the headless case, and the same answer.
-const interactive =
-  Boolean(process.stdin.isTTY && process.stdout.isTTY) && process.env.FLOWVIANT_REEXEC !== '1';
+// `canPrompt()`, not a bare isTTY pair: a BACKGROUNDED job (`flowviant &`) has
+// two TTYs and cannot be asked anything — the first read raises SIGTTIN and the
+// kernel STOPS the process, which is why 0.55.2's timeout did not save it (a
+// stopped process runs no timers). See tty.mjs.
+const { canPrompt, askWithTimeout } = await import('./lib/tty.mjs');
+const interactive = canPrompt() && process.env.FLOWVIANT_REEXEC !== '1';
 
 /** How long the one-time binding confirm waits before serving unbound. A person
  *  who just typed `flowviant` answers in seconds; anything longer is a restart
  *  nobody is watching, and the machine must not sit dark for it. */
 const CONFIRM_TIMEOUT_MS = 20_000;
+
+/** The picker's own budget. Longer than the confirm: this one asks you to READ
+ *  a list before answering, and its fallback costs you a start rather than
+ *  costing you a binding. */
+const PICK_TIMEOUT_MS = 60_000;
 const externalToken = process.argv.includes('--fleet') || Boolean(process.env.FLOWVIANT_FLEET);
 
 /** Re-exec a plain `flowviant` after an inline login — the login command's own
@@ -283,12 +292,22 @@ if (!FLEET_TOKEN) {
     );
     console.log(listLines(choices, creds));
     console.log(`  ${choices.length + 1}. connect ${repoRoot ? 'this repo' : 'a repo'} to a different project (flowviant login)`);
-    const rl = (await import('node:readline/promises')).createInterface({
-      input: process.stdin,
-      output: process.stdout,
-    });
-    const raw = (await rl.question(`Which project should this daemon serve? [1-${choices.length + 1}] `)).trim();
-    rl.close();
+    // Bounded like the confirm below, and for the same reason — but silence
+    // means something DIFFERENT here and the difference is load-bearing. There
+    // is a real ambiguity to resolve; serving a guess is the skadooble bug.
+    // So no answer REFUSES, which is exactly what this branch already does
+    // headless, and the message says how to answer without being present.
+    const raw = await askWithTimeout(
+      `Which project should this daemon serve? [1-${choices.length + 1}] `,
+      PICK_TIMEOUT_MS
+    );
+    if (raw === null) {
+      console.error(
+        `\nno answer in ${Math.round(PICK_TIMEOUT_MS / 1000)}s — nothing started. ` +
+          `Name one with \`--project <name|id>\`, or run \`flowviant\` here in the foreground and pick.`
+      );
+      process.exit(1);
+    }
     const n = Number.parseInt(raw, 10);
     if (n === choices.length + 1) await reexecAfterLogin();
     const picked = Number.isInteger(n) ? choices[n - 1] : undefined;
@@ -346,26 +365,11 @@ if (!FLEET_TOKEN) {
   //    which is the only person it could ever have been fixed for.
   const creds = await import('./lib/credentials.mjs');
   const label = creds.projectLabel(CREDENTIAL.entry);
-  const rl = (await import('node:readline/promises')).createInterface({
-    input: process.stdin,
-    output: process.stdout,
-  });
-  const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), CONFIRM_TIMEOUT_MS);
-  let raw = null; // null = nobody answered
-  try {
-    raw = (
-      await rl.question(
-        `This machine's one connected project is ${label}. Serve this repo (${CREDENTIAL.repoRoot}) as ${label}? [Y/n] `,
-        { signal: ac.signal }
-      )
-    ).trim().toLowerCase();
-  } catch {
-    /* aborted — nobody is at this terminal */
-  } finally {
-    clearTimeout(timer);
-    rl.close();
-  }
+  const answered = await askWithTimeout(
+    `This machine's one connected project is ${label}. Serve this repo (${CREDENTIAL.repoRoot}) as ${label}? [Y/n] `,
+    CONFIRM_TIMEOUT_MS
+  );
+  const raw = answered === null ? null : answered.toLowerCase(); // null = nobody answered
   if (raw === null) {
     console.log(
       `\n  no answer in ${Math.round(CONFIRM_TIMEOUT_MS / 1000)}s — serving ${label} for this run ` +
