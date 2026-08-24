@@ -16,6 +16,7 @@ import { join } from 'node:path';
 import { FLEET_URL, FLEET_TOKEN, USER_AGENT, DAEMON_INSTANCE } from './config.mjs';
 import { c, note, ok, warn } from './ui.mjs';
 import { deployCreds, appSecretsFor, scrub, myPubB64 } from './env.mjs';
+import { childEnv } from './childEnv.mjs';
 
 const deployUrl = (tail) => FLEET_URL.replace(/\/agents\/?$/, `/${tail}`);
 
@@ -206,8 +207,18 @@ export function processDeployJobs(jobs, ctx) {
 }
 
 async function runDeploy(job, target, ctx) {
-  const env = { ...process.env, ...deployCreds() }; // inject infra creds; never a file
-  delete env.FLEET_TOKEN; // the deploy command has no business reading it; keep it out of a command that might echo its env
+  // AN ALLOWLIST, not `{...process.env}` minus names. What stood here was
+  //
+  //     const env = { ...process.env, ...deployCreds() };
+  //     delete env.FLEET_TOKEN;
+  //
+  // and that delete was a NO-OP: `FLEET_TOKEN` is a module constant in
+  // config.mjs, while the environment variable is `FLOWVIANT_FLEET`. The
+  // machine credential was therefore in the environment of every deploy
+  // command — and of `target.build`, which is a string the REPO controls —
+  // under a comment asserting the opposite. A denylist is a claim about a set
+  // you cannot see; this is built from {} instead.
+  const env = childEnv({ cwd: ctx.repoRoot, extra: deployCreds() }); // infra creds; never a file
   const logs = [];
   // Rollback is a single wrangler command; deploy is build → secrets → deploy.
   if (job.kind === 'rollback') {
