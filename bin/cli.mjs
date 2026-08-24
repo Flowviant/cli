@@ -239,6 +239,11 @@ if (process.argv[2] === 'env') {
 // key. Same reasoning as the headless case, and the same answer.
 const interactive =
   Boolean(process.stdin.isTTY && process.stdout.isTTY) && process.env.FLOWVIANT_REEXEC !== '1';
+
+/** How long the one-time binding confirm waits before serving unbound. A person
+ *  who just typed `flowviant` answers in seconds; anything longer is a restart
+ *  nobody is watching, and the machine must not sit dark for it. */
+const CONFIRM_TIMEOUT_MS = 20_000;
 const externalToken = process.argv.includes('--fleet') || Boolean(process.env.FLOWVIANT_FLEET);
 
 /** Re-exec a plain `flowviant` after an inline login — the login command's own
@@ -321,17 +326,52 @@ if (!FLEET_TOKEN) {
   // ONE stored project, never tied to a repo — the pre-0.55.0 world. Ask once;
   // yes binds and every later start is silent. This is the exact question
   // whose absence had a calendar checkout serving skadooble.
+  //
+  // AND IT TIMES OUT, because a prompt on a start path is a way for a machine
+  // to go dark. `FLOWVIANT_REEXEC` above covers the restart THIS version
+  // performs, but it cannot cover the one that matters most: the hop that
+  // installs a fixed daemon is spawned by the OLD one, which never sets it.
+  // 0.55.0 → 0.55.1 was exactly that — an auto-update landing unattended would
+  // stop here with the machine serving nothing. A guard that only works once
+  // everyone already has it is not a guard.
+  //
+  // ON TIMEOUT WE SERVE, AND WE DO NOT BIND. Those are two decisions:
+  //  · SERVE, because it is what every version before 0.55.0 did with this
+  //    exact store, so the silent path is the status quo rather than a new
+  //    risk — and a daemon that answers is strictly better than one that does
+  //    not, which is the whole reason this product has exactly one refusal.
+  //  · DO NOT BIND, because binding is the thing the question was FOR. Nobody
+  //    answered, so nothing is cemented; the next human start asks again. That
+  //    keeps the skadooble case fixed for the person who is actually looking,
+  //    which is the only person it could ever have been fixed for.
   const creds = await import('./lib/credentials.mjs');
   const label = creds.projectLabel(CREDENTIAL.entry);
   const rl = (await import('node:readline/promises')).createInterface({
     input: process.stdin,
     output: process.stdout,
   });
-  const raw = (
-    await rl.question(`This machine's one connected project is ${label}. Serve this repo (${CREDENTIAL.repoRoot}) as ${label}? [Y/n] `)
-  ).trim().toLowerCase();
-  rl.close();
-  if (raw === '' || raw === 'y' || raw === 'yes') {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), CONFIRM_TIMEOUT_MS);
+  let raw = null; // null = nobody answered
+  try {
+    raw = (
+      await rl.question(
+        `This machine's one connected project is ${label}. Serve this repo (${CREDENTIAL.repoRoot}) as ${label}? [Y/n] `,
+        { signal: ac.signal }
+      )
+    ).trim().toLowerCase();
+  } catch {
+    /* aborted — nobody is at this terminal */
+  } finally {
+    clearTimeout(timer);
+    rl.close();
+  }
+  if (raw === null) {
+    console.log(
+      `\n  no answer in ${Math.round(CONFIRM_TIMEOUT_MS / 1000)}s — serving ${label} for this run ` +
+        `without tying it to this repo. Run \`flowviant\` here and answer to make it stick.`
+    );
+  } else if (raw === '' || raw === 'y' || raw === 'yes') {
     creds.bindStoredRepo(CREDENTIAL.entry.projectId, CREDENTIAL.repoRoot);
   } else {
     console.error(
