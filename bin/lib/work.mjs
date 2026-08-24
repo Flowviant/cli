@@ -519,8 +519,34 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
       }
 
       if (!Number.isInteger(port) || port <= 0 || port > 65535) continue;
+
+      // VALIDATE THE MEMBERS-GATE TRIPLE AT THE BOUNDARY, the way sessionId and
+      // port already are — one place doing the check is one deploy away from
+      // being zero places. A malformed value is DROPPED rather than errored and
+      // the share opens password-only: a gate is never degraded to open, but it
+      // is also never left un-opened over a field we could not read.
+      const secret = /^[A-Za-z0-9_-]{32,128}$/.test(String(job?.secret ?? ''))
+        ? String(job.secret)
+        : null;
+      const shareId = isSafePathSegment(String(job?.shareId ?? '')) ? String(job.shareId) : null;
+      let authorizeUrl = null;
+      try {
+        const u = new URL(String(job?.authorizeUrl ?? ''));
+        if (u.protocol === 'https:') authorizeUrl = u.toString();
+      } catch {
+        /* not a URL — password-only, which is honest */
+      }
+      // All three or none: two of the three is a gate that cannot bounce.
+      const gateOk = Boolean(secret && shareId && authorizeUrl);
+
       // Already serving exactly this. Re-opening would replace a working URL
       // somebody may be looking at right now.
+      //
+      // NOTE this key is (session, port) and NOT the secret. Rotating a secret
+      // under a LIVE share is deliberately unsupported: `requestPreview`
+      // early-returns on a live row of the same port, so a new secret only ever
+      // arrives with a genuinely new row, by which time this map has been
+      // cleared. Anyone adding rotation must widen the key first.
       if (livePreviews.get(sessionId)?.port === port) continue;
       if (previewClaiming.has(sessionId)) continue;
       previewClaiming.add(sessionId);
@@ -566,6 +592,7 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
             // a bare TCP probe green, and the share's URL+password would serve
             // a worktree nobody consented to publish.
             stillServing: async () => listenersIn(wt).some((l) => l.port === port),
+            ...(gateOk ? { grantSecret: secret, shareId, authorizeUrl } : {}),
             // The gate closed itself after repeated failed passwords. Stored,
             // so the incident is visible — and the entry is dropped so the
             // owner can re-share the port without restarting the daemon.
@@ -588,7 +615,15 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
             return;
           }
           livePreviews.set(sessionId, { port, url: t.url, stop: t.stop });
-          await postPreview({ sessionId, url: t.url, user: t.user, password: t.password });
+          // The gate we ACTUALLY installed, so the app never asserts a door
+          // nobody observed. An older server ignores the field.
+          await postPreview({
+            sessionId,
+            url: t.url,
+            user: t.user,
+            password: t.password,
+            gate: t.gateMode,
+          });
         } finally {
           previewClaiming.delete(sessionId);
         }

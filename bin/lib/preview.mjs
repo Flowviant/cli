@@ -311,7 +311,7 @@ const TAIL_BYTES = 2000;
 /**
  * Gate `port` behind a password and publish it on a quick tunnel.
  *
- * Resolves { url, user, password, stop } on success, or { error } — a sentence
+ * Resolves { url, user, password, gateMode, stop } on success, or { error } — a sentence
  * from this machine, to be relayed as-is. It never resolves a URL without a
  * password, and it never returns a tunnel whose origin was not listening when
  * we checked.
@@ -348,6 +348,11 @@ export async function openTunnel({
   onTunnelGone,
   stillServing,
   probeMs = 20_000,
+  // The members-gate triple, all three or none. Absent = an older server, or a
+  // password-mode share: the gate runs exactly as it always has.
+  grantSecret,
+  shareId,
+  authorizeUrl,
 }) {
   // Re-validate at the machine. The server checked this port against the last
   // report; reports are up to a minute old and a dev server is a process a
@@ -392,6 +397,13 @@ export async function openTunnel({
   gate = await startAuthProxy({
     targetPort: port,
     log,
+    // Never logged, never written to previews.json, never in the reap
+    // signature, never in argv or a child env — /proc/<pid>/cmdline is
+    // world-readable and this box also runs the driver's dev server and every
+    // CLI turn. In-process only.
+    grantSecret,
+    shareId,
+    authorizeUrl,
     onAbuse: () => {
       stop();
       try {
@@ -483,7 +495,7 @@ export async function openTunnel({
         }
       });
 
-      finish({ url: m[0], user: gate.user, password: gate.password, stop });
+      finish({ url: m[0], user: gate.user, password: gate.password, gateMode: gate.gateMode, stop });
     };
 
     tunnel.stdout.on('data', onOut);
