@@ -59,7 +59,17 @@ function reexec(teardown) {
   }
   const child = spawn(process.execPath, process.argv.slice(1), {
     stdio: 'inherit',
-    env: process.env,
+    // MARK THE CHILD AS A RESTART, not as a person typing `flowviant`.
+    // stdio is inherited, so the child sees two TTYs and believes a human is
+    // watching — and 0.55.0 asks a one-time binding question on exactly that
+    // signal. An auto-update that lands while nobody is looking would then sit
+    // on `Serve this repo as X? [Y/n]` with the machine dark until someone
+    // walks past. The rule credentials.mjs already states for systemd applies
+    // verbatim here: a RESTART must not hang on a prompt. Skipping the confirm
+    // is not a widening — the daemon serves exactly the credential it was
+    // already serving one second ago, and the question gets asked the next
+    // time a human starts it by hand.
+    env: { ...process.env, FLOWVIANT_REEXEC: '1' },
   });
   child.on('exit', (code) => process.exit(code ?? 0));
 }

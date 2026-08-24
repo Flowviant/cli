@@ -233,7 +233,12 @@ if (process.argv[2] === 'env') {
 // that name every stored project and every way out. The one thing this block
 // must never do is serve a project the resolution did not name — "it said
 // skadooble in my calendar repo" is the confusion this exists to end.
-const interactive = Boolean(process.stdin.isTTY && process.stdout.isTTY);
+// A RESTART IS NOT A PERSON. `reexec` (update.mjs) inherits stdio, so an
+// auto-updated daemon's child sees two TTYs; without this it would stop on the
+// binding confirm below and the machine would stay dark until somebody typed a
+// key. Same reasoning as the headless case, and the same answer.
+const interactive =
+  Boolean(process.stdin.isTTY && process.stdout.isTTY) && process.env.FLOWVIANT_REEXEC !== '1';
 const externalToken = process.argv.includes('--fleet') || Boolean(process.env.FLOWVIANT_FLEET);
 
 /** Re-exec a plain `flowviant` after an inline login — the login command's own

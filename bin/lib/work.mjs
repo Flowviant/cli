@@ -48,7 +48,7 @@ import {
   SYSTEM_WORK_PLAIN,
   WORK_TURN_KICKOFF_PLAIN,
 } from './prompts.mjs';
-import { materializeInto, excludeInWorktree, scrub as envScrub } from './env.mjs';
+import { materializeInto, hasMaterialized, excludeInWorktree, scrub as envScrub } from './env.mjs';
 import { detectRuntimes, canRun, recordSkills, RUNTIMES } from './runtimes.mjs';
 import { isTerminalSessionLive, isAgyConversationLive } from './localSessions.mjs';
 import { worktreeDiff } from './worktreeDiff.mjs';
@@ -895,6 +895,25 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
       // otherwise), and ignored files never appear in `git status --porcelain`.
       // Best-effort, like everywhere else — the session still builds; paths
       // that need secrets may 500.
+      try {
+        materializeInto(wt);
+      } catch {
+        /* best-effort */
+      }
+    } else if (!hasMaterialized(wt)) {
+      // CREATION-ONLY NEEDED A SECOND CONDITION. The rule above is right about
+      // a LIVE directory — its env belongs to the session and re-writing it
+      // mid-flight is not ours to do — but "created" and "ever given a bundle"
+      // are different events, and the gap between them is a whole daemon
+      // restart: `handleRosterEnv` (which warms the encrypted cache) runs
+      // AFTER `processWorkTurns` on the same poll, so a worktree made on the
+      // first turn after a restart was materialized against an EMPTY bundle
+      // and, being neither fresh nor covered by a bundle CHANGE, never
+      // revisited. `materializeInto` now declines to record a pass it made in
+      // ignorance (bundleVersion < 0), so this branch is what retries it —
+      // once, on the next turn, and never again after it succeeds. Idempotent
+      // by construction: identical bodies are not rewritten, so nothing
+      // hot-restarts a dev server the driver is watching.
       try {
         materializeInto(wt);
       } catch {

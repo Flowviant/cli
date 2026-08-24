@@ -34,6 +34,8 @@ import {
   mkdirSync,
   existsSync,
   appendFileSync,
+  chmodSync,
+  lstatSync,
   rmSync,
 } from 'node:fs';
 import { execFileSync } from 'node:child_process';
@@ -123,11 +125,52 @@ export function myPubB64() {
   return keypair ? sodium.to_base64(keypair.publicKey, B64()) : null;
 }
 
-/** Query params the roster poll carries: identity + materialized version. */
+/** Query params the roster poll carries: identity, materialized version, and
+ *  the target files we REFUSED to write.
+ *
+ *  `envv` alone was a half-truth and the surface built on it said the wrong
+ *  thing out loud: it is set the moment the bundle DECRYPTS, independent of
+ *  whether a single byte reached a worktree, so a project whose `.env` is
+ *  tracked in git got the green "on the current env" chip while every session
+ *  ran on whatever stale placeholder git had checked out. The daemon knew —
+ *  it warned, to a console nobody reads. `envskip` is that warning routed
+ *  somewhere a human is actually looking.
+ *
+ *  A daemon→server REPORT, so it needs no version floor: an older daemon
+ *  simply sends no `envskip` key, which reads as "nothing to report" — and
+ *  that is honest, because an older daemon genuinely is not measuring it.
+ *  Bounded hard: a query string is not a log. */
 export async function envQueryParams() {
   await ensureKeypair();
   const params = { envpub: myPubB64() };
   if (bundleVersion >= 0) params.envv = String(bundleVersion);
+  // THE EMPTY STRING IS A REPORT, and it is the only thing that can ever CLEAR
+  // the surface's warning. Gating this on truthiness (which is what it did
+  // first) meant a person who followed the on-screen remedy exactly — gitignore
+  // the file, restart — sent no `envskip` at all, the server left the column
+  // alone by design, and the amber line stayed up forever telling them to fix
+  // something already fixed. Absence must keep meaning IGNORANCE, so the gate
+  // is "has a pass actually run", never "is there something to say".
+  // (fleet.mjs's query loop had to stop filtering on truthiness too — one
+  // check here is useless while a second one downstream drops the same value.)
+  if (everMaterialized) {
+    const files = [...new Set([...skippedByWorktree.values()].flat())].sort();
+    // Each path is percent-encoded BEFORE the join, because `isSafeEnvTargetFile`
+    // permits a comma in a filename and the server splits on one — unencoded,
+    // `a,b.env` would arrive as two files that do not exist. Truncation is by
+    // WHOLE ELEMENTS against a byte budget; a mid-path cut names a file nobody
+    // has, which is worse than naming fewer.
+    const parts = [];
+    let budget = 400;
+    for (const f of files) {
+      if (parts.length >= 10) break;
+      const enc = encodeURIComponent(f);
+      if (enc.length + 1 > budget) break;
+      parts.push(enc);
+      budget -= enc.length + 1;
+    }
+    params.envskip = parts.join(',');
+  }
   return params;
 }
 
@@ -310,6 +353,37 @@ function isIgnoredInGit(wt, relPath) {
 
 // Per-worktree: the target files we last materialized THIS SESSION.
 const lastFilesByWorktree = new Map();
+
+/** Target files refused for a GIT reason, PER WORKTREE — reported to the
+ *  server on the next poll. Per-worktree because the refusal is: both
+ *  predicates (`isTrackedInGit`, `isIgnoredInGit`) run with `cwd: wt`, so
+ *  ".env is refused" is a fact about ONE tree. A process-global set mixed two
+ *  trees' answers together and, worse, could only ever grow.
+ *
+ *  Names only — a path is not a secret, and the whole point is that a human
+ *  can act on it ("gitignore apps/api/.dev.vars"). Only the two GIT causes go
+ *  in here: they have a remedy the reader can carry out, and the surface names
+ *  that remedy. A transient write failure is a warn, not a standing claim. */
+const skippedByWorktree = new Map();
+
+/** Worktrees whose most recent pass wrote everything it was asked to.
+ *  `hasMaterialized` is built on THIS rather than on "a pass ran", so a pass
+ *  that refused something RETRIES on the next turn — which is what lets
+ *  `echo .env >> .gitignore` actually take effect without waiting for an
+ *  unrelated bundle change. A pass with nothing to write counts as clean. */
+const cleanWorktrees = new Set();
+
+/** True once any materialization pass has completed. Distinguishes "we refused
+ *  nothing" from "we have not looked", which is the whole contract of the
+ *  `envskip` report — see envQueryParams. */
+let everMaterialized = false;
+
+/** Has this process completed a CLEAN materialization pass for this worktree?
+ *  The creation-only rule (work.mjs) needs a second condition or a directory
+ *  that existed before the bundle did is never revisited. */
+export function hasMaterialized(wt) {
+  return cleanWorktrees.has(wt);
+}
 // Project-global union of every target file we've ever materialized — PERSISTED
 // in the cache and seeded on load, so a file whose key was deleted while the
 // daemon was down still gets its stale plaintext copy cleaned on the next
@@ -366,6 +440,15 @@ export function appSecretsFor(env) {
  *  app secrets go to the provider at deploy, deploy creds are injected only. */
 export function materializeInto(wt) {
   if (!wt || !existsSync(wt)) return;
+  // NEVER SYNCED IS NOT "NO SECRETS", and conflating them cost a whole session.
+  // `values` is empty both before the first bundle lands and for a project that
+  // genuinely has none; `bundleVersion < 0` is the one that means IGNORANCE.
+  // Writing nothing here and RECORDING it as materialized let a worktree
+  // created on the first poll after a restart — before handleRosterEnv had
+  // warmed the cache — sit secret-less for its entire life, because nothing
+  // re-materializes a directory that is neither fresh nor covered by a bundle
+  // CHANGE. Returning without recording is what makes the next turn retry.
+  if (bundleVersion < 0) return;
   const byFile = new Map();
   for (const v of values) {
     if (v.scope !== 'app' || v.env !== 'dev') continue; // only local dev secrets hit a worktree file
@@ -382,9 +465,16 @@ export function materializeInto(wt) {
   excludeInWorktree(wt, [...byFile.keys()]);
 
   const written = [];
+  /** Refused for a GIT reason this pass — reported, and remediable. */
+  const refusedForGit = [];
+  /** Anything that did not get written, git reasons and write failures alike.
+   *  Blocks the clean mark so the next turn tries again. */
+  let anyProblem = false;
   for (const [file, list] of byFile) {
     if (isTrackedInGit(wt, file)) {
       warn(`env: "${file}" is tracked in git — refusing to write secrets there (gitignore it). Its keys are NOT materialized.`);
+      refusedForGit.push(file);
+      anyProblem = true;
       continue;
     }
     // The load-bearing check. A materialized secret sits in a worktree whose
@@ -392,10 +482,27 @@ export function materializeInto(wt) {
     // "git cannot see this file" is a precondition for writing it, not a nicety.
     if (!isIgnoredInGit(wt, file)) {
       warn(`env: "${file}" is not gitignored — refusing to write secrets there. Add it to .gitignore. Its keys are NOT materialized.`);
+      refusedForGit.push(file);
+      anyProblem = true;
       continue;
     }
     try {
       const abs = join(wt, file);
+      // A SYMLINK AT THE TARGET IS NOT A TARGET. `writeFileSync` follows one,
+      // so a link committed into the repo (or dropped by an agent) at the
+      // materialization path would write the project's decrypted secrets
+      // wherever it points — outside the worktree, and outside everything the
+      // check-ignore gate can reason about. `lstat`, not `stat`, and refuse.
+      // Cheap, and the whole exposure is one call away otherwise.
+      try {
+        if (lstatSync(abs).isSymbolicLink()) {
+          warn(`env: "${file}" is a symlink — refusing to write secrets through it.`);
+          anyProblem = true;
+          continue;
+        }
+      } catch {
+        /* does not exist yet — the ordinary case */
+      }
       mkdirSync(dirname(abs), { recursive: true });
       const body = renderEnvFile(list);
       // Skip an identical rewrite — otherwise every bundle bump touches the
@@ -407,9 +514,22 @@ export function materializeInto(wt) {
         /* new file */
       }
       if (prior !== body) writeFileSync(abs, body, { mode: 0o600 });
+      // `mode` on writeFileSync applies at CREATION only — an overwrite of a
+      // file that already existed keeps whatever mode it had, so a 0644 stub
+      // committed by a teammate (or left by an older daemon) would hold
+      // plaintext secrets world-readable on a shared box. chmod every time.
+      try {
+        chmodSync(abs, 0o600);
+      } catch {
+        /* best-effort: a filesystem without modes is not a reason to refuse */
+      }
       written.push(file);
     } catch (e) {
+      // NOT reported as a refusal: the surface's line names a git cause and a
+      // git remedy, and a full disk is neither. It still blocks the clean mark,
+      // so the next turn retries.
       warn(`env: could not write ${file} into worktree: ${e.message}`);
+      anyProblem = true;
     }
   }
 
@@ -423,6 +543,18 @@ export function materializeInto(wt) {
   }
   for (const f of written) knownTargetFiles.add(f);
   lastFilesByWorktree.set(wt, written);
+
+  // THE PASS'S VERDICT, recorded whole and REPLACING the previous one — this is
+  // what lets a refusal clear. `refusedForGit` is recomputed from scratch every
+  // pass, so a file that gets gitignored simply is not in the next one, and the
+  // union reported on the poll shrinks. `anyProblem` (which also covers a write
+  // failure) is what decides whether this worktree gets retried on the next
+  // turn; a clean pass is remembered so we stop touching a live directory.
+  if (refusedForGit.length > 0) skippedByWorktree.set(wt, refusedForGit);
+  else skippedByWorktree.delete(wt);
+  if (anyProblem) cleanWorktrees.delete(wt);
+  else cleanWorktrees.add(wt);
+  everMaterialized = true;
 }
 
 /**

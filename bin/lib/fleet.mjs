@@ -69,6 +69,7 @@ import { ensureVault, syncVault } from './vault.mjs';
 import {
   envQueryParams,
   handleRosterEnv,
+  loadCachedEnv,
   materializeInto,
   myPubB64,
   scrub as envScrub,
@@ -150,9 +151,17 @@ async function fetchRoster(haveIds, livePreviewSessionIds = [], heldSessionIds =
     /* best-effort — the poll must never fail on a readout */
   }
   // Env-sync identity + materialized version (the Settings "env vN" chip).
+  //
+  // `!= null`, NOT truthiness. `envskip` uses the EMPTY STRING as a real
+  // report — "measured, refused nothing" — and it is the only value that can
+  // clear the surface's warning. A `if (v)` here silently dropped it, so
+  // fixing the filter in envQueryParams alone would have changed nothing.
+  // This is the same trap the skills relay eight lines up documents and
+  // sidesteps by calling `url.searchParams.set` directly; the general fix is
+  // better than a second special case.
   try {
     for (const [k, v] of Object.entries(await envQueryParams())) {
-      if (v) url.searchParams.set(k, v);
+      if (v != null) url.searchParams.set(k, v);
     }
   } catch {
     /* env identity is best-effort — the poll must never fail on it */
@@ -395,6 +404,39 @@ export async function runFleetDaemon() {
     warn('could not take the single-instance lock (unwritable ~/.flowviant) — running unguarded');
 
   await preflight({ needGit: true });
+
+  // WARM THE ENV CACHE BEFORE THE FIRST POLL, not on the first roster tick.
+  // `handleRosterEnv` loads it, and `handleRosterEnv` runs AFTER
+  // `processWorkTurns` in the reconcile below — so on the first poll after a
+  // restart a brand-new session worktree was materialized against an EMPTY
+  // bundle, and then never revisited (creation-only, and `needSync` is false
+  // when the cache holds the version the server is already on). The turn ran
+  // with no secrets and nothing said so.
+  //
+  // This is only possible since 0.55.0: the credential store knows which
+  // project this checkout is, so the cache — which is keyed by projectId — can
+  // be found before the server has named anything. A `--fleet`/env token names
+  // no project until the roster does, so it keeps the old lazy path.
+  // Best-effort throughout: a cache miss is the ordinary first-run state.
+  //
+  // GATED ON THE STORE ACTUALLY BEING THE SOURCE. `--fleet` / `FLOWVIANT_FLEET`
+  // OVERRIDE the stored credential (config.mjs), but `CREDENTIAL` is resolved
+  // from the store regardless — so reading its projectId here would decrypt and
+  // materialize project A's cached secrets while this daemon is serving project
+  // B's token. That is the wrong project's plaintext in a worktree, which is
+  // the exact failure the repo binding exists to prevent, arriving by a
+  // different door. An external token names no project until the roster does,
+  // so it keeps the lazy path and loses nothing but one poll.
+  const externalToken =
+    process.argv.includes('--fleet') || Boolean(process.env.FLOWVIANT_FLEET);
+  if (!externalToken && CREDENTIAL?.entry?.projectId) {
+    try {
+      await loadCachedEnv(CREDENTIAL.entry.projectId);
+    } catch {
+      /* no cache, no keypair yet, unreadable home — the roster tick retries */
+    }
+  }
+
   // Kill any preview dev-server/tunnel groups a previously-crashed daemon left
   // running (detached children survive an ungraceful exit) before we start fresh.
   reapOrphanPreviews((m) => info(m));
