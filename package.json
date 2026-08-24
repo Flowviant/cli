@@ -8,6 +8,7 @@
   },
   "files": [
     "bin",
+    "!bin/lib/*.test.mjs",
     "README.md",
     "LICENSE"
   ],
