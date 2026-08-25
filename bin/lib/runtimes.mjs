@@ -36,9 +36,9 @@
  * machine HAVE" — activity, never capacity, and never a default we invented.
  */
 
-import { execFileSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { execFileSync, spawn } from 'node:child_process';
+import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { SAFE, MODEL, USER_AGENT } from './config.mjs';
 
@@ -975,4 +975,192 @@ export function recordSkills(names) {
 /** What to send on the roster poll — null until a turn has taught us. */
 export function knownSkills() {
   return skillsCache;
+}
+
+/**
+ * LEARN WHAT `/` CAN OFFER, ON A MACHINE NO TURN HAS TAUGHT.
+ *
+ * WHY THIS EXISTS. `recordSkills` above is fed from the init event of a tab
+ * turn — authoritative and free, but with a hole nobody priced: THE FIRST THING
+ * ANYONE DOES IN A NEW TAB IS TYPE `/`, and that is by definition before that
+ * machine has run a turn. The menu was guaranteed empty exactly where it is
+ * first reached. Not a theoretical hole: checked against production on
+ * 2026-08-25, `agent_tokens.skills` was NULL for EVERY machine credential that
+ * has ever existed, because the only tab turns ever run predated the release
+ * that reports. The feature had never worked for anyone, once.
+ *
+ * IT COSTS ONE SMALL REQUEST, AND THAT IS THE HONEST NUMBER. This file used to
+ * forbid probing outright — "a `claude -p` run purely to populate a dropdown
+ * would spend the operator's quota on an affordance" — and that rule was
+ * written picturing a COMPLETED TURN. This is not one: Claude Code emits
+ * `system.init`, carrying its own fully resolved skill set, within ~0.5s and
+ * long before it finishes answering, so the child is killed the moment that
+ * event is read. But the request HAS gone out by then — measured on 2.1.245 by
+ * reading the transcript a killed probe left behind: 2 input tokens, 4 output,
+ * ~6k cache-creation. Two zero-request routes were tried and both failed: an
+ * empty prompt errors before init is emitted, and `--input-format stream-json`
+ * emits nothing at all until a message arrives. So the cost is one cheap turn,
+ * ONCE per daemon process, on the cheapest model, and only on a machine no turn
+ * has taught. Do not let this grow into a per-tab or per-poll probe.
+ *
+ * `--model haiku` for that reason, and it is safe by this repo's own rule: a
+ * name lives in AGENT_MODELS only once `claude --model <name>` is known to be
+ * accepted on a real install. If it were ever refused the probe simply learns
+ * nothing and the machine stays unmeasured — which is exactly today's state, so
+ * the failure mode is the status quo rather than a regression.
+ *
+ * IT SCANS FOR THE INIT EVENT, never assuming it is line 1 — and that is not
+ * defensive padding, it is measured. With `--model haiku` the CLI prints a
+ * `system/status` line FIRST and init lands on line 2; with the default model
+ * init is line 1. A first-line-only reader (the version this replaced) silently
+ * learned nothing the moment a model flag was added.
+ *
+ * IT CLEANS UP AFTER ITSELF, and this is not optional. `claude -p` writes a
+ * transcript to `~/.claude/projects/<munged-cwd>/<session-id>.jsonl` the moment
+ * it starts, and `localSessions.mjs` reports the newest ENDED session per
+ * directory to the Workbench as an ADOPTABLE row. Left behind, every daemon
+ * start would put a phantom untitled session in the `+` menu offering to adopt
+ * a conversation that never happened. The init event names its own session id,
+ * so the file is ours by name and is removed by it.
+ *
+ * IT IS BEST-EFFORT IN EVERY DIRECTION. No claude, no PATH, a CLI that changed
+ * its event shape, an unwritable home — all leave `skillsCache` exactly as it
+ * was (null, "nobody looked"), which is the honest answer and the one the app
+ * already renders correctly. Nothing here may throw, and nothing may block the
+ * poll it is called from.
+ */
+
+/** Long enough for a cold CLI start on a slow box, short enough that a hung
+ *  child is not left holding a session for the life of the daemon. */
+const SKILL_PROBE_TIMEOUT_MS = 30_000;
+
+/** Init arrives within the first couple of events or not at all; this is the
+ *  guard against parsing a whole turn's output looking for it. */
+const SKILL_PROBE_MAX_LINES = 20;
+
+let skillProbeStarted = false;
+
+/** Where Claude Code keeps a transcript for `cwd`: `/` and `.` both become `-`. */
+function transcriptCandidates(cwd, sessionId) {
+  const base = join(homedir(), '.claude', 'projects');
+  const out = [join(base, cwd.replace(/[/.]/g, '-'), `${sessionId}.jsonl`)];
+  // The munge is Claude Code's, not ours, so a version that changes it must not
+  // leave the file behind: fall back to finding our own session id by name.
+  try {
+    for (const d of readdirSync(base)) out.push(join(base, d, `${sessionId}.jsonl`));
+  } catch {
+    /* no project store — nothing was written either */
+  }
+  return out;
+}
+
+function removeProbeTranscript(cwd, sessionId) {
+  if (!sessionId || !/^[A-Za-z0-9_-]{8,64}$/.test(sessionId)) return;
+  for (const f of transcriptCandidates(cwd, sessionId)) {
+    try {
+      if (existsSync(f)) {
+        rmSync(f, { force: true });
+        return;
+      }
+    } catch {
+      /* best-effort */
+    }
+  }
+}
+
+/**
+ * One line of the probe's stdout → the init event's payload, or null for "not
+ * it, keep reading".
+ *
+ * SEPARATE FROM THE SCAN LOOP so the thing that actually broke can be tested
+ * without spawning a CLI. The first version of this probe read line 1 and
+ * stopped, which was measured-correct with the default model and silently
+ * WRONG with `--model haiku`: that path prints a `system/status` line first and
+ * puts init on line 2, so the probe learned nothing and reported nothing, which
+ * is indistinguishable from the bug it was written to fix.
+ *
+ * A line that is not JSON is not a failure — a CLI warning on stdout is a line
+ * to skip, not a reason to abandon the probe.
+ */
+export function parseInitLine(line) {
+  let ev;
+  try {
+    ev = JSON.parse(line);
+  } catch {
+    return null;
+  }
+  if (!ev || ev.type !== 'system' || ev.subtype !== 'init') return null;
+  return {
+    // An init event WITHOUT skills is still the init event: stop reading, but
+    // record nothing. Conflating the two would keep the probe scanning a whole
+    // turn's output on a CLI that does not report them.
+    skills: Array.isArray(ev.skills) ? ev.skills : null,
+    sessionId: typeof ev.session_id === 'string' ? ev.session_id : null,
+  };
+}
+
+/**
+ * Kick off the one-shot probe. Returns immediately; the result lands in
+ * `skillsCache` and rides the NEXT poll, so nothing waits on it.
+ *
+ * A no-op once a turn has taught us (`skillsCache !== null`) — a turn's init
+ * event and this one say the same thing, and the turn is free.
+ */
+export function probeSkillsOnce(cwd) {
+  if (skillProbeStarted || skillsCache !== null) return;
+  skillProbeStarted = true;
+  let child;
+  try {
+    // Claude Code specifically, not the `wiki` profile's runtime pick: `skills`
+    // is Claude Code's own field and the `/` tray only renders for claude tabs.
+    child = spawn(
+      RUNTIMES.claude.bin,
+      ['-p', 'x', '--model', 'haiku', '--output-format', 'stream-json', '--verbose'],
+      { cwd, stdio: ['ignore', 'pipe', 'ignore'] }
+    );
+  } catch {
+    return; // no claude on PATH — the machine simply stays unmeasured
+  }
+  let buf = '';
+  let lines = 0;
+  let settled = false;
+  const finish = (sessionId) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    try {
+      child.kill('SIGKILL');
+    } catch {
+      /* already gone */
+    }
+    // AFTER the kill, and on a delay: the transcript is the CHILD's file, so
+    // deleting it while the child still lives races a recreate.
+    if (sessionId) setTimeout(() => removeProbeTranscript(cwd, sessionId), 750).unref?.();
+  };
+  const timer = setTimeout(() => finish(null), SKILL_PROBE_TIMEOUT_MS);
+  timer.unref?.();
+  child.on('error', () => finish(null));
+  child.on('exit', () => finish(null));
+  child.stdout.on('data', (d) => {
+    if (settled) return;
+    buf += d.toString();
+    let nl;
+    while (!settled && (nl = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, nl);
+      buf = buf.slice(nl + 1);
+      if (!line.trim()) continue;
+      if (++lines > SKILL_PROBE_MAX_LINES) {
+        finish(null);
+        return;
+      }
+      const init = parseInitLine(line);
+      if (!init) continue;
+      if (init.skills) recordSkills(init.skills);
+      finish(init.sessionId);
+      return;
+    }
+    // A single line this long is not an init event; stop buffering a whole
+    // turn's output into memory waiting for one.
+    if (!settled && buf.length > 1_000_000) finish(null);
+  });
 }

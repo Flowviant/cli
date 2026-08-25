@@ -76,7 +76,14 @@ import {
 } from './env.mjs';
 import { processDeployJobs, reportDeployConfig } from './deploy.mjs';
 import { machineSnapshot } from './resources.mjs';
-import { detectRuntimes, knownSkills, pickRuntimeFor, RUNTIMES } from './runtimes.mjs';
+import {
+  detectRuntimes,
+  knownSkills,
+  pickRuntimeFor,
+  probeSkillsOnce,
+  recordSkills,
+  RUNTIMES,
+} from './runtimes.mjs';
 import { createWorkManager } from './work.mjs';
 import { scanLocalSessions } from './localSessions.mjs';
 
@@ -1224,6 +1231,13 @@ export async function runFleetDaemon() {
               label: c.cyan('[wiki]'),
               streamJson: true,
               onActivity,
+              // FREE SKILLS, off a turn that was running anyway. This stream is
+              // already parsed and its init event already carries the CLI's own
+              // resolved skill set — the same fact a tab turn teaches — so the
+              // only thing missing was the handler. The wiki turn runs in a
+              // detached worktree of THIS repo, so its `.claude/skills` and the
+              // machine's personal ones resolve identically to a tab's.
+              onInit: (i) => recordSkills(i.skills),
               onSpawn: (ch) => {
                 wikiChild = ch;
               },
@@ -1268,6 +1282,8 @@ export async function runFleetDaemon() {
                 label: c.cyan('[wiki]'),
                 streamJson: true,
                 onActivity,
+                // Same free harvest as the sweep above.
+                onInit: (i) => recordSkills(i.skills),
                 onSpawn: (ch) => {
                   wikiChild = ch;
                 },
@@ -1528,6 +1544,13 @@ export async function runFleetDaemon() {
     // the daemon's own worktrees are carved out (a session the daemon spawned
     // is already a tab, not something to offer adopting).
     void maybeReportLocalSessions({ repoRoot, excludeDirs: [baseDir] });
+    // WHAT `/` CAN OFFER, on a machine no turn has taught yet. One-shot and
+    // self-cancelling (it returns immediately if a turn has already reported),
+    // never awaited, and it lands in the cache that the NEXT poll reads — so
+    // nothing here waits on a child process. In the loop rather than at
+    // startup on purpose: a daemon that has been up since before this release
+    // gets measured too, without needing a restart to earn its own menu.
+    probeSkillsOnce(repoRoot);
     processCleanupJobs(roster.cleanupJobs);
     const rosterIds = new Set(roster.agents.map((a) => a.agentId));
 
