@@ -337,6 +337,32 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
    *  network, and a teammate's push being visible within three minutes is the
    *  same promise the rest of the product makes. */
   const WORKTREE_FETCH_MS = 3 * 60_000;
+  /**
+   * WHERE EACH SESSION WORKS, learned from the turns we are handed.
+   *
+   * Every other beat — the worktree sweep, ship, the preview re-check — has to
+   * ask the SAME directory the turn ran in, and only the turn job carries
+   * `place`. Caching it here is what keeps them agreeing without a second
+   * server→daemon field: a session absent from this map has never run a turn,
+   * and its own id is the right answer for that case anyway (it is the default
+   * place, and a session with no turn has no worktree either).
+   *
+   * A tab standing in the CHECKOUT is the case this exists for: its directory
+   * is not `sessions/<id>` and never will be, so a sweep that assumed the
+   * default would measure a directory that does not exist and report nothing —
+   * which is exactly why "I still do not see a preview URL" was true of a tab
+   * opened in the checkout.
+   */
+  const sessionPlaces = new Map();
+  const placeOf = (sessionId) => sessionPlaces.get(sessionId) ?? sessionId;
+  /** The DIRECTORY a session works in. Every path that used to build
+   *  `sessions/<id>` by hand goes through here, or a tab in the checkout gets
+   *  measured against a directory that does not exist. */
+  const placeDir = (sessionId) => {
+    const place = placeOf(sessionId);
+    return place === REPO_PLACE ? repoRoot : join(baseDir, 'sessions', place);
+  };
+
   let lastWorktreeSweep = 0;
   let lastWorktreeFetch = 0;
   let sweepingWorktrees = false;
@@ -358,8 +384,11 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
     }
   };
   const sessionWorktreeReport = (sessionId) => {
-    if (!isSafePathSegment(sessionId)) return null;
-    const wt = join(baseDir, 'sessions', sessionId);
+    // The session's PLACE, not its name: a tab in the checkout is measured in
+    // the checkout, and a tab sharing another tab's worktree is measured there.
+    const place = placeOf(sessionId);
+    if (place !== REPO_PLACE && !isSafePathSegment(place)) return null;
+    const wt = placeDir(sessionId);
     const d = worktreeDiff(wt, baseRef);
     if (!d) return null;
     // WHAT IS LISTENING in this worktree, attributed by the CWD of the process
@@ -585,7 +614,7 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
       void (async () => {
         try {
           if (!(await claimPreview(sessionId))) return; // somebody else has it
-          const wt = join(baseDir, 'sessions', sessionId);
+          const wt = placeDir(sessionId);
           // RE-VALIDATE the attribution here, not just the liveness. The server
           // checked this port against a report up to a minute old; more
           // importantly, checking `listenersIn` again is what keeps the answer
@@ -773,7 +802,7 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
       void (async () => {
         try {
           if (!(await claimDevRun(sessionId))) return; // somebody else has it
-          const wt = join(baseDir, 'sessions', sessionId);
+          const wt = placeDir(sessionId);
           const r = await startDevServer({
             sessionId,
             worktree: wt,
@@ -845,7 +874,7 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
   const adoptDevRuns = (activeIds) => {
     let adopted = 0;
     for (const entry of reapOrphanDevRuns(activeIds, note)) {
-      const wt = join(baseDir, 'sessions', entry.sessionId);
+      const wt = placeDir(entry.sessionId);
       // The recorded cwd must still be this session's worktree. A recycled pid
       // pointing anywhere else is somebody else's process.
       if (entry.cwd !== wt) continue;
@@ -1647,6 +1676,9 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
       // Serialized by PLACE: two tabs sharing a worktree take turns in it
       // rather than editing the same files at the same time.
       const place = job.place || job.sessionId;
+      // Remembered for every other beat — the sweep, ship, the preview
+      // re-check — so they all ask the same directory this turn runs in.
+      sessionPlaces.set(job.sessionId, place);
       chainFor(place, async () => {
         try {
           const tries = workAttempts.get(job.id) ?? 0;
@@ -2273,7 +2305,9 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
            * so the recorded name is the fallback — the one case where the name
            * is the only thing there is.
            */
-          const wt = join(baseDir, 'sessions', job.sessionId);
+          // The session's PLACE — the directory it actually works in.
+          const shipPlace = placeOf(job.sessionId);
+          const wt = shipPlace === REPO_PLACE ? repoRoot : join(baseDir, 'sessions', shipPlace);
           let branch = `session/${job.sessionId}`;
           let detached = false;
           if (existsSync(wt)) {
@@ -2459,7 +2493,7 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
             ok(`${c.cyan('ship')} ${c.dim(`— ${commits.length} commit${commits.length === 1 ? '' : 's'} on main`)}`);
             return;
           }
-          const dir = sessionWtFor(job.sessionId);
+          const dir = placeWtFor(shipPlace);
           if (!dir) {
             await done({
               ok: false,
