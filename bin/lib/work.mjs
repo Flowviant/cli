@@ -51,6 +51,10 @@ import {
 } from './prompts.mjs';
 import { materializeInto, hasMaterialized, excludeInWorktree, scrub as envScrub } from './env.mjs';
 import { detectRuntimes, canRun, recordSkills, RUNTIMES } from './runtimes.mjs';
+
+/** The place id meaning "the checkout", not a worktree. Must match the
+ *  server's REPO_PLACE — it is a wire value, not a local convention. */
+const REPO_PLACE = 'repo';
 import { isTerminalSessionLive, isAgyConversationLive } from './localSessions.mjs';
 import { worktreeDiff } from './worktreeDiff.mjs';
 import { homedir } from 'node:os';
@@ -119,8 +123,22 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
    * while that session's turn has a live CLI in it.
    */
   const workChains = new Map(); // sessionId -> settled-safe tail promise
-  const chainFor = (sessionId, fn) => {
-    const prev = workChains.get(sessionId) ?? Promise.resolve();
+  /**
+   * Serialize work by PLACE — the directory — not by session.
+   *
+   * It was keyed by session id, which was the same thing right up until a place
+   * could be shared: two sessions pointed at one worktree had independent
+   * chains, so their turns would run at the same time in the same directory and
+   * edit each other's files mid-edit. Keying on the place is what makes "two
+   * tabs in one repo" behave the way two terminal tabs in one repo behave —
+   * they take turns.
+   *
+   * The cross-PROCESS half was already right and needed no change: the turn
+   * lock is a file inside the worktree (`flowviant-turn.lock`), so two sessions
+   * sharing a place already share the lock by construction.
+   */
+  const chainFor = (placeId, fn) => {
+    const prev = workChains.get(placeId) ?? Promise.resolve();
     // `.then(fn, fn)`, like withWikiLock: one rejected link must never wedge
     // every later turn of the tab.
     const run = prev.then(fn, fn);
@@ -128,11 +146,11 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
       () => {},
       () => {}
     );
-    workChains.set(sessionId, stored);
+    workChains.set(placeId, stored);
     // Release the entry when the chain drains, so the map cannot grow for the
     // process lifetime and `workChains.has()` means "busy right now".
     stored.then(() => {
-      if (workChains.get(sessionId) === stored) workChains.delete(sessionId);
+      if (workChains.get(placeId) === stored) workChains.delete(placeId);
     });
     return run;
   };
@@ -1159,8 +1177,34 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
    * is the point. If the directory was retired but the branch survives, the
    * worktree re-attaches to the branch and the committed work is still there.
    */
-  const sessionWtFor = (sessionId, baseAt) => {
-    if (!isSafePathSegment(sessionId)) return null;
+  /**
+   * WHERE A SESSION WORKS — its PLACE, which is a directory on a branch.
+   *
+   * A session used to BE a worktree: one tab, one directory, cut at birth and
+   * retired at close. That binding was never an isolation guarantee — a turn
+   * runs with permissions skipped, so the worktree is a starting directory and
+   * not a fence, and any agent could always `cd` into another one. The product
+   * was asserting an invariant it did not have.
+   *
+   * So a session now REFERENCES a place rather than being one. Many sessions
+   * may name the same place; a session may name the repo checkout itself; and
+   * `session/<own-id>` is simply the DEFAULT place, cut fresh at first turn,
+   * which is why an absent `place` behaves exactly as every existing tab does.
+   *
+   * `'repo'` IS NOT A DIRECTORY NAME AND MUST NOT BECOME ONE. It resolves to
+   * the checkout the daemon already serves — never created, never retired,
+   * because it is not ours to remove. The value reaching here is a server-side
+   * enum, never a browser-supplied path: `sessions.routes.ts` resolves it the
+   * same way adoption resolves a cwd, and for the same reason.
+   */
+  const placeWtFor = (placeId, baseAt) => {
+    if (placeId === REPO_PLACE) {
+      // The checkout. `fresh: false` on purpose — nothing was opened, so no
+      // caller may treat this as a newly-cut branch.
+      return { wt: repoRoot, fresh: false };
+    }
+    if (!isSafePathSegment(placeId)) return null;
+    const sessionId = placeId;
     const wt = join(baseDir, 'sessions', sessionId);
     const fresh = !existsSync(wt);
     if (fresh) {
@@ -1538,6 +1582,10 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
     }
   };
 
+  /** The pre-places name, kept so every existing caller reads unchanged: a
+   *  session's own id IS its default place. */
+  const sessionWtFor = (sessionId, baseAt) => placeWtFor(sessionId, baseAt);
+
   const retireWorkSessions = (activeIds, heldElsewhere) => {
     if (!Array.isArray(activeIds)) return;
     // Sessions ANOTHER daemon on this credential is serving. They are absent
@@ -1596,7 +1644,10 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
       // run it again while the report is merely undelivered.
       if (pendingWorkReports.has(job.id)) continue;
       workAnswering.add(job.id);
-      chainFor(job.sessionId, async () => {
+      // Serialized by PLACE: two tabs sharing a worktree take turns in it
+      // rather than editing the same files at the same time.
+      const place = job.place || job.sessionId;
+      chainFor(place, async () => {
         try {
           const tries = workAttempts.get(job.id) ?? 0;
           if (tries >= MAX_WORK_TRIES) {
@@ -1711,7 +1762,10 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
           }
           // Based at the SOURCE's HEAD when adopting — the resumed
           // conversation was had against those commits, not the project base.
-          const dir = sessionWtFor(job.sessionId, adopting ? srcHead : undefined);
+          // The PLACE this tab works in — its own worktree unless the server
+          // named another. An older server sends no `place` and the default is
+          // the session's own id, which is what every tab has always done.
+          const dir = placeWtFor(place, adopting ? srcHead : undefined);
           if (!dir) {
             await settleWorkTurn(job.id, {
               ok: false,

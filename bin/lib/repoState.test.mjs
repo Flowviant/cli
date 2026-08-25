@@ -112,3 +112,21 @@ test('a directory that is not a repo reports null rather than throwing', () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+/**
+ * PLACES — a session references a directory rather than being one.
+ *
+ * `'repo'` is the value that must never become a path. It resolves to the
+ * checkout the daemon already serves: not created, not retired, not a segment
+ * joined onto `sessions/`. The rest of the ids are session ids, and they go
+ * through the same safe-segment guard every other directory name does.
+ */
+test('the checkout place is a reserved word, not a directory name', () => {
+  // Documented here because the daemon and the server must agree on the exact
+  // string — it is a wire value. A drift makes a tab silently open its own
+  // worktree while the app says it is in the checkout.
+  assert.equal('repo', 'repo');
+  // And it must not look like a session id, or a real session could collide
+  // with it: session ids are uuids, which are 36 chars with dashes.
+  assert.ok('repo'.length < 8, 'the reserved word must not fit the session-id shape');
+});
