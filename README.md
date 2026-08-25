@@ -41,7 +41,7 @@ Prefer an explicit token? Create a machine credential in the app and pass it dir
 FLOWVIANT_FLEET=fva_… npx flowviant@latest
 ```
 
-Launch with `@latest` so each start pulls the newest published version — a bare `npx flowviant` can reuse a stale cache. A running daemon also self-updates at startup and when idle (`FLOWVIANT_NO_UPDATE=1` makes it nag-only; `flowviant update` updates now).
+Launch with `@latest` so each start pulls the newest published version — a bare `npx flowviant` can reuse a stale cache. A running daemon also keeps itself current: from **0.58.0** it restarts itself through `npx flowviant@latest` when a new version ships, so npx launches stay up to date the same way a global install does. (Before 0.58.0 that was only true of a global install — under npx the daemon printed a notice and stayed put, which is how machines ended up sitting several releases back.) It only ever restarts when no turn is running. `FLOWVIANT_NO_UPDATE=1` makes it nag-only; `flowviant update` updates now.
 
 ## Sessions
 

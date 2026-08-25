@@ -6,8 +6,27 @@
  * version ships. The server reports {latest, min} on every roster poll; the
  * daemon compares its own VERSION and, at a SAFE boundary (startup or idle —
  * never mid-task), self-updates + re-execs. Below `min` it updates regardless
- * (older protocol is known-broken); otherwise it honors AUTO_UPDATE. When it
- * can't install (npx cache, or auto off) it nags with the exact command.
+ * (older protocol is known-broken); otherwise it honors AUTO_UPDATE.
+ *
+ * NPX UPDATES TOO, SINCE 0.58.0 — and until then it never did, which is the
+ * whole reason this comment is longer than it was. `AUTO_UPDATE` is ON by
+ * default (`FLOWVIANT_NO_UPDATE !== '1'`), so the flag was never what held
+ * machines back: the npx branch was. It refused to install — correctly, since
+ * `npm i -g` lands where the running process will never look — and then only
+ * NAGGED A CONSOLE NOBODY READS. The README meanwhile told everyone to launch
+ * with `npx flowviant@latest` and promised that "a running daemon also
+ * self-updates", which was false for exactly the audience it was written for.
+ * The result, measured across one account's five machines on 2026-08-25:
+ * 0.48.3, 0.51.1, 0.51.2, 0.54.2 and 0.56.0, each frozen at whatever npx had
+ * cached the day it launched. The clincher was the 0.56.0 one — it polled that
+ * morning, saw LATEST 0.56.1, had AUTO_UPDATE on, and still did not move.
+ *
+ * The fix is that under npx the RE-EXEC IS THE UPDATE. There is nothing to
+ * install: relaunching through `npx -y flowviant@latest` makes npx resolve
+ * `latest` against the registry and fetch it (measured — it pulled 0.57.0 into
+ * a new cache entry beside the stale 0.54.2). So the npx path stops nagging and
+ * starts restarting itself, honouring AUTO_UPDATE and the same idle gate as the
+ * global path.
  */
 
 import { execFileSync, spawn } from 'node:child_process';
@@ -51,13 +70,22 @@ export function runningViaNpx() {
  * this process alive only as a thin proxy waiting on the child, so the user's
  * shell stays attached to one foreground process.
  */
-function reexec(teardown) {
+function reexec(teardown, { viaNpx = false, target = null } = {}) {
   try {
     teardown?.();
   } catch {
     /* best-effort */
   }
-  const child = spawn(process.execPath, process.argv.slice(1), {
+  // UNDER NPX THE RE-EXEC IS THE UPDATE, so it must not re-run our own argv[1]:
+  // that path points into the npx cache entry holding the version we are trying
+  // to leave, and re-running it would reload the stale copy forever. Going back
+  // through `npx -y flowviant@latest` is what makes npx resolve `latest` against
+  // the registry and fetch the new one. `-y` because a restart must never stop
+  // on npx's install prompt — the same rule FLOWVIANT_REEXEC keeps below.
+  const [cmd, args] = viaNpx
+    ? ['npx', ['-y', 'flowviant@latest', ...process.argv.slice(2)]]
+    : [process.execPath, process.argv.slice(1)];
+  const child = spawn(cmd, args, {
     stdio: 'inherit',
     // MARK THE CHILD AS A RESTART, not as a person typing `flowviant`.
     // stdio is inherited, so the child sees two TTYs and believes a human is
@@ -69,9 +97,33 @@ function reexec(teardown) {
     // is not a widening — the daemon serves exactly the credential it was
     // already serving one second ago, and the question gets asked the next
     // time a human starts it by hand.
-    env: { ...process.env, FLOWVIANT_REEXEC: '1' },
+    env: {
+      ...process.env,
+      FLOWVIANT_REEXEC: '1',
+      // WHAT WE RESTARTED IN ORDER TO BECOME. The successor compares its own
+      // VERSION against this: if it came back still short, the update did not
+      // take (a registry serving a stale `latest`, an npx cache that refused to
+      // move, a half-written global install) and it must NAG rather than
+      // restart again. Without this the npx path is a re-exec loop — and unlike
+      // the global path there is no install step whose failure would throw and
+      // stop it.
+      ...(target ? { FLOWVIANT_UPDATE_TARGET: target } : {}),
+    },
   });
   child.on('exit', (code) => process.exit(code ?? 0));
+}
+
+/**
+ * Did a restart that was supposed to land us on `target` fail to?
+ *
+ * True only when a PREVIOUS process handed us a target we are still below. A
+ * plain start has no marker, and a successful update is at or above it — so
+ * this is false in every case except the one it exists for.
+ */
+export function updateRestartFailed(target) {
+  const attempted = process.env.FLOWVIANT_UPDATE_TARGET;
+  if (!attempted) return false;
+  return cmpVersion(VERSION, attempted) < 0 && cmpVersion(target ?? attempted, attempted) <= 0;
 }
 
 /** Install @latest globally. Throws on failure (EACCES without sudo, offline…). */
@@ -122,6 +174,42 @@ export function handleVersionSignal({ latest, min, autoUpdate, safeToUpdate, tea
   const npx = runningViaNpx();
   const wantInstall = belowMin || autoUpdate;
 
+  // A RESTART THAT DID NOT TAKE must not be tried again on the next poll. The
+  // global path is self-limiting (a failed `npm i -g` throws and lands in the
+  // 15-minute backoff), but the npx path has no install step to fail — it just
+  // relaunches, so a registry or cache that keeps serving the old version would
+  // loop this process forever, tearing down live turns every ten seconds.
+  if (updateRestartFailed(target)) {
+    if (naggedFor !== target) {
+      naggedFor = target;
+      warn(
+        `restarted to pick up ${target} but came back as ${cur} — staying put. Update by hand: ${
+          npx ? 'relaunch with `npx flowviant@latest`' : 'npm i -g flowviant@latest'
+        }.`
+      );
+    }
+    return false;
+  }
+
+  // UNDER NPX THERE IS NOTHING TO INSTALL — the relaunch IS the update, because
+  // `npx -y flowviant@latest` resolves `latest` against the registry. Same two
+  // gates as the global path: the operator's AUTO_UPDATE choice, and an idle
+  // machine, because a re-exec mid-turn SIGTERMs the tab's CLI. No npm-view
+  // probe here: npx is about to ask the registry itself, and the loop guard
+  // above is what a stale answer runs into.
+  if (wantInstall && npx) {
+    if (!safeToUpdate) {
+      if (naggedFor !== target) {
+        naggedFor = target;
+        note(`flowviant ${cur} → ${target} available — restarting once no turn is running.`);
+      }
+      return false;
+    }
+    note(`flowviant ${cur} → ${target}: restarting through npx to pick it up…`);
+    reexec(teardown, { viaNpx: true, target });
+    return true;
+  }
+
   if (wantInstall && !npx) {
     if (!safeToUpdate) {
       // Outdated but a turn is running — wait until the machine is quiet. Nag
@@ -167,7 +255,7 @@ export function handleVersionSignal({ latest, min, autoUpdate, safeToUpdate, tea
       note(`flowviant ${cur} → ${published}: self-updating…`);
       installLatest();
       ok('updated — restarting into the new version.');
-      reexec(teardown);
+      reexec(teardown, { target: published });
       return true;
     } catch (e) {
       lastInstallFailAt = Date.now();

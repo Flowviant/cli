@@ -16,8 +16,11 @@
  * sat against an empty tool list, which is a worse failure than not starting.
  *
  * Launch with `@latest` so each start pulls the newest published version (bare
- * `npx flowviant` can reuse a stale cache). A running daemon also self-updates
- * on its own — at startup and when idle — so it stays current without restarts
+ * `npx flowviant` can reuse a stale cache). A running daemon also keeps itself
+ * current — at startup and when idle, never mid-turn. Since 0.58.0 that is true
+ * under NPX too, by relaunching through `npx flowviant@latest`; before it, the
+ * npx branch refused to install and only nagged, so npx launches — the way this
+ * README tells everyone to start — silently stayed on whatever was cached
  * (FLOWVIANT_NO_UPDATE=1 makes it nag-only; `flowviant update` updates now).
  * `flowviant stop` stops every daemon on this box — the answer to "is one even
  * running?", which otherwise ends in a pid hunt through `ps`.
