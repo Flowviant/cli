@@ -907,12 +907,27 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
        * long as the server lived.
        */
       if (job?.action === 'resolve') {
-        if (liveDevRuns.has(sessionId)) continue;
-        if (devRunClaiming.has(sessionId)) continue;
+        /**
+         * EVERY SKIP SAYS SO. These were silent `continue`s, and that cost real
+         * time: a request sat unclaimed and the only sentence anyone got was
+         * "the machine did not pick this up — it may be offline", which was
+         * false — the machine was polling throughout. A job dropped without a
+         * trace in the row OR the log is undiagnosable from either end, so the
+         * skips are narrated even though they are all legitimate states.
+         */
+        if (liveDevRuns.has(sessionId)) {
+          note(`dev ${sessionId.slice(0, 8)}: already serving this tab — ignoring the request`);
+          continue;
+        }
+        if (devRunClaiming.has(sessionId)) continue; // in flight this tick; not news
         devRunClaiming.add(sessionId);
         void (async () => {
           try {
-            if (!(await claimDevRun(sessionId))) return; // somebody else has it
+            if (!(await claimDevRun(sessionId))) {
+              note(`dev ${sessionId.slice(0, 8)}: another process holds this request`);
+              return;
+            }
+            note(`dev ${sessionId.slice(0, 8)}: working out how to start this project…`);
             const wt = placeDir(sessionId);
             const out = await chainFor(placeOf(sessionId), () =>
               resolveDevCommandOnMachine({
@@ -963,14 +978,21 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
         continue;
       }
       // Already serving this tab. Re-starting would kill a server somebody is
-      // looking at right now.
-      if (liveDevRuns.has(sessionId)) continue;
-      if (devRunClaiming.has(sessionId)) continue;
+      // looking at right now. Narrated for the same reason the resolve branch
+      // is: a silent skip is invisible from the browser AND from the machine.
+      if (liveDevRuns.has(sessionId)) {
+        note(`dev ${sessionId.slice(0, 8)}: already serving this tab — ignoring the request`);
+        continue;
+      }
+      if (devRunClaiming.has(sessionId)) continue; // in flight this tick; not news
       devRunClaiming.add(sessionId);
 
       void (async () => {
         try {
-          if (!(await claimDevRun(sessionId))) return; // somebody else has it
+          if (!(await claimDevRun(sessionId))) {
+            note(`dev ${sessionId.slice(0, 8)}: another process holds this request`);
+            return;
+          }
           const wt = placeDir(sessionId);
           const r = await startDevServer({
             sessionId,
