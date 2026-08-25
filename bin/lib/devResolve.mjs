@@ -115,7 +115,7 @@ export function pickCommand(text) {
  * the caller's only job with a failure is to relay it, and an exception at this
  * boundary would strand the row.
  */
-export async function resolveDevCommandOnMachine({ cwd, model, log }) {
+export async function resolveDevCommandOnMachine({ cwd, model, log, onActivity }) {
   let sessionId = null;
   let timer;
   try {
@@ -127,6 +127,18 @@ export async function resolveDevCommandOnMachine({ cwd, model, log }) {
         answerFromResult: true,
         model,
         label: 'dev',
+        /**
+         * THE TURN'S OWN HUMANIZED TAIL, forwarded so a browser can watch it.
+         *
+         * This is the only feature in the product where a Claude does work
+         * nobody can see — no transcript, by design — and the driver's answer
+         * to that is the right one: "we could have it stream the output for
+         * transparency on the menu." So the same `read …` / `+ npm install …`
+         * lines a tab relays are forwarded here. It is the CLI's own stdout
+         * humanized, never an inference about it, which is the standing rule
+         * for every activity readout in this product.
+         */
+        onActivity,
         onInit: (i) => {
           if (i?.sessionId) sessionId = i.sessionId;
         },

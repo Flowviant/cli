@@ -112,6 +112,7 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
   const DEV_RUN_CLAIM_URL = FLEET_URL.replace(/\/agents\/?$/, '/dev-run-claim');
   const DEV_RUN_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/dev-run-done');
   const DEV_RUN_RESOLVED_URL = FLEET_URL.replace(/\/agents\/?$/, '/dev-run-resolved');
+  const DEV_RUN_PROGRESS_URL = FLEET_URL.replace(/\/agents\/?$/, '/dev-run-progress');
   const SESSION_COMMANDS_URL = FLEET_URL.replace(/\/agents\/?$/, '/session-commands');
   const ATTACHMENT_URL = FLEET_URL.replace(/\/agents\/?$/, '/attachment');
   const workAnswering = new Set(); // turn ids currently queued/running here
@@ -784,6 +785,65 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
    * a second implementation of that policy inside the one component a deploy
    * cannot upgrade is exactly the drift this product keeps closing.
    */
+  /**
+   * THE RESOLVE TURN'S OUTPUT, streamed while it happens.
+   *
+   * A headless turn is the one place in this product where a Claude works and
+   * nobody can see it — deliberately, since it must not reach the transcript —
+   * and the answer to that is transparency rather than a promise: "we could
+   * have it stream the output for transparency on the menu."
+   *
+   * THROTTLED, and the tail is BOUNDED at the machine. This is a per-line hook
+   * on a turn that may run for minutes; posting each line would be hundreds of
+   * requests, and sending the whole transcript would grow without limit. Same
+   * shape as the session activity relay, for the same reasons.
+   */
+  const devProgress = new Map(); // sessionId → { lines, at, timer }
+  const DEV_PROGRESS_MS = 2_000;
+  const DEV_PROGRESS_LINES = 40;
+
+  const flushDevProgress = async (sessionId) => {
+    const st = devProgress.get(sessionId);
+    if (!st || !st.lines.length) return;
+    st.at = Date.now();
+    const logTail = st.lines.join('\n').slice(-4000);
+    try {
+      await fetch(DEV_RUN_PROGRESS_URL, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${FLEET_TOKEN}`,
+          'User-Agent': USER_AGENT,
+          'Content-Type': 'application/json',
+        },
+        signal: AbortSignal.timeout(15_000),
+        body: JSON.stringify({ sessionId, instance: DAEMON_INSTANCE, logTail }),
+      });
+    } catch {
+      /* progress is best-effort — the row's own state is the truth */
+    }
+  };
+
+  const noteDevProgress = (sessionId, label) => {
+    if (!label) return;
+    const st = devProgress.get(sessionId) ?? { lines: [], at: 0, timer: null };
+    st.lines.push(String(label).slice(0, 300));
+    if (st.lines.length > DEV_PROGRESS_LINES) st.lines.splice(0, st.lines.length - DEV_PROGRESS_LINES);
+    devProgress.set(sessionId, st);
+    // Leading-edge post, then a trailing one — so the FIRST line appears at
+    // once (an empty panel for two seconds reads as nothing happening) and the
+    // last line is never left unsent.
+    if (Date.now() - st.at > DEV_PROGRESS_MS) {
+      void flushDevProgress(sessionId);
+      return;
+    }
+    if (st.timer) return;
+    st.timer = setTimeout(() => {
+      st.timer = null;
+      void flushDevProgress(sessionId);
+    }, DEV_PROGRESS_MS);
+    st.timer.unref?.();
+  };
+
   const postDevResolved = async (body) => {
     try {
       await fetch(DEV_RUN_RESOLVED_URL, {
@@ -865,6 +925,8 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
                 log: (m) => note(`${sessionId.slice(0, 8)}: ${m}`),
               })
             );
+            // The last lines, before the row leaves the resolving state.
+            await flushDevProgress(sessionId);
             await postDevResolved({
               sessionId,
               command: out?.command ?? null,
@@ -877,6 +939,9 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
               error: `the machine could not run that turn: ${e?.message ?? 'unknown error'}`,
             });
           } finally {
+            const st = devProgress.get(sessionId);
+            if (st?.timer) clearTimeout(st.timer);
+            devProgress.delete(sessionId);
             devRunClaiming.delete(sessionId);
           }
         })();
