@@ -32,6 +32,7 @@
  */
 
 import { execFileSync } from 'node:child_process';
+import { listenersIn, listenersSupported } from './listeners.mjs';
 
 /** Same cap the session diffstat uses: enough to see the shape, small enough
  *  that one machine cannot flood a row. */
@@ -142,6 +143,26 @@ export function repoState(repoRoot, baseRef) {
   const worktrees = readWorktrees(repoRoot);
   const branches = readBranches(repoRoot, baseRef);
   if (!worktrees && !branches) return null;
+  /**
+   * WHAT IS LISTENING IN THE CHECKOUT ITSELF.
+   *
+   * `listenersIn` has always taken any directory, and had only ever been asked
+   * about SESSION WORKTREES — so somebody running `npm run dev` in their normal
+   * checkout, which is what "just testing or playing around in dev" actually
+   * looks like, was invisible to every surface in the product. The measurement
+   * was there; nobody was pointing it at the repo.
+   *
+   * THE ATTRIBUTION RULE IS UNCHANGED, and it is the reason this widens to the
+   * repo root and no further: a port is attributed by the CWD OF THE PROCESS
+   * HOLDING THE SOCKET, so this reports servers running inside THIS PROJECT'S
+   * checkout and nothing else. Postgres on 5432 has its own cwd and does not
+   * appear here — which is the whole point, and why "just show every port on
+   * the box" is not what this does.
+   *
+   * Reported, not offered: this is a readout of what is up. Sharing one is a
+   * separate act with its own gates (see previewJobs).
+   */
+  const listening = listenersIn(repoRoot);
   const wt = worktrees ?? [];
   const br = branches ?? [];
   return {
@@ -153,5 +174,10 @@ export function repoState(repoRoot, baseRef) {
     branches: br.slice(0, MAX_BRANCHES),
     branchesTotal: br.length,
     sessionBranches: br.filter((b) => b.session).length,
+    listening,
+    // "Nothing is listening" and "this machine cannot look" (Windows, a failed
+    // scan) are the same empty array without this — and the second must never
+    // render as the first. Same field, same reason, as the session report.
+    listeningSupported: listenersSupported(),
   };
 }
