@@ -36,11 +36,13 @@ import {
   USER_AGENT,
   REFRESH_BEFORE_SECONDS,
   DAEMON_INSTANCE,
+  MODEL,
 } from './config.mjs';
 import { git, gitRaw, splitNul, baseBranchName, isSafePathSegment } from './git.mjs';
 import { listenersIn, listenersSupported } from './listeners.mjs';
 import { openTunnel } from './preview.mjs';
 import { startDevServer, reapOrphanDevRuns, killDevRunEntry } from './devServer.mjs';
+import { resolveDevCommandOnMachine } from './devResolve.mjs';
 import { c, note, ok, warn } from './ui.mjs';
 import { mcpFor, runTurn } from './claude.mjs';
 import {
@@ -109,6 +111,7 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
   const PREVIEW_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/preview-done');
   const DEV_RUN_CLAIM_URL = FLEET_URL.replace(/\/agents\/?$/, '/dev-run-claim');
   const DEV_RUN_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/dev-run-done');
+  const DEV_RUN_RESOLVED_URL = FLEET_URL.replace(/\/agents\/?$/, '/dev-run-resolved');
   const SESSION_COMMANDS_URL = FLEET_URL.replace(/\/agents\/?$/, '/session-commands');
   const ATTACHMENT_URL = FLEET_URL.replace(/\/agents\/?$/, '/attachment');
   const workAnswering = new Set(); // turn ids currently queued/running here
@@ -774,6 +777,30 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
     }
   };
 
+  /**
+   * The answer to a `resolve`, handed up as a STRING for the server to parse.
+   *
+   * Never argv: `parseDevCommand` is the single owner of what may execute, and
+   * a second implementation of that policy inside the one component a deploy
+   * cannot upgrade is exactly the drift this product keeps closing.
+   */
+  const postDevResolved = async (body) => {
+    try {
+      await fetch(DEV_RUN_RESOLVED_URL, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${FLEET_TOKEN}`,
+          'User-Agent': USER_AGENT,
+          'Content-Type': 'application/json',
+        },
+        signal: AbortSignal.timeout(30_000),
+        body: JSON.stringify({ ...body, instance: DAEMON_INSTANCE }),
+      });
+    } catch {
+      /* the row's own TTL is the backstop */
+    }
+  };
+
   const stopDevRun = async (sessionId, reason) => {
     const live = liveDevRuns.get(sessionId);
     liveDevRuns.delete(sessionId);
@@ -795,6 +822,64 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
         if (devRunClaiming.has(sessionId)) continue;
         devRunClaiming.add(sessionId);
         void stopDevRun(sessionId, 'stopped').finally(() => devRunClaiming.delete(sessionId));
+        continue;
+      }
+
+      /**
+       * RESOLVE — ask a Claude what starts this project, and say so. Starts
+       * NOTHING.
+       *
+       * It exists because the sheet used to open with a text field prefilled
+       * `npm run dev`, which presumes a stack. The turn is headless and reaches
+       * no transcript: "i still want claude to start the server for me but i
+       * dont want it to literally open a chat. have it do it in the
+       * background."
+       *
+       * IT TAKES THE PLACE LOCK, through the same `chainFor` every turn goes
+       * through, and that is deliberate rather than incidental. The turn reads
+       * the repo and may `npm install` into this worktree; running it beside a
+       * tab turn editing the same directory is the exact collision the chain
+       * exists to prevent. The cost is that a resolve makes the tab wait, which
+       * is honest — you cannot usefully build while an install is running
+       * anyway — and it is bounded, because this turn ENDS. That is the whole
+       * reason it answers with a command instead of running one: a foreground
+       * `npm run dev` would never return, and the lock would be held for as
+       * long as the server lived.
+       */
+      if (job?.action === 'resolve') {
+        if (liveDevRuns.has(sessionId)) continue;
+        if (devRunClaiming.has(sessionId)) continue;
+        devRunClaiming.add(sessionId);
+        void (async () => {
+          try {
+            if (!(await claimDevRun(sessionId))) return; // somebody else has it
+            const wt = placeDir(sessionId);
+            const out = await chainFor(placeOf(sessionId), () =>
+              resolveDevCommandOnMachine({
+                cwd: wt,
+                // The machine's own pin, exactly as a tab turn gets — never
+                // the user's global default, which for Claude may be a
+                // long-context tier their subscription cannot bill autonomous
+                // work on. This turn is autonomous by definition.
+                model: MODEL,
+                log: (m) => note(`${sessionId.slice(0, 8)}: ${m}`),
+              })
+            );
+            await postDevResolved({
+              sessionId,
+              command: out?.command ?? null,
+              error: out?.error ?? null,
+            });
+          } catch (e) {
+            await postDevResolved({
+              sessionId,
+              command: null,
+              error: `the machine could not run that turn: ${e?.message ?? 'unknown error'}`,
+            });
+          } finally {
+            devRunClaiming.delete(sessionId);
+          }
+        })();
         continue;
       }
 

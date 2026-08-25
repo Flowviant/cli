@@ -1054,7 +1054,18 @@ function transcriptCandidates(cwd, sessionId) {
   return out;
 }
 
-function removeProbeTranscript(cwd, sessionId) {
+/**
+ * Delete the transcript a headless `-p` turn left behind.
+ *
+ * EXPORTED because the skills probe is no longer the only thing that runs one:
+ * resolving a project's dev command is a background Claude turn too, and every
+ * such turn has the same footprint. `claude -p` writes
+ * `~/.claude/projects/<munged-cwd>/<id>.jsonl` at startup, and
+ * `localSessions.mjs` offers the newest ENDED session per directory as
+ * ADOPTABLE — so anything we run for our own purposes would put a phantom
+ * untitled session in somebody's `+` menu.
+ */
+export function removeProbeTranscript(cwd, sessionId) {
   if (!sessionId || !/^[A-Za-z0-9_-]{8,64}$/.test(sessionId)) return;
   for (const f of transcriptCandidates(cwd, sessionId)) {
     try {

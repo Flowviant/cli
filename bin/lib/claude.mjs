@@ -236,7 +236,17 @@ function handleStreamLine(line, { cwd, emit, onActivity, appendText, answerFromR
     //
     // Only ever REPORTED, never enforced. Flowviant does not decide what your
     // Claude can do; it relays what your Claude said it has.
-    if (Array.isArray(ev.skills)) onInit?.({ skills: ev.skills.map(String) });
+    // `sessionId` rides along for one reason: a `-p` turn WRITES a transcript,
+    // and `localSessions.mjs` offers the newest ended session per directory as
+    // ADOPTABLE — so any headless turn we run for our own purposes would leave
+    // a phantom untitled session in the `+` menu. The caller that needs to
+    // clean up after itself cannot do so without this id.
+    if (Array.isArray(ev.skills) || typeof ev.session_id === 'string') {
+      onInit?.({
+        skills: Array.isArray(ev.skills) ? ev.skills.map(String) : undefined,
+        sessionId: typeof ev.session_id === 'string' ? ev.session_id : undefined,
+      });
+    }
   } else if (ev.type === 'result') {
     // The final assistant text (carries WIKI_DONE / REGROUND_DONE).
     if (typeof ev.result === 'string') appendText(ev.result + '\n');
