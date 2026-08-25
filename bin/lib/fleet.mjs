@@ -86,6 +86,7 @@ import {
 } from './runtimes.mjs';
 import { createWorkManager } from './work.mjs';
 import { scanLocalSessions } from './localSessions.mjs';
+import { repoState } from './repoState.mjs';
 
 async function fetchRoster(
   haveIds,
@@ -295,6 +296,62 @@ async function maybeReportLocalSessions({ repoRoot, excludeDirs }) {
   } catch {
     localSessionsSent = null;
     localSessionsSentAt = 0;
+  }
+}
+
+/**
+ * EVERY BRANCH AND WORKTREE ON THIS MACHINE, pushed on the same beat as
+ * presence — the answer to "is my Claude leaving a mess in here?".
+ *
+ * Same three economies as the presence report above and for the same reasons:
+ * scanned at most once a minute, not re-sent while identical (repoState orders
+ * deterministically so the string only moves when the repo does), and silent
+ * for the rest of the process once an older server 404s.
+ *
+ * ONE DIFFERENCE, deliberate: there is no re-send heartbeat window. Presence
+ * expires in the UI because a session that ENDED must stop reading as live;
+ * a branch list is not presence — a branch that existed a minute ago still
+ * exists — so re-posting an unchanged list would be a write per machine per
+ * five minutes to say nothing at all.
+ */
+const REPO_STATE_URL = FLEET_URL.replace(/\/agents\/?$/, '/repo-state');
+const REPO_STATE_SCAN_MS = 60_000;
+let repoStateUnsupported = false; // the server 404'd — quiet until restart
+let repoStateScanAt = 0;
+let repoStateSent = null; // last payload the server ACCEPTED, stringified
+async function maybeReportRepoState({ repoRoot, baseRef }) {
+  if (repoStateUnsupported) return;
+  if (Date.now() - repoStateScanAt < REPO_STATE_SCAN_MS) return;
+  repoStateScanAt = Date.now();
+  let payload;
+  try {
+    const state = repoState(repoRoot, baseRef);
+    if (!state) return; // not readable — say nothing rather than say "none"
+    payload = JSON.stringify(state);
+  } catch {
+    return; // a readout must never throw into the poll loop
+  }
+  if (payload === repoStateSent) return;
+  try {
+    const res = await fetch(REPO_STATE_URL, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${FLEET_TOKEN}`,
+        'User-Agent': USER_AGENT,
+        'Content-Type': 'application/json',
+      },
+      signal: AbortSignal.timeout(15_000),
+      body: payload,
+    });
+    if (res.status === 404) {
+      repoStateUnsupported = true; // older server — nothing was replaced here
+      return;
+    }
+    // Only an ACCEPTED report counts: anything else forgets it so the next
+    // pass retries rather than dedup-suppressing a report nobody received.
+    repoStateSent = res.ok ? payload : null;
+  } catch {
+    repoStateSent = null;
   }
 }
 
@@ -1544,6 +1601,9 @@ export async function runFleetDaemon() {
     // the daemon's own worktrees are carved out (a session the daemon spawned
     // is already a tab, not something to offer adopting).
     void maybeReportLocalSessions({ repoRoot, excludeDirs: [baseDir] });
+    // …and the repo itself: every worktree and every branch, ours and not.
+    // Never awaited, throttled inside, and silent on an older server.
+    void maybeReportRepoState({ repoRoot, baseRef });
     // WHAT `/` CAN OFFER, on a machine no turn has taught yet. One-shot and
     // self-cancelling (it returns immediately if a turn has already reported),
     // never awaited, and it lands in the cache that the NEXT poll reads — so

@@ -2193,8 +2193,53 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
             return;
           }
           note(`${c.cyan('ship')} ${c.dim(`— "${job.sessionName || job.sessionId}"`)}`);
-          const branch = `session/${job.sessionId}`;
+          /**
+           * WHAT IS ACTUALLY CHECKED OUT — not what we named it at birth.
+           *
+           * Ship used to compute `session/<id>` and then REFUSE if HEAD had
+           * moved: "ask it to return to its session branch, then ship again".
+           * That refusal is the thing this product says it never does — it had
+           * no reason of its own beyond bookkeeping, and in a terminal
+           * `git checkout -b` breaks nothing, which is the whole standard this
+           * surface is held to.
+           *
+           * The bug it was written for was real and is fixed properly here
+           * rather than frozen out: ship once merged the branch NAME while
+           * logging HEAD, so receipts named commits that never landed on main.
+           * That was TWO SOURCES OF TRUTH, not branch switching. There is one
+           * now, and it is the worktree's own HEAD.
+           *
+           * Resolved BEFORE the idempotency check below, and that ordering is
+           * load-bearing: `session/<id>` can still exist, stale and already an
+           * ancestor of base, while the real work sits on the branch that was
+           * checked out afterwards. Asking the old name first would answer
+           * "already merged — nothing new to ship" over unshipped commits.
+           *
+           * A directory that is gone (a retired or closed tab) cannot be asked,
+           * so the recorded name is the fallback — the one case where the name
+           * is the only thing there is.
+           */
           const wt = join(baseDir, 'sessions', job.sessionId);
+          let branch = `session/${job.sessionId}`;
+          let detached = false;
+          if (existsSync(wt)) {
+            try {
+              branch = git(['symbolic-ref', '--short', 'HEAD'], wt);
+            } catch {
+              detached = true;
+            }
+          }
+          // THE ONE REFUSAL LEFT, and it is not policy. A detached HEAD names
+          // no branch, so there is nothing to merge and nothing to record —
+          // that is an ambiguity in git, not a rule of ours.
+          if (detached) {
+            await done({
+              ok: false,
+              error:
+                'this session is on a detached HEAD — no branch to ship. Ask it to check out a branch, then ship again',
+            });
+            return;
+          }
           let branchExists = true;
           try {
             git(['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`], repoRoot);
@@ -2388,23 +2433,11 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
             });
             return;
           }
-          // What is checked out here must BE the session branch. Sessions may
-          // create branches when asked — but then "ship" is ambiguous, and
-          // folding+logging HEAD while merging the stale branch NAME once
-          // shipped receipts for commits that never landed on main.
-          let head = null;
-          try {
-            head = git(['symbolic-ref', '--short', 'HEAD'], dir.wt);
-          } catch {
-            /* detached */
-          }
-          if (head !== branch) {
-            await done({
-              ok: false,
-              error: `the session is on ${head ? `branch '${head}'` : 'a detached HEAD'}, not its own '${branch}' — ask it to return to its session branch, then ship again`,
-            });
-            return;
-          }
+          // NO "return to your session branch" GUARD. `branch` was read from
+          // this worktree's HEAD above, so the fold, the tip and the receipts
+          // below all name the same thing by construction — which is what the
+          // old guard was really protecting, and it protected it by refusing
+          // instead of by measuring.
           // Fold main into the branch FIRST: conflicts land here, in the
           // session's own worktree, where the next turn can resolve them.
           try {
