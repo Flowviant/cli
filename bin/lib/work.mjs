@@ -372,10 +372,29 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
    * the server does not name keeps whatever a turn taught, and failing that its
    * own id, which is the pre-places default.
    */
+  /**
+   * WHERE EACH TAB WORKS — and it has to be able to UNLEARN.
+   *
+   * This only ever set. Combined with a server that omitted null places, a tab
+   * moved from the checkout back to its own worktree simply stopped being
+   * mentioned, and this map kept the old value forever. `placeDir` decides
+   * where a turn is SPAWNED and where the worktree is measured, so the browser
+   * said "its own worktree" while the CLI went on working in the checkout, and
+   * the tab reported the checkout's listeners as its own. That is the exact
+   * confusion the whole places feature exists to prevent.
+   *
+   * An explicit `null` now means "its own worktree" and DELETES the entry.
+   * Absence of the whole map still means "an older server said nothing", which
+   * is the only thing absence can safely mean.
+   */
   const learnPlaces = (map) => {
     if (!map || typeof map !== 'object') return;
     for (const [sid, place] of Object.entries(map)) {
       if (typeof place === 'string' && place) sessionPlaces.set(sid, place);
+      // null / '' / anything else: the server is telling us this tab is in its
+      // OWN worktree. Falling back to the default requires forgetting, not
+      // ignoring.
+      else sessionPlaces.delete(sid);
     }
   };
   /** The DIRECTORY a session works in. Every path that used to build
