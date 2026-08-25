@@ -355,6 +355,25 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
    */
   const sessionPlaces = new Map();
   const placeOf = (sessionId) => sessionPlaces.get(sessionId) ?? sessionId;
+  /**
+   * Places straight off the roster, so a tab is measured the moment it EXISTS
+   * rather than after somebody types into it.
+   *
+   * Learning only from turn jobs meant a tab nobody had spoken to yet was
+   * measured at `sessions/<id>` — a directory that does not exist for a tab
+   * working in the checkout — so it reported no branch, no diffstat and no
+   * ports, and every control reading those had nothing to render.
+   *
+   * The roster is authoritative and turn jobs still agree with it; a session
+   * the server does not name keeps whatever a turn taught, and failing that its
+   * own id, which is the pre-places default.
+   */
+  const learnPlaces = (map) => {
+    if (!map || typeof map !== 'object') return;
+    for (const [sid, place] of Object.entries(map)) {
+      if (typeof place === 'string' && place) sessionPlaces.set(sid, place);
+    }
+  };
   /** The DIRECTORY a session works in. Every path that used to build
    *  `sessions/<id>` by hand goes through here, or a tab in the checkout gets
    *  measured against a directory that does not exist. */
@@ -2617,6 +2636,7 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
 
   return {
     flushWorkReports,
+    learnPlaces,
     processWorkTurns,
     processShipJobs,
     processDiffJobs,

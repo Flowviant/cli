@@ -824,6 +824,7 @@ export async function runFleetDaemon() {
   // retirement — lives in work.mjs; this hands it the loop's mutable state.
   const {
     flushWorkReports,
+    learnPlaces,
     processWorkTurns,
     processShipJobs,
     processDiffJobs,
@@ -1549,6 +1550,10 @@ export async function runFleetDaemon() {
     void flushWorkReports();
     processMergeJobs(roster.mergeJobs);
     processPatchRevertJobs(roster.patchRevertJobs);
+    // WHERE each live tab works, BEFORE anything measures one: the sweep below
+    // and every preview check ask `placeOf`, and a tab nobody has typed into
+    // yet has taught it nothing.
+    learnPlaces(roster.sessionPlaces);
     processWorkTurns(roster.workTurnJobs);
     // The roster's live-session list rides along: an ENDED session's ship
     // must not be refused by checks whose remedies need a live tab.
