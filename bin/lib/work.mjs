@@ -43,6 +43,7 @@ import { listenersIn, listenersSupported } from './listeners.mjs';
 import { processesInGroups, liveGroups, processesSupported } from './processes.mjs';
 import { createPlaceLock } from './placeLock.mjs';
 import { sweepMergedBranch } from './shipSweep.mjs';
+import { mergeOutward as shipMergeOutward } from './shipMerge.mjs';
 import { openTunnel } from './preview.mjs';
 import { c, note, ok, warn } from './ui.mjs';
 import { mcpFor, runTurn } from './claude.mjs';
@@ -2269,35 +2270,23 @@ export function createWorkManager({ repoRoot, baseDir, getBaseRef, getMcpUrl, ge
           // Merge outward through a throwaway worktree so no checkout moves.
           // The throwaway dies on EVERY exit — success, conflict or throw —
           // or the next ship of this session trips over its corpse.
-          const mergeOutward = (tip, count) => {
-            const tmp = join(baseDir, 'ship', job.sessionId);
-            try {
-              try {
-                git(['worktree', 'remove', '--force', tmp], repoRoot);
-              } catch {
-                /* not there — fine */
-              }
-              git(['worktree', 'add', '--detach', tmp, baseRef()], repoRoot);
-              gitMerge(
-                [
-                  'merge',
-                  '--no-ff',
-                  tip,
-                  '-m',
-                  `ship(${job.sessionName || job.sessionId.slice(0, 8)}): ${count} commit${count === 1 ? '' : 's'}`,
-                ],
-                tmp
-              );
-              git(['push', 'origin', `HEAD:${baseBranchName(baseRef())}`], tmp);
-            } finally {
-              try {
-                git(['worktree', 'remove', '--force', tmp], repoRoot);
-                git(['worktree', 'prune'], repoRoot);
-              } catch {
-                /* best effort */
-              }
-            }
-          };
+          // Carry the tip out onto base and push it. See `shipMerge.mjs` for
+          // the throwaway-worktree shape, the one retry when two people ship at
+          // once, and why the operator's own branch is fast-forwarded after.
+          const mergeOutward = (tip, count) =>
+            shipMergeOutward({
+              tip,
+              count,
+              branch,
+              label: job.sessionName || job.sessionId.slice(0, 8),
+              git,
+              gitMerge,
+              repoRoot,
+              tmpDir: join(baseDir, 'ship', job.sessionId),
+              baseRef,
+              workingTree: placeWtFor(shipPlace)?.wt ?? null,
+              warn,
+            });
           // Idempotency: base already contains the branch tip. A re-offered
           // job after a lost report lands here — never a re-merge, and never
           // "nothing to ship" AS A FAILURE for work that in fact shipped. The
