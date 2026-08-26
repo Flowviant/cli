@@ -359,6 +359,25 @@ export function runTurn({ prompt, resume, system, cwd, mcpConfig, mcpArgs, mcpEn
     const child = spawn(rt.bin, args, {
       cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
+      /**
+       * ITS OWN PROCESS GROUP, so what the agent starts stays attributable.
+       *
+       * Everything the CLI spawns inherits this pgid and KEEPS it through
+       * `nohup` and `setsid` — which is exactly when attribution by descendancy
+       * fails, because reparenting to init breaks the ppid chain the moment a
+       * process becomes long-running. `processes.mjs` reads the group; the
+       * Workbench renders it.
+       *
+       * TEARDOWN IS DELIBERATELY UNCHANGED: `shutdownWork` still SIGTERMs this
+       * CHILD and never the group. Signalling the group would kill the dev
+       * server the driver started every time the daemon restarts — including
+       * on an ordinary auto-update, unattended — which is the outcome the
+       * deleted dev-run supervisor spent a whole registry avoiding. Flowviant
+       * does not manage those processes; it reports them.
+       *
+       * Not `unref`'d: the daemon must still wait on this turn.
+       */
+      detached: true,
       // Only ADDS to the environment (the worker token, for runtimes that read
       // it from there). Never replaces it: the CLI's own credentials live in
       // this environment, and handing it a curated one signs it out.

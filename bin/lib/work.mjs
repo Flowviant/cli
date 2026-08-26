@@ -40,9 +40,9 @@ import {
 } from './config.mjs';
 import { git, gitRaw, splitNul, baseBranchName, isSafePathSegment } from './git.mjs';
 import { listenersIn, listenersSupported } from './listeners.mjs';
+import { processesInGroups, liveGroups, processesSupported } from './processes.mjs';
+import { createPlaceLock } from './placeLock.mjs';
 import { openTunnel } from './preview.mjs';
-import { startDevServer, reapOrphanDevRuns, killDevRunEntry } from './devServer.mjs';
-import { resolveDevCommandOnMachine } from './devResolve.mjs';
 import { c, note, ok, warn } from './ui.mjs';
 import { mcpFor, runTurn } from './claude.mjs';
 import {
@@ -109,55 +109,47 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
   const DIFF_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/diff-done');
   const PREVIEW_CLAIM_URL = FLEET_URL.replace(/\/agents\/?$/, '/preview-claim');
   const PREVIEW_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/preview-done');
-  const DEV_RUN_CLAIM_URL = FLEET_URL.replace(/\/agents\/?$/, '/dev-run-claim');
-  const DEV_RUN_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/dev-run-done');
-  const DEV_RUN_RESOLVED_URL = FLEET_URL.replace(/\/agents\/?$/, '/dev-run-resolved');
-  const DEV_RUN_PROGRESS_URL = FLEET_URL.replace(/\/agents\/?$/, '/dev-run-progress');
   const SESSION_COMMANDS_URL = FLEET_URL.replace(/\/agents\/?$/, '/session-commands');
   const ATTACHMENT_URL = FLEET_URL.replace(/\/agents\/?$/, '/attachment');
   const workAnswering = new Set(); // turn ids currently queued/running here
   const workAttempts = new Map(); // turn id -> completed runTurn attempts
   const MAX_WORK_TRIES = 3;
   const shipping = new Set(); // sessionIds with a ship queued/running here
+  const { placeLocks, inPlace } = createPlaceLock();
+
   /**
-   * Per-SESSION serialization, parallel ACROSS sessions: turns within one tab
-   * must land in order (they share a directory and a context), but two tabs
-   * are two terminals — the human opened both on purpose. Ship jobs ride the
-   * SAME chain, never a separate one: a ship must not run git in a worktree
-   * while that session's turn has a live CLI in it.
-   */
-  const workChains = new Map(); // sessionId -> settled-safe tail promise
-  /**
-   * Serialize work by PLACE — the directory — not by session.
+   * WHICH PROCESS GROUPS EACH TAB HAS STARTED.
    *
-   * It was keyed by session id, which was the same thing right up until a place
-   * could be shared: two sessions pointed at one worktree had independent
-   * chains, so their turns would run at the same time in the same directory and
-   * edit each other's files mid-edit. Keying on the place is what makes "two
-   * tabs in one repo" behave the way two terminal tabs in one repo behave —
-   * they take turns.
+   * A turn's CLI is spawned `detached`, so its pid is a process-group id and
+   * everything the agent starts inherits it — through `nohup` and `setsid`,
+   * which is precisely where attribution by ppid falls apart. Kept per SESSION
+   * and not per turn: the point of the feature is the watcher that outlives the
+   * turn that started it.
    *
-   * The cross-PROCESS half was already right and needed no change: the turn
-   * lock is a file inside the worktree (`flowviant-turn.lock`), so two sessions
-   * sharing a place already share the lock by construction.
+   * PRUNED ON EVERY READ against the kernel, which is not housekeeping. A pgid
+   * is a pid and pids are recycled, so an un-pruned set would eventually
+   * attribute a stranger's process to a tab that has been closed for a week.
    */
-  const chainFor = (placeId, fn) => {
-    const prev = workChains.get(placeId) ?? Promise.resolve();
-    // `.then(fn, fn)`, like withWikiLock: one rejected link must never wedge
-    // every later turn of the tab.
-    const run = prev.then(fn, fn);
-    const stored = run.then(
-      () => {},
-      () => {}
-    );
-    workChains.set(placeId, stored);
-    // Release the entry when the chain drains, so the map cannot grow for the
-    // process lifetime and `workChains.has()` means "busy right now".
-    stored.then(() => {
-      if (workChains.get(placeId) === stored) workChains.delete(placeId);
-    });
-    return run;
+  const sessionGroups = new Map(); // sessionId -> Set<pgid>
+
+  const noteSessionGroup = (sessionId, pgid) => {
+    if (!sessionId || !pgid) return;
+    const set = sessionGroups.get(sessionId) ?? new Set();
+    set.add(pgid);
+    sessionGroups.set(sessionId, set);
   };
+
+  /** This tab's live processes, or null where the machine cannot look. */
+  const sessionProcesses = (sessionId) => {
+    if (!processesSupported()) return null;
+    const known = sessionGroups.get(sessionId);
+    if (!known || known.size === 0) return [];
+    const alive = liveGroups(known);
+    if (alive.size === 0) sessionGroups.delete(sessionId);
+    else sessionGroups.set(sessionId, alive);
+    return processesInGroups(alive, { scrub: envScrub });
+  };
+
 
   /**
    * EVERY turn settles — the work loop's prime contract. A pending turn nobody
@@ -447,11 +439,21 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
     // failed scan reports nothing, and both were indistinguishable from an idle
     // worktree — harmless while the only consumer needed a NON-empty array, and
     // a permanent `Starting…` the moment a Run dev offer hangs off an empty one.
+    // …AND WHAT IT IS RUNNING, attributed by PROCESS GROUP rather than by cwd.
+    // A watcher (`rbxtsc -w`, `tsc --watch`) holds no socket and touches no
+    // file for minutes, so it was invisible from a browser in a way it never is
+    // in a terminal. Same rules as `listening` beside it: a daemon→server
+    // report on an endpoint that already exists, so NO version floor, and
+    // `processesSupported` keeps "cannot look" (Windows) apart from "looked and
+    // found none", which renders differently.
+    const processes = sessionProcesses(sessionId);
     return {
       sessionId,
       ...d,
       listening: listenersIn(wt),
       listeningSupported: listenersSupported(),
+      ...(processes === null ? {} : { processes }),
+      processesSupported: processesSupported(),
     };
   };
   /** One session, now — called after its turn settles. */
@@ -753,409 +755,24 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
     argv.every((a) => typeof a === 'string' && a.length > 0 && a.length <= 200) &&
     !argv.some((a) => /[&|;<>`$(){}*?~\\]/.test(a));
 
-  // ── DEV RUNS ──────────────────────────────────────────────────────────
+  // ── DEV RUNS ARE DELETED (2026-08-26) ─────────────────────────────────
   //
-  // The web asks for the PROJECT'S STORED command to run in a tab's worktree.
-  // The argv arrives on the job, already parsed from a string a human approved;
-  // nothing here reads a repo file to decide what executes. See devServer.mjs.
-  const liveDevRuns = new Map(); // sessionId -> { stop, pid }
-  const devRunClaiming = new Set();
-
-  const postDevRun = async (body) => {
-    try {
-      await fetch(DEV_RUN_DONE_URL, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${FLEET_TOKEN}`,
-          'User-Agent': USER_AGENT,
-          'Content-Type': 'application/json',
-        },
-        signal: AbortSignal.timeout(30_000),
-        body: JSON.stringify({ ...body, instance: DAEMON_INSTANCE }),
-      });
-    } catch {
-      /* the row stops being confirmed and reads as stopped — which is true */
-    }
-  };
-
-  const claimDevRun = async (sessionId) => {
-    try {
-      const res = await fetch(DEV_RUN_CLAIM_URL, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${FLEET_TOKEN}`,
-          'User-Agent': USER_AGENT,
-          'Content-Type': 'application/json',
-        },
-        signal: AbortSignal.timeout(30_000),
-        body: JSON.stringify({ sessionId, instance: DAEMON_INSTANCE }),
-      });
-      const j = await res.json().catch(() => ({}));
-      return Boolean(j?.data?.claimed);
-    } catch {
-      return false;
-    }
-  };
-
-  /**
-   * The answer to a `resolve`, handed up as a STRING for the server to parse.
-   *
-   * Never argv: `parseDevCommand` is the single owner of what may execute, and
-   * a second implementation of that policy inside the one component a deploy
-   * cannot upgrade is exactly the drift this product keeps closing.
-   */
-  /**
-   * THE RESOLVE TURN'S OUTPUT, streamed while it happens.
-   *
-   * A headless turn is the one place in this product where a Claude works and
-   * nobody can see it — deliberately, since it must not reach the transcript —
-   * and the answer to that is transparency rather than a promise: "we could
-   * have it stream the output for transparency on the menu."
-   *
-   * THROTTLED, and the tail is BOUNDED at the machine. This is a per-line hook
-   * on a turn that may run for minutes; posting each line would be hundreds of
-   * requests, and sending the whole transcript would grow without limit. Same
-   * shape as the session activity relay, for the same reasons.
-   */
-  const devProgress = new Map(); // sessionId → { lines, at, timer }
-  const DEV_PROGRESS_MS = 2_000;
-  const DEV_PROGRESS_LINES = 40;
-
-  const flushDevProgress = async (sessionId) => {
-    const st = devProgress.get(sessionId);
-    if (!st || !st.lines.length) return;
-    st.at = Date.now();
-    const logTail = st.lines.join('\n').slice(-4000);
-    try {
-      await fetch(DEV_RUN_PROGRESS_URL, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${FLEET_TOKEN}`,
-          'User-Agent': USER_AGENT,
-          'Content-Type': 'application/json',
-        },
-        signal: AbortSignal.timeout(15_000),
-        body: JSON.stringify({ sessionId, instance: DAEMON_INSTANCE, logTail }),
-      });
-    } catch {
-      /* progress is best-effort — the row's own state is the truth */
-    }
-  };
-
-  const noteDevProgress = (sessionId, label) => {
-    if (!label) return;
-    const st = devProgress.get(sessionId) ?? { lines: [], at: 0, timer: null };
-    st.lines.push(String(label).slice(0, 300));
-    if (st.lines.length > DEV_PROGRESS_LINES) st.lines.splice(0, st.lines.length - DEV_PROGRESS_LINES);
-    devProgress.set(sessionId, st);
-    // Leading-edge post, then a trailing one — so the FIRST line appears at
-    // once (an empty panel for two seconds reads as nothing happening) and the
-    // last line is never left unsent.
-    if (Date.now() - st.at > DEV_PROGRESS_MS) {
-      void flushDevProgress(sessionId);
-      return;
-    }
-    if (st.timer) return;
-    st.timer = setTimeout(() => {
-      st.timer = null;
-      void flushDevProgress(sessionId);
-    }, DEV_PROGRESS_MS);
-    st.timer.unref?.();
-  };
-
-  const postDevResolved = async (body) => {
-    try {
-      await fetch(DEV_RUN_RESOLVED_URL, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${FLEET_TOKEN}`,
-          'User-Agent': USER_AGENT,
-          'Content-Type': 'application/json',
-        },
-        signal: AbortSignal.timeout(30_000),
-        body: JSON.stringify({ ...body, instance: DAEMON_INSTANCE }),
-      });
-    } catch {
-      /* the row's own TTL is the backstop */
-    }
-  };
-
-  const stopDevRun = async (sessionId, reason) => {
-    const live = liveDevRuns.get(sessionId);
-    liveDevRuns.delete(sessionId);
-    try {
-      live?.stop?.();
-    } catch {
-      /* best-effort */
-    }
-    await postDevRun({ sessionId, ended: true, endedReason: reason });
-  };
-
-  const processDevRunJobs = (jobs) => {
-    if (!Array.isArray(jobs) || jobs.length === 0) return;
-    for (const job of jobs.slice(0, 5)) {
-      const sessionId = String(job?.sessionId || '');
-      if (!isSafePathSegment(sessionId)) continue;
-
-      if (job?.action === 'stop') {
-        if (devRunClaiming.has(sessionId)) continue;
-        devRunClaiming.add(sessionId);
-        void stopDevRun(sessionId, 'stopped').finally(() => devRunClaiming.delete(sessionId));
-        continue;
-      }
-
-      /**
-       * RESOLVE — ask a Claude what starts this project, and say so. Starts
-       * NOTHING.
-       *
-       * It exists because the sheet used to open with a text field prefilled
-       * `npm run dev`, which presumes a stack. The turn is headless and reaches
-       * no transcript: "i still want claude to start the server for me but i
-       * dont want it to literally open a chat. have it do it in the
-       * background."
-       *
-       * IT TAKES THE PLACE LOCK, through the same `chainFor` every turn goes
-       * through, and that is deliberate rather than incidental. The turn reads
-       * the repo and may `npm install` into this worktree; running it beside a
-       * tab turn editing the same directory is the exact collision the chain
-       * exists to prevent. The cost is that a resolve makes the tab wait, which
-       * is honest — you cannot usefully build while an install is running
-       * anyway — and it is bounded, because this turn ENDS. That is the whole
-       * reason it answers with a command instead of running one: a foreground
-       * `npm run dev` would never return, and the lock would be held for as
-       * long as the server lived.
-       */
-      if (job?.action === 'resolve') {
-        /**
-         * EVERY SKIP SAYS SO. These were silent `continue`s, and that cost real
-         * time: a request sat unclaimed and the only sentence anyone got was
-         * "the machine did not pick this up — it may be offline", which was
-         * false — the machine was polling throughout. A job dropped without a
-         * trace in the row OR the log is undiagnosable from either end, so the
-         * skips are narrated even though they are all legitimate states.
-         */
-        if (liveDevRuns.has(sessionId)) {
-          note(`dev ${sessionId.slice(0, 8)}: already serving this tab — ignoring the request`);
-          continue;
-        }
-        if (devRunClaiming.has(sessionId)) continue; // in flight this tick; not news
-        devRunClaiming.add(sessionId);
-        void (async () => {
-          try {
-            if (!(await claimDevRun(sessionId))) {
-              note(`dev ${sessionId.slice(0, 8)}: another process holds this request`);
-              return;
-            }
-            note(`dev ${sessionId.slice(0, 8)}: working out how to start this project…`);
-            const wt = placeDir(sessionId);
-            const out = await chainFor(placeOf(sessionId), () =>
-              resolveDevCommandOnMachine({
-                cwd: wt,
-                // The machine's own pin, exactly as a tab turn gets — never
-                // the user's global default, which for Claude may be a
-                // long-context tier their subscription cannot bill autonomous
-                // work on. This turn is autonomous by definition.
-                model: MODEL,
-                log: (m) => note(`${sessionId.slice(0, 8)}: ${m}`),
-              })
-            );
-            // The last lines, before the row leaves the resolving state.
-            await flushDevProgress(sessionId);
-            await postDevResolved({
-              sessionId,
-              command: out?.command ?? null,
-              error: out?.error ?? null,
-            });
-          } catch (e) {
-            await postDevResolved({
-              sessionId,
-              command: null,
-              error: `the machine could not run that turn: ${e?.message ?? 'unknown error'}`,
-            });
-          } finally {
-            const st = devProgress.get(sessionId);
-            if (st?.timer) clearTimeout(st.timer);
-            devProgress.delete(sessionId);
-            devRunClaiming.delete(sessionId);
-          }
-        })();
-        continue;
-      }
-
-      // RE-VALIDATE THE SHAPE at this boundary. The server parsed the string
-      // and owns the policy; the machine owns the refusal to execute something
-      // malformed, because one place doing a check is one deploy away from
-      // being zero places.
-      const argv = Array.isArray(job?.argv) ? job.argv.map(String) : [];
-      if (!isPlausibleDevArgv(argv)) {
-        void postDevRun({
-          sessionId,
-          started: false,
-          endedReason: 'refused',
-          error: 'the machine did not recognise that command',
-        });
-        continue;
-      }
-      // Already serving this tab. Re-starting would kill a server somebody is
-      // looking at right now. Narrated for the same reason the resolve branch
-      // is: a silent skip is invisible from the browser AND from the machine.
-      if (liveDevRuns.has(sessionId)) {
-        note(`dev ${sessionId.slice(0, 8)}: already serving this tab — ignoring the request`);
-        continue;
-      }
-      if (devRunClaiming.has(sessionId)) continue; // in flight this tick; not news
-      devRunClaiming.add(sessionId);
-
-      void (async () => {
-        try {
-          if (!(await claimDevRun(sessionId))) {
-            note(`dev ${sessionId.slice(0, 8)}: another process holds this request`);
-            return;
-          }
-          const wt = placeDir(sessionId);
-          const r = await startDevServer({
-            sessionId,
-            worktree: wt,
-            argv,
-            log: (m) => note(`dev ${sessionId.slice(0, 8)}: ${m}`),
-            onState: (st) => {
-              void postDevRun({ sessionId, ...st });
-              // Re-report the worktree at once so the chip flips within a
-              // second instead of waiting up to 60s for the sweep.
-              void reportSessionWorktree(sessionId).catch(() => undefined);
-            },
-            onExit: (ex) => {
-              liveDevRuns.delete(sessionId);
-              void postDevRun({ sessionId, ended: true, ...ex });
-            },
-          });
-          if (!r.ok) {
-            await postDevRun({
-              sessionId,
-              started: false,
-              endedReason: r.endedReason ?? 'spawn_failed',
-              error: r.error ?? 'the machine could not start it',
-            });
-            return;
-          }
-          liveDevRuns.set(sessionId, { stop: r.stop, pid: r.pid });
-          // THE AUDIT ROW. Without it a daemon-spawned dev server would be the
-          // ONLY execution on this box with no entry in the very surface built
-          // so an admin can answer "what ran on this machine" — and it would be
-          // missing precisely the execution whose provenance is most worth
-          // checking. `runtime: null` because no CLI ran it: the daemon did.
-          void fetch(SESSION_COMMANDS_URL, {
-            method: 'POST',
-            headers: {
-              Authorization: `Bearer ${FLEET_TOKEN}`,
-              'User-Agent': USER_AGENT,
-              'Content-Type': 'application/json',
-            },
-            signal: AbortSignal.timeout(30_000),
-            body: JSON.stringify({
-              sessionId,
-              cwd: wt,
-              commands: [{ command: argv.join(' '), at: new Date().toISOString() }],
-            }),
-          }).catch(() => {
-            /* best-effort — the audit records what reached it */
-          });
-        } finally {
-          devRunClaiming.delete(sessionId);
-        }
-      })();
-    }
-  };
-
-  /**
-   * ADOPT what the previous process left behind.
-   *
-   * This is the half of "consistently running" that actually delivers it. A
-   * self-update re-execs, and a same-repo takeover replaces this process — both
-   * leave dev servers alive on purpose (see `shutdownDevRuns`), and without
-   * adoption the successor would neither supervise them nor be able to stop
-   * them, so the row would say running while nothing owned the process.
-   *
-   * Identity is the CWD plus liveness, never the command string: `npm run dev`
-   * is identical across two tabs, two worktrees, and the driver's own
-   * hand-started server, so a cmdline match would be indistinguishable from a
-   * coincidence. A could-not-measure is NOT a match and kills nothing.
-   */
-  const adoptDevRuns = (activeIds) => {
-    let adopted = 0;
-    for (const entry of reapOrphanDevRuns(activeIds, note)) {
-      const wt = placeDir(entry.sessionId);
-      // The recorded cwd must still be this session's worktree. A recycled pid
-      // pointing anywhere else is somebody else's process.
-      if (entry.cwd !== wt) continue;
-      if (liveDevRuns.has(entry.sessionId)) continue;
-      liveDevRuns.set(entry.sessionId, {
-        pid: entry.pid,
-        stop: () => killDevRunEntry(entry),
-      });
-      adopted += 1;
-      // The output ring is EMPTY for an adopted run and the row says so rather
-      // than pretending to a tail it does not have.
-      void postDevRun({
-        sessionId: entry.sessionId,
-        started: true,
-        pid: entry.pid,
-        port: listenersIn(wt)[0]?.port ?? null,
-        logTail: '[reattached after the machine restarted — earlier output is not kept]',
-      });
-    }
-    if (adopted > 0) note(`re-attached ${adopted} dev server${adopted === 1 ? '' : 's'}`);
-  };
-
-  /** The sessionIds this machine is still running, sent on the poll so the
-   *  server can tell a live run from one whose machine went away. */
-  const liveDevRunIds = () => [...liveDevRuns.keys()];
-
-  /** A tab closed. ORDER MATTERS and the caller keeps it: the tunnel is retired
-   *  BEFORE the process it points at, so a viewer sees a dead link rather than
-   *  a 502 from a gate whose origin vanished — and both happen before
-   *  `retireWorkSessions` can `git worktree remove` the directory out from
-   *  under a running node process, which it would do without complaint because
-   *  its dirty check inspects only TRACKED files and node_modules is not one. */
-  const retireDevRuns = (activeIds) => {
-    if (!Array.isArray(activeIds)) return; // an older server, not a close
-    const live = new Set(activeIds);
-    for (const sessionId of [...liveDevRuns.keys()]) {
-      if (live.has(sessionId)) continue;
-      if (devRunClaiming.has(sessionId)) continue;
-      devRunClaiming.add(sessionId);
-      void stopDevRun(sessionId, 'tab_closed').finally(() => devRunClaiming.delete(sessionId));
-    }
-  };
-
-  /**
-   * Daemon shutdown, and the SPLIT is what delivers "consistently running".
-   *
-   * `kill: true` — a human hit Ctrl-C, the credential was revoked, or a stop was
-   * commanded. All three mean THIS MACHINE IS STANDING DOWN, and leaving dev
-   * servers behind would strand them.
-   *
-   * `kill: false` — a same-repo takeover, or a self-update re-exec. Both mean
-   * ANOTHER DAEMON IS ABOUT TO SERVE THIS REPO IN ONE SECOND, and killing would
-   * mean `flowviant` re-run in your own directory restarts the app you were
-   * watching, and a routine auto-update silently kills every dev server with
-   * nothing to bring them back — precisely the goal defeated. The registry rows
-   * are left for the successor to adopt.
-   */
-  const shutdownDevRuns = (kill) => {
-    if (!kill) {
-      liveDevRuns.clear();
-      return;
-    }
-    for (const [, live] of liveDevRuns) {
-      try {
-        live.stop?.();
-      } catch {
-        /* best-effort */
-      }
-    }
-    liveDevRuns.clear();
-  };
+  // The machine no longer starts application processes. It never learned to
+  // decide what "run dev" means for a stack nobody enumerated — `rojo serve`
+  // and `rbxtsc -w` are both correct for one Roblox repo and neither could
+  // clear the server's argv0 allowlist, and widening that list is a code change
+  // per ecosystem forever.
+  //
+  // Nothing downstream is lost, because SHARING NEVER DEPENDED ON US STARTING
+  // IT. `listenersIn` attributes a listening socket to a place by the cwd of
+  // the process holding it, so a server the driver's own agent started in the
+  // tab is measured exactly like one this file used to spawn. The web renders
+  // that measured list and a person picks which port to share.
+  //
+  // Gone with it: `devServer.mjs`, `devResolve.mjs`, the four `/fleet/dev-run-*`
+  // endpoints, the claim lease, the orphan registry at ~/.flowviant/devruns.json
+  // and its adopt-across-re-exec dance. If supervision is ever wanted back it
+  // returns as "supervise this process", never as "run dev".
 
   const livePreviewIds = () => [...livePreviews.keys()];
 
@@ -1852,7 +1469,10 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
     for (const id of ids) {
       if (live.has(id)) continue;
       if (peers.has(id)) continue; // another daemon's tab — not ours to retire
-      if (workChains.has(id) || shipping.has(id)) continue; // still draining here
+      // Asked of the PLACE, not the session: the lock is keyed by directory,
+      // and a session sharing one with a busy peer is not ours to retire
+      // either — its worktree is the peer's working directory.
+      if (placeLocks.has(placeOf(id)) || shipping.has(id)) continue; // still draining here
       const wt = join(dir, id);
       try {
         // Uncommitted work is the human's — a resource sweep does not outrank
@@ -1889,7 +1509,8 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
       // Remembered for every other beat — the sweep, ship, the preview
       // re-check — so they all ask the same directory this turn runs in.
       sessionPlaces.set(job.sessionId, place);
-      chainFor(place, async () => {
+      // A READER: other turns in this place run alongside it. See `inPlace`.
+      inPlace(place, false, async () => {
         try {
           const tries = workAttempts.get(job.id) ?? 0;
           if (tries >= MAX_WORK_TRIES) {
@@ -2309,6 +1930,12 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
                 if (!ch) return;
                 spawned.push(ch);
                 workChildren.set(ch, lockPath ?? null);
+                // The CLI is spawned `detached`, so its pid IS its process
+                // group id — and every process it starts inherits that, through
+                // `nohup` and `setsid` alike. Remembered per SESSION rather
+                // than per turn, because the whole point is the watcher that
+                // outlives the turn that started it.
+                if (ch.pid) noteSessionGroup(job.sessionId, ch.pid);
                 if (lockPath && ch.pid) {
                   try {
                     writeFileSync(lockPath, String(ch.pid));
@@ -2472,10 +2099,13 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
       // delivers it; re-running the ship would misread its own success.
       if (pendingShipReports.has(job.sessionId)) continue;
       shipping.add(job.sessionId);
-      // The SESSION's own chain, never a ship-wide one: a ship must not run
-      // git in this worktree while a turn's CLI is live in it. `shipping`
-      // (above) keeps overlapping polls from queueing the same job twice.
-      chainFor(job.sessionId, async () => {
+      // A WRITER, keyed by PLACE: ship folds and merges with git in this
+      // directory, and no CLI running here can coordinate with that. Keyed by
+      // place rather than by session id, which is what this used to do while
+      // turns keyed on the place — so the two never shared a lock and the
+      // guarantee in this comment was not actually held. `shipping` (above)
+      // keeps overlapping polls from queueing the same job twice.
+      inPlace(placeOf(job.sessionId), true, async () => {
         let settled = false;
         let deferred = false;
         const done = async (payload) => {
@@ -2812,13 +2442,13 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
    * half-finished answer settled as the tab's reply, and a queued-but-
    * undelivered settle report would die in memory — after which the skip-
    * guard's protection is gone and the re-exec'd daemon re-runs a turn whose
-   * side effects (edits, commits, cards) already happened. `workChains` holds
-   * an entry for every queued-or-running turn and ship (entries self-delete
-   * when a chain drains); the other collections are belt over braces for the
-   * windows around it.
+   * side effects (edits, commits, cards) already happened. `placeLocks` holds
+   * an entry for every place with a running or waiting turn or ship (entries
+   * self-delete when a place goes quiet); the other collections are belt over
+   * braces for the windows around it.
    */
   const workBusy = () =>
-    workChains.size > 0 ||
+    placeLocks.size > 0 ||
     shipping.size > 0 ||
     workChildren.size > 0 ||
     workAnswering.size > 0 ||
@@ -2836,11 +2466,6 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
     livePreviewIds,
     retirePreviews,
     shutdownPreviews,
-    processDevRunJobs,
-    liveDevRunIds,
-    retireDevRuns,
-    shutdownDevRuns,
-    adoptDevRuns,
     retireWorkSessions,
     reportWorktrees,
     shutdownWork,
