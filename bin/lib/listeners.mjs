@@ -40,7 +40,7 @@ const MAX_PIDS = 4000;
  *  twenty is somebody's docker-compose and the extra rows say nothing. */
 const MAX_ROWS = 8;
 /** Longest process label we relay. */
-const MAX_LABEL = 24;
+const MAX_LABEL = 40;
 
 // ── /proc/net/tcp parsing (linux) ──────────────────────────────────────────
 
@@ -83,15 +83,47 @@ function listeningByInode() {
   return out;
 }
 
+/**
+ * WHAT TO CALL A LISTENING PROCESS.
+ *
+ * This used to be `basename(argv[0])`, which names the RUNTIME and not the
+ * program — so half the rows in a JavaScript repo read `node` and told the
+ * reader nothing about which of their servers this was. The question that
+ * changed it: "a non developer wouldnt know what node is or workerd."
+ *
+ * THE FIX IS NOT A LOOKUP TABLE. Mapping `workerd` → "Cloudflare Worker" is
+ * the `DEV_ARGV0` shape: a hardcoded list of tools that is wrong for every
+ * stack nobody enumerated, needing a release per ecosystem forever. What is
+ * always available instead is argv[1] — the thing the runtime was asked to
+ * run — so `node …/node_modules/.bin/vite` becomes `node vite` and
+ * `node server.js` becomes `node server.js`. No list, works on every stack.
+ *
+ * A FLAG IS SKIPPED rather than guessed past: `python3 -m http.server` keeps
+ * `python3` instead of claiming to be called `-m`. Only the first two argv
+ * elements are ever read — enough to name the program, far short of the whole
+ * command line, which is the thing this deliberately does not relay.
+ *
+ * And this is still only a MEASUREMENT. The name a person gives a share lives
+ * on `session_previews.label`, is written by a human PATCH, and is what a
+ * teammate actually reads — no amount of argv produces "Storefront".
+ */
+export function labelFromArgv(argv) {
+  const base = (v) => (v || '').split('/').pop() || v || '';
+  const head = base(argv?.[0]);
+  if (!head) return null;
+  // argv[1] only when it NAMES something rather than configuring it. A `-`
+  // prefix is the one universally reliable tell, and skipping is the honest
+  // answer — `python3 -m http.server` keeps `python3` rather than claiming to
+  // be called `-m`.
+  const next = argv?.[1] && !argv[1].startsWith('-') ? base(argv[1]) : '';
+  const label = next && next !== head ? `${head} ${next}` : head;
+  return label.slice(0, MAX_LABEL) || null;
+}
+
 function labelFor(pid) {
   try {
     const raw = readFileSync(`/proc/${pid}/cmdline`, 'utf8');
-    const first = raw.split('\0').filter(Boolean)[0] || '';
-    // The basename only. A full argv is the driver's command line, which can
-    // carry a token in an inline env assignment — and the whole argv is never
-    // what a reader needs to recognise their own dev server.
-    const base = first.split('/').pop() || first;
-    return base.slice(0, MAX_LABEL) || null;
+    return labelFromArgv(raw.split('\0').filter(Boolean));
   } catch {
     return null;
   }
