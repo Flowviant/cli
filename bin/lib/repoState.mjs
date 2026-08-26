@@ -165,6 +165,7 @@ export function repoState(repoRoot, baseRef) {
   const listening = listenersIn(repoRoot);
   const wt = worktrees ?? [];
   const br = branches ?? [];
+  const sessionRows = br.filter((b) => b.session);
   return {
     base: baseRef,
     worktrees: wt.slice(0, MAX_WORKTREES),
@@ -173,7 +174,25 @@ export function repoState(repoRoot, baseRef) {
     // part somebody is actually working in.
     branches: br.slice(0, MAX_BRANCHES),
     branchesTotal: br.length,
-    sessionBranches: br.filter((b) => b.session).length,
+    sessionBranches: sessionRows.length,
+    /**
+     * …AND HOW MANY OF THEM STILL HOLD WORK.
+     *
+     * "40 branches" is meaningful to nobody. "3 branches holding work you
+     * haven't shipped" is meaningful to everybody, and it is the only half of
+     * the count anyone can act on. `ahead` is commits this branch has that base
+     * does not — already measured above by `ahead-behind`, so this costs no
+     * extra git call.
+     *
+     * OMITTED, never guessed, when the measurement is missing: an older git
+     * takes the fallback format in `readBranches` and reports no `ahead` at
+     * all, and a count of zero unshipped branches would then be a claim nobody
+     * measured. Absent means "could not tell"; the surface renders the flat
+     * count instead.
+     */
+    ...(sessionRows.every((b) => typeof b.ahead === 'number')
+      ? { sessionBranchesUnshipped: sessionRows.filter((b) => b.ahead > 0).length }
+      : {}),
     listening,
     // "Nothing is listening" and "this machine cannot look" (Windows, a failed
     // scan) are the same empty array without this — and the second must never

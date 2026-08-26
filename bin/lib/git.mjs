@@ -98,6 +98,32 @@ export function detectBaseRef(repoRoot) {
   } catch {
     /* origin/HEAD not set */
   }
+  /**
+   * NO `origin/HEAD`. Prefer a CONVENTION over an accident.
+   *
+   * This used to fall straight through to `origin/<whatever is checked out
+   * right now>` — which, since the result is computed once at daemon start and
+   * held for the life of the process, meant starting the daemon while you
+   * happened to be on `staging` silently made staging the merge target for
+   * every ship until you restarted. Nothing said so.
+   *
+   * A remote branch actually called `main` or `master` is a far better guess
+   * than the branch you were standing on, and unlike that one it does not
+   * depend on when the process booted. The old behaviour survives as the last
+   * resort, because a repo with neither is a repo where we genuinely have
+   * nothing better.
+   *
+   * The real fix is that a human can now SET it (`projects.baseBranch`), which
+   * overrides all of this. This just stops the unset case being arbitrary.
+   */
+  for (const conventional of ['origin/main', 'origin/master']) {
+    try {
+      git(['rev-parse', '--verify', '--quiet', `refs/remotes/${conventional}`], repoRoot);
+      return conventional;
+    } catch {
+      /* not this one */
+    }
+  }
   try {
     return `origin/${git(['rev-parse', '--abbrev-ref', 'HEAD'], repoRoot)}`;
   } catch {

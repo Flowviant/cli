@@ -319,7 +319,7 @@ async function maybeReportRepoState({ repoRoot, baseRef }) {
   repoStateScanAt = Date.now();
   let payload;
   try {
-    const state = repoState(repoRoot, baseRef);
+    const state = repoState(repoRoot, getBaseRef());
     if (!state) return; // not readable — say nothing rather than say "none"
     payload = JSON.stringify(state);
   } catch {
@@ -399,7 +399,19 @@ export async function runFleetDaemon() {
   console.log(`  ${c.bold(c.cyan('◣ flowviant'))}  ${c.dim(`machine daemon · v${VERSION}`)}`);
   console.log(`  ${c.dim('──────────────────────────────────────────────')}`);
   const repoRoot = repoRootOrDie();
-  const baseRef = detectBaseRef(repoRoot);
+  /**
+   * WHERE SHIP LANDS. Detected at startup, then OVERRIDDEN by the roster when a
+   * human has chosen one (`projects.baseBranch`).
+   *
+   * A `let` and a getter rather than a const, because the answer can change
+   * while the daemon runs — and because the detected value itself is fragile:
+   * with no `origin/HEAD` set, `detectBaseRef` falls back to
+   * `origin/<whatever was checked out at startup>`, which froze for the life of
+   * the process. A stored value is the fix; this is the wiring that lets it
+   * reach the code that merges.
+   */
+  let baseRef = detectBaseRef(repoRoot);
+  const getBaseRef = () => baseRef;
   info(SAFE ? 'mode   · safe (restricted toolset)' : 'mode   · unattended (skips permission prompts)');
   // WHICH PROJECT, before anything connects — the roster names it again a few
   // seconds later with the server's word, but "which project is this daemon
@@ -815,7 +827,7 @@ export async function runFleetDaemon() {
   } = createWorkManager({
     repoRoot,
     baseDir,
-    baseRef,
+    getBaseRef,
     getMcpUrl: () => mcpUrl,
     getLeaseTtl: () => leaseTtlSeconds,
   });
@@ -1542,6 +1554,20 @@ export async function runFleetDaemon() {
     // `git worktree remove` would happily pull the directory out from under a
     // running node process, which then serves bytes from open file handles in
     // a directory that no longer exists, with no error anywhere.
+    /**
+     * WHERE SHIP LANDS, if a human has chosen. Absence means "you decide" —
+     * the state every daemon was in before this existed, and what an
+     * unconfigured project still means — so it must NOT clear a detection.
+     * Announced on change, because a silent switch of merge target is the one
+     * thing worse than not offering the choice at all.
+     */
+    if (typeof roster.baseBranch === 'string' && roster.baseBranch.trim()) {
+      const want = `origin/${baseBranchName(roster.baseBranch.trim())}`;
+      if (want !== baseRef) {
+        note(`base   · ${want} ${c.dim('(set for this project)')}`);
+        baseRef = want;
+      }
+    }
     // A session another daemon on this credential is serving is NOT a closed
     // tab. Without this the daemon that lost the lease removes the worktree the
     // winner is working in — absence would mean "somebody else won" instead of
@@ -1662,7 +1688,7 @@ export async function runFleetDaemon() {
     // machines). Config report is cheap + dedup'd; jobs are single-flight.
     if (roster.env?.deployAuthorized) {
       void reportDeployConfig(repoRoot);
-      processDeployJobs(roster.deployJobs, { repoRoot, baseRef, myPubB64 });
+      processDeployJobs(roster.deployJobs, { repoRoot, baseRef: getBaseRef(), myPubB64 });
     }
 
     // Stop workers whose agent left the roster (removed in the app).

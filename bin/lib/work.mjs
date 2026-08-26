@@ -42,6 +42,7 @@ import { git, gitRaw, splitNul, baseBranchName, isSafePathSegment } from './git.
 import { listenersIn, listenersSupported } from './listeners.mjs';
 import { processesInGroups, liveGroups, processesSupported } from './processes.mjs';
 import { createPlaceLock } from './placeLock.mjs';
+import { sweepMergedBranch } from './shipSweep.mjs';
 import { openTunnel } from './preview.mjs';
 import { c, note, ok, warn } from './ui.mjs';
 import { mcpFor, runTurn } from './claude.mjs';
@@ -100,7 +101,18 @@ function brainFor(job) {
   return out;
 }
 
-export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLeaseTtl }) {
+export function createWorkManager({ repoRoot, baseDir, getBaseRef, getMcpUrl, getLeaseTtl }) {
+  /**
+   * WHERE SHIP LANDS, read fresh every time rather than captured at startup.
+   *
+   * A getter, like `getMcpUrl` and `getLeaseTtl` beside it, because the answer
+   * can now change while the daemon runs: a human sets `projects.baseBranch`
+   * and the next roster poll carries it. Captured by value this would be
+   * whatever `origin/HEAD` said the moment the process booted — which is also
+   * the shape of the bug it replaces, where an unset `origin/HEAD` froze
+   * `origin/<branch you happened to be on>` for the life of the daemon.
+   */
+  const baseRef = () => getBaseRef();
   const WORK_TOKEN_URL = FLEET_URL.replace(/\/agents\/?$/, '/work-token');
   const WORK_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/work-turn-done');
   const SHIP_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/ship-done');
@@ -227,6 +239,9 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
     } else {
       pendingShipReports.delete(sessionId);
       reportBackoff.delete(sessionId);
+      // The report has landed, so the idempotency path no longer needs the
+      // branch to exist. See `sweepMergedSessionBranch`.
+      sweepMergedSessionBranch(sessionId);
     }
     return r;
   };
@@ -423,7 +438,7 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
     const place = placeOf(sessionId);
     if (place !== REPO_PLACE && !isSafePathSegment(place)) return null;
     const wt = placeDir(sessionId);
-    const d = worktreeDiff(wt, baseRef);
+    const d = worktreeDiff(wt, baseRef());
     if (!d) return null;
     // WHAT IS LISTENING in this worktree, attributed by the CWD of the process
     // holding the socket. It rides the sweep the daemon already makes rather
@@ -972,6 +987,10 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
         else if (r !== 'retry') {
           pendingShipReports.delete(id);
           reportBackoff.delete(id);
+          // Delivered late is still delivered — same sweep as the immediate
+          // path, and it must be here too or a report that needed a retry
+          // would leave its branch behind forever.
+          sweepMergedSessionBranch(id);
         }
       }
     } finally {
@@ -1071,7 +1090,7 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
       // would hand it a repo state it has never seen. Everything else is
       // unchanged, the attach fallback included: a surviving branch already
       // chose its base, and re-basing it here would move committed work.
-      const at = baseAt || baseRef;
+      const at = baseAt || baseRef();
       try {
         git(['worktree', 'add', '-b', branch, wt, at], repoRoot);
       } catch {
@@ -1442,6 +1461,18 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
    *  session's own id IS its default place. */
   const sessionWtFor = (sessionId, baseAt) => placeWtFor(sessionId, baseAt);
 
+  /** See `shipSweep.mjs`. Bound to this manager's repo, base and report queue. */
+  const sweepMergedSessionBranch = (sessionId) =>
+    sweepMergedBranch(sessionId, {
+      git,
+      repoRoot,
+      baseRef: baseRef(),
+      note,
+      // The report queue is consulted at CALL time, never captured — a sweep
+      // scheduled while a report was outstanding must still see it land.
+      isReportPending: (id) => pendingShipReports.has(id),
+    });
+
   const retireWorkSessions = (activeIds, heldElsewhere) => {
     if (!Array.isArray(activeIds)) return;
     // Sessions ANOTHER daemon on this credential is serving. They are absent
@@ -1479,9 +1510,15 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
         // it, closed tab or not. (The non-force remove would refuse anyway;
         // the explicit check keeps the intent legible.)
         if (git(['status', '--porcelain'], wt) !== '') continue;
-        git(['worktree', 'remove', wt], repoRoot); // non-force; the branch survives
+        git(['worktree', 'remove', wt], repoRoot); // non-force
         workTokens.delete(id);
         removed++;
+        // NOW the branch can be judged. While this worktree existed the branch
+        // was checked out in it, so `git branch -d` refused on every earlier
+        // attempt — a tab that shipped and then closed would otherwise leave
+        // its merged branch behind forever, which is the common case.
+        // Unshipped work still refuses here: `-d` is what decides.
+        sweepMergedSessionBranch(id);
       } catch {
         /* not cleanly removable — leave it */
       }
@@ -2191,7 +2228,7 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
           }
           const ancestorOfBase = (ref) => {
             try {
-              git(['merge-base', '--is-ancestor', ref, baseRef], repoRoot);
+              git(['merge-base', '--is-ancestor', ref, baseRef()], repoRoot);
               return true;
             } catch {
               return false;
@@ -2240,7 +2277,7 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
               } catch {
                 /* not there — fine */
               }
-              git(['worktree', 'add', '--detach', tmp, baseRef], repoRoot);
+              git(['worktree', 'add', '--detach', tmp, baseRef()], repoRoot);
               gitMerge(
                 [
                   'merge',
@@ -2251,7 +2288,7 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
                 ],
                 tmp
               );
-              git(['push', 'origin', `HEAD:${baseBranchName(baseRef)}`], tmp);
+              git(['push', 'origin', `HEAD:${baseBranchName(baseRef())}`], tmp);
             } finally {
               try {
                 git(['worktree', 'remove', '--force', tmp], repoRoot);
@@ -2272,7 +2309,7 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
             const tip = git(['rev-parse', branch], repoRoot);
             let commits = [];
             try {
-              const m = git(['log', baseRef, '--merges', '--format=%H %P', '-n', '500'], repoRoot)
+              const m = git(['log', baseRef(), '--merges', '--format=%H %P', '-n', '500'], repoRoot)
                 .split('\n')
                 .map((l) => l.trim().split(' '))
                 .find((p) => p.length >= 3 && p[2] === tip);
@@ -2283,7 +2320,7 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
             await done({
               ok: true,
               commits,
-              note: `${baseBranchName(baseRef)} already contains this session's branch — nothing new to merge`,
+              note: `${baseBranchName(baseRef())} already contains this session's branch — nothing new to merge`,
             });
             ok(`${c.cyan('ship')} ${c.dim('— already on main; nothing new to merge')}`);
             return;
@@ -2301,7 +2338,7 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
               return;
             }
             const tip = git(['rev-parse', branch], repoRoot);
-            const commits = logCommits(`${baseRef}..${tip}`);
+            const commits = logCommits(`${baseRef()}..${tip}`);
             if (commits.length === 0) {
               await done({
                 ok: false,
@@ -2369,7 +2406,7 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
           // Fold main into the branch FIRST: conflicts land here, in the
           // session's own worktree, where the next turn can resolve them.
           try {
-            gitMerge(['merge', '--no-edit', baseRef], dir.wt);
+            gitMerge(['merge', '--no-edit', baseRef()], dir.wt);
           } catch (e) {
             const detail = `${e?.stdout ?? ''}\n${e?.stderr ?? ''}\n${e?.message ?? ''}`;
             // NEVER leave the session mid-merge: a MERGE_HEAD left behind puts
@@ -2400,7 +2437,7 @@ export function createWorkManager({ repoRoot, baseDir, baseRef, getMcpUrl, getLe
           // one X for both, so the ledger can never carry receipts for commits
           // that did not land.
           const tip = git(['rev-parse', branch], repoRoot);
-          const commits = logCommits(`${baseRef}..${tip}`);
+          const commits = logCommits(`${baseRef()}..${tip}`);
           if (commits.length === 0) {
             // Post-fold this is nearly unreachable (a zero-commit branch is an
             // ancestor of base, settled above) — but if the branch's commits
