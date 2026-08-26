@@ -414,6 +414,8 @@ export function createWorkManager({ repoRoot, baseDir, getBaseRef, getMcpUrl, ge
   };
 
   let lastWorktreeSweep = 0;
+  /** Sessions this process has already tried to measure. See `reportWorktrees`. */
+  const worktreeSeen = new Set();
   let lastWorktreeFetch = 0;
   let sweepingWorktrees = false;
   const postWorktrees = async (reports) => {
@@ -478,10 +480,34 @@ export function createWorkManager({ repoRoot, baseDir, getBaseRef, getMcpUrl, ge
     if (r) await postWorktrees([r]);
   };
   /** Every live session, throttled — called from the reconcile loop. */
+  /**
+   * A SESSION NOBODY HAS MEASURED YET JUMPS THE SWEEP (2026-08-26).
+   *
+   * The throttle is GLOBAL, not per-session, so a tab opened one second after a
+   * sweep waited the remaining fifty-nine for its first measurement — and until
+   * it lands there is no branch, no directory and no listeners anywhere in the
+   * product, because every one of those readouts is gated on a measurement and
+   * renders nothing rather than inventing a state. Asked directly: "how come it
+   * takes a while for a new session to show branch and worktree and listeners
+   * after i create a new tab."
+   *
+   * ATTEMPTED, never MEASURED, is what is remembered. A session whose directory
+   * cannot be read yet — a pre-places daemon that has not cut one, a worktree
+   * mid-creation — would otherwise be "unmeasured" on every poll and force a
+   * full sweep each time. Recording the attempt bounds it at exactly one extra
+   * sweep per session, ever, after which the normal cadence carries it.
+   */
   const reportWorktrees = (activeIds) => {
     if (!Array.isArray(activeIds) || activeIds.length === 0) return;
     if (sweepingWorktrees) return;
-    if (Date.now() - lastWorktreeSweep < WORKTREE_SWEEP_MS) return;
+    const firstSight = activeIds.some((id) => !worktreeSeen.has(id));
+    if (!firstSight && Date.now() - lastWorktreeSweep < WORKTREE_SWEEP_MS) return;
+    // Bounded to LIVE sessions: a long-running daemon must not accumulate a
+    // uuid per tab anyone has ever opened. Pruning also means a reopened tab is
+    // measured immediately again, which is the same answer for the same reason.
+    const live = new Set(activeIds);
+    for (const id of worktreeSeen) if (!live.has(id)) worktreeSeen.delete(id);
+    for (const id of activeIds) worktreeSeen.add(id);
     sweepingWorktrees = true;
     lastWorktreeSweep = Date.now();
     void (async () => {
