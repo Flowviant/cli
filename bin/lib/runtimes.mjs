@@ -337,17 +337,31 @@ export const RUNTIMES = {
      * strongest form of it available anywhere: `--append-system-prompt` sits
      * above the conversation rather than inside it.
      */
-    args({ prompt, system, model, effort, resume, streamJson, perm, mcp = [], resultSchemaArgs = [], adoptResumeId }) {
+    args({ prompt, system, model, effort, resume, streamJson, perm, mcp = [], resultSchemaArgs = [], adoptResumeId, resumeThreadId }) {
       const a = [];
-      // ADOPTION — the first turn of a tab born from a terminal session.
-      // `--resume <id> --fork-session` finds the session globally (any cwd),
-      // carries its full context, and writes the FORK natively into THIS cwd's
-      // own store, leaving the original transcript untouched (measured on
-      // 2.1.234). From turn 2 on the plain `--continue` below resumes the fork
-      // where it now lives, so nothing downstream knows the tab was adopted.
-      // INSTEAD of --continue, never alongside it: they are the same decision
-      // ("what conversation is this?") answered two different ways.
+      // THREE ANSWERS TO ONE QUESTION — "what conversation is this?" — and they
+      // are mutually exclusive, never combined.
+      //
+      // ADOPTION: `--resume <id> --fork-session` finds the session globally
+      // (any cwd), carries its full context, and writes the FORK natively into
+      // THIS cwd's own store, leaving the original transcript untouched
+      // (measured on 2.1.234).
+      //
+      // BY ID: the conversation THIS TAB spoke under last time, learned from
+      // the CLI's own `system.init` event and pinned per session. It exists
+      // because `--continue` is CWD-KEYED, and a directory stopped being one
+      // tab the day tabs moved into their driver's project folder — two tabs
+      // sharing a directory both said `--continue` and both resumed whichever
+      // conversation spoke most recently there, so tab B inherited tab A's
+      // entire context and every turn after that ping-ponged between them.
+      // Exactly the failure codex's own note warns about for `resume --last`,
+      // arriving for Claude by a different route. An id is unambiguous wherever
+      // the tab is standing.
+      //
+      // `--continue` is the LAST resort, and only where nothing better is
+      // known.
       if (adoptResumeId) a.push('--resume', adoptResumeId, '--fork-session');
+      else if (resumeThreadId) a.push('--resume', resumeThreadId);
       else if (resume) a.push('--continue');
       a.push('-p', prompt, '--append-system-prompt', system);
       a.push(...mcp, ...resultSchemaArgs);

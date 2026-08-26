@@ -1178,9 +1178,23 @@ export function createWorkManager({ repoRoot, baseDir, getBaseRef, getMcpUrl, ge
    * working tree itself would show up as an untracked path and block every
    * ship of an otherwise-clean session.
    */
-  const sessionMetaPath = (wt, name) => {
+  /**
+   * A file beside the worktree's git dir, holding something about ONE TAB.
+   *
+   * `scope` is the session id and is NOT optional for anything per-tab. These
+   * markers were named bare — `flowviant-codex-thread`, `flowviant-agy-
+   * conversation` — which was unambiguous while one directory meant one tab.
+   * The day tabs moved into their driver's project folder, every tab there
+   * started reading and writing ONE marker: tab B would resume tab A's codex
+   * thread, and the last turn to finish would overwrite the id for both.
+   *
+   * The turn LOCK is deliberately still un-scoped — it guards the directory
+   * against a second CLI, which is a property of the place and not of a tab.
+   */
+  const sessionMetaPath = (wt, name, scope) => {
     try {
-      return join(git(['rev-parse', '--absolute-git-dir'], wt), name);
+      const safe = scope && /^[A-Za-z0-9_-]{1,64}$/.test(String(scope)) ? `-${scope}` : '';
+      return join(git(['rev-parse', '--absolute-git-dir'], wt), `${name}${safe}`);
     } catch {
       return null;
     }
@@ -1198,7 +1212,7 @@ export function createWorkManager({ repoRoot, baseDir, getBaseRef, getMcpUrl, ge
    * the AGENT's to explain to the user, never a reason to fail the adoption —
    * the conversation is the thing being adopted, and it resumes either way.
    */
-  const carryDirtyState = (srcCwd, wt) => {
+  const carryDirtyState = (srcCwd, wt, sessionId) => {
     const problems = [];
     try {
       // A Buffer, not utf8: a `--binary` patch (and a hunk from a non-UTF-8
@@ -1211,7 +1225,7 @@ export function createWorkManager({ repoRoot, baseDir, getBaseRef, getMcpUrl, ge
         maxBuffer: 64 * 1024 * 1024,
       });
       if (patch.length) {
-        const patchPath = sessionMetaPath(wt, 'flowviant-adopt.patch');
+        const patchPath = sessionMetaPath(wt, 'flowviant-adopt.patch', sessionId);
         if (!patchPath) throw new Error('no private git dir to stage the patch in');
         try {
           writeFileSync(patchPath, patch);
@@ -1296,8 +1310,10 @@ export function createWorkManager({ repoRoot, baseDir, getBaseRef, getMcpUrl, ge
    */
   const sessionCapable = (rid) =>
     (Boolean(RUNTIMES[rid]?.mcp) || rid === 'antigravity') && canRun(RUNTIMES[rid], 'build');
-  const sessionRuntime = (wt, jobRuntime) => {
-    const marker = sessionMetaPath(wt, 'flowviant-runtime');
+  const sessionRuntime = (wt, jobRuntime, sessionId) => {
+    // SCOPED: two tabs standing in one directory may run different CLIs, and an
+    // unscoped pin would hand the second one the first one's runtime.
+    const marker = sessionMetaPath(wt, 'flowviant-runtime', sessionId);
     let pinned = null;
     if (marker && existsSync(marker)) {
       try {
@@ -1716,7 +1732,7 @@ export function createWorkManager({ repoRoot, baseDir, getBaseRef, getMcpUrl, ge
           // which is what every tab ran on until now) — honored by
           // sessionRuntime: on a first turn a named runtime IS the pick, and a
           // named runtime that disagrees with the pin settles below.
-          const rt = sessionRuntime(dir.wt, job.runtime || null);
+          const rt = sessionRuntime(dir.wt, job.runtime || null, job.sessionId);
           if (rt.mismatch) {
             // Something upstream changed this tab's identity mid-life. A held
             // context must never be answered by a different brain — say so.
@@ -1809,9 +1825,43 @@ export function createWorkManager({ repoRoot, baseDir, getBaseRef, getMcpUrl, ge
           // persisted below, beside the runtime pin; absent, the turn runs
           // FRESH in the same worktree — the dirty state is most of the held
           // context, and a machine-global guess is someone else's conversation.
+          /**
+           * CLAUDE RESUMES BY THE CONVERSATION ID THIS TAB SPOKE UNDER.
+           *
+           * `--continue` is CWD-KEYED. That was unambiguous while one directory
+           * meant one tab, and it stopped being true the day tabs moved into
+           * their driver's project folder: every tab there said `--continue`
+           * and every one of them resumed whichever conversation had spoken
+           * most recently in that directory. Tab B inherited tab A's entire
+           * context, and each turn afterwards ping-ponged between them — the
+           * exact failure the codex note two blocks down warns about for
+           * `resume --last`, arriving for Claude by a different route.
+           *
+           * The id comes from the CLI's own `system.init` event, which the
+           * stream parser already surfaces, and is pinned per session so it is
+           * unambiguous wherever the tab is standing.
+           *
+           * NO ID, NO `--continue`: a tab whose place is shared starts FRESH
+           * rather than guessing, because in a shared directory the guess is
+           * someone else's conversation. `--continue` survives only where the
+           * directory belongs to this tab alone, which is the one case it was
+           * ever right for.
+           */
+          let claudeResumeId = null;
+          if (rt.id === 'claude') {
+            const convMarker = sessionMetaPath(dir.wt, 'flowviant-claude-session', job.sessionId);
+            if (convMarker && existsSync(convMarker)) {
+              try {
+                const v = readFileSync(convMarker, 'utf8').trim();
+                if (/^[A-Za-z0-9_-]{8,64}$/.test(v)) claudeResumeId = v;
+              } catch {
+                /* unreadable marker — run fresh */
+              }
+            }
+          }
           let codexResumeId = null;
           if (rt.id === 'codex') {
-            const threadMarker = sessionMetaPath(dir.wt, 'flowviant-codex-thread');
+            const threadMarker = sessionMetaPath(dir.wt, 'flowviant-codex-thread', job.sessionId);
             if (threadMarker && existsSync(threadMarker)) {
               try {
                 const v = readFileSync(threadMarker, 'utf8').trim();
@@ -1829,7 +1879,7 @@ export function createWorkManager({ repoRoot, baseDir, getBaseRef, getMcpUrl, ge
           // dispatch sharing the machine could overwrite that between turns.
           let agyConvId = null;
           if (rt.id === 'antigravity' && !adopting) {
-            const convMarker = sessionMetaPath(dir.wt, 'flowviant-agy-conversation');
+            const convMarker = sessionMetaPath(dir.wt, 'flowviant-agy-conversation', job.sessionId);
             if (convMarker && existsSync(convMarker)) {
               try {
                 const v = readFileSync(convMarker, 'utf8').trim();
@@ -1852,19 +1902,23 @@ export function createWorkManager({ repoRoot, baseDir, getBaseRef, getMcpUrl, ge
           // it (cwd-keyed; measured safe), so a lost marker degrades to the
           // weaker resume instead of silently starting over.
           const spokeHere = !dir.fresh && Boolean(job.sessionRef) && job.sessionRef === dir.wt;
+          // A place this tab does NOT have to itself: `--continue` there is a
+          // guess at somebody else's conversation, so it is withheld and only
+          // a pinned id may resume.
+          const placeIsMine = !placeOf(job.sessionId) || placeOf(job.sessionId) === job.sessionId;
           const resume =
             rt.id === 'codex'
               ? Boolean(codexResumeId)
               : rt.id === 'antigravity'
-                ? Boolean(agyConvId) || spokeHere
-                : spokeHere;
+                ? Boolean(agyConvId) || (placeIsMine && spokeHere)
+                : Boolean(claudeResumeId) || (placeIsMine && spokeHere);
           // The dirty carry, on the adopt worktree's FIRST life only: a
           // re-attempted adoption (the directory already exists) carried what
           // it could the first time, and re-applying would double it. A carry
           // problem never fails the adoption — it becomes one bracketed line
           // in the prompt, so the AGENT tells the user what stayed behind.
           let carryNote = '';
-          if (adopting && dir.fresh && adoptSrc) carryNote = carryDirtyState(adoptSrc, dir.wt);
+          if (adopting && dir.fresh && adoptSrc) carryNote = carryDirtyState(adoptSrc, dir.wt, job.sessionId);
           // The tab's transcript starts EMPTY on adoption (scrollback is
           // disposable, the held context is the brain — never import an
           // archive), so the first reply opens with a recap: the human sees
@@ -1884,6 +1938,7 @@ export function createWorkManager({ repoRoot, baseDir, getBaseRef, getMcpUrl, ge
           workAttempts.set(job.id, tries + 1);
           let out;
           let seenThreadId = null; // codex's conversation id, off thread.started
+          let seenClaudeSession = null; // claude's own conversation id, off system.init
           const spawned = []; // this turn's children, for the teardown registry
           const narrator = makeNarrator(job.sessionId, job.id);
 
@@ -1977,7 +2032,16 @@ export function createWorkManager({ repoRoot, baseDir, getBaseRef, getMcpUrl, ge
               // no extra spawn — and reported on the next roster poll so the
               // composer can autocomplete a `/`. See runtimes.mjs for why it is
               // learned from a turn rather than looked up.
-              onInit: (i) => recordSkills(i.skills),
+              onInit: (i) => {
+                recordSkills(i.skills);
+                // The conversation this turn is actually speaking under. Held
+                // and persisted after the turn ends, so the NEXT one resumes
+                // this exact thread rather than whatever the directory saw
+                // last. Last write wins on purpose: a resume that fell back to
+                // fresh reports the fresh id, healing the marker.
+                if (typeof i.sessionId === 'string' && i.sessionId.trim())
+                  seenClaudeSession = i.sessionId.trim();
+              },
               cwd: dir.wt,
               mcpArgs: mcp.args,
               mcpEnv: mcp.env,
@@ -2012,7 +2076,7 @@ export function createWorkManager({ repoRoot, baseDir, getBaseRef, getMcpUrl, ge
             out = await runTurn({
               ...turnArgs,
               resume,
-              resumeThreadId: codexResumeId || undefined,
+              resumeThreadId: codexResumeId || claudeResumeId || undefined,
               resumeConversationId: agyConvId || undefined,
             });
             // A resume that produced NOTHING usually means the held
@@ -2049,8 +2113,26 @@ export function createWorkManager({ repoRoot, baseDir, getBaseRef, getMcpUrl, ge
           // before it ever touches disk — it later rides in argv as
           // `resume <id>` — and best-effort, like the runtime pin: an
           // unwritable marker just means the tab runs fresh next turn.
+          // The conversation THIS TAB just spoke under, pinned so the next
+          // turn resumes it by id rather than asking the directory. Written
+          // after the turn for the same reason codex's is: an id learned
+          // mid-turn is only true once the turn that learned it finished.
+          if (
+            rt.id === 'claude' &&
+            seenClaudeSession &&
+            /^[A-Za-z0-9_-]{8,64}$/.test(seenClaudeSession)
+          ) {
+            const convMarker = sessionMetaPath(dir.wt, 'flowviant-claude-session', job.sessionId);
+            if (convMarker) {
+              try {
+                writeFileSync(convMarker, seenClaudeSession);
+              } catch {
+                /* best-effort — the next turn re-learns it */
+              }
+            }
+          }
           if (rt.id === 'codex' && seenThreadId && CODEX_THREAD_RE.test(seenThreadId)) {
-            const threadMarker = sessionMetaPath(dir.wt, 'flowviant-codex-thread');
+            const threadMarker = sessionMetaPath(dir.wt, 'flowviant-codex-thread', job.sessionId);
             if (threadMarker) {
               try {
                 writeFileSync(threadMarker, seenThreadId);
@@ -2082,7 +2164,7 @@ export function createWorkManager({ repoRoot, baseDir, getBaseRef, getMcpUrl, ge
           // cwd registry. From here on the marker is the tab's identity and
           // the registry is never trusted again.
           if (rt.id === 'antigravity' && answer.length > 0) {
-            const convMarker = sessionMetaPath(dir.wt, 'flowviant-agy-conversation');
+            const convMarker = sessionMetaPath(dir.wt, 'flowviant-agy-conversation', job.sessionId);
             if (convMarker && !existsSync(convMarker)) {
               const learned = adopting ? job.adopt.id : agyRegistryLookup(dir.wt);
               if (learned && AGY_CONV_RE.test(learned)) {
