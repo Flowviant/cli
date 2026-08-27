@@ -59,7 +59,11 @@ import { detectRuntimes, canRun, recordSkills, RUNTIMES } from './runtimes.mjs';
 /** The place id meaning "the checkout", not a worktree. Must match the
  *  server's REPO_PLACE — it is a wire value, not a local convention. */
 const REPO_PLACE = 'repo';
-import { isTerminalSessionLive, isAgyConversationLive } from './localSessions.mjs';
+import {
+  isTerminalSessionLive,
+  isAgyConversationLive,
+  titleForSession,
+} from './localSessions.mjs';
 import { worktreeDiff } from './worktreeDiff.mjs';
 import { homedir } from 'node:os';
 
@@ -465,6 +469,29 @@ export function createWorkManager({ repoRoot, baseDir, getBaseRef, getMcpUrl, ge
     // `processesSupported` keeps "cannot look" (Windows) apart from "looked and
     // found none", which renders differently.
     const processes = sessionProcesses(sessionId);
+    // THE NAME CLAUDE ALREADY GAVE THIS CONVERSATION, relayed.
+    //
+    // Claude Code titles its own sessions; a Flowviant tab was born "session 3"
+    // and stayed that way unless somebody renamed it by hand, so a strip of
+    // eight tabs said nothing about any of them. The title is not ours to
+    // invent — reading it is the same relay this whole file does, and asking
+    // a model for one would be a second brain, which the product forbids.
+    //
+    // Only CLAUDE tabs have one here: the id is the one the CLI reported at
+    // `system.init` and pinned per tab, so a codex or agy tab simply has no
+    // marker and reports no title. No runtime check is needed for that — the
+    // absent marker IS the check.
+    //
+    // No version floor: a daemon→server report on an endpoint that already
+    // exists, so an older daemon sends no key and the server leaves the name
+    // exactly as it found it.
+    let title = null;
+    try {
+      const marker = sessionMetaPath(wt, 'flowviant-claude-session', sessionId);
+      if (marker) title = titleForSession(wt, readFileSync(marker, 'utf8').trim());
+    } catch {
+      /* no marker yet — this tab has not spoken, or is not Claude */
+    }
     return {
       sessionId,
       ...d,
@@ -472,6 +499,7 @@ export function createWorkManager({ repoRoot, baseDir, getBaseRef, getMcpUrl, ge
       listeningSupported: listenersSupported(),
       ...(processes === null ? {} : { processes }),
       processesSupported: processesSupported(),
+      ...(title ? { title } : {}),
     };
   };
   /** One session, now — called after its turn settles. */

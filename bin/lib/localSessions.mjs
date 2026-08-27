@@ -74,6 +74,47 @@ function transcriptTitle(file, mtimeMs) {
   return title;
 }
 
+/**
+ * THE TITLE CLAUDE GAVE ITS OWN CONVERSATION, for one session we already know
+ * the id of.
+ *
+ * `scanLocalSessions` finds transcripts the hard way — walk every project
+ * directory, read each file's own `cwd` — because it is answering "what is in
+ * this repo" and knows no ids. This asks the same store a narrower question:
+ * the tab pinned the id the CLI reported at `system.init`, and the directory is
+ * the place the turn was spawned in, so the file is one munge away (Claude Code
+ * names the directory after the cwd with `/` and `.` replaced by `-`).
+ *
+ * The realpath fallback is not defensive padding: a place under a symlinked
+ * home munges to a DIFFERENT directory name depending on which form the CLI was
+ * handed, and the daemon does not control which that was.
+ *
+ * Returns null for anything it cannot read. A missing title is honest silence —
+ * the tab keeps whatever name it has.
+ */
+export function titleForSession(cwd, sessionId) {
+  if (!cwd || typeof sessionId !== 'string' || !/^[A-Za-z0-9_-]{8,64}$/.test(sessionId)) {
+    return null;
+  }
+  const projects = join(homedir(), '.claude', 'projects');
+  const dirs = [String(cwd)];
+  try {
+    const real = realpathSync(String(cwd));
+    if (real !== String(cwd)) dirs.push(real);
+  } catch {
+    /* the place is gone — nothing to read */
+  }
+  for (const dir of dirs) {
+    const file = join(projects, dir.replace(/[/.]/g, '-'), `${sessionId}.jsonl`);
+    try {
+      return transcriptTitle(file, statSync(file).mtimeMs);
+    } catch {
+      /* not this munge — try the other */
+    }
+  }
+  return null;
+}
+
 /** Path-prefix containment on already-realpath'd absolute paths. */
 const inside = (p, root) => p === root || p.startsWith(root.endsWith('/') ? root : `${root}/`);
 
