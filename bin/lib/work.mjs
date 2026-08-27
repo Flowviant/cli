@@ -402,10 +402,21 @@ export function createWorkManager({ repoRoot, baseDir, getBaseRef, getMcpUrl, ge
   const learnPlaces = (map) => {
     if (!map || typeof map !== 'object') return;
     for (const [sid, place] of Object.entries(map)) {
-      if (typeof place === 'string' && place) sessionPlaces.set(sid, place);
-      // null / '' / anything else: the server is telling us this tab is in its
-      // OWN worktree. Falling back to the default requires forgetting, not
-      // ignoring.
+      // VALIDATE AT THE TRUST BOUNDARY. `placeDir` joins this value straight
+      // into `sessions/<place>` and it is the directory a turn is SPAWNED in
+      // and a preview port is measured against — the security boundary for the
+      // whole preview feature. The server resolves place to an enum (never a
+      // path), but a server bug or compromise sending `../../etc` would
+      // otherwise point a session's measured directory anywhere on the box and
+      // defeat the port attribution. `sessionWorktreeReport` and `placeWtFor`
+      // already reject an unsafe segment; doing it here covers every consumer
+      // (the preview-claim `placeDir` did not re-check). REPO_PLACE resolves to
+      // repoRoot, so it is allowed through despite not being a path segment.
+      if (typeof place === 'string' && place && (place === REPO_PLACE || isSafePathSegment(place)))
+        sessionPlaces.set(sid, place);
+      // null / '' / an unsafe value: the server is telling us this tab is in its
+      // OWN worktree (or is malformed). Falling back to the default requires
+      // forgetting, not ignoring.
       else sessionPlaces.delete(sid);
     }
   };
@@ -2005,7 +2016,14 @@ export function createWorkManager({ repoRoot, baseDir, getBaseRef, getMcpUrl, ge
           };
           const auditCommand = (a) => {
             if (a?.kind !== 'bash' || !a.command) return;
-            auditBatch.push({ command: a.command, at: new Date().toISOString() });
+            // Scrubbed like every other string that leaves this box (the
+            // narrator label, the settle answer, commit subjects, ship/merge
+            // lines, the per-tab process report). A command line is exactly
+            // where a secret leaks — `curl -H "authorization: <token>"`,
+            // `PGPASSWORD=… psql` — and the audit is stored 30 days and rendered
+            // in the admin view, so the one uplink that omitted scrub was the
+            // one most likely to carry a plaintext secret.
+            auditBatch.push({ command: envScrub(a.command), at: new Date().toISOString() });
             if (auditBatch.length >= 25) flushAudit();
           };
           try {
