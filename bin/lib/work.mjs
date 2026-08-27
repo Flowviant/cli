@@ -39,8 +39,9 @@ import {
   MODEL,
 } from './config.mjs';
 import { git, gitRaw, splitNul, baseBranchName, isSafePathSegment } from './git.mjs';
-import { listenersIn, listenersSupported } from './listeners.mjs';
-import { processesInGroups, liveGroups, processesSupported } from './processes.mjs';
+import { listenersIn, measureListeners, listenersSupported } from './listeners.mjs';
+import { measureProcesses, liveGroups, processesSupported } from './processes.mjs';
+import { mutateRegistry, readRegistry } from './procRegistry.mjs';
 import { createPlaceLock } from './placeLock.mjs';
 import { sweepMergedBranch } from './shipSweep.mjs';
 import { mergeOutward as shipMergeOutward } from './shipMerge.mjs';
@@ -125,6 +126,8 @@ export function createWorkManager({ repoRoot, baseDir, getBaseRef, getMcpUrl, ge
   const WORKTREES_URL = FLEET_URL.replace(/\/agents\/?$/, '/session-worktrees');
   const DIFF_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/diff-done');
   const PREVIEW_CLAIM_URL = FLEET_URL.replace(/\/agents\/?$/, '/preview-claim');
+  const KILL_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/kill-done');
+  const KILL_CLAIM_URL = FLEET_URL.replace(/\/agents\/?$/, '/kill-claim');
   const PREVIEW_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/preview-done');
   const SESSION_COMMANDS_URL = FLEET_URL.replace(/\/agents\/?$/, '/session-commands');
   const ATTACHMENT_URL = FLEET_URL.replace(/\/agents\/?$/, '/attachment');
@@ -149,11 +152,65 @@ export function createWorkManager({ repoRoot, baseDir, getBaseRef, getMcpUrl, ge
    */
   const sessionGroups = new Map(); // sessionId -> Set<pgid>
 
+  /**
+   * …AND IT SURVIVES A RESTART, which it did not until 2026-08-27.
+   *
+   * This map used to live only in this closure. The processes it tracks
+   * OUTLIVE the daemon on purpose — `shutdownWork` SIGTERMs the CLI child and
+   * never the group, precisely so an unattended auto-update does not kill the
+   * driver's dev server — so every daemon restart left a live watcher running
+   * with nothing left that knew whose it was. The tab reported `[]`, the web
+   * read that as "looked, found none", and the Running section went dark until
+   * some later turn happened to open a new group.
+   *
+   * That is not a small bug: AUTO_UPDATE is on by default, so it fired on every
+   * release, on every machine. And it broke the three-state rule this file
+   * states in its own header — the honest answer after a restart was "we have
+   * forgotten", and `[]` is not that. Persisting is what makes `[]` true again,
+   * which is why the fix is a disk write and not a fourth state.
+   *
+   * `procRegistry` is the right home and was sitting unused: it was built for
+   * exactly this ("the daemon spawns things that outlive it… the successor has
+   * to find them"), was orphaned when the dev-run system was deleted, and
+   * already does the atomic write, the stale-lock recovery, the entry cap and
+   * the dead-pid TTL. Its prune is deliberately LOOSE here — it keeps an entry
+   * whose leader is gone, because the leader is the CLI and it exits at the end
+   * of every turn while the watcher it started keeps running. `liveGroups` is
+   * the real prune, on every read, against the kernel.
+   */
+  const GROUPS_DIR = join(homedir(), '.flowviant');
+  const GROUPS_FILE = join(GROUPS_DIR, 'session-groups.json');
+  const GROUPS_LOCK = join(GROUPS_DIR, 'session-groups.lock');
+
+  const persistGroups = () => {
+    const flat = [];
+    for (const [sid, set] of sessionGroups)
+      for (const pgid of set) flat.push({ sessionId: sid, pid: pgid, startedAt: Date.now() });
+    try {
+      mutateRegistry(GROUPS_DIR, GROUPS_FILE, GROUPS_LOCK, () => flat);
+    } catch {
+      /* best-effort: losing the file costs a restart's visibility, never a turn */
+    }
+  };
+
+  try {
+    for (const e of readRegistry(GROUPS_FILE)) {
+      if (!e?.sessionId || !Number.isInteger(e?.pid)) continue;
+      const set = sessionGroups.get(e.sessionId) ?? new Set();
+      set.add(e.pid);
+      sessionGroups.set(e.sessionId, set);
+    }
+  } catch {
+    /* no registry yet — the ordinary first run */
+  }
+
   const noteSessionGroup = (sessionId, pgid) => {
     if (!sessionId || !pgid) return;
     const set = sessionGroups.get(sessionId) ?? new Set();
+    if (set.has(pgid)) return;
     set.add(pgid);
     sessionGroups.set(sessionId, set);
+    persistGroups();
   };
 
   /** This tab's live processes, or null where the machine cannot look. */
@@ -162,9 +219,24 @@ export function createWorkManager({ repoRoot, baseDir, getBaseRef, getMcpUrl, ge
     const known = sessionGroups.get(sessionId);
     if (!known || known.size === 0) return [];
     const alive = liveGroups(known);
+    // Only touch the disk when the set actually MOVED. This runs on every
+    // sweep, for every live tab, forever; an unconditional write would be a
+    // file rewrite a minute for the life of the daemon to restate what is
+    // already there — the same reasoning the auto-name relay uses for its
+    // unchanged-title check.
+    const changed = alive.size !== known.size;
     if (alive.size === 0) sessionGroups.delete(sessionId);
     else sessionGroups.set(sessionId, alive);
-    return processesInGroups(alive, { scrub: envScrub });
+    if (changed) persistGroups();
+    return measureProcesses(alive, { scrub: envScrub });
+  };
+
+  /** Every process group this machine is tracking, across every tab — what a
+   *  kill request is checked against before anything is signalled. */
+  const allKnownGroups = () => {
+    const all = new Set();
+    for (const set of sessionGroups.values()) for (const g of set) all.add(g);
+    return all;
   };
 
 
@@ -479,7 +551,7 @@ export function createWorkManager({ repoRoot, baseDir, getBaseRef, getMcpUrl, ge
     // report on an endpoint that already exists, so NO version floor, and
     // `processesSupported` keeps "cannot look" (Windows) apart from "looked and
     // found none", which renders differently.
-    const processes = sessionProcesses(sessionId);
+    const proc = sessionProcesses(sessionId);
     // THE NAME CLAUDE ALREADY GAVE THIS CONVERSATION, relayed.
     //
     // Claude Code titles its own sessions; a Flowviant tab was born "session 3"
@@ -503,12 +575,18 @@ export function createWorkManager({ repoRoot, baseDir, getBaseRef, getMcpUrl, ge
     } catch {
       /* no marker yet — this tab has not spoken, or is not Claude */
     }
+    // The TOTAL rides beside the capped rows, because a list silently cut at
+    // twelve answers "what is running in here" with a number that is not true.
+    // `wrangler dev` alone opens nine, so the old cap of eight was already
+    // dropping a row on an ordinary stack with nothing on the wire to say so.
+    const lis = measureListeners(wt);
     return {
       sessionId,
       ...d,
-      listening: listenersIn(wt),
+      listening: lis.rows,
+      listeningTotal: lis.total,
       listeningSupported: listenersSupported(),
-      ...(processes === null ? {} : { processes }),
+      ...(proc === null ? {} : { processes: proc.rows, processesTotal: proc.total }),
       processesSupported: processesSupported(),
       ...(title ? { title } : {}),
     };
@@ -891,6 +969,150 @@ export function createWorkManager({ repoRoot, baseDir, getBaseRef, getMcpUrl, ge
       }
     }
     livePreviews.clear();
+  };
+
+  // ── stopping one measured process ────────────────────────────────────────
+  //
+  // The driver points at a row the MACHINE reported and says stop. Flowviant
+  // never picks the target, never sweeps, never signals anything on its own
+  // initiative, and never signals a GROUP — teardown deliberately SIGTERMs the
+  // CLI child and not its group precisely so an unattended auto-update cannot
+  // take the driver's dev server with it, and a control that signalled groups
+  // would hand that outcome back one click at a time.
+  //
+  // WHY THIS EXISTS AT ALL, since "ask your Claude to kill it" looks like it
+  // already covers it. It does not, and it fails hardest in the case that
+  // motivates it: every tab one person owns shares ONE place, the cross-process
+  // turn lock is per-place and deliberately un-scoped, so while any other tab
+  // of yours is mid-turn a new turn does not spawn — it warns and waits. If the
+  // runaway process you want stopped is being held by a turn that is hung, the
+  // turn that would kill it never runs. (Two more: FLOWVIANT_SAFE=1 — which the
+  // README recommends on a shared box — has no kill, pkill, lsof or ss in its
+  // allowlist; and under the README's own top hardening tip, a daemon on its
+  // own OS user, the operator's dev server is EPERM to the agent.)
+  //
+  // A PID IS NOT AN IDENTITY, and this is the whole safety argument. Pids are
+  // recycled, the row the browser is looking at is up to a sweep old, and the
+  // instance lock already learned this the expensive way — its own comment says
+  // "a looser version of this check SIGTERMed one". So the pid the server sends
+  // is a REQUEST, never an authority: this re-derives attribution from the
+  // kernel immediately before signalling, and refuses unless the pid is STILL
+  // in one of this tab's process groups or STILL holding a socket in this
+  // tab's place. A recycled pid belonging to something else fails that, which
+  // is the property a start-time witness would have bought at the cost of
+  // another wire field.
+  //
+  // CLAIMED, not read, for the reason `processPreviewJobs` states: two daemons
+  // legitimately share one credential and both are handed the same array.
+  // Signalling twice is survivable; signalling twice with a recycle in between
+  // is the failure this whole comment is about.
+  const killing = new Set(); // job ids in flight on this tick
+
+  const postKill = async (body) => {
+    try {
+      await fetch(KILL_DONE_URL, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${FLEET_TOKEN}`,
+          'User-Agent': USER_AGENT,
+          'Content-Type': 'application/json',
+        },
+        signal: AbortSignal.timeout(30_000),
+        body: JSON.stringify({ ...body, instance: DAEMON_INSTANCE }),
+      });
+    } catch {
+      /* unsettled, and the server expires it — the asker is told, never spun */
+    }
+  };
+
+  const claimKill = async (id) => {
+    try {
+      const res = await fetch(KILL_CLAIM_URL, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${FLEET_TOKEN}`,
+          'User-Agent': USER_AGENT,
+          'Content-Type': 'application/json',
+        },
+        signal: AbortSignal.timeout(15_000),
+        body: JSON.stringify({ id, instance: DAEMON_INSTANCE }),
+      });
+      const j = await res.json().catch(() => null);
+      return j?.data?.claimed === true;
+    } catch {
+      return false; // the peer may hold it; doing nothing is the safe answer
+    }
+  };
+
+  /**
+   * Is this pid, RIGHT NOW, one of the things we told the browser about for
+   * this session? Two lanes, matching the two lists a row can come from.
+   *
+   * Deliberately re-measured rather than read from anything cached: a cache is
+   * exactly as old as the report the browser is acting on, and staleness is the
+   * hazard.
+   */
+  const killTargetOk = (sessionId, pid) => {
+    const groups = sessionGroups.get(sessionId);
+    if (groups && groups.size) {
+      const alive = liveGroups(groups);
+      const rows = measureProcesses(alive)?.rows ?? [];
+      if (rows.some((r) => r.pid === pid)) return true;
+    }
+    const wt = placeDir(sessionId);
+    if (wt) {
+      try {
+        if (measureListeners(wt).rows.some((r) => r.pid === pid)) return true;
+      } catch {
+        /* unmeasurable → not verified → refused, which is the safe direction */
+      }
+    }
+    return false;
+  };
+
+  const runKill = async (job) => {
+    const id = String(job.id);
+    const sessionId = String(job.sessionId || '');
+    const pid = Number(job.pid);
+    const signal = job.signal === 'KILL' ? 'SIGKILL' : 'SIGTERM';
+
+    if (!processesSupported()) {
+      await postKill({ id, outcome: 'unsupported' });
+      return;
+    }
+    if (!killTargetOk(sessionId, pid)) {
+      // Not a lie and not a failure: the process is genuinely no longer one of
+      // this tab's, which is the common case when somebody clicks a row that
+      // has since exited. The asker gets that sentence rather than a spinner.
+      await postKill({ id, outcome: 'not_found' });
+      return;
+    }
+    if (!(await claimKill(id))) return;
+    try {
+      process.kill(pid, signal);
+      await postKill({ id, outcome: 'signalled', signal });
+    } catch (e) {
+      // EPERM is the daemon-on-its-own-user posture doing exactly what it is
+      // for. Report it as its own word: "we may not" and "it was gone" are
+      // different sentences and the surface says which.
+      await postKill({ id, outcome: e?.code === 'ESRCH' ? 'not_found' : 'error', detail: String(e?.code || e) });
+    }
+  };
+
+  const processKillJobs = (jobs) => {
+    if (!Array.isArray(jobs) || jobs.length === 0) return;
+    for (const job of jobs.slice(0, 5)) {
+      const id = String(job?.id || '');
+      const pid = Number(job?.pid);
+      // Bounded at the boundary the same way sessionId and port already are.
+      // pid 1 is init and is never something a tab started; a signal there
+      // would ask the kernel to shut the box down.
+      if (!id || killing.has(id)) continue;
+      if (!Number.isInteger(pid) || pid <= 1 || pid > 4_294_967_295) continue;
+      if (!isSafePathSegment(String(job?.sessionId || ''))) continue;
+      killing.add(id);
+      void runKill(job).finally(() => killing.delete(id));
+    }
   };
 
   const processDiffJobs = (jobs) => {
@@ -2641,6 +2863,7 @@ export function createWorkManager({ repoRoot, baseDir, getBaseRef, getMcpUrl, ge
     processWorkTurns,
     processShipJobs,
     processDiffJobs,
+    processKillJobs,
     heldSessionIds,
     processPreviewJobs,
     livePreviewIds,

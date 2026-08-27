@@ -815,6 +815,7 @@ export async function runFleetDaemon() {
     processWorkTurns,
     processShipJobs,
     processDiffJobs,
+    processKillJobs,
     heldSessionIds,
     processPreviewJobs,
     livePreviewIds,
@@ -1586,6 +1587,11 @@ export async function runFleetDaemon() {
     // credential are both handed this array, and both opening a tunnel strands
     // a public hostname nobody can settle.
     processPreviewJobs(roster.previewJobs);
+    // One measured process a human asked to stop. Claimed before acted on for
+    // the same reason a share is, and re-verified against the kernel inside —
+    // the pid on this job is a request, never an authority, because pids are
+    // recycled and the row the browser clicked is up to a sweep old.
+    processKillJobs(roster.killJobs);
     // …and what the SURVIVING ones hold: branch, ahead-of-base, diffstat.
     // Throttled inside, never awaited — a `git status` the human cannot run
     // themselves from a browser, relayed. After retirement so a directory that

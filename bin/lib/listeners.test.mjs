@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { labelFromArgv } from './listeners.mjs';
+import { labelFromArgv, isChosenPort, byChosenThenPort } from './listeners.mjs';
 
 /**
  * WHAT TO CALL A LISTENING PROCESS.
@@ -39,4 +39,63 @@ test('it never relays more than the program name', () => {
 test('a degenerate argv is null, not an empty label', () => {
   assert.equal(labelFromArgv([]), null);
   assert.equal(labelFromArgv(['']), null);
+});
+
+/**
+ * CHOSEN vs KERNEL-ASSIGNED.
+ *
+ * `wrangler dev` opens nine listening sockets and exactly one is the dev URL.
+ * The driver's report of the real thing: "its hard to discern which one is the
+ * one to click to view the dev url." A socket opened on port 0 gets whatever
+ * the kernel had free; a port outside that range was named by somebody. That is
+ * a fact the box states about itself, not a guess about anybody's stack.
+ */
+test('a chosen port is one the kernel did not hand out', () => {
+  const linux = [32768, 60999]; // this box's real range
+  // The driver's actual nine, classified.
+  assert.equal(isChosenPort(3001, linux), true); // the dev URL
+  assert.equal(isChosenPort(9230, linux), true); // node's inspector
+  for (const p of [34051, 45593, 41285, 40529, 45947, 46315, 45971])
+    assert.equal(isChosenPort(p, linux), false);
+  // macOS starts its range much higher, which is exactly why the range is READ
+  // rather than assumed: 34051 is a chosen port on a Mac and is not on Linux.
+  assert.equal(isChosenPort(34051, [49152, 65535]), true);
+});
+
+test('an unreadable range classifies NOTHING — it never defaults to false', () => {
+  // Three states, and this is the one that costs a surface its honesty: absent
+  // must reach the browser as absent so it renders today's flat list, not as
+  // `false` which would mark every port on the box kernel-assigned.
+  assert.equal(isChosenPort(3001, null), undefined);
+  assert.equal(isChosenPort(3001, undefined), undefined);
+});
+
+/**
+ * THE CAP MUST NOT EAT THE ROW THAT MATTERS.
+ *
+ * Ordering was by port number, which is arbitrary with respect to importance —
+ * so a dev server on a high port could be the row the cap dropped, silently,
+ * with nothing on the wire saying anything had been cut.
+ */
+test('chosen ports sort first, so the cut falls on the tail nobody opens', () => {
+  const rows = [
+    { port: 45947, chosen: false },
+    { port: 8080, chosen: true },
+    { port: 34051, chosen: false },
+    { port: 3001, chosen: true },
+  ];
+  assert.deepEqual(
+    [...rows].sort(byChosenThenPort).map((r) => r.port),
+    [3001, 8080, 34051, 45947]
+  );
+});
+
+test('with no classification the order degrades to the old port sort', () => {
+  // An older kernel read, or a platform that would not say: `chosen` is absent
+  // on every row and this must stay stable rather than becoming arbitrary.
+  const rows = [{ port: 45947 }, { port: 3001 }, { port: 9230 }];
+  assert.deepEqual(
+    [...rows].sort(byChosenThenPort).map((r) => r.port),
+    [3001, 9230, 45947]
+  );
 });

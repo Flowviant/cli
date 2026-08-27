@@ -80,6 +80,28 @@ function pgrpOf(pid) {
   return Number.isInteger(pgrp) && pgrp > 0 ? pgrp : null;
 }
 
+/**
+ * Resident set size in BYTES for one pid, or null.
+ *
+ * Read from `VmRSS` in /proc/<pid>/status rather than from `statm`, whose
+ * second field is resident PAGES and would need a page size we would have to
+ * assume. 4096 is not universal — arm64 boxes run 16K pages — and a memory
+ * readout that is silently four times wrong on somebody's machine is worse than
+ * no readout at all. `status` states its own unit.
+ *
+ * Lives here rather than in `listeners.mjs` because it is a fact about a
+ * PROCESS; both scanners import it, so there is one implementation of the unit
+ * question and not two that can drift.
+ */
+export function rssBytes(pid) {
+  try {
+    const m = /^VmRSS:\s+(\d+)\s+kB$/m.exec(readFileSync(`/proc/${pid}/status`, 'utf8'));
+    return m ? Number(m[1]) * 1024 : null;
+  } catch {
+    return null; // gone between the scan and the read — ordinary
+  }
+}
+
 function cmdlineOf(pid) {
   try {
     const raw = readFileSync(`/proc/${pid}/cmdline`, 'utf8');
@@ -109,7 +131,8 @@ function scanLinux(pgids) {
     if (pid === pgrp) continue;
     const cmd = cmdlineOf(raw);
     if (!cmd) continue;
-    out.push({ pid, pgid: pgrp, cmd });
+    const rss = rssBytes(raw);
+    out.push({ pid, pgid: pgrp, cmd, ...(rss != null ? { rss } : {}) });
   }
   return out;
 }
@@ -117,7 +140,7 @@ function scanLinux(pgids) {
 function scanDarwin(pgids) {
   let text;
   try {
-    text = execFileSync('ps', ['-axo', 'pid=,pgid=,command='], {
+    text = execFileSync('ps', ['-axo', 'pid=,pgid=,rss=,command='], {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
       timeout: 5000,
@@ -128,13 +151,13 @@ function scanDarwin(pgids) {
   }
   const out = [];
   for (const line of text.split('\n')) {
-    const m = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line);
+    const m = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(.*)$/.exec(line);
     if (!m) continue;
     const pid = Number(m[1]);
     const pgid = Number(m[2]);
     if (!pgids.has(pgid) || pid === pgid) continue;
-    const cmd = m[3].trim();
-    if (cmd) out.push({ pid, pgid, cmd });
+    const cmd = m[4].trim();
+    if (cmd) out.push({ pid, pgid, cmd, rss: Number(m[3]) * 1024 }); // ps reports KB
   }
   return out;
 }
@@ -146,18 +169,36 @@ function scanDarwin(pgids) {
  * "looked, found none" and is a different fact a surface renders differently.
  */
 export function processesInGroups(pgids, { scrub } = {}) {
+  const m = measureProcesses(pgids, { scrub });
+  return m === null ? null : m.rows;
+}
+
+/**
+ * …and the TOTAL the cap was applied to.
+ *
+ * The rows alone are a lie about scale the moment a group has more than twelve
+ * members: a dashboard summing them states an incomplete figure as a complete
+ * one. Same rule the listener list and the Repository block's worktree counts
+ * keep — the capped list rides beside the count it was cut from, or it answers
+ * "how much is in here" with a number that is not true.
+ */
+export function measureProcesses(pgids, { scrub } = {}) {
   if (!processesSupported()) return null;
   const want = pgids instanceof Set ? pgids : new Set(pgids ?? []);
-  if (want.size === 0) return [];
+  if (want.size === 0) return { rows: [], total: 0 };
   const rows = platform() === 'darwin' ? scanDarwin(want) : scanLinux(want);
   // Oldest first: a pid is monotonic, so the long-running watcher you started
   // an hour ago sorts above the `sh -c` spawned two seconds ago. Cutting from
   // the END keeps the durable processes and drops the churn.
   rows.sort((a, b) => a.pid - b.pid);
-  return rows.slice(0, MAX_PROCS).map((r) => ({
+  const capped = rows.slice(0, MAX_PROCS).map((r) => ({
     pid: r.pid,
     cmd: String(scrub ? scrub(r.cmd) : r.cmd).slice(0, MAX_CMD),
+    // Absent rather than zero where it could not be read: a watcher using no
+    // memory is not a thing, so a 0 here would only ever mean "we failed".
+    ...(r.rss != null ? { rss: r.rss } : {}),
   }));
+  return { rows: capped, total: rows.length };
 }
 
 /**

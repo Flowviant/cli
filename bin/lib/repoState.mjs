@@ -32,7 +32,7 @@
  */
 
 import { execFileSync } from 'node:child_process';
-import { listenersIn, listenersSupported } from './listeners.mjs';
+import { measureListeners, listenersSupported } from './listeners.mjs';
 
 /** Same cap the session diffstat uses: enough to see the shape, small enough
  *  that one machine cannot flood a row. */
@@ -162,7 +162,13 @@ export function repoState(repoRoot, baseRef) {
    * Reported, not offered: this is a readout of what is up. Sharing one is a
    * separate act with its own gates (see previewJobs).
    */
-  const listening = listenersIn(repoRoot);
+  // The TOTAL beside the capped rows, for the reason every other capped list
+  // here carries one: a list silently cut at twelve answers "what is running in
+  // the checkout" with a number that is not true, and `wrangler dev` alone
+  // opens nine.
+  const lis = measureListeners(repoRoot);
+  const listening = lis.rows;
+  const listeningTotal = lis.total;
   const wt = worktrees ?? [];
   const br = branches ?? [];
   const sessionRows = br.filter((b) => b.session);
@@ -194,6 +200,7 @@ export function repoState(repoRoot, baseRef) {
       ? { sessionBranchesUnshipped: sessionRows.filter((b) => b.ahead > 0).length }
       : {}),
     listening,
+    listeningTotal,
     // "Nothing is listening" and "this machine cannot look" (Windows, a failed
     // scan) are the same empty array without this — and the second must never
     // render as the first. Same field, same reason, as the session report.
