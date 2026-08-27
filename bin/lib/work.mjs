@@ -41,7 +41,7 @@ import {
 import { git, gitRaw, splitNul, baseBranchName, isSafePathSegment } from './git.mjs';
 import { listenersIn, measureListeners, listenersSupported } from './listeners.mjs';
 import { measureProcesses, liveGroups, processesSupported } from './processes.mjs';
-import { mutateRegistry, readRegistry } from './procRegistry.mjs';
+import { mutateRegistry, processAlive, readRegistry } from './procRegistry.mjs';
 import { createPlaceLock } from './placeLock.mjs';
 import { sweepMergedBranch } from './shipSweep.mjs';
 import { mergeOutward as shipMergeOutward } from './shipMerge.mjs';
@@ -107,7 +107,15 @@ function brainFor(job) {
   return out;
 }
 
-export function createWorkManager({ repoRoot, baseDir, getBaseRef, getMcpUrl, getLeaseTtl }) {
+export function createWorkManager({
+  repoRoot,
+  baseDir,
+  getBaseRef,
+  getMcpUrl,
+  getLeaseTtl,
+  /** "The repo picture changed — look again." See the caller in fleet.mjs. */
+  onRepoChanged = () => {},
+}) {
   /**
    * WHERE SHIP LANDS, read fresh every time rather than captured at startup.
    *
@@ -319,6 +327,19 @@ export function createWorkManager({ repoRoot, baseDir, getBaseRef, getMcpUrl, ge
       // The report has landed, so the idempotency path no longer needs the
       // branch to exist. See `sweepMergedSessionBranch`.
       sweepMergedSessionBranch(sessionId);
+      // AND THE DIFFSTAT IS NOW WRONG BY DEFINITION. A ship folds base in,
+      // merges the tip out and deletes the branch, so a fresh measurement reads
+      // `ahead: 0` with an empty diffstat — and without this the rail keeps
+      // rendering the ENTIRE pre-ship diff while the transcript two hundred
+      // pixels away says "Shipped to main". The ship button re-arms over a
+      // branch that is already merged. Same rule the kill path just learned:
+      // an action that changes what the machine would measure must cause a new
+      // measurement, and the 60s sweep is not that.
+      void reportPlaceWorktrees(sessionId).catch(() => {});
+      // …and the REPO picture changed too: the session branch is gone and base
+      // moved. Without this the Repository block keeps counting a branch the
+      // ship just deleted.
+      onRepoChanged();
     }
     return r;
   };
@@ -591,10 +612,42 @@ export function createWorkManager({ repoRoot, baseDir, getBaseRef, getMcpUrl, ge
       ...(title ? { title } : {}),
     };
   };
-  /** One session, now — called after its turn settles. */
+  /** One session, now. */
   const reportSessionWorktree = async (sessionId) => {
     const r = sessionWorktreeReport(sessionId);
     if (r) await postWorktrees([r]);
+  };
+
+  /**
+   * …AND EVERY OTHER TAB STANDING IN THE SAME DIRECTORY.
+   *
+   * One tab is not one directory any more. Since tabs moved into the driver's
+   * own folder, every tab a person owns resolves to the SAME place — so a turn
+   * in tab A changed the directory tab B is also describing, and only tab A was
+   * re-measured. Tab B went on rendering its pre-turn `+A −D` for up to a
+   * minute, which makes the tab strip visibly disagree with itself about one
+   * directory. That is the "why are two tabs showing one dev server" confusion
+   * the places readout exists to END, arriving through the diffstat instead.
+   *
+   * It fires on EVERY turn, every ship and every stop, which is what made this
+   * the most-hit instance of the rule and the least visible: nothing is wrong
+   * on the tab you are looking at.
+   *
+   * Bounded by the live set the roster last handed us, and the reports go in
+   * ONE post — the endpoint is already batched, and a tab per request would
+   * turn a five-tab place into five round trips on every settle.
+   */
+  const reportPlaceWorktrees = async (sessionId) => {
+    const place = placeOf(sessionId);
+    const ids = [sessionId];
+    // `worktreeSeen` is the roster's own live set, pruned to `activeWorkSessions`
+    // on every sweep — so this can never report a tab that has closed, and it
+    // needs no second source of truth about which tabs exist.
+    for (const id of worktreeSeen) {
+      if (id !== sessionId && placeOf(id) === place) ids.push(id);
+    }
+    const reports = ids.map(sessionWorktreeReport).filter(Boolean);
+    if (reports.length) await postWorktrees(reports);
   };
   /** Every live session, throttled — called from the reconcile loop. */
   /**
@@ -1070,6 +1123,30 @@ export function createWorkManager({ repoRoot, baseDir, getBaseRef, getMcpUrl, ge
     return false;
   };
 
+  /**
+   * How long to watch for the process to actually go before answering.
+   *
+   * SIGTERM is a REQUEST, not an event: a dev server traps it and tears down
+   * its children, which takes a beat. Answering the instant the signal returns
+   * would report "signalled" over a process that is about to die, and the
+   * surface would then offer Force stop on something already on its way out.
+   *
+   * Four seconds is long enough for the ordinary teardown and short enough that
+   * a person is still looking at the row. Past it the honest answer is that the
+   * signal landed and the thing is still there — which is a real state, and the
+   * one where escalating actually means something.
+   */
+  const KILL_GRACE_MS = 4000;
+
+  const waitForExit = async (pid) => {
+    const until = Date.now() + KILL_GRACE_MS;
+    while (Date.now() < until) {
+      if (!processAlive(pid)) return true;
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    return !processAlive(pid);
+  };
+
   const runKill = async (job) => {
     const id = String(job.id);
     const sessionId = String(job.sessionId || '');
@@ -1083,19 +1160,56 @@ export function createWorkManager({ repoRoot, baseDir, getBaseRef, getMcpUrl, ge
     if (!killTargetOk(sessionId, pid)) {
       // Not a lie and not a failure: the process is genuinely no longer one of
       // this tab's, which is the common case when somebody clicks a row that
-      // has since exited. The asker gets that sentence rather than a spinner.
+      // has since exited. The asker gets that sentence rather than a spinner —
+      // and the RE-MEASURE below is what takes the stale row off their screen,
+      // since a row you can click for something already gone is the readout
+      // being behind, not the person being wrong.
       await postKill({ id, outcome: 'not_found' });
+      await remeasureAfterKill(sessionId);
       return;
     }
     if (!(await claimKill(id))) return;
     try {
       process.kill(pid, signal);
-      await postKill({ id, outcome: 'signalled', signal });
+      // WHAT HAPPENED, not what we did. "We sent a signal" is a fact about us;
+      // "it stopped" is a fact about the machine, and the machine is standing
+      // right here able to check. Reporting the weaker word would also make the
+      // Force stop offer wrong for the whole window, since escalating only
+      // means something while the process is genuinely still there.
+      const gone = await waitForExit(pid);
+      await postKill({ id, outcome: gone ? 'stopped' : 'signalled', signal });
     } catch (e) {
       // EPERM is the daemon-on-its-own-user posture doing exactly what it is
       // for. Report it as its own word: "we may not" and "it was gone" are
       // different sentences and the surface says which.
       await postKill({ id, outcome: e?.code === 'ESRCH' ? 'not_found' : 'error', detail: String(e?.code || e) });
+    }
+    await remeasureAfterKill(sessionId);
+  };
+
+  /**
+   * THE LIST THE PERSON IS LOOKING AT WAS MEASURED BEFORE ANY OF THIS.
+   *
+   * Without this the row survives the thing it describes: the panel renders the
+   * last sweep's `listening`, the sweep is on a SIXTY-SECOND beat, and the
+   * reported outcome sits next to a port row still claiming to be live. The
+   * first person to use it said exactly that — "i clicked stop on the listening
+   * but its still running… then it finally disappears".
+   *
+   * The rule it was missing is one this file already keeps everywhere else: an
+   * action that changes what the machine would measure must cause a new
+   * measurement. A turn settling does it; a kill did not. `reportSessionWorktree`
+   * is the un-throttled per-session path built for precisely this and it was
+   * being called from exactly one place.
+   *
+   * Never awaited by the caller's answer path: the outcome is posted first, so
+   * a slow re-measure can delay the list but never the sentence.
+   */
+  const remeasureAfterKill = async (sessionId) => {
+    try {
+      await reportPlaceWorktrees(sessionId);
+    } catch {
+      /* the 60s sweep still carries it — this only makes it prompt */
     }
   };
 
@@ -1383,6 +1497,9 @@ export function createWorkManager({ repoRoot, baseDir, getBaseRef, getMcpUrl, ge
         git(['worktree', 'add', '-b', branch, wt, at], repoRoot);
       } catch {
         git(['worktree', 'prune'], repoRoot);
+        // A directory and a branch just stopped existing. The Repository block
+        // would otherwise keep listing both until its own 60s scan came round.
+        onRepoChanged();
         try {
           // The branch may already exist (a retired directory's work) — attach.
           git(['worktree', 'add', wt, branch], repoRoot);
@@ -2474,7 +2591,7 @@ export function createWorkManager({ repoRoot, baseDir, getBaseRef, getMcpUrl, ge
           // written half a file, and the tab should show that honestly). NOT
           // awaited: this runs inside the session's chain, and a slow POST
           // would delay the next turn of that tab behind a readout.
-          void reportSessionWorktree(job.sessionId).catch(() => {});
+          void reportPlaceWorktrees(job.sessionId).catch(() => {});
         }
       });
     }

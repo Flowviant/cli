@@ -831,6 +831,24 @@ export async function runFleetDaemon() {
     getBaseRef,
     getMcpUrl: () => mcpUrl,
     getLeaseTtl: () => leaseTtlSeconds,
+    /**
+     * "THE REPO JUST CHANGED — look again."
+     *
+     * `maybeReportRepoState` is on its own 60s wall clock and nothing ever
+     * reset it, so every Flowviant action that alters the branch/worktree
+     * picture — a ship deleting the merged branch, retirement removing a
+     * directory and pruning, a tab being cut — left the rail's Repository block
+     * listing things that no longer exist for up to a minute. It is the same
+     * rule the diffstat just learned: an action that changes what the machine
+     * would measure must cause a new measurement.
+     *
+     * A callback rather than an export because work.mjs is imported BY this
+     * file, so it cannot import back. Clearing the timestamp is enough — the
+     * next reconcile does the scan, on the beat it already runs.
+     */
+    onRepoChanged: () => {
+      repoStateScanAt = 0;
+    },
   });
   workShutdown = shutdownWork; // teardown can now reach the live session CLIs
 

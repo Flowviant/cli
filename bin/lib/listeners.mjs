@@ -261,6 +261,15 @@ function scanLinux(worktree) {
       continue; // not ours, or gone
     }
     if (!inside(cwd)) continue;
+    // NEVER THE DAEMON ITSELF. `startAuthProxy` binds a loopback port IN THIS
+    // PROCESS to gate a preview, and the daemon's own cwd is inside the
+    // checkout — so the gate was attributed to the repo place and surfaced as
+    // a listener the operator could click Stop on. Stopping it would take down
+    // the door in front of a live share, and it is not a thing anybody
+    // started: it is us. Same rule `processes.mjs` keeps by never reporting the
+    // group leader, for the same reason — a process that IS Flowviant is not a
+    // process Flowviant reports.
+    if (Number(pid) === process.pid) continue;
 
     let fds;
     try {
@@ -334,8 +343,11 @@ function scanDarwin(worktree) {
   } catch {
     /* no memory on this box — rows simply carry no rss */
   }
+  const self = String(process.pid);
   for (const line of lsof(['-nP', '-iTCP', '-sTCP:LISTEN', '-F', 'pn']).split('\n')) {
-    if (line.startsWith('p')) pid = line.slice(1);
+    // The daemon's own preview gate is not something the driver started — see
+    // the linux branch for the whole argument.
+    if (line.startsWith('p')) pid = line.slice(1) === self ? null : line.slice(1);
     else if (line.startsWith('n') && pid) {
       const m = /:(\d+)$/.exec(line.slice(1));
       if (!m) continue;
