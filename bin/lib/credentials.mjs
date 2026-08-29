@@ -136,6 +136,40 @@ export function projectLabel(e) {
   return e?.name ?? (e?.projectId ? `project ${e.projectId.slice(0, 8)}…` : 'an unnamed project');
 }
 
+/** Collapse a name or slug for loose comparison: "My Project", "my-project"
+ *  and "myproject" all become "myproject". */
+function normalizeName(s) {
+  return String(s ?? '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, '');
+}
+
+/**
+ * WHICH stored project most likely goes with this repo — a HINT for the
+ * picker's default, and DELIBERATELY not a licence to serve it. `resolveStored
+ * Credential` matches by repo PATH and refuses to guess past that, because
+ * serving a project the path did not name is the "it said skadooble in my
+ * calendar repo" surprise this whole file exists to prevent. A name that
+ * matches the repo's folder or its github repo-name is softer evidence — good
+ * enough to put the cursor on that row so the answer is one keypress, never
+ * good enough to skip the human. Two names can collide (a project "api" and a
+ * repo "api"), which is exactly why this only pre-selects.
+ *
+ * Returns the index of a UNIQUE match, or -1 when nothing matches or more than
+ * one does — an ambiguous hint is not a hint, and a default that is as likely
+ * wrong as right is worse than starting at the top.
+ */
+export function likelyChoiceIndex(choices, { repoBasename, repoSlugName } = {}) {
+  const wants = new Set([normalizeName(repoBasename), normalizeName(repoSlugName)].filter(Boolean));
+  if (wants.size === 0) return -1;
+  const hits = [];
+  choices.forEach((e, i) => {
+    const n = normalizeName(e?.name);
+    if (n && wants.has(n)) hits.push(i);
+  });
+  return hits.length === 1 ? hits[0] : -1;
+}
+
 function mutate(fn) {
   const f = readFile() ?? {};
   if (!f.projects || typeof f.projects !== 'object') f.projects = {};

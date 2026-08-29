@@ -244,7 +244,7 @@ if (process.argv[2] === 'env') {
 // two TTYs and cannot be asked anything — the first read raises SIGTTIN and the
 // kernel STOPS the process, which is why 0.55.2's timeout did not save it (a
 // stopped process runs no timers). See tty.mjs.
-const { canPrompt, askWithTimeout } = await import('./lib/tty.mjs');
+const { canPrompt, askWithTimeout, selectMenu, menuSupported } = await import('./lib/tty.mjs');
 const interactive = canPrompt() && process.env.FLOWVIANT_REEXEC !== '1';
 
 /** How long the one-time binding confirm waits before serving unbound. A person
@@ -285,6 +285,8 @@ if (!FLEET_TOKEN) {
   }
   if (CREDENTIAL.choices?.length && interactive) {
     const creds = await import('./lib/credentials.mjs');
+    const { originSlug } = await import('./lib/git.mjs');
+    const { basename } = await import('node:path');
     const { choices, repoRoot } = CREDENTIAL;
     console.log(
       CREDENTIAL.reason === 'outside-repo'
@@ -293,27 +295,78 @@ if (!FLEET_TOKEN) {
           ? `More than one connected project names this repo (${repoRoot}) — pick which one this daemon serves:`
           : `This repo (${repoRoot}) is not connected to any project yet. Connected on this machine:`
     );
-    console.log(listLines(choices, creds));
-    console.log(`  ${choices.length + 1}. connect ${repoRoot ? 'this repo' : 'a repo'} to a different project (flowviant login)`);
+
+    const loginLabel = `connect ${repoRoot ? 'this repo' : 'a repo'} to a different project (flowviant login)`;
+    // WHICH ONE LOOKS RIGHT — a pre-selection, never an auto-serve. The resolver
+    // refuses to serve a project the repo PATH did not name (the skadooble law);
+    // this only decides which row the cursor starts on, using the repo's folder
+    // name and its github repo-name against the stored project names. A unique
+    // match becomes ONE keypress; a wrong guess costs nothing, because the human
+    // still confirms. `multiple-bound` gets no hint — every choice already names
+    // this repo, so nothing distinguishes them.
+    const slug = repoRoot ? originSlug(repoRoot) : null;
+    const likely =
+      CREDENTIAL.reason === 'multiple-bound'
+        ? -1
+        : creds.likelyChoiceIndex(choices, {
+            repoBasename: repoRoot ? basename(repoRoot) : null,
+            repoSlugName: slug ? slug.split('/')[1] : null,
+          });
+
     // Bounded like the confirm below, and for the same reason — but silence
     // means something DIFFERENT here and the difference is load-bearing. There
     // is a real ambiguity to resolve; serving a guess is the skadooble bug.
     // So no answer REFUSES, which is exactly what this branch already does
     // headless, and the message says how to answer without being present.
-    const raw = await askWithTimeout(
-      `Which project should this daemon serve? [1-${choices.length + 1}] `,
-      PICK_TIMEOUT_MS
-    );
-    if (raw === null) {
-      console.error(
-        `\nno answer in ${Math.round(PICK_TIMEOUT_MS / 1000)}s — nothing started. ` +
-          `Name one with \`--project <name|id>\`, or run \`flowviant\` here in the foreground and pick.`
-      );
-      process.exit(1);
+    let chosen = null; // 0-based into [...choices, login]
+    if (menuSupported()) {
+      const rowLabel = (e) =>
+        creds.projectLabel(e) + (e.repoRoot ? `  — connected for ${e.repoRoot}` : '  — not tied to a repo yet');
+      const options = [...choices.map(rowLabel), loginLabel];
+      // Say WHY the cursor starts where it does — "intuitive" made visible.
+      if (likely >= 0) options[likely] += '   ← looks like this repo';
+      const res = await selectMenu({
+        options,
+        defaultIndex: likely >= 0 ? likely : 0,
+        timeoutMs: PICK_TIMEOUT_MS,
+      });
+      if (res.timedOut) {
+        console.error(
+          `\nno answer in ${Math.round(PICK_TIMEOUT_MS / 1000)}s — nothing started. ` +
+            `Name one with \`--project <name|id>\`, or run \`flowviant\` here in the foreground and pick.`
+        );
+        process.exit(1);
+      }
+      if (res.cancelled) {
+        console.error('nothing chosen — nothing started.');
+        process.exit(1);
+      }
+      if (!res.unsupported) chosen = res.index;
     }
-    const n = Number.parseInt(raw, 10);
-    if (n === choices.length + 1) await reexecAfterLogin();
-    const picked = Number.isInteger(n) ? choices[n - 1] : undefined;
+    if (chosen === null) {
+      // Numeric fallback — a pipe, or a terminal without raw mode. Empty Enter
+      // takes the likely default when there is one, so it is one keystroke here
+      // too.
+      console.log(listLines(choices, creds));
+      console.log(`  ${choices.length + 1}. ${loginLabel}`);
+      const hint = likely >= 0 ? ` (enter for ${creds.projectLabel(choices[likely])})` : '';
+      const raw = await askWithTimeout(
+        `Which project should this daemon serve? [1-${choices.length + 1}]${hint} `,
+        PICK_TIMEOUT_MS
+      );
+      if (raw === null) {
+        console.error(
+          `\nno answer in ${Math.round(PICK_TIMEOUT_MS / 1000)}s — nothing started. ` +
+            `Name one with \`--project <name|id>\`, or run \`flowviant\` here in the foreground and pick.`
+        );
+        process.exit(1);
+      }
+      const n = raw === '' && likely >= 0 ? likely + 1 : Number.parseInt(raw, 10);
+      chosen = Number.isInteger(n) ? n - 1 : -1;
+    }
+
+    if (chosen === choices.length) await reexecAfterLogin();
+    const picked = chosen >= 0 ? choices[chosen] : undefined;
     if (!picked) {
       console.error('nothing chosen — nothing started.');
       process.exit(1);

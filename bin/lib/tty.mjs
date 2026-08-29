@@ -109,3 +109,126 @@ export async function askWithTimeout(query, timeoutMs) {
     process.off('SIGTTOU', noop);
   }
 }
+
+/**
+ * Can we draw an arrow-navigable menu? Raw mode is what turns ↑/↓ into
+ * keystrokes we receive one at a time; without `setRawMode` (a pipe, a
+ * terminal that refuses raw input) there is nothing to drive, and the caller
+ * falls back to the numeric prompt rather than drawing a menu nobody can move.
+ * `canPrompt()` still gates whether we ask AT ALL — this only decides HOW.
+ */
+export function menuSupported() {
+  return Boolean(
+    process.stdin.isTTY && process.stdout.isTTY && typeof process.stdin.setRawMode === 'function'
+  );
+}
+
+/**
+ * The menu's key handling, PURE so it can be tested without a terminal. Given a
+ * keypress and the current cursor, returns exactly one intent:
+ *   { index }   move the highlight (arrows wrap; k/j vim-style; g/G ends)
+ *   { choose }  take a row (Enter takes the highlight; 1–9 jump-and-take)
+ *   { cancel }  Esc, q, or Ctrl-C — nothing chosen
+ *   null        a key we ignore
+ * A number past the end is ignored, not clamped: pressing 9 in a 3-row list
+ * must not silently select row 3.
+ */
+export function menuKey(key, { index, count }) {
+  if (key === '\x03' || key === '\x1b' || key === 'q' || key === 'Q') return { cancel: true };
+  if (key === '\r' || key === '\n') return { choose: index };
+  if (key === '\x1b[A' || key === 'k') return { index: (index - 1 + count) % count };
+  if (key === '\x1b[B' || key === 'j') return { index: (index + 1) % count };
+  if (key === '\x1b[H' || key === 'g') return { index: 0 };
+  if (key === '\x1b[F' || key === 'G') return { index: count - 1 };
+  if (/^[1-9]$/.test(key)) {
+    const n = Number(key) - 1;
+    return n < count ? { choose: n } : null;
+  }
+  return null;
+}
+
+const MENU_FOOTER = '↑/↓ move · enter select · 1–9 jump · esc cancel';
+
+/**
+ * An arrow-navigable picker for the start path. Resolves one of:
+ *   { index }        the row taken
+ *   { cancelled }    Esc/q/Ctrl-C
+ *   { timedOut }     nobody drove it within timeoutMs
+ *   { unsupported }  no raw mode — the caller uses the numeric prompt instead
+ *
+ * Held to this file's one law — no start-path prompt may hang the daemon — the
+ * same way `askWithTimeout` is: it keeps the timeout, installs the
+ * SIGTTIN/SIGTTOU no-ops that keep that timer alive, restores the terminal in
+ * every exit, and refuses (returns `unsupported`) rather than half-drawing when
+ * raw mode is not really there. The caller still gates on `canPrompt()` before
+ * ever reaching here.
+ */
+export async function selectMenu({ options, defaultIndex = 0, timeoutMs }) {
+  if (!menuSupported()) return { unsupported: true };
+  const stdin = process.stdin;
+  const out = process.stdout;
+  const count = options.length;
+  if (count === 0) return { unsupported: true };
+  let index = Math.min(Math.max(defaultIndex | 0, 0), count - 1);
+
+  const width = Math.max(24, (out.columns || 80) - 2);
+  const clip = (s) => (s.length > width ? s.slice(0, width - 1) + '…' : s);
+  const frame = () =>
+    options
+      .map((o, i) => (i === index ? `\x1b[7m> ${clip(o)}\x1b[0m` : `  ${clip(o)}`))
+      .join('\n') +
+    '\n' +
+    `\x1b[2m  ${MENU_FOOTER}\x1b[0m`;
+  const lineCount = count + 1; // rows + footer
+
+  let rendered = false;
+  const draw = () => {
+    if (rendered) out.write(`\x1b[${lineCount}A`); // back to the top of our block
+    out.write('\r\x1b[0J'); // clear from here to the end of the screen
+    out.write(frame() + '\n');
+    rendered = true;
+  };
+
+  const noop = () => {};
+  return await new Promise((resolve) => {
+    let done = false;
+    const finish = (result) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      stdin.removeListener('data', onData);
+      try {
+        stdin.setRawMode(false);
+      } catch {
+        /* already restored / gone */
+      }
+      stdin.pause();
+      process.off('SIGTTIN', noop);
+      process.off('SIGTTOU', noop);
+      out.write('\x1b[?25h'); // show the cursor again
+      resolve(result);
+    };
+    const onData = (buf) => {
+      const action = menuKey(buf.toString('utf8'), { index, count });
+      if (!action) return;
+      if (action.cancel) return finish({ cancelled: true });
+      if (action.choose !== undefined) return finish({ index: action.choose });
+      if (action.index !== undefined) {
+        index = action.index;
+        draw();
+      }
+    };
+    process.on('SIGTTIN', noop);
+    process.on('SIGTTOU', noop);
+    const timer = setTimeout(() => finish({ timedOut: true }), timeoutMs);
+    try {
+      stdin.setRawMode(true);
+    } catch {
+      return finish({ unsupported: true });
+    }
+    stdin.resume();
+    out.write('\x1b[?25l'); // hide the cursor while we own the block
+    draw();
+    stdin.on('data', onData);
+  });
+}
