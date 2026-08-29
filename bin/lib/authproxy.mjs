@@ -32,10 +32,45 @@
  *  - NEVER 302 A WEBSOCKET UPGRADE. Browsers do not follow 3xx on an upgrade,
  *    they fail the connection — HMR would break in a way that looks like a dead
  *    dev server. A cookie-less upgrade stays a 401.
- *  - `SameSite=Lax` is chosen, so this gate CANNOT be embedded in a
- *    cross-site iframe. The Workbench must not try; making it work would mean
- *    `SameSite=None`, which is a different security posture and a conscious
- *    re-argument, not a quiet flag change.
+ *  - THE FRAME IS THE APP'S AND ONLY THE APP'S (0.72.0, and this reverses the
+ *    old "cannot be embedded, the Workbench must not try" rule deliberately —
+ *    the Workbench now DOES frame the share, so both halves are re-argued
+ *    here). Two changes, one per blocker:
+ *    (a) THE COOKIE. `SameSite=Lax` is kept for a top-level visit — it is the
+ *        CSRF boundary and works in every browser ever shipped. A FRAMED
+ *        navigation (`Sec-Fetch-Dest: iframe`) instead gets `SameSite=None;
+ *        Partitioned` (CHIPS): partitioning keys the cookie to the top-level
+ *        site that framed it, so evil.com framing this hostname gets its OWN
+ *        empty jar, never the viewer's grant — which is why None here is not
+ *        the CSRF hole it would be unpartitioned. Branching on Sec-Fetch-Dest
+ *        rather than always sending both attributes matters: Safari 18.5–26.1
+ *        DROPPED any Set-Cookie carrying `Partitioned` outright, so stamping it
+ *        unconditionally would have broken the working top-level path on those
+ *        builds. A browser too old to send Sec-Fetch-Dest gets Lax and the
+ *        frame fails exactly as it always did — Open remains the escape.
+ *        AND THE PARTITIONING CLAIM HAS A BACKSTOP, because one browser class
+ *        breaks it: Chromium 76–113 (and same-vintage webviews/forks) sends
+ *        Sec-Fetch-Dest — so it takes this branch — while ignoring the
+ *        `Partitioned` attribute it has never heard of, storing a PLAIN
+ *        unpartitioned SameSite=None cookie: the exact CSRF hole the sentence
+ *        above says partitioning prevents. So `crossSiteAbuse` refuses a
+ *        GRANT-authenticated request that Fetch Metadata marks cross-site
+ *        unless it is a top-level GET/HEAD navigation (the Open link, the
+ *        frame's own src). Every browser in the vulnerable class sends
+ *        Sec-Fetch-Site (it shipped alongside Dest), a browser sending
+ *        neither never got a None cookie in the first place, and the password
+ *        path is exempt — Basic auth is never attached cross-site by a
+ *        browser, so curl and Playwright feel nothing.
+ *    (b) THE FRAME POLICY. In grant mode the forwarded response's frame policy
+ *        is REWRITTEN to `frame-ancestors 'self' <app origin>` (origin taken
+ *        from `authorizeUrl`, the one app fact this gate already holds). That
+ *        permits exactly ONE cross-origin framer — the app the viewer is
+ *        already authenticated to — instead of switching clickjacking
+ *        protection off for everyone; enforced `frame-ancestors` outranks
+ *        `X-Frame-Options` in every current engine, and the stripped XFO is
+ *        the belt-and-braces for the rest. Password-only mode rewrites
+ *        NOTHING: there is no app origin to allow and no cookie that could
+ *        authenticate a frame, so the origin's own policy stands verbatim.
  *
  * Three things this file gets wrong easily, all of them fixed here and all of
  * them worth keeping fixed:
@@ -155,6 +190,95 @@ export function startAuthProxy({ targetPort, log, onAbuse, grantSecret, shareId,
 
   const authed = (req) => credential(req) === 'ok';
 
+  /**
+   * The CSRF backstop for the partitioned cookie (header rule 4a): a browser
+   * old enough to ignore `Partitioned` while honouring `SameSite=None` will
+   * attach the grant to cross-site requests, so a request that FETCH METADATA
+   * says is cross-site is refused unless it is a plain navigation GET/HEAD —
+   * the two shapes this product legitimately serves cross-site (the Open
+   * link, the Workbench frame's own src; a rendered attacker frame is then
+   * stopped by the frame-ancestors rewrite). Applies ONLY to grant-cookie
+   * auth: a password in an Authorization header is never attached cross-site
+   * by a browser, and clients that send no Sec-Fetch headers never held a
+   * None cookie, so absence stays permitted.
+   */
+  const crossSiteAbuse = (req) => {
+    if (String(req.headers['sec-fetch-site'] || '').toLowerCase() !== 'cross-site') return false;
+    const mode = String(req.headers['sec-fetch-mode'] || '').toLowerCase();
+    // Cross-site fetch/XHR/img/script with the cookie — nothing legitimate
+    // looks like this: the framed app's own subresources are same-origin.
+    if (mode && mode !== 'navigate') return true;
+    // A cross-site POST navigation is the classic auto-submitted CSRF form.
+    return !(req.method === 'GET' || req.method === 'HEAD');
+  };
+
+  /** True when THIS request authenticated with the password rather than the
+   *  cookie — the credential class CSRF cannot ride. */
+  const viaPassword = (req) => sameSecret(req.headers['authorization'], expected);
+
+  /** The one app fact this gate holds: the origin allowed to frame us. Derived
+   *  from `authorizeUrl` (server-built from PUBLIC_APP_URL) rather than a new
+   *  wire field, so an older server changes nothing and no floor is needed. */
+  let appOrigin = null;
+  try {
+    if (grants) appOrigin = new URL(authorizeUrl).origin;
+  } catch {
+    appOrigin = null;
+  }
+
+  /**
+   * Replace the origin's frame policy with ours: `frame-ancestors 'self'
+   * <app origin>`. Rules that must survive any edit:
+   *  - REWRITE the directive inside an existing enforced CSP, never append a
+   *    second policy beside it — multiple CSP headers intersect, so an origin
+   *    `frame-ancestors 'none'` would still win over anything we added.
+   *  - APPEND a policy holding only our directive when the origin stated no
+   *    frame-ancestors at all — a public tunnel hostname deserves a frame
+   *    policy even when localhost never needed one.
+   *  - LEAVE Report-Only alone: browsers ignore frame-ancestors there, and
+   *    rewriting a report channel would be editing the driver's telemetry.
+   *  - DELETE X-Frame-Options: an enforced frame-ancestors makes every current
+   *    engine ignore it anyway; deleting is for the stragglers.
+   */
+  const framePolicy = () => `frame-ancestors 'self' ${appOrigin}`;
+  const rewriteFramePolicy = (headers) => {
+    if (!grants || !appOrigin) return headers;
+    const out = { ...headers };
+    delete out['x-frame-options'];
+    let sawDirective = false;
+    // Node joins duplicate response headers with ', ', so one string can hold
+    // SEVERAL policies (comma-separated), each holding several directives
+    // (semicolon-separated). Split on BOTH levels or replacing a directive
+    // eats the tail of a neighbouring policy — CSP source lists never contain
+    // a comma, so the outer split is safe.
+    const rewriteOne = (v) =>
+      String(v)
+        .split(',')
+        .map((policy) =>
+          policy
+            .split(';')
+            .map((part) => {
+              if (/^\s*frame-ancestors(\s|$)/i.test(part)) {
+                sawDirective = true;
+                return ` ${framePolicy()}`;
+              }
+              return part;
+            })
+            .join(';')
+        )
+        .join(',');
+    const csp = out['content-security-policy'];
+    if (csp !== undefined) {
+      out['content-security-policy'] = Array.isArray(csp) ? csp.map(rewriteOne) : rewriteOne(csp);
+    }
+    if (!sawDirective) {
+      const existing = out['content-security-policy'];
+      if (existing === undefined) out['content-security-policy'] = framePolicy();
+      else out['content-security-policy'] = Array.isArray(existing) ? [...existing, framePolicy()] : [existing, framePolicy()];
+    }
+    return out;
+  };
+
   // The gate credential is OURS and stops here. Everything else is passed
   // through untouched: the origin is the driver's own dev server and rewriting
   // its request would be us editing their app's input.
@@ -234,12 +358,18 @@ export function startAuthProxy({ targetPort, log, onAbuse, grantSecret, shareId,
     if (!r.ok) return challenge(res);
     const to = safeRelative(u.searchParams.get('to'));
     const maxAge = Math.max(0, r.payload.exp - Math.floor(Date.now() / 1000));
+    // FRAMED means Partitioned (header rule 4a). Sec-Fetch-Dest survives the
+    // whole redirect chain (it describes the navigation, not the hop), so the
+    // callback sees `iframe` exactly when the Workbench is the one asking.
+    const dest = String(req.headers['sec-fetch-dest'] || '').toLowerCase();
+    const framed = dest === 'iframe' || dest === 'frame' || dest === 'embed' || dest === 'object';
+    const site = framed ? 'SameSite=None; Partitioned' : 'SameSite=Lax';
     // The immediate 302 to a clean path is MANDATORY, not cosmetic: it takes
     // `?g=` out of the address bar, out of the Referer every subresource would
     // carry, and out of browser history. It cannot take it out of cloudflared's
     // access log — which is why the grant is short-lived and share-bound.
     res.writeHead(302, {
-      'Set-Cookie': `${GRANT_COOKIE}=${r.raw}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=${maxAge}`,
+      'Set-Cookie': `${GRANT_COOKIE}=${r.raw}; Path=/; Secure; HttpOnly; ${site}; Max-Age=${maxAge}`,
       Location: to,
       ...noStore,
     });
@@ -262,8 +392,18 @@ export function startAuthProxy({ targetPort, log, onAbuse, grantSecret, shareId,
       if (grants && verdict !== 'badpass' && isBrowserNav(req)) return bounce(req, res, verdict);
       return challenge(res);
     }
+    // 4. The grant is a cookie, and a cookie can be ridden (header rule 4a's
+    // backstop). Never a bounce — the caller HAS a credential; the request
+    // SHAPE is what is refused.
+    if (grants && crossSiteAbuse(req) && !viaPassword(req)) {
+      res.writeHead(403, { 'Content-Type': 'text/plain', ...noStore });
+      res.end('cross-site request refused');
+      return;
+    }
     const proxyReq = request(forwardOpts(req), (proxyRes) => {
-      res.writeHead(proxyRes.statusCode || 502, proxyRes.headers);
+      // The one RESPONSE rewrite this gate performs (header rule 4b): the
+      // frame policy. Everything else is the driver's own app talking.
+      res.writeHead(proxyRes.statusCode || 502, rewriteFramePolicy(proxyRes.headers));
       proxyRes.pipe(res);
     });
     proxyReq.on('error', () => {
@@ -293,6 +433,14 @@ export function startAuthProxy({ targetPort, log, onAbuse, grantSecret, shareId,
     // re-authenticated in the main document.
     if (!authed(req)) {
       socket.write('HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm="Flowviant preview"\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+    // The same cross-site backstop as the request path: a cookie-ridden
+    // cross-site handshake (Sec-Fetch-Mode: websocket) is refused; the framed
+    // app's own HMR socket is same-origin and never trips it.
+    if (grants && crossSiteAbuse(req) && !viaPassword(req)) {
+      socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
       socket.destroy();
       return;
     }

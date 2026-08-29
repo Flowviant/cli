@@ -51,7 +51,7 @@ Nothing starts work except you opening a tab and typing in it.
 
 ## Sharing a preview
 
-You run your dev server yourself, in the session's own worktree, exactly as you would in any terminal. The daemon NOTICES the listening port; ask for a share in the app and it puts a [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/) quick tunnel in front of it (auto-fetched if missing, pinned and checksummed) behind a **mandatory password gate**. Flowviant stores only the tunnel URL; your browser talks to it directly.
+You run your dev server yourself, in the session's own worktree, exactly as you would in any terminal. The daemon NOTICES the listening port; ask for a share in the app and it puts a [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/) quick tunnel in front of it (auto-fetched if missing, pinned and checksummed) behind a **mandatory password gate**. Flowviant stores only the tunnel URL; your browser talks to it directly. Since 0.72.0 the gate also lets the Workbench embed the share in a frame: it rewrites the response's frame policy to permit exactly the app's origin, and a framed sign-in gets a partitioned cookie so it works where third-party cookies are blocked.
 
 The daemon never executes anything the repository declares. An earlier version read a `.flowviant/preview.json` from the branch and spawned the command it named — that start path was removed in 0.53.0 and is not coming back; see the header of `bin/lib/preview.mjs` for exactly what it did, so nobody rebuilds it.
 

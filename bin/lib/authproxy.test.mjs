@@ -40,9 +40,27 @@ function mint(over = {}) {
   return `${body}.${b64url(createHmac('sha256', SECRET).update('fvgrant.v1.' + body).digest())}`;
 }
 
-/** An origin that reports back exactly what reached it. */
+/** An origin that reports back exactly what reached it — and, under `/hdr/`,
+ *  answers wearing the frame policy named in the path, so the response-rewrite
+ *  tests exercise a real proxied response rather than the helper. */
 const origin = createServer((req, res) => {
-  res.writeHead(200, { 'Content-Type': 'application/json' });
+  const headers = { 'Content-Type': 'application/json' };
+  if (req.url.startsWith('/hdr/deny')) {
+    headers['X-Frame-Options'] = 'DENY';
+    headers['Content-Security-Policy'] = "default-src 'self'; frame-ancestors 'none'; img-src data:";
+  } else if (req.url.startsWith('/hdr/noframe')) {
+    headers['Content-Security-Policy'] = "default-src 'self'";
+  } else if (req.url.startsWith('/hdr/reportonly')) {
+    headers['Content-Security-Policy-Report-Only'] = "frame-ancestors 'none'";
+  } else if (req.url.startsWith('/hdr/double')) {
+    // Two CSP headers — the wire folds them into one comma-joined string, and
+    // a rewrite that only splits on ';' eats the second policy's head.
+    res.setHeader('Content-Security-Policy', [
+      "script-src 'self'; frame-ancestors 'none'",
+      "default-src 'self'; img-src data:",
+    ]);
+  }
+  res.writeHead(200, headers);
   res.end(JSON.stringify({ url: req.url, headers: req.headers }));
 });
 await new Promise((r) => origin.listen(0, '127.0.0.1', r));
@@ -64,6 +82,24 @@ after(() => {
 const base = `http://127.0.0.1:${gate.port}`;
 const get = (path, headers = {}) =>
   fetch(base + path, { headers, redirect: 'manual' });
+
+// fetch() is a browser-faithful client: it OVERRIDES `Sec-Fetch-Mode` with its
+// own value ('cors'), so tests that assert on Fetch Metadata must speak raw
+// HTTP to control the headers exactly.
+import { request as httpRequest } from 'node:http';
+const raw = (path, { method = 'GET', headers = {}, body } = {}) =>
+  new Promise((resolve, reject) => {
+    const r = httpRequest(
+      { host: '127.0.0.1', port: gate.port, path, method, headers },
+      (res) => {
+        res.resume();
+        res.on('end', () => resolve({ status: res.statusCode }));
+      }
+    );
+    r.on('error', reject);
+    if (body) r.write(body);
+    r.end();
+  });
 
 test('the gate reports the door it installed', () => {
   assert.equal(gate.gateMode, 'grant');
@@ -152,6 +188,160 @@ test('the callback sets a __Host- cookie and redirects to a clean path', async (
   assert.match(cookie, /HttpOnly/);
   assert.match(cookie, /Secure/);
   assert.match(cookie, /SameSite=Lax/);
+});
+
+test('a FRAMED callback sets a Partitioned SameSite=None cookie instead of Lax', async () => {
+  // Sec-Fetch-Dest describes the navigation and survives the redirect chain,
+  // so the callback sees `iframe` exactly when the Workbench is the framer.
+  // Partitioned keys the jar to the top-level site, which is what makes
+  // SameSite=None here not a CSRF hole.
+  const res = await get(`/__fv/cb?g=${encodeURIComponent(mint())}&to=%2F`, {
+    'sec-fetch-dest': 'iframe',
+  });
+  assert.equal(res.status, 302);
+  const cookie = res.headers.get('set-cookie');
+  assert.match(cookie, /SameSite=None/);
+  assert.match(cookie, /Partitioned/);
+  assert.doesNotMatch(cookie, /SameSite=Lax/);
+  // Still __Host--eligible: Secure, Path=/, no Domain.
+  assert.match(cookie, /Secure/);
+  assert.match(cookie, /Path=\//);
+  assert.doesNotMatch(cookie, /Domain=/);
+});
+
+test('a TOP-LEVEL callback never carries Partitioned — Safari 18.5–26.1 drops such cookies whole', async () => {
+  const res = await get(`/__fv/cb?g=${encodeURIComponent(mint())}&to=%2F`, {
+    'sec-fetch-dest': 'document',
+  });
+  assert.match(res.headers.get('set-cookie'), /SameSite=Lax/);
+  assert.doesNotMatch(res.headers.get('set-cookie'), /Partitioned/);
+});
+
+test("the origin's frame refusal is rewritten to permit exactly the app", async () => {
+  const res = await get('/hdr/deny', { cookie: `${GRANT_COOKIE}=${mint()}` });
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get('x-frame-options'), null, 'XFO must be stripped');
+  const csp = res.headers.get('content-security-policy');
+  // The directive is REWRITTEN in place, never appended beside the origin's
+  // own — two CSP headers intersect, so an appended allow would still lose to
+  // the origin's frame-ancestors 'none'.
+  assert.match(csp, /frame-ancestors 'self' https:\/\/app\.flowviant\.com/);
+  assert.doesNotMatch(csp, /frame-ancestors 'none'/);
+  // The rest of the origin's policy is untouched — the gate edits the frame
+  // policy and nothing else.
+  assert.match(csp, /default-src 'self'/);
+  assert.match(csp, /img-src data:/);
+});
+
+test('an origin with NO frame policy gets ours added', async () => {
+  const res = await get('/hdr/noframe', { cookie: `${GRANT_COOKIE}=${mint()}` });
+  const csp = res.headers.get('content-security-policy');
+  assert.match(csp, /frame-ancestors 'self' https:\/\/app\.flowviant\.com/);
+  assert.match(csp, /default-src 'self'/);
+});
+
+test('TWO CSP policies survive the rewrite whole — only the directive is replaced', async () => {
+  const res = await get('/hdr/double', { cookie: `${GRANT_COOKIE}=${mint()}` });
+  const csp = res.headers.get('content-security-policy');
+  assert.match(csp, /frame-ancestors 'self' https:\/\/app\.flowviant\.com/);
+  assert.doesNotMatch(csp, /frame-ancestors 'none'/);
+  // The neighbouring policy's directives are intact on both sides of the comma.
+  assert.match(csp, /script-src 'self'/);
+  assert.match(csp, /default-src 'self'/);
+  assert.match(csp, /img-src data:/);
+});
+
+test('Report-Only is left alone — rewriting a report channel edits telemetry', async () => {
+  const res = await get('/hdr/reportonly', { cookie: `${GRANT_COOKIE}=${mint()}` });
+  assert.equal(res.headers.get('content-security-policy-report-only'), "frame-ancestors 'none'");
+});
+
+test('a PASSWORD-ONLY gate rewrites nothing — no app origin, no framing story', async () => {
+  const pwGate = await startAuthProxy({ targetPort: originPort });
+  assert.ok(pwGate);
+  try {
+    const auth = 'Basic ' + Buffer.from(`${pwGate.user}:${pwGate.password}`).toString('base64');
+    const res = await fetch(`http://127.0.0.1:${pwGate.port}/hdr/deny`, {
+      headers: { authorization: auth },
+      redirect: 'manual',
+    });
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get('x-frame-options'), 'DENY');
+    assert.match(res.headers.get('content-security-policy'), /frame-ancestors 'none'/);
+  } finally {
+    pwGate.stop();
+  }
+});
+
+test('CSRF backstop — a cross-site FETCH riding the grant cookie is refused', async () => {
+  // Chromium 76–113 honours SameSite=None while ignoring Partitioned, so the
+  // grant can arrive on a cross-site request there. Fetch Metadata is the
+  // backstop: nothing legitimate is a cross-site non-navigation.
+  const res = await raw('/api/data', {
+    headers: {
+      cookie: `${GRANT_COOKIE}=${mint()}`,
+      'sec-fetch-site': 'cross-site',
+      'sec-fetch-mode': 'cors',
+    },
+  });
+  assert.equal(res.status, 403);
+});
+
+test('CSRF backstop — a cross-site POST navigation (auto-submitted form) is refused', async () => {
+  const res = await raw('/submit', {
+    method: 'POST',
+    headers: {
+      cookie: `${GRANT_COOKIE}=${mint()}`,
+      'sec-fetch-site': 'cross-site',
+      'sec-fetch-mode': 'navigate',
+      accept: 'text/html',
+    },
+    body: 'x=1',
+  });
+  assert.equal(res.status, 403);
+});
+
+test('CSRF backstop — a cross-site GET NAVIGATION still works: it is the Open link and the frame src', async () => {
+  const res = await raw('/page', {
+    headers: {
+      cookie: `${GRANT_COOKIE}=${mint()}`,
+      accept: 'text/html',
+      'sec-fetch-site': 'cross-site',
+      'sec-fetch-mode': 'navigate',
+      'sec-fetch-dest': 'iframe',
+    },
+  });
+  assert.equal(res.status, 200);
+});
+
+test('CSRF backstop — same-origin subresources inside the frame are untouched', async () => {
+  const res = await raw('/assets/app.js', {
+    headers: {
+      cookie: `${GRANT_COOKIE}=${mint()}`,
+      'sec-fetch-site': 'same-origin',
+      'sec-fetch-mode': 'cors',
+    },
+  });
+  assert.equal(res.status, 200);
+});
+
+test('CSRF backstop — the PASSWORD path is exempt: Basic auth never rides cross-site', async () => {
+  const auth = 'Basic ' + Buffer.from(`${gate.user}:${gate.password}`).toString('base64');
+  const res = await raw('/hook', {
+    method: 'POST',
+    headers: { authorization: auth, 'sec-fetch-site': 'cross-site', 'sec-fetch-mode': 'cors' },
+    body: '{}',
+  });
+  assert.equal(res.status, 200);
+});
+
+test('CSRF backstop — no Sec-Fetch headers means no refusal: such a browser never held a None cookie', async () => {
+  const res = await raw('/submit', {
+    method: 'POST',
+    headers: { cookie: `${GRANT_COOKIE}=${mint()}` },
+    body: 'x=1',
+  });
+  assert.equal(res.status, 200);
 });
 
 test('the callback refuses an off-origin destination', async () => {

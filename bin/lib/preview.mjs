@@ -46,7 +46,7 @@ import {
 import { join } from 'node:path';
 import { homedir, platform, arch } from 'node:os';
 import { startAuthProxy } from './authproxy.mjs';
-import { isListening } from './listeners.mjs';
+import { forgetInfraPid, isListening, noteInfraPid } from './listeners.mjs';
 
 // ── cloudflared: pinned, verified, or not fetched at all ───────────────────
 
@@ -389,6 +389,7 @@ export async function openTunnel({
         }
       }
       forgetPreviewPid(tunnel.pid);
+      forgetInfraPid(tunnel.pid);
     }
   };
 
@@ -428,6 +429,9 @@ export async function openTunnel({
   // word would let a recycled pid land on an operator's own unrelated
   // cloudflared and group-SIGKILL it.
   recordPreviewPid(tunnel.pid, `--url http://localhost:${gate.port}`);
+  // Keep our own plumbing out of the listeners measurement (see listeners.mjs:
+  // cloudflared's metrics socket lives in the checkout's cwd).
+  noteInfraPid(tunnel.pid);
 
   return new Promise((resolve) => {
     let settled = false;

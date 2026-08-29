@@ -58,6 +58,26 @@ import { platform } from 'node:os';
 import { rssBytes } from './processes.mjs';
 import { sep } from 'node:path';
 
+/**
+ * INFRASTRUCTURE CHILDREN ARE NOT LISTENERS. cloudflared opens its own local
+ * metrics socket, and its cwd is inherited from the daemon — inside the
+ * checkout — so a live share put a `cloudflared` row in the repo place's list:
+ * Flowviant's own plumbing offered back to the operator as a thing to share or
+ * stop. Same rule as the `process.pid` exclusion below: a process that IS
+ * Flowviant is not a process Flowviant reports. `preview.mjs` registers each
+ * tunnel child here as it spawns it (that import direction already exists;
+ * the reverse would be a cycle). In-process is enough: a PEER daemon's tunnel
+ * lives in a different checkout, so cwd attribution already excludes it, and
+ * a crashed daemon's orphan is reaped at the next startup.
+ */
+const infraPids = new Set();
+export const noteInfraPid = (pid) => {
+  if (Number.isInteger(pid) && pid > 0) infraPids.add(pid);
+};
+export const forgetInfraPid = (pid) => {
+  infraPids.delete(pid);
+};
+
 /** A box with more processes than this is not one we walk per sweep. The scan
  *  is one readlink per pid and runs every reconcile; this is the runaway
  *  bound, not a capacity statement. */
@@ -269,7 +289,7 @@ function scanLinux(worktree) {
     // started: it is us. Same rule `processes.mjs` keeps by never reporting the
     // group leader, for the same reason — a process that IS Flowviant is not a
     // process Flowviant reports.
-    if (Number(pid) === process.pid) continue;
+    if (Number(pid) === process.pid || infraPids.has(Number(pid))) continue;
 
     let fds;
     try {
@@ -346,8 +366,9 @@ function scanDarwin(worktree) {
   const self = String(process.pid);
   for (const line of lsof(['-nP', '-iTCP', '-sTCP:LISTEN', '-F', 'pn']).split('\n')) {
     // The daemon's own preview gate is not something the driver started — see
-    // the linux branch for the whole argument.
-    if (line.startsWith('p')) pid = line.slice(1) === self ? null : line.slice(1);
+    // the linux branch for the whole argument. Nor its cloudflared children.
+    if (line.startsWith('p'))
+      pid = line.slice(1) === self || infraPids.has(Number(line.slice(1))) ? null : line.slice(1);
     else if (line.startsWith('n') && pid) {
       const m = /:(\d+)$/.exec(line.slice(1));
       if (!m) continue;
