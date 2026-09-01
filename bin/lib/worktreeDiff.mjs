@@ -169,6 +169,16 @@ export function worktreeDiff(wt, baseRef) {
   } catch {
     return null; // not a worktree (or not readable) — report nothing, not zeros
   }
+  // The commit HEAD names, for the strip's branch chip. Best-effort: an
+  // unborn branch (fresh repo, no commit yet) has a name and no sha, and the
+  // report simply omits the key — absent must never become an empty string,
+  // which would render as a blank chip.
+  let headSha = '';
+  try {
+    headSha = git(['rev-parse', 'HEAD'], wt);
+  } catch {
+    /* unborn HEAD — no sha to report */
+  }
   let base = '';
   try {
     base = git(['merge-base', 'HEAD', baseRef], wt);
@@ -289,6 +299,7 @@ export function worktreeDiff(wt, baseRef) {
   // pathological commit subject — would 400 every session's readout at once.
   return {
     branch: branch.slice(0, 200),
+    ...(headSha ? { headSha: headSha.slice(0, 64) } : {}),
     path: wt,
     ahead,
     behind,
