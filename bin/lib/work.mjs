@@ -336,6 +336,7 @@ export function createWorkManager({
       // an action that changes what the machine would measure must cause a new
       // measurement, and the 60s sweep is not that.
       void reportPlaceWorktrees(sessionId).catch(() => {});
+      burstListeners(sessionId);
       // …and the REPO picture changed too: the session branch is gone and base
       // moved. Without this the Repository block keeps counting a branch the
       // ship just deleted.
@@ -648,6 +649,69 @@ export function createWorkManager({
     }
     const reports = ids.map(sessionWorktreeReport).filter(Boolean);
     if (reports.length) await postWorktrees(reports);
+  };
+
+  /**
+   * THE FIRST MINUTE AFTER A SETTLE — when "run the dev server" actually binds.
+   *
+   * The settle-time report fires the moment the reply lands, but a dev server
+   * the agent just started usually takes a few more seconds to open its socket
+   * (vite boots, next compiles). It therefore missed the settle measurement and
+   * waited the full 60s sweep — up to a minute of "nothing is running here"
+   * over a server that was already up, which is the slowest link in the whole
+   * "ask for dev → see the preview" chain. Asked directly: "how do we make it
+   * more responsive when the user prompts claude to run dev to waiting for it
+   * to appear on the preview?"
+   *
+   * A DECAYING BURST, and it re-CHECKS before it re-REPORTS: each beat walks
+   * /proc for the place's listeners (purely local, no git, no network) and only
+   * when the PORT SET actually changed does the full place report run and post.
+   * A settle where nothing ever binds costs five /proc walks and zero posts; a
+   * dev server that binds at +7s is on the wire at +9 instead of +60. The burst
+   * for a place restarts on its next settle, so overlapping turns cannot stack
+   * timers, and every timer is unref'd — a readout must never hold the process
+   * open.
+   *
+   * This also serves the OPPOSITE transition for free: a stopped dev server
+   * (the panel's Stop, a ctrl-C in a terminal) vanishes from the port set the
+   * same way it appeared, so the preview's "origin gone" story starts in
+   * seconds too.
+   */
+  const LISTEN_BURST_DELAYS_MS = [4_000, 9_000, 16_000, 30_000, 55_000];
+  const listenBursts = new Map(); // place -> timers[]
+  const listenSignature = (wt) => {
+    try {
+      const l = measureListeners(wt);
+      return l.rows.map((r) => r.port).sort((a, b) => a - b).join(',');
+    } catch {
+      return '';
+    }
+  };
+  const burstListeners = (sessionId) => {
+    try {
+      const place = placeOf(sessionId);
+      for (const t of listenBursts.get(place) ?? []) clearTimeout(t);
+      const wt = placeDir(sessionId);
+      // Captured alongside the settle report, so only a CHANGE after this
+      // moment triggers a post — the settle report already said the rest.
+      let last = listenSignature(wt);
+      const timers = LISTEN_BURST_DELAYS_MS.map((d) =>
+        setTimeout(() => {
+          try {
+            const sig = listenSignature(wt);
+            if (sig === last) return;
+            last = sig;
+            void reportPlaceWorktrees(sessionId).catch(() => {});
+          } catch {
+            /* a readout — the sweep still carries it */
+          }
+        }, d)
+      );
+      for (const t of timers) t.unref?.();
+      listenBursts.set(place, timers);
+    } catch {
+      /* never let the burst break a settle */
+    }
   };
   /** Every live session, throttled — called from the reconcile loop. */
   /**
@@ -2592,6 +2656,7 @@ export function createWorkManager({
           // awaited: this runs inside the session's chain, and a slow POST
           // would delay the next turn of that tab behind a readout.
           void reportPlaceWorktrees(job.sessionId).catch(() => {});
+          burstListeners(job.sessionId);
         }
       });
     }
