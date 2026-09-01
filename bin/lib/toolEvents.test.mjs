@@ -5,7 +5,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { toolEventOf } from './runtimes.mjs';
+import { countLines, toolEventOf } from './runtimes.mjs';
 
 test('Read → path, worktree-relative', () => {
   assert.deepEqual(toolEventOf('Read', { file_path: '/wt/src/a.ts' }, '/wt'), {
@@ -78,4 +78,45 @@ test('TodoWrite → one plan event; statuses map done/active/open; empty is null
 test('unknown tools are silent — a card is never invented', () => {
   assert.equal(toolEventOf('WebFetch', { url: 'https://x' }), null);
   assert.equal(toolEventOf('NotebookEdit', {}), null);
+});
+
+test('SCRUB BEFORE CAP: a secret at the cap boundary is replaced whole, never leaked as a prefix', () => {
+  const secret = 'S3CR3T-'.repeat(10); // 70 chars
+  const scrub = (s) => s.split(secret).join('[REDACTED:TOKEN]');
+  // The secret starts at char 180 — under the old cap-then-scrub order the
+  // 200-cap cut it at char 200, leaving 20 unmatched secret chars on the wire.
+  const cmd = `${'x'.repeat(179)} ${secret} --flag`;
+  const e = toolEventOf('Bash', { command: cmd }, '', scrub);
+  assert.ok(!e.c.includes('S3CR3T'));
+  assert.ok(e.c.length <= 200);
+});
+
+test('a scrub replacement that GROWS the string still lands under the cap', () => {
+  const scrub = (s) => s.split('pw').join('[REDACTED:DATABASE_PASSWORD]');
+  const e = toolEventOf('Bash', { command: `${'y'.repeat(190)} pw` }, '', scrub);
+  assert.ok(e.c.length <= 200);
+});
+
+test('the mini-diff lines are scrubbed too, and counts come from the raw string', () => {
+  const scrub = (s) => s.split('hunter2secret').join('[REDACTED:PW]');
+  const e = toolEventOf(
+    'Edit',
+    {
+      file_path: '/wt/x.ts',
+      old_string: 'const pw = "hunter2secret"',
+      new_string: 'const pw = env.PW\nrest\nof\nit\nmore',
+    },
+    '/wt',
+    scrub
+  );
+  assert.equal(e.dl[0], '- const pw = "[REDACTED:PW]"');
+  assert.equal(e.d, 1);
+  assert.equal(e.a, 5);
+});
+
+test('countLines never materializes a split and matches split-length semantics', () => {
+  assert.equal(countLines(''), 0);
+  assert.equal(countLines('one'), 1);
+  assert.equal(countLines('a\nb\nc'), 3);
+  assert.equal(countLines('a\n'), 2);
 });

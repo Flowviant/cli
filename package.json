@@ -1,7 +1,7 @@
 {
   "name": "flowviant",
-  "version": "0.74.0",
-  "description": "Run your own coding CLIs as build agents for Flowviant — Claude Code, Codex or Antigravity, on your own credentials. Holds your sessions, keeps a worktree per tab, and ships branches on your word.",
+  "version": "0.74.1",
+  "description": "Run your own coding CLIs as build agents for Flowviant \u2014 Claude Code, Codex or Antigravity, on your own credentials. Holds your sessions, keeps a worktree per tab, and ships branches on your word.",
   "type": "module",
   "bin": {
     "flowviant": "bin/cli.mjs"

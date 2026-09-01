@@ -107,6 +107,25 @@ export function humanizeClaudeTool(name, input = {}, cwd = '') {
   }
 }
 
+/** Count '\n' without materializing a split — a Write's content can be a
+ *  multi-MB generated file, and `split('\n')` re-allocates all of it as line
+ *  strings on the synchronous stream path the narrator and wake socket share.
+ *  Numbers cannot leak, so counting runs on the RAW string. */
+export function countLines(s) {
+  const str = String(s ?? '');
+  if (!str) return 0;
+  let n = 1;
+  let i = -1;
+  while ((i = str.indexOf('\n', i + 1)) !== -1) n++;
+  return n;
+}
+
+/** How much raw string the scrubber sees before any cap is applied. A secret
+ *  can only surface in the first ~capped chars of a field; giving the scrub a
+ *  window this much larger means a secret would have to be longer than the
+ *  window minus the cap to straddle out of it — no real credential is. */
+const SCRUB_WINDOW = 8_192;
+
 /**
  * Tool-call → ONE STRUCTURED EVENT for the transcript's tool cards — the
  * relay's durable form, where `humanizeClaudeTool` above is its one-line live
@@ -121,45 +140,57 @@ export function humanizeClaudeTool(name, input = {}, cwd = '') {
  *   dl: a few "-/+" prefixed preview lines of an Edit
  *   items: the plan's todos, x = text, s = done|active|open
  *
- * The CALLER scrubs (work.mjs envScrub) — this stays a pure shape function so
- * it is testable without a vault.
+ * SCRUB BEFORE CAP — the order is load-bearing (review, 2026-09-01). The
+ * caller passes its `envScrub`; every string is scrubbed over a bounded
+ * window FIRST and capped LAST, because the reverse order had two failures:
+ * a secret straddling the cap boundary was cut into a prefix the
+ * exact-substring scrub could no longer match (a partial credential on the
+ * wire), and a scrub REPLACEMENT that grew a string past the cap tripped the
+ * server's field limits. `scrub` defaults to identity so this stays testable
+ * without a vault.
  */
-export function toolEventOf(name, input = {}, cwd = '') {
-  const rel = (p) => shortPath(p, cwd).slice(0, 300);
-  const lines = (s) => (s ? String(s).split('\n').length : 0);
+export function toolEventOf(name, input = {}, cwd = '', scrub = (s) => s) {
+  // Window → scrub → cap. The window bounds what a multi-MB input costs; the
+  // cap is applied AFTER the scrub so a replacement cannot overflow it.
+  const clean = (v, cap) => scrub(String(v ?? '').slice(0, SCRUB_WINDOW)).slice(0, cap);
+  const rel = (p) => clean(shortPath(p, cwd), 300);
+  // The first k lines of a side, from a scrubbed bounded prefix — never a
+  // full split of the raw string.
+  const firstLines = (s, k) =>
+    scrub(String(s ?? '').slice(0, SCRUB_WINDOW)).split('\n', k).slice(0, k);
   switch (name) {
     case 'Read':
       return { t: 'read', p: rel(input.file_path) };
     case 'Write':
-      return { t: 'write', p: rel(input.file_path), a: lines(input.content) };
+      return { t: 'write', p: rel(input.file_path), a: countLines(input.content) };
     case 'Edit': {
       const oldS = String(input.old_string ?? '');
       const newS = String(input.new_string ?? '');
       // A MINI-DIFF, not the diff: the first lines of each side, enough to
       // recognise the change at a glance. The real diff lives in git.
       const dl = [
-        ...oldS.split('\n').slice(0, 2).map((l) => `- ${l}`),
-        ...newS.split('\n').slice(0, 3).map((l) => `+ ${l}`),
+        ...firstLines(oldS, 2).map((l) => `- ${l}`),
+        ...firstLines(newS, 3).map((l) => `+ ${l}`),
       ].map((l) => l.slice(0, 160));
-      return { t: 'edit', p: rel(input.file_path), a: lines(newS), d: lines(oldS), dl };
+      return { t: 'edit', p: rel(input.file_path), a: countLines(newS), d: countLines(oldS), dl };
     }
     case 'Grep':
       return {
         t: 'grep',
-        q: String(input.pattern ?? '').slice(0, 200),
+        q: clean(input.pattern, 200),
         ...(input.path ? { p: rel(input.path) } : {}),
       };
     case 'Glob':
-      return { t: 'glob', q: String(input.pattern ?? '').slice(0, 200) };
+      return { t: 'glob', q: clean(input.pattern, 200) };
     case 'Bash':
-      return { t: 'bash', c: String(input.command ?? '').slice(0, 200) };
+      return { t: 'bash', c: clean(input.command, 200) };
     case 'Task':
-      return { t: 'task', q: String(input.description ?? '').slice(0, 200) };
+      return { t: 'task', q: clean(input.description, 200) };
     case 'TodoWrite': {
       const todos = Array.isArray(input.todos) ? input.todos.slice(0, 20) : [];
       const items = todos
         .map((td) => ({
-          x: String(td?.content ?? '').slice(0, 120),
+          x: clean(td?.content, 120),
           s: td?.status === 'completed' ? 'done' : td?.status === 'in_progress' ? 'active' : 'open',
         }))
         .filter((i) => i.x);

@@ -2404,21 +2404,19 @@ export function createWorkManager({
            *   · the PLAN is a single event — a new TodoWrite replaces the old
            *     plan at the current position, so the log shows the latest plan
            *     where it last changed rather than five stale copies;
-           *   · capped at the newest 60, with the shed counted (`dropped`) —
-           *     scrollback semantics, the same trade the transcript itself
-           *     makes.
+           *   · capped at the newest 60 NON-PLAN rows, with the shed counted
+           *     call-for-call (`dropped += n`) — scrollback semantics, the
+           *     same trade the transcript itself makes; the plan is exempt,
+           *     because it is current state rather than scrollback.
            */
           const toolLog = { ev: [], dropped: 0 };
-          const scrubEv = (e) => {
-            for (const k of ['p', 'q', 'c']) if (typeof e[k] === 'string') e[k] = envScrub(e[k]);
-            if (Array.isArray(e.dl)) e.dl = e.dl.map((l) => envScrub(l));
-            if (Array.isArray(e.items)) for (const i of e.items) i.x = envScrub(i.x);
-            return e;
-          };
           const pushToolEvent = (name, input) => {
-            const e = toolEventOf(name, input, dir.wt);
+            // envScrub rides INTO the builder, which scrubs over a bounded
+            // window BEFORE its caps — scrubbing after the cut both leaked a
+            // boundary-straddling secret's prefix and grew a capped field
+            // past the server's limits (review, 2026-09-01).
+            const e = toolEventOf(name, input, dir.wt, envScrub);
             if (!e) return;
-            scrubEv(e);
             if (e.t === 'plan') {
               const i = toolLog.ev.findIndex((x) => x.t === 'plan');
               if (i >= 0) toolLog.ev.splice(i, 1);
@@ -2442,9 +2440,15 @@ export function createWorkManager({
                 toolLog.ev.push(e);
               }
             }
+            // The cap evicts the oldest NON-plan row: the plan is current
+            // state, not scrollback — the one card the fold keeps out — and a
+            // shed collapsed row counts its repeats, so "N steps" never
+            // understates what the cut removed.
             while (toolLog.ev.length > 60) {
-              toolLog.ev.shift();
-              toolLog.dropped++;
+              const i = toolLog.ev.findIndex((x) => x.t !== 'plan');
+              if (i < 0) break; // only the plan left; it stays
+              const [shed] = toolLog.ev.splice(i, 1);
+              toolLog.dropped = Math.min(1_000_000, toolLog.dropped + (shed?.n ?? 1));
             }
           };
           const narrator = makeNarrator(job.sessionId, job.id, () =>
@@ -2672,6 +2676,9 @@ export function createWorkManager({
             await settleWorkTurn(job.id, {
               ok: false,
               answer: "Couldn't resume the terminal session — it may have been removed.",
+              // Whatever it DID before coming back empty is exactly the
+              // question a failed turn's log answers.
+              ...(toolLog.ev.length > 0 ? { tools: toolLog } : {}),
             });
             warn('adopt turn produced no output — settled as failed');
             return;
@@ -2719,6 +2726,9 @@ export function createWorkManager({
             // routinely quotes command output, and command output can quote a
             // synced secret.
             answer: envScrub(String(e?.message ?? 'the session turn failed')).slice(0, 2000),
+            // "What did it do before it failed" is exactly the question a
+            // crashed turn's log answers — same spread as the main settle.
+            ...(toolLog.ev.length > 0 ? { tools: toolLog } : {}),
           });
           warn(`session turn failed: ${e?.message ?? e}`);
         } finally {
