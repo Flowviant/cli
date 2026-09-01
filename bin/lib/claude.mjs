@@ -197,7 +197,7 @@ const oneLine = (s, n = 160) => String(s).replace(/\s+/g, ' ').trim().slice(0, n
 // every intermediate text block still NARRATES, but only the final `result`
 // event contributes text — otherwise the same sentences arrive twice, once as
 // they stream and once in the result, and the tab posts the duplicate.
-function handleStreamLine(line, { cwd, emit, onActivity, appendText, answerFromResult, onInit }) {
+function handleStreamLine(line, { cwd, emit, onActivity, onToolEvent, appendText, answerFromResult, onInit }) {
   let ev;
   try {
     ev = JSON.parse(line);
@@ -222,6 +222,10 @@ function handleStreamLine(line, { cwd, emit, onActivity, appendText, answerFromR
         push({ kind: 'say', label: oneLine(b.text) });
       } else if (b.type === 'tool_use') {
         push(humanizeToolUse(b.name, b.input || {}, cwd));
+        // The STRUCTURED form of the same event, for the transcript's tool
+        // cards — raw name + input, so the collector can keep what the
+        // one-line humanizer drops (an Edit's counts, the plan's items).
+        onToolEvent?.(b.name, b.input || {});
       }
     }
   } else if (ev.type === 'system' && ev.subtype === 'init') {
@@ -270,7 +274,7 @@ function handleStreamLine(line, { cwd, emit, onActivity, appendText, answerFromR
 // returned string for sentinel detection, and each activity is handed to
 // `onActivity` so the caller can forward progress. Build-agent turns leave it
 // off and keep the raw text passthrough + line sentinels.
-export function runTurn({ prompt, resume, system, cwd, mcpConfig, mcpArgs, mcpEnv, runtime = 'claude', label, onSpawn, streamJson, answerFromResult, onActivity, onInit, onThreadId, wikiPerm, readOnly, planPerm, vaultDir, resultSchemaArgs, model, effort, adoptResumeId, resumeThreadId, resumeConversationId }) {
+export function runTurn({ prompt, resume, system, cwd, mcpConfig, mcpArgs, mcpEnv, runtime = 'claude', label, onSpawn, streamJson, answerFromResult, onActivity, onToolEvent, onInit, onThreadId, wikiPerm, readOnly, planPerm, vaultDir, resultSchemaArgs, model, effort, adoptResumeId, resumeThreadId, resumeConversationId }) {
   return new Promise((resolve) => {
     const rt = runtimeById(runtime);
     if (!rt.args) {
@@ -401,7 +405,7 @@ export function runTurn({ prompt, resume, system, cwd, mcpConfig, mcpArgs, mcpEn
       /** One line of the child's stdout, in whichever dialect it speaks. */
       const onLine = (line) => {
         if (!rt.parse)
-          return handleStreamLine(line, { cwd, emit, onActivity, appendText, answerFromResult, onInit });
+          return handleStreamLine(line, { cwd, emit, onActivity, onToolEvent, appendText, answerFromResult, onInit });
         const ev = rt.parse(line, cwd);
         if (!ev) return;
         // The conversation id, when the runtime announces one (codex's

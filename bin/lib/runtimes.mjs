@@ -89,8 +89,84 @@ export function humanizeClaudeTool(name, input = {}, cwd = '') {
         command: String(input.command ?? '').slice(0, 2000),
         label: `$ ${oneLine(input.command, 60)}`,
       };
+    case 'TodoWrite': {
+      // The CLI's own todo list — the plan the transcript's PLAN card renders.
+      // The label narrates the change ("plan: 2 of 5 — cut over /api/session");
+      // the structured items ride through toolEventOf below.
+      const todos = Array.isArray(input.todos) ? input.todos : [];
+      if (todos.length === 0) return null;
+      const done = todos.filter((t) => t?.status === 'completed').length;
+      const active = todos.find((t) => t?.status === 'in_progress');
+      return {
+        kind: 'plan',
+        label: `plan: ${done} of ${todos.length}${active?.content ? ` — ${oneLine(active.content, 60)}` : ''}`,
+      };
+    }
     default:
       return null; // other tools: silent
+  }
+}
+
+/**
+ * Tool-call → ONE STRUCTURED EVENT for the transcript's tool cards — the
+ * relay's durable form, where `humanizeClaudeTool` above is its one-line live
+ * form. Same source (the CLI's own tool_use input), zero inference: every
+ * field is something the CLI emitted, and a tool this doesn't know renders as
+ * nothing rather than as a guess.
+ *
+ * Wire vocabulary (compact keys — this rides a 1.5s-throttled POST):
+ *   t: read|edit|write|grep|glob|bash|task|plan
+ *   p: path (worktree-relative)   q: pattern/description   c: command
+ *   a/d: line counts added/deleted (from the input's own strings)
+ *   dl: a few "-/+" prefixed preview lines of an Edit
+ *   items: the plan's todos, x = text, s = done|active|open
+ *
+ * The CALLER scrubs (work.mjs envScrub) — this stays a pure shape function so
+ * it is testable without a vault.
+ */
+export function toolEventOf(name, input = {}, cwd = '') {
+  const rel = (p) => shortPath(p, cwd).slice(0, 300);
+  const lines = (s) => (s ? String(s).split('\n').length : 0);
+  switch (name) {
+    case 'Read':
+      return { t: 'read', p: rel(input.file_path) };
+    case 'Write':
+      return { t: 'write', p: rel(input.file_path), a: lines(input.content) };
+    case 'Edit': {
+      const oldS = String(input.old_string ?? '');
+      const newS = String(input.new_string ?? '');
+      // A MINI-DIFF, not the diff: the first lines of each side, enough to
+      // recognise the change at a glance. The real diff lives in git.
+      const dl = [
+        ...oldS.split('\n').slice(0, 2).map((l) => `- ${l}`),
+        ...newS.split('\n').slice(0, 3).map((l) => `+ ${l}`),
+      ].map((l) => l.slice(0, 160));
+      return { t: 'edit', p: rel(input.file_path), a: lines(newS), d: lines(oldS), dl };
+    }
+    case 'Grep':
+      return {
+        t: 'grep',
+        q: String(input.pattern ?? '').slice(0, 200),
+        ...(input.path ? { p: rel(input.path) } : {}),
+      };
+    case 'Glob':
+      return { t: 'glob', q: String(input.pattern ?? '').slice(0, 200) };
+    case 'Bash':
+      return { t: 'bash', c: String(input.command ?? '').slice(0, 200) };
+    case 'Task':
+      return { t: 'task', q: String(input.description ?? '').slice(0, 200) };
+    case 'TodoWrite': {
+      const todos = Array.isArray(input.todos) ? input.todos.slice(0, 20) : [];
+      const items = todos
+        .map((td) => ({
+          x: String(td?.content ?? '').slice(0, 120),
+          s: td?.status === 'completed' ? 'done' : td?.status === 'in_progress' ? 'active' : 'open',
+        }))
+        .filter((i) => i.x);
+      return items.length ? { t: 'plan', items } : null;
+    }
+    default:
+      return null;
   }
 }
 

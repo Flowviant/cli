@@ -55,7 +55,7 @@ import {
   WORK_TURN_KICKOFF_PLAIN,
 } from './prompts.mjs';
 import { materializeInto, hasMaterialized, excludeInWorktree, scrub as envScrub } from './env.mjs';
-import { detectRuntimes, canRun, recordSkills, RUNTIMES } from './runtimes.mjs';
+import { detectRuntimes, canRun, recordSkills, toolEventOf, RUNTIMES } from './runtimes.mjs';
 
 /** The place id meaning "the checkout", not a worktree. Must match the
  *  server's REPO_PLACE — it is a wire value, not a local convention. */
@@ -365,7 +365,7 @@ export function createWorkManager({
    *  line over the finished reply — the server drops narration for a turn
    *  that is no longer pending. (A session-level pending count can't tell the
    *  settled turn's stale line from the queued NEXT turn's fresh one.) */
-  const makeNarrator = (sessionId, turnId) => {
+  const makeNarrator = (sessionId, turnId, getTools) => {
     const recent = [];
     let lastSent = 0;
     let dirty = false;
@@ -387,7 +387,15 @@ export function createWorkManager({
             'Content-Type': 'application/json',
           },
           signal: AbortSignal.timeout(10_000),
-          body: JSON.stringify({ sessionId, turnId, lines }),
+          body: JSON.stringify({
+            sessionId,
+            turnId,
+            lines,
+            // The structured tool log so far, riding the same throttled beat.
+            // Same lifecycle as the lines: overwritten as the turn moves,
+            // cleared server-side at settle. Absent until something ran.
+            ...(getTools ? { tools: getTools() } : {}),
+          }),
         });
       } catch {
         /* narration is decoration — a dropped line is not an incident */
@@ -2382,7 +2390,66 @@ export function createWorkManager({
           let seenThreadId = null; // codex's conversation id, off thread.started
           let seenClaudeSession = null; // claude's own conversation id, off system.init
           const spawned = []; // this turn's children, for the teardown registry
-          const narrator = makeNarrator(job.sessionId, job.id);
+          /**
+           * THE TURN'S TOOL LOG — the structured relay behind the transcript's
+           * tool cards. Same source as the narrator (the CLI's own tool_use
+           * events), zero inference; scrubbed AT COLLECTION so every copy that
+           * leaves the machine — live beat and settle alike — is already clean.
+           *
+           * Shape rules, applied here because the collector is the one writer:
+           *   · consecutive identical read/grep/glob/bash/task events collapse
+           *     into one row with a count (n);
+           *   · consecutive edits of ONE file merge, summing counts, keeping
+           *     the newest preview;
+           *   · the PLAN is a single event — a new TodoWrite replaces the old
+           *     plan at the current position, so the log shows the latest plan
+           *     where it last changed rather than five stale copies;
+           *   · capped at the newest 60, with the shed counted (`dropped`) —
+           *     scrollback semantics, the same trade the transcript itself
+           *     makes.
+           */
+          const toolLog = { ev: [], dropped: 0 };
+          const scrubEv = (e) => {
+            for (const k of ['p', 'q', 'c']) if (typeof e[k] === 'string') e[k] = envScrub(e[k]);
+            if (Array.isArray(e.dl)) e.dl = e.dl.map((l) => envScrub(l));
+            if (Array.isArray(e.items)) for (const i of e.items) i.x = envScrub(i.x);
+            return e;
+          };
+          const pushToolEvent = (name, input) => {
+            const e = toolEventOf(name, input, dir.wt);
+            if (!e) return;
+            scrubEv(e);
+            if (e.t === 'plan') {
+              const i = toolLog.ev.findIndex((x) => x.t === 'plan');
+              if (i >= 0) toolLog.ev.splice(i, 1);
+              toolLog.ev.push(e);
+            } else {
+              const last = toolLog.ev[toolLog.ev.length - 1];
+              const sameKey =
+                last &&
+                last.t === e.t &&
+                last.p === e.p &&
+                last.q === e.q &&
+                last.c === e.c;
+              if (sameKey && (e.t === 'edit' || e.t === 'write')) {
+                last.n = (last.n ?? 1) + 1;
+                last.a = (last.a ?? 0) + (e.a ?? 0);
+                last.d = (last.d ?? 0) + (e.d ?? 0);
+                if (e.dl) last.dl = e.dl;
+              } else if (sameKey) {
+                last.n = (last.n ?? 1) + 1;
+              } else {
+                toolLog.ev.push(e);
+              }
+            }
+            while (toolLog.ev.length > 60) {
+              toolLog.ev.shift();
+              toolLog.dropped++;
+            }
+          };
+          const narrator = makeNarrator(job.sessionId, job.id, () =>
+            toolLog.ev.length > 0 ? toolLog : undefined
+          );
 
           // THE COMMAND AUDIT — every `$ …` the CLI's stream reports, batched
           // to the server verbatim so an admin can read what actually ran on
@@ -2476,6 +2543,8 @@ export function createWorkManager({
                 narrator.line(a?.label);
                 auditCommand(a);
               },
+              // The structured twin of the line above — see toolLog.
+              onToolEvent: pushToolEvent,
               // What this CLI says it can be asked for by name. Harvested off
               // the init event the stream already carries — no probe, no scan,
               // no extra spawn — and reported on the next roster poll so the
@@ -2636,6 +2705,10 @@ export function createWorkManager({
             // here. Recording the path unconditionally is how a crashed first
             // turn used to brick resume for the session's whole life.
             ...(answer.length > 0 ? { sessionRef: dir.wt } : {}),
+            // The turn's tool log, in final form — the durable copy that lands
+            // on the settled message (the live copy on the record is cleared
+            // at settle). Already scrubbed at collection.
+            ...(toolLog.ev.length > 0 ? { tools: toolLog } : {}),
           });
           if (answer.length > 0) ok(`${c.cyan('tab')} ${c.dim('— replied in the session')}`);
           else warn('session turn produced no output — settled as failed');
