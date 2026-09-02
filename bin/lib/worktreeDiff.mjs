@@ -55,7 +55,7 @@ const MAX_COMMITS = 50;
  * a plausible id is dropped here rather than shipped: the server drops unknown
  * ids too, but a readout should not spend a request on obvious noise.
  */
-function taskIdsFromMessage(body) {
+export function taskIdsFromMessage(body) {
   const ids = [];
   for (const line of String(body || '').split('\n')) {
     const m = line.match(/^\s*Flowviant-Task\s*:\s*(.+?)\s*$/i);

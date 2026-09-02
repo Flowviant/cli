@@ -816,6 +816,7 @@ export async function runFleetDaemon() {
     processShipJobs,
     processDiffJobs,
     processKillJobs,
+    processPrJobs,
     heldSessionIds,
     processPreviewJobs,
     livePreviewIds,
@@ -1610,6 +1611,11 @@ export async function runFleetDaemon() {
     // the pid on this job is a request, never an authority, because pids are
     // recycled and the row the browser clicked is up to a sweep old.
     processKillJobs(roster.killJobs);
+    // PR-mode work (push + open, or merge) — leased like a kill: two daemons
+    // pushing one branch would open two PRs. Runs under the operator's own
+    // `gh` credential; a settle never closes a card (done is observed by the
+    // landed walk when the merge reaches base).
+    processPrJobs(roster.prJobs);
     // …and what the SURVIVING ones hold: branch, ahead-of-base, diffstat.
     // Throttled inside, never awaited — a `git status` the human cannot run
     // themselves from a browser, relayed. After retirement so a directory that

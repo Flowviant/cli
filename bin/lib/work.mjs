@@ -39,6 +39,7 @@ import {
   MODEL,
 } from './config.mjs';
 import { git, gitRaw, splitNul, baseBranchName, isSafePathSegment } from './git.mjs';
+import { createLandedObserver } from './landed.mjs';
 import { listenersIn, measureListeners, listenersSupported } from './listeners.mjs';
 import { measureProcesses, liveGroups, processesSupported } from './processes.mjs';
 import { mutateRegistry, processAlive, readRegistry } from './procRegistry.mjs';
@@ -139,6 +140,12 @@ export function createWorkManager({
   const PREVIEW_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/preview-done');
   const SESSION_COMMANDS_URL = FLEET_URL.replace(/\/agents\/?$/, '/session-commands');
   const ATTACHMENT_URL = FLEET_URL.replace(/\/agents\/?$/, '/attachment');
+  const PR_CLAIM_URL = FLEET_URL.replace(/\/agents\/?$/, '/pr-claim');
+  const PR_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/pr-done');
+  // What arrived on base, whichever road it took — observed after every beat
+  // that can move origin/<base>: the sweep's fetch, a ship's push, a PR merge
+  // this daemon performed. See landed.mjs for the seeding and delivery rules.
+  const landed = createLandedObserver({ repoRoot, baseRef });
   const workAnswering = new Set(); // turn ids currently queued/running here
   const workAttempts = new Map(); // turn id -> completed runTurn attempts
   const MAX_WORK_TRIES = 3;
@@ -341,6 +348,10 @@ export function createWorkManager({
       // moved. Without this the Repository block keeps counting a branch the
       // ship just deleted.
       onRepoChanged();
+      // The ship's push moved the local origin/<base> ref — observe now, so
+      // the landed report (and anything trailered a ship carried) lands on
+      // this beat rather than the next 3-minute fetch.
+      void landed.observe().catch(() => {});
     }
     return r;
   };
@@ -764,6 +775,9 @@ export function createWorkManager({
           } catch {
             /* offline, or no remote — the numbers just age */
           }
+          // The fetch may have moved the base tip — walk and report what
+          // landed. Best-effort like everything in this sweep.
+          void landed.observe().catch(() => {});
         }
         const reports = [];
         for (const id of activeIds.slice(0, 20)) {
@@ -1298,6 +1312,181 @@ export function createWorkManager({
       if (!isSafePathSegment(String(job?.sessionId || ''))) continue;
       killing.add(id);
       void runKill(job).finally(() => killing.delete(id));
+    }
+  };
+
+  // ── PR-mode jobs (projects.mergeMode === 'pr') ──────────────────────────
+  // 'open' = push the session's branch and open a PR; 'merge' = merge it.
+  // Both under the operator's own `gh` credential from the daemon's inherited
+  // env — the same posture the dispatch-era merge path took, and the same one
+  // claude.mjs documents for turns. LEASED like a kill: two daemons pushing
+  // one branch would open two PRs. NOTHING here closes a card — done is
+  // observed by the landed walk when the merge reaches base.
+  const prWorking = new Set();
+  const ghFirstLine = (e) =>
+    ((e?.stderr?.toString?.() || e?.message || 'failed').split('\n').find((l) => l.trim()) ||
+      'failed')
+      .slice(0, 400);
+  const PR_URL_RE = /^https:\/\/github\.com\/[^\s/]+\/[^\s/]+\/pull\/\d+$/;
+  const claimPr = async (id) => {
+    try {
+      const res = await fetch(PR_CLAIM_URL, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${FLEET_TOKEN}`,
+          'User-Agent': USER_AGENT,
+          'Content-Type': 'application/json',
+        },
+        signal: AbortSignal.timeout(15_000),
+        body: JSON.stringify({ id, instance: DAEMON_INSTANCE }),
+      });
+      const j = await res.json().catch(() => null);
+      return j?.data?.claimed === true;
+    } catch {
+      return false; // could not claim → do nothing. The other daemon may have.
+    }
+  };
+  const settlePr = async (body) => {
+    try {
+      await fetch(PR_DONE_URL, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${FLEET_TOKEN}`,
+          'User-Agent': USER_AGENT,
+          'Content-Type': 'application/json',
+        },
+        signal: AbortSignal.timeout(20_000),
+        body: JSON.stringify({ ...body, instance: DAEMON_INSTANCE }),
+      });
+    } catch {
+      /* the row expires into an honest no_answer; the re-request is the retry */
+    }
+  };
+  const runPrJob = async (job) => {
+    const id = String(job.id);
+    if (!(await claimPr(id))) return;
+    // gh present and authenticated, or the honest 'unsupported' — its own
+    // outcome because "the machine cannot do this at all" and "GitHub said
+    // no" read differently to the person who asked.
+    try {
+      execFileSync('gh', ['auth', 'status'], { stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch (e) {
+      const missing = e?.code === 'ENOENT';
+      await settlePr({
+        id,
+        outcome: 'unsupported',
+        detail: missing
+          ? 'the GitHub CLI (gh) is not installed on this machine'
+          : 'gh is not authenticated on this machine — run `gh auth login` there',
+      });
+      return;
+    }
+    // The branch is whatever the session's own worktree HEAD says — the same
+    // resolution ship uses, for the same reason (the branch is where the
+    // driver left it, not where we put it).
+    const sessionId = String(job.sessionId);
+    const place = placeOf(sessionId);
+    const wt = place === REPO_PLACE ? repoRoot : join(baseDir, 'sessions', place);
+    let branch = `session/${sessionId}`;
+    let detached = false;
+    if (existsSync(wt)) {
+      try {
+        branch = git(['symbolic-ref', '--short', 'HEAD'], wt);
+      } catch {
+        detached = true;
+      }
+    }
+    if (detached) {
+      await settlePr({
+        id,
+        outcome: 'failed',
+        detail: 'the session is on a detached HEAD — no branch to push',
+      });
+      return;
+    }
+    if (job.kind !== 'merge') {
+      // OPEN: push, then create — or adopt a PR already open for the branch
+      // (a re-delivery, or one the driver opened by hand).
+      try {
+        git(['push', '-u', 'origin', branch], existsSync(wt) ? wt : repoRoot);
+      } catch (e) {
+        await settlePr({ id, outcome: 'failed', detail: ghFirstLine(e) });
+        return;
+      }
+      let url = null;
+      try {
+        url = execFileSync('gh', ['pr', 'view', branch, '--json', 'url', '--jq', '.url'], {
+          cwd: repoRoot,
+          stdio: ['ignore', 'pipe', 'pipe'],
+        })
+          .toString()
+          .trim();
+      } catch {
+        /* no PR open for the branch — create one */
+      }
+      if (!url) {
+        try {
+          const out = execFileSync(
+            'gh',
+            // `--fill` titles the PR from the branch's own commits — no model
+            // call, nothing invented. baseBranchName, not baseRef: gh 422s on
+            // a remote-tracking name like origin/main.
+            ['pr', 'create', '--head', branch, '--base', baseBranchName(baseRef()), '--fill'],
+            { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] }
+          )
+            .toString()
+            .trim();
+          url = out.split('\n').filter(Boolean).pop() ?? null;
+        } catch (e) {
+          await settlePr({ id, outcome: 'failed', detail: ghFirstLine(e) });
+          return;
+        }
+      }
+      await settlePr({
+        id,
+        outcome: 'opened',
+        ...(url && PR_URL_RE.test(url) ? { prUrl: url } : {}),
+      });
+      return;
+    }
+    // MERGE: a MERGE COMMIT, never squash and never rebase — the cards'
+    // receipts are commit shas, and a squash rewrites them off base, which
+    // would orphan every receipt AND blind the landed walk's trailer read.
+    // No --delete-branch: the local branch may be a live worktree's HEAD.
+    try {
+      execFileSync('gh', ['pr', 'merge', branch, '--merge'], {
+        cwd: repoRoot,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } catch (e) {
+      const line = ghFirstLine(e);
+      if (!/already merged/i.test(line)) {
+        await settlePr({ id, outcome: 'failed', detail: line });
+        return;
+      }
+    }
+    await settlePr({ id, outcome: 'merged' });
+    // The merge moved base on GitHub. Fetch and observe NOW, so the cards
+    // close on this beat rather than the next 3-minute sweep — the same
+    // re-measure-after-an-action rule the kill and ship paths keep.
+    try {
+      git(['fetch', 'origin', '--quiet'], repoRoot);
+    } catch {
+      /* offline — the sweep's next fetch carries it */
+    }
+    void landed.observe().catch(() => {});
+    onRepoChanged();
+  };
+  const processPrJobs = (jobs) => {
+    if (!Array.isArray(jobs) || jobs.length === 0) return;
+    for (const job of jobs.slice(0, 5)) {
+      const id = String(job?.id || '');
+      if (!id || prWorking.has(id)) continue;
+      if (!isSafePathSegment(String(job?.sessionId || ''))) continue;
+      prWorking.add(id);
+      void runPrJob(job)
+        .catch(() => {})
+        .finally(() => prWorking.delete(id));
     }
   };
 
@@ -3129,6 +3318,7 @@ export function createWorkManager({
     processShipJobs,
     processDiffJobs,
     processKillJobs,
+    processPrJobs,
     heldSessionIds,
     processPreviewJobs,
     livePreviewIds,

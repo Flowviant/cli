@@ -77,6 +77,10 @@ export async function reportDeployConfig(repoRoot) {
     healthcheck: t.healthcheck,
     healthStatus: t.healthStatus,
     pushSecrets: t.pushSecrets,
+    // Deploy-on-merge: the env this target auto-deploys to when commits land
+    // on base. MUST ride this map — a field forgotten here never reaches the
+    // server, and the server is what turns a landed report into the job.
+    ...(typeof t.onMerge === 'string' ? { onMerge: t.onMerge } : {}),
   }));
   try {
     await post('deploy-config', { pubkey: myPubB64(), targets: meta });
