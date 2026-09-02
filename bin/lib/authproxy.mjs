@@ -421,6 +421,13 @@ export function startAuthProxy({ targetPort, log, onAbuse, grantSecret, shareId,
   // WS upgrade (HMR). The browser resends the Basic-auth header on same-origin
   // upgrades, so we gate it too, then pipe the two sockets together.
   server.on('upgrade', (req, socket, head) => {
+    // OWN THE SOCKET FROM THE FIRST LINE. Between this handler firing and the
+    // origin's 101, the client socket had no 'error' listener — a browser
+    // that RSTs mid-handshake (tab closed during HMR reconnect) emitted
+    // 'error' with nobody listening, and an uncaughtException took the WHOLE
+    // daemon down (2026-08 audit HIGH, reproduced on Node 24; closed
+    // 2026-09-02). The post-101 block still swaps in the cross-destroy pair.
+    socket.on('error', () => socket.destroy());
     // Nothing under the reserved prefix is ever piped to the origin.
     if (safePathname(req.url).startsWith('/__fv/')) {
       socket.destroy();
