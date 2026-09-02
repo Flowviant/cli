@@ -1404,26 +1404,48 @@ export function createWorkManager({
       });
       return;
     }
+    // NEVER the base branch. A checkout-place tab (the operator's, at N=1)
+    // commonly stands on base, and pushing it would BE the direct push this
+    // mode exists to replace — on an unprotected repo the work lands with no
+    // PR and the observer closes the cards as landed, PR mode silently
+    // defeated by its own open job.
+    const baseName = baseBranchName(baseRef());
+    if (branch === baseName) {
+      await settlePr({
+        id,
+        outcome: 'failed',
+        detail: `the session is on the base branch (${baseName}) — nothing to open a pull request from; work on a branch first`,
+      });
+      return;
+    }
+    const pushCwd = existsSync(wt) ? wt : repoRoot;
+    /** Adopt only an OPEN PR. gh's branch finder falls back to the most recent
+     *  MERGED/CLOSED PR when no open one exists, and adopting a dead PR turns
+     *  every later delivery on a long-lived session branch into a silent
+     *  black hole ('opened'/'merged' over work that never moves). */
+    const openPrUrl = () => {
+      try {
+        const j = JSON.parse(
+          execFileSync('gh', ['pr', 'view', branch, '--json', 'url,state'], {
+            cwd: repoRoot,
+            stdio: ['ignore', 'pipe', 'pipe'],
+          }).toString()
+        );
+        return j?.state === 'OPEN' && typeof j?.url === 'string' ? j.url.trim() : null;
+      } catch {
+        return null; // no PR for the branch at all
+      }
+    };
     if (job.kind !== 'merge') {
-      // OPEN: push, then create — or adopt a PR already open for the branch
+      // OPEN: push, then create — or adopt a PR already OPEN for the branch
       // (a re-delivery, or one the driver opened by hand).
       try {
-        git(['push', '-u', 'origin', branch], existsSync(wt) ? wt : repoRoot);
+        git(['push', '-u', 'origin', branch], pushCwd);
       } catch (e) {
         await settlePr({ id, outcome: 'failed', detail: ghFirstLine(e) });
         return;
       }
-      let url = null;
-      try {
-        url = execFileSync('gh', ['pr', 'view', branch, '--json', 'url', '--jq', '.url'], {
-          cwd: repoRoot,
-          stdio: ['ignore', 'pipe', 'pipe'],
-        })
-          .toString()
-          .trim();
-      } catch {
-        /* no PR open for the branch — create one */
-      }
+      let url = openPrUrl();
       if (!url) {
         try {
           const out = execFileSync(
@@ -1431,7 +1453,7 @@ export function createWorkManager({
             // `--fill` titles the PR from the branch's own commits — no model
             // call, nothing invented. baseBranchName, not baseRef: gh 422s on
             // a remote-tracking name like origin/main.
-            ['pr', 'create', '--head', branch, '--base', baseBranchName(baseRef()), '--fill'],
+            ['pr', 'create', '--head', branch, '--base', baseName, '--fill'],
             { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] }
           )
             .toString()
@@ -1449,10 +1471,20 @@ export function createWorkManager({
       });
       return;
     }
-    // MERGE: a MERGE COMMIT, never squash and never rebase — the cards'
-    // receipts are commit shas, and a squash rewrites them off base, which
-    // would orphan every receipt AND blind the landed walk's trailer read.
+    // MERGE: push FIRST — GitHub merges the REMOTE PR tip, and the quiz the
+    // reviewer just passed fingerprinted the LOCAL worktree, so merging
+    // without a push would land a stale tip while the observer closed the
+    // cards over commits that never reached base. Then a MERGE COMMIT, never
+    // squash and never rebase — the cards' receipts are commit shas, and a
+    // squash rewrites them off base, which would orphan every receipt AND
+    // blind the landed walk's trailer read.
     // No --delete-branch: the local branch may be a live worktree's HEAD.
+    try {
+      git(['push', 'origin', branch], pushCwd);
+    } catch (e) {
+      await settlePr({ id, outcome: 'failed', detail: ghFirstLine(e) });
+      return;
+    }
     try {
       execFileSync('gh', ['pr', 'merge', branch, '--merge'], {
         cwd: repoRoot,
@@ -1465,15 +1497,51 @@ export function createWorkManager({
         return;
       }
     }
-    await settlePr({ id, outcome: 'merged' });
-    // The merge moved base on GitHub. Fetch and observe NOW, so the cards
-    // close on this beat rather than the next 3-minute sweep — the same
-    // re-measure-after-an-action rule the kill and ship paths keep.
-    try {
-      git(['fetch', 'origin', '--quiet'], repoRoot);
-    } catch {
-      /* offline — the sweep's next fetch carries it */
+    // VERIFY before settling 'merged': modern gh exits 0 on an
+    // already-MERGED PR, so a dead PR from an earlier delivery reads as
+    // success while this branch's newest commits sit unmerged. The branch
+    // tip being an ancestor of base is the fact 'merged' claims — check it,
+    // with one short retry for the fetch racing GitHub's merge commit.
+    const tipSha = (() => {
+      try {
+        return git(['rev-parse', branch], pushCwd);
+      } catch {
+        return null;
+      }
+    })();
+    const tipOnBase = () => {
+      if (!tipSha) return false;
+      try {
+        git(['merge-base', '--is-ancestor', tipSha, baseRef()], repoRoot);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    let merged = false;
+    for (let attempt = 0; attempt < 2 && !merged; attempt++) {
+      if (attempt > 0) await new Promise((r) => setTimeout(r, 2000));
+      try {
+        git(['fetch', 'origin', '--quiet'], repoRoot);
+      } catch {
+        /* offline — the check below answers from what we have */
+      }
+      merged = tipOnBase();
     }
+    if (!merged) {
+      await settlePr({
+        id,
+        outcome: 'failed',
+        detail:
+          'GitHub reports a merge, but this branch\'s newest commits are not on the base branch — the PR that merged was an older one. Deliver again to open a fresh pull request.',
+      });
+      return;
+    }
+    await settlePr({ id, outcome: 'merged' });
+    // The merge moved base. Observe NOW, so the cards close on this beat
+    // rather than the next 3-minute sweep — the same re-measure-after-an-
+    // action rule the kill and ship paths keep. (The fetch already ran in
+    // the verify loop above.)
     void landed.observe().catch(() => {});
     onRepoChanged();
   };
@@ -1481,12 +1549,16 @@ export function createWorkManager({
     if (!Array.isArray(jobs) || jobs.length === 0) return;
     for (const job of jobs.slice(0, 5)) {
       const id = String(job?.id || '');
-      if (!id || prWorking.has(id)) continue;
-      if (!isSafePathSegment(String(job?.sessionId || ''))) continue;
-      prWorking.add(id);
+      const sid = String(job?.sessionId || '');
+      if (!id || !isSafePathSegment(sid)) continue;
+      // Keyed by SESSION, not job id: a deliver-time open and an approve-time
+      // merge for one session must run in order (the roster offers them FIFO;
+      // running them concurrently would merge before the push-and-create).
+      if (prWorking.has(sid)) continue;
+      prWorking.add(sid);
       void runPrJob(job)
         .catch(() => {})
-        .finally(() => prWorking.delete(id));
+        .finally(() => prWorking.delete(sid));
     }
   };
 

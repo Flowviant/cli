@@ -29,12 +29,14 @@ import { homedir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { git, baseBranchName } from './git.mjs';
 import { taskIdsFromMessage } from './worktreeDiff.mjs';
+import { warn } from './ui.mjs';
 import { FLEET_URL, FLEET_TOKEN, USER_AGENT } from './config.mjs';
 
 const LANDED_URL = FLEET_URL.replace(/\/agents\/?$/, '/base-landed');
-/** The server accepts 50; `-n 50` takes the NEWEST 50 of a bigger range, and
- *  persisting the tip afterwards skips the remainder — a documented cap, the
- *  same trade every capped report here makes. */
+/** The server accepts 50 per report. A bigger range walks OLDEST-FIRST in
+ *  batches: the persisted tip advances to the last commit actually reported,
+ *  so the remainder is picked up on the next beat rather than skipped forever
+ *  — a trailered card in commit 51 of a big catch-up still closes. */
 const MAX_COMMITS = 50;
 const SHA_RE = /^[0-9a-f]{7,64}$/i;
 
@@ -72,19 +74,12 @@ export function createLandedObserver({ repoRoot, baseRef }) {
     }
   };
 
-  /** New non-merge commits in from..to, oldest first. `--no-merges` for the
+  /** New non-merge commits in from..to, OLDEST FIRST. `--no-merges` for the
    *  same reason branchCommits keeps it: a merge commit describes a range
    *  rather than doing work, and its constituents are walked as themselves. */
   const walk = (from, to) => {
     const raw = git(
-      [
-        'log',
-        '--no-merges',
-        '-n',
-        String(MAX_COMMITS),
-        '--format=%H%x1f%s%x1f%B%x1e',
-        `${from}..${to}`,
-      ],
+      ['log', '--reverse', '--no-merges', '--format=%H%x1f%s%x1f%B%x1e', `${from}..${to}`],
       repoRoot
     );
     const out = [];
@@ -99,7 +94,7 @@ export function createLandedObserver({ repoRoot, baseRef }) {
         taskIds: taskIdsFromMessage(body).slice(0, 8),
       });
     }
-    return out.reverse();
+    return out;
   };
 
   /** Look at the base tip; if it moved, report the range. Call after anything
@@ -117,15 +112,21 @@ export function createLandedObserver({ repoRoot, baseRef }) {
       return;
     }
     if (st.tip === tip) return;
-    let commits;
+    let all;
     try {
-      commits = walk(st.tip, ref);
+      all = walk(st.tip, ref);
     } catch {
       // The old tip is no longer answerable (force-push, gc) — reseed and
       // report nothing rather than guess at a range.
       writeState({ ref, tip });
       return;
     }
+    // Oldest-first BATCH: a range past the server's cap advances the tip only
+    // to the last commit reported, so the remainder rides the next beat —
+    // nothing is skipped forever. (A range of nothing but merge commits still
+    // reports, tip-only: the tip moving is the fact deploy-on-merge rides.)
+    const commits = all.slice(0, MAX_COMMITS);
+    const reportedTip = all.length > MAX_COMMITS ? commits[commits.length - 1].sha : tip;
     inFlight = true;
     try {
       const res = await fetch(LANDED_URL, {
@@ -136,16 +137,33 @@ export function createLandedObserver({ repoRoot, baseRef }) {
           'Content-Type': 'application/json',
         },
         signal: AbortSignal.timeout(20_000),
-        body: JSON.stringify({ base: baseBranchName(ref), tip, commits }),
+        body: JSON.stringify({ base: baseBranchName(ref), tip: reportedTip, commits }),
       });
       if (res.status === 404) {
         unsupported = true;
         return;
       }
-      // Persist ONLY an accepted report — a 5xx (the server could not close
-      // the cards) or a network failure leaves the tip where it was, so the
-      // next beat re-walks the same range and the close re-runs, idempotently.
-      if (res.ok) writeState({ ref, tip });
+      if (res.ok) {
+        // Persist ONLY an accepted report — a 5xx (the server could not close
+        // the cards) or a network failure leaves the tip where it was, so the
+        // next beat re-walks the same range and the close re-runs, idempotently.
+        writeState({ ref, tip: reportedTip });
+        // Deploy-on-merge refusals are computed server-side and would
+        // otherwise vanish — an onMerge:'prod' (or a target with no
+        // commands[env]) must not be quietly inert.
+        const j = await res.json().catch(() => null);
+        for (const r of j?.data?.deployRefused ?? []) {
+          warn(`deploy-on-merge refused for target "${r?.targetId}": ${r?.reason}`);
+        }
+      } else if (res.status >= 400 && res.status < 500) {
+        // A persistent 4xx (deploy skew, a payload this server refuses) would
+        // otherwise re-send the same poison range on every beat forever.
+        // Drop the range — the closes it carried re-run at the next REAL tip
+        // move only if their cards are still open, which is the idempotent
+        // half; the honest cost is stated out loud.
+        writeState({ ref, tip });
+        warn(`base-landed report refused (${res.status}) — skipped ${commits.length} commit(s)`);
+      }
     } catch {
       /* offline — the next fetch beat retries */
     } finally {
