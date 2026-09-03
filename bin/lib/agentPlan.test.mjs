@@ -89,3 +89,58 @@ test('caps every string it carries', () => {
   assert.equal(out.agents[0].name.length, 80);
   assert.equal(out.note.length, 1000);
 });
+
+// ── An agent's answer at the end of a turn ──────────────────────────────────
+
+test('reads a delivery, with and without raised cards', async () => {
+  const { parseTurnResult } = await import('./agentPlan.mjs');
+  const plain = parseTurnResult('```json\n{"status":"delivered","summary":"did it"}\n```');
+  assert.equal(plain.outcome, 'delivered');
+  assert.equal(plain.answer, 'did it');
+  assert.deepEqual(plain.raised, []);
+
+  const withRaised = parseTurnResult(
+    JSON.stringify({
+      status: 'delivered',
+      summary: 's',
+      raised: [{ title: 'flaky test', brief: 'it was already failing' }],
+    })
+  );
+  assert.equal(withRaised.raised.length, 1);
+  assert.equal(withRaised.raised[0].title, 'flaky test');
+});
+
+test('reads a block as a question', async () => {
+  const { parseTurnResult } = await import('./agentPlan.mjs');
+  const out = parseTurnResult(JSON.stringify({ status: 'blocked', question: 'which auth?' }));
+  assert.equal(out.outcome, 'question');
+  assert.equal(out.answer, 'which auth?');
+});
+
+// A "blocked" with no question parks an agent with nothing to reply to. Falling
+// through to null says truthfully that the machine went quiet instead.
+test('refuses a block that asks nothing', async () => {
+  const { parseTurnResult } = await import('./agentPlan.mjs');
+  assert.equal(parseTurnResult(JSON.stringify({ status: 'blocked' })), null);
+  assert.equal(parseTurnResult(JSON.stringify({ status: 'blocked', question: '   ' })), null);
+});
+
+// NULL IS THE MOST IMPORTANT ANSWER. Anything ambiguous must end up here rather
+// than being read as success — optimistic status from a machine that quit is
+// the one lie this board cannot afford.
+test('returns null for anything that did not declare an outcome', async () => {
+  const { parseTurnResult } = await import('./agentPlan.mjs');
+  assert.equal(parseTurnResult(''), null);
+  assert.equal(parseTurnResult('I got about halfway and then ran out of context.'), null);
+  assert.equal(parseTurnResult(JSON.stringify({ status: 'done' })), null);
+  assert.equal(parseTurnResult(JSON.stringify({ summary: 'did it' })), null);
+});
+
+// A delivery buried after prose still counts — the turn ran and was paid for.
+test('finds the object after prose, and ignores a decoy brace', async () => {
+  const { parseTurnResult } = await import('./agentPlan.mjs');
+  const out = parseTurnResult(
+    'I touched {config} and then finished.\n```json\n{"status":"delivered","summary":"ok"}\n```'
+  );
+  assert.equal(out.outcome, 'delivered');
+});

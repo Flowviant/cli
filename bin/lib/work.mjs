@@ -44,7 +44,7 @@ import { listenersIn, measureListeners, listenersSupported } from './listeners.m
 import { measureProcesses, liveGroups, processesSupported } from './processes.mjs';
 import { mutateRegistry, processAlive, readRegistry } from './procRegistry.mjs';
 import { createPlaceLock } from './placeLock.mjs';
-import { parseProposal } from './agentPlan.mjs';
+import { parseProposal, parseTurnResult } from './agentPlan.mjs';
 import { sweepMergedBranch } from './shipSweep.mjs';
 import { mergeOutward as shipMergeOutward } from './shipMerge.mjs';
 import { openTunnel } from './preview.mjs';
@@ -57,6 +57,9 @@ import {
   WORK_TURN_KICKOFF_PLAIN,
   SYSTEM_PLAN,
   AGENT_PLAN_KICKOFF,
+  SYSTEM_AGENT,
+  AGENT_TASK_KICKOFF,
+  AGENT_HUMAN_KICKOFF,
 } from './prompts.mjs';
 import { materializeInto, hasMaterialized, excludeInWorktree, scrub as envScrub } from './env.mjs';
 import {
@@ -154,6 +157,9 @@ export function createWorkManager({
   const PR_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/pr-done');
   const AGENT_PLAN_CLAIM_URL = FLEET_URL.replace(/\/agents\/?$/, '/agent-plan-claim');
   const AGENT_PLAN_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/agent-plan-done');
+  const AGENT_TURN_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/agent-turn-done');
+  const AGENT_ACTIVITY_URL = FLEET_URL.replace(/\/agents\/?$/, '/agent-activity');
+  const AGENT_PARKED_URL = FLEET_URL.replace(/\/agents\/?$/, '/agent-parked');
   // What arrived on base, whichever road it took — observed after every beat
   // that can move origin/<base>: the sweep's fetch, a ship's push, a PR merge
   // this daemon performed. See landed.mjs for the seeding and delivery rules.
@@ -3563,12 +3569,271 @@ export function createWorkManager({
     }
   };
 
+  // ── AGENT TURNS: one task per prompt ───────────────────────────────────────
+  //
+  // An agent is one CLI in one worktree on one branch, working its cards ONE AT
+  // A TIME. The server types the next prompt when this one lands; this side
+  // does the work and reports what happened.
+  //
+  // NO MCP ON THIS TURN AT ALL. Everything the agent needs to say fits in its
+  // final JSON object, and everything it needs to PROVE is measured from git
+  // here afterwards — an agent naming its own commit shas would be a receipt
+  // pointing at whatever it liked. That is also what keeps this feature from
+  // adding a token kind to a scope map that has silently shipped empty twice.
+  //
+  // UNLEASED, unlike a plan or a kill. The server hands out at most one turn
+  // per agent per poll and its settle is conditional on the row still being
+  // pending, so a second daemon cannot advance the queue twice. What it could
+  // do is run a CLI twice in one worktree, which is what this in-flight set and
+  // the place lock prevent — the same discipline `processWorkTurns` keeps.
+  const agentTurns = new Set(); // turn ids in flight on this tick
+
+  const postAgentTurn = async (body) => {
+    try {
+      await fetch(AGENT_TURN_DONE_URL, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${FLEET_TOKEN}`,
+          'User-Agent': USER_AGENT,
+          'Content-Type': 'application/json',
+        },
+        signal: AbortSignal.timeout(30_000),
+        body: JSON.stringify(body),
+      });
+    } catch {
+      /* unsettled; the server expires it and the agent lands in Stuck saying so */
+    }
+  };
+
+  const postAgentActivity = async (agentId, text) => {
+    try {
+      await fetch(AGENT_ACTIVITY_URL, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${FLEET_TOKEN}`,
+          'User-Agent': USER_AGENT,
+          'Content-Type': 'application/json',
+        },
+        signal: AbortSignal.timeout(15_000),
+        body: JSON.stringify({ agentId, text }),
+      });
+    } catch {
+      /* narration is a readout; losing a line costs nothing */
+    }
+  };
+
+  /**
+   * DID THE ACCOUNT HIT A LIMIT?
+   *
+   * Deliberately a LITERAL MATCH on the few sentences the CLIs actually print,
+   * and the matched line is relayed VERBATIM. It is a trigger, not a
+   * classifier: nothing here decides what an error "means" or writes a sentence
+   * of its own, because the product's own rule is that it relays and never
+   * infers. The honest limit is that a phrasing nobody listed reads as an
+   * ordinary failed turn — which lands the agent in Stuck with the CLI's words
+   * attached, and is a perfectly survivable second-best.
+   */
+  const LIMIT_PHRASES = [
+    /usage limit reached/i,
+    /rate limit/i,
+    /you've reached your .* limit/i,
+    /quota exceeded/i,
+    /insufficient_quota/i,
+  ];
+  const limitLine = (text) => {
+    for (const line of String(text ?? '').split('\n')) {
+      const t = line.trim();
+      if (t && LIMIT_PHRASES.some((re) => re.test(t))) return envScrub(t).slice(0, 300);
+    }
+    return null;
+  };
+
+  /** Every sha that landed on this branch between two points. Measured, never
+   *  asserted — this is the whole reason an agent is not asked for its own. */
+  const commitsBetween = (wt, from) => {
+    if (!from) return [];
+    const out = git(['log', '--format=%H', `${from}..HEAD`], wt);
+    return typeof out === 'string'
+      ? out.split('\n').map((x) => x.trim()).filter(Boolean).slice(0, 50)
+      : [];
+  };
+
+  const runAgentTurn = async (job) => {
+    const turnId = String(job.id);
+    const agentId = String(job.agentId || '');
+    const place = String(job.placeId || '');
+    if (!isSafePathSegment(place)) {
+      await postAgentTurn({ turnId, outcome: 'nothing' });
+      return;
+    }
+
+    await inPlace(place, false, async () => {
+      const dir = placeWtFor(place);
+      if (!dir) {
+        // No worktree and none could be cut. `nothing` rather than an invented
+        // error: the board says the machine went quiet, which is true.
+        await postAgentTurn({ turnId, outcome: 'nothing' });
+        return;
+      }
+      const wt = dir.wt;
+      // WHERE THE BRANCH WAS BEFORE THIS TURN, so the commits reported are the
+      // ones this turn actually made.
+      const before = (git(['rev-parse', 'HEAD'], wt) || '').trim() || null;
+      const branch = (git(['symbolic-ref', '--quiet', '--short', 'HEAD'], wt) || '').trim() || null;
+
+      const rt = job.runtime || 'claude';
+      if (!canRun(RUNTIMES[rt], 'build')) {
+        await postAgentTurn({
+          turnId,
+          outcome: 'nothing',
+          answer: `this machine cannot run ${rt}`,
+          branch,
+          worktree: wt,
+        });
+        return;
+      }
+
+      // ONE AGENT IS ONE DIRECTORY, so the CLI's own cwd-keyed resume is exactly
+      // right here — the ambiguity that forced per-tab session pinning in the
+      // Workbench (many tabs, one place) cannot arise. The marker is what
+      // distinguishes the first turn from every later one across restarts.
+      const ranMarker = sessionMetaPath(wt, 'flowviant-agent-ran');
+      const resume = Boolean(ranMarker && existsSync(ranMarker));
+
+      let out = '';
+      let child = null;
+      try {
+        out = await runTurn({
+          prompt:
+            job.kind === 'task' && job.task
+              ? AGENT_TASK_KICKOFF({
+                  agentName: job.agentName,
+                  task: job.task,
+                  position: job.position ?? 1,
+                  total: job.total ?? 1,
+                })
+              : AGENT_HUMAN_KICKOFF({
+                  agentName: job.agentName,
+                  message: job.body ?? '',
+                  askedByName: job.askedByName,
+                  task: job.task,
+                  position: job.position ?? 1,
+                  total: job.total ?? 1,
+                }),
+          system: SYSTEM_AGENT,
+          cwd: wt,
+          runtime: rt,
+          resume,
+          streamJson: true,
+          answerFromResult: true,
+          label: c.cyan('[agent]'),
+          // The CLI's own tail, relayed. Throttled by the same rule the tab's
+          // narrator keeps: overwritten, never appended, and ignored by the
+          // board past ~90 seconds.
+          onActivity: (a) => {
+            const line = a?.label;
+            if (!line) return;
+            const now = Date.now();
+            if (now - (lastAgentBeat.get(agentId) ?? 0) < 2_000) return;
+            lastAgentBeat.set(agentId, now);
+            void postAgentActivity(agentId, envScrub(String(line)).slice(0, 400));
+          },
+          onSpawn: (ch) => {
+            child = ch;
+            workChildren.set(ch, null);
+            noteSessionGroup(agentId, ch.pid);
+          },
+        });
+      } finally {
+        if (child) workChildren.delete(child);
+        if (ranMarker) {
+          try {
+            writeFileSync(ranMarker, '1');
+          } catch {
+            /* a missing marker only costs one un-resumed turn */
+          }
+        }
+      }
+
+      const commits = commitsBetween(wt, before);
+      const limit = limitLine(out);
+      if (limit) {
+        // EVERY agent parks, because the account is shared: one hitting the
+        // limit means all of them have. The turn itself is reported as
+        // `nothing` — it did not deliver and it did not ask.
+        await postAgentParked(limit);
+        await postAgentTurn({ turnId, outcome: 'nothing', answer: limit, branch, worktree: wt });
+        return;
+      }
+
+      const res = parseTurnResult(out);
+      if (!res) {
+        await postAgentTurn({
+          turnId,
+          outcome: 'nothing',
+          // The CLI's own words when it produced any. A turn that explained why
+          // it stopped is far more use than "the agent stopped".
+          answer: out.trim()
+            ? envScrub(out).slice(-1500)
+            : 'the turn produced no output on the machine — its CLI may be signed out',
+          ...(commits.length ? { commits } : {}),
+          branch,
+          worktree: wt,
+        });
+        return;
+      }
+      await postAgentTurn({
+        turnId,
+        outcome: res.outcome,
+        answer: envScrub(res.answer ?? '').slice(0, 8000),
+        ...(commits.length ? { commits } : {}),
+        ...(res.raised?.length ? { raised: res.raised } : {}),
+        branch,
+        worktree: wt,
+      });
+    });
+  };
+
+  const lastAgentBeat = new Map(); // agentId -> last activity POST, ms
+
+  const postAgentParked = async (reason) => {
+    try {
+      await fetch(AGENT_PARKED_URL, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${FLEET_TOKEN}`,
+          'User-Agent': USER_AGENT,
+          'Content-Type': 'application/json',
+        },
+        signal: AbortSignal.timeout(15_000),
+        body: JSON.stringify({ reason }),
+      });
+    } catch {
+      /* the next turn will hit the same limit and try again */
+    }
+  };
+
+  const processAgentTurnJobs = (jobs) => {
+    if (!Array.isArray(jobs) || jobs.length === 0) return;
+    for (const job of jobs.slice(0, 4)) {
+      const id = String(job?.id || '');
+      if (!id || agentTurns.has(id)) continue;
+      if (!job.agentId || !job.placeId) continue;
+      agentTurns.add(id);
+      void runAgentTurn(job).finally(() => agentTurns.delete(id));
+    }
+  };
+
   const workBusy = () =>
     placeLocks.size > 0 ||
     // A planning turn is a live CLI child of ours, and an auto-update that
     // SIGTERMs it mid-flight would leave a press claimed, unsettled and
     // waiting out its lease while somebody watches a spinner.
     planning.size > 0 ||
+    // An agent turn is real work in a real worktree. Killed mid-flight it
+    // leaves uncommitted edits and a turn the server will eventually expire
+    // into a card nobody can explain.
+    agentTurns.size > 0 ||
     shipping.size > 0 ||
     workChildren.size > 0 ||
     workAnswering.size > 0 ||
@@ -3593,5 +3858,6 @@ export function createWorkManager({
     shutdownWork,
     workBusy,
     processAgentPlanJobs,
+    processAgentTurnJobs,
   };
 }

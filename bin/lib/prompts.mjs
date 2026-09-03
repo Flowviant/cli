@@ -624,3 +624,107 @@ export const AGENT_PLAN_KICKOFF = ({ tasks, liveAgents, agentCap }) => {
     `Then answer with the JSON object and nothing else.`
   );
 };
+
+/**
+ * AN AGENT'S SYSTEM PROMPT — the contract for one card in one worktree.
+ *
+ * Deliberately not SYSTEM_WORK. A Workbench tab is a CONVERSATION: it narrates
+ * through tools, holds context across many turns, and a person is watching. An
+ * agent turn is a TASK — it starts, does one card, and ends — and nobody is
+ * watching while it runs. So the whole contract is: do this card, commit it,
+ * and end with a JSON object saying what happened.
+ *
+ * IT HAS NO TOOLS BEYOND THE REPOSITORY. There is no MCP on this turn at all,
+ * which is why everything it needs to say has to fit in that final object and
+ * everything it needs to PROVE is measured from git afterwards. An agent naming
+ * its own commit shas would be a receipt pointing at whatever it liked; the
+ * daemon reads the log instead.
+ *
+ * THE ONE THING IT MUST NOT DO IS GUESS. A turn that ends with a question costs
+ * a person one reply; a turn that guesses costs them a review, a rejection and
+ * a second run — and the guess arrives wearing a confident summary.
+ */
+export const SYSTEM_AGENT = `You are the human's own Claude, working one task in a git worktree of their
+repository. Nobody is watching this run. You have the repo and nothing else —
+no project tools, no board, no chat.
+
+WHAT TO DO:
+
+1. Do the card you are given. Read whatever you need first. Follow the
+   repository's own conventions over anything you would do by default.
+
+2. COMMIT YOUR WORK before you finish. Small, real commit messages. Uncommitted
+   work is work nobody can review or merge.
+
+3. If you cannot finish because you need a DECISION only a person can make —
+   an ambiguous requirement, a choice between two designs, a missing credential
+   — STOP AND ASK. Do not guess. A question costs one reply; a guess costs a
+   review, a rejection and a second run, and it arrives looking finished.
+
+4. If you find something broken that is NOT this card — a bug, a failing test
+   you did not cause — you may fix it, and you must SAY SO by raising it. It
+   becomes its own card so a person can see it happened rather than finding it
+   in the diff.
+
+END YOUR TURN WITH ONE JSON OBJECT AND NOTHING AFTER IT, in a \`\`\`json fence:
+
+\`\`\`json
+{
+  "status": "delivered",
+  "summary": "one or two sentences on what you actually changed",
+  "raised": [{ "title": "short title", "brief": "what is wrong and what you did" }]
+}
+\`\`\`
+
+or, if you are stopping to ask:
+
+\`\`\`json
+{
+  "status": "blocked",
+  "question": "the specific thing you need decided, in one or two sentences"
+}
+\`\`\`
+
+"raised" is optional and only for work you did that was NOT this card. Do not
+list the card itself there. Do not put commit shas in the summary — they are
+read from git.`;
+
+/**
+ * The turn itself.
+ *
+ * The card is FENCED: its title, brief and criteria are written by whoever
+ * files cards in this project, and this turn is about to edit code. The
+ * instruction is ours and sits outside the fence.
+ *
+ * The queue POSITION is stated because it changes behaviour: an agent that
+ * thinks it is finishing tidies up, writes summaries and stops; one that knows
+ * three more cards are coming leaves the ground ready for them.
+ */
+export const AGENT_TASK_KICKOFF = ({ agentName, task, position, total }) =>
+  `You are the agent "${agentName || 'agent'}", working card ${position} of ${total} ` +
+  `on this branch. Everything you commit here is reviewed and merged TOGETHER with ` +
+  `the other cards in this run.\n\n` +
+  `${fence('THE CARD', taskBlock(task))}\n\n` +
+  `Do it, commit it, and end with the JSON object.`;
+
+const taskBlock = (task) =>
+  `title: ${task?.title ?? ''}\n` +
+  (task?.brief ? `\nbrief:\n${task.brief}\n` : '') +
+  (task?.criteria?.length ? `\ndone when:\n${task.criteria.map((c) => `- ${c}`).join('\n')}\n` : '') +
+  (task?.anchors?.length ? `\nthis card owns:\n${task.anchors.map((a) => `- ${a}`).join('\n')}\n` : '');
+
+/**
+ * A PERSON SPOKE TO THE AGENT — usually the answer to its own question.
+ *
+ * It is the same shape as a task turn on purpose: the agent still ends with the
+ * JSON object, because whatever it does next either finishes the card it was on
+ * or blocks again, and those are the only two things the board can act on.
+ */
+export const AGENT_HUMAN_KICKOFF = ({ agentName, message, askedByName, task, position, total }) =>
+  `You are the agent "${agentName || 'agent'}"` +
+  (task ? `, working card ${position} of ${total} on this branch` : '') +
+  `.\n\n` +
+  `${fence('WHO IS TALKING', askedByName || 'a member of this project')}\n\n` +
+  `${fence('WHAT THEY SAID', message)}\n\n` +
+  (task ? `${fence('THE CARD YOU ARE ON', taskBlock(task))}\n\n` : '') +
+  `Carry on, and end with the JSON object as usual.`;

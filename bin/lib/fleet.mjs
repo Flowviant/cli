@@ -818,6 +818,7 @@ export async function runFleetDaemon() {
     processKillJobs,
     processPrJobs,
     processAgentPlanJobs,
+    processAgentTurnJobs,
     heldSessionIds,
     processPreviewJobs,
     livePreviewIds,
@@ -1622,6 +1623,9 @@ export async function runFleetDaemon() {
     // those lanes may still be writing — it measures, so a stale read is a
     // slightly worse hint and never a wrong action.
     processAgentPlanJobs(roster.agentPlanJobs);
+    // …and an agent's next card. After the plan jobs because a press becoming
+    // agents is the thing that produces these.
+    processAgentTurnJobs(roster.agentTurnJobs);
     // …and what the SURVIVING ones hold: branch, ahead-of-base, diffstat.
     // Throttled inside, never awaited — a `git status` the human cannot run
     // themselves from a browser, relayed. After retirement so a directory that

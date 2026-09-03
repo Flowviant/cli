@@ -124,3 +124,64 @@ export function parseProposal(text) {
       : {}),
   };
 }
+
+/**
+ * READING AN AGENT'S ANSWER at the end of a turn.
+ *
+ * Same lenient-packaging / strict-shape rule as `parseProposal`, and the same
+ * reason: the turn already ran and the operator already paid for it, so
+ * refusing the whole thing over a stray "Here you go:" throws away real work.
+ *
+ * NULL IS A REAL ANSWER AND THE MOST IMPORTANT ONE. It means the turn declared
+ * NEITHER delivered nor blocked — a signed-out CLI, a crash, an exhausted
+ * quota, or a model that simply stopped — and the caller reports it as
+ * `nothing`, which sends the agent to Stuck. Optimistic status from a machine
+ * that quit is the one lie this board cannot afford, so anything ambiguous ends
+ * up here rather than being read as success.
+ */
+export function parseTurnResult(text) {
+  const parsedRaw = String(text ?? '');
+  const fenced = parsedRaw.match(/```(?:json)?\s*([\s\S]*?)```/);
+  const candidates = [];
+  if (fenced) candidates.push(fenced[1]);
+  for (let i = 0; i < parsedRaw.length; i++) {
+    if (parsedRaw[i] !== '{') continue;
+    const end = balanced(parsedRaw, i);
+    if (end > i) candidates.push(parsedRaw.slice(i, end + 1));
+  }
+  for (const body of candidates) {
+    let v;
+    try {
+      v = JSON.parse(body);
+    } catch {
+      continue;
+    }
+    if (!v || typeof v !== 'object') continue;
+    if (v.status === 'blocked') {
+      const question = typeof v.question === 'string' ? v.question.trim() : '';
+      // A "blocked" with no question is not an answer anybody can act on — it
+      // parks an agent with nothing to reply to. Treated as `nothing`, which
+      // at least says truthfully that the machine went quiet.
+      if (!question) continue;
+      return { outcome: 'question', answer: question.slice(0, 8000) };
+    }
+    if (v.status === 'delivered') {
+      return {
+        outcome: 'delivered',
+        answer: (typeof v.summary === 'string' ? v.summary : '').slice(0, 8000),
+        raised: Array.isArray(v.raised)
+          ? v.raised
+              .filter((r) => r && typeof r.title === 'string' && r.title.trim())
+              .slice(0, 10)
+              .map((r) => ({
+                title: r.title.trim().slice(0, 300),
+                ...(typeof r.brief === 'string' && r.brief.trim()
+                  ? { brief: r.brief.trim().slice(0, 2000) }
+                  : {}),
+              }))
+          : [],
+      };
+    }
+  }
+  return null;
+}
