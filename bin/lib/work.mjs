@@ -4115,6 +4115,52 @@ export function createWorkManager({
     }
   };
 
+  /**
+   * KEEP EACH PERSON'S MANUAL WORKTREE FRESH.
+   *
+   * Every teammate's Workbench tabs share one directory of their own on a
+   * branch of their own — which is not a preference, it is what git allows:
+   * two worktrees cannot have the same branch checked out, so "everyone works
+   * on main" is only true for the machine's OPERATOR, whose place is the
+   * checkout itself. Everyone else needs a branch, and a branch left alone
+   * drifts behind main until the first thing they do in a new tab is a merge
+   * they did not ask for.
+   *
+   * FAST-FORWARD ONLY, and that is the whole safety argument. If their branch
+   * has no commits of its own it simply catches up, which is the ordinary case
+   * and the one worth automating. The moment it HAS diverged, this stops and
+   * leaves it exactly as it is: their commits are theirs, a rebase would
+   * rewrite them under somebody who is not looking, and a merge would put a
+   * commit in their history that they did not make. Their own Claude can fold
+   * base in whenever they ask it to.
+   *
+   * Guarded three ways: a DIRTY tree is left alone (uncommitted work outranks
+   * freshness), a place with a live lock is skipped (a turn is standing in it),
+   * and the whole thing is silent — nothing here reports, warns or blocks.
+   */
+  const freshenManualPlaces = () => {
+    let dir;
+    try {
+      dir = readdirSync(join(baseDir, 'sessions'));
+    } catch {
+      return; // no worktrees yet
+    }
+    for (const place of dir) {
+      // Only a PERSON's manual place. An agent's own worktree (`a-<id>`) is
+      // deliberately not touched: its branch is the reviewable unit, and
+      // moving it under a review would change what somebody is deciding about.
+      if (!place.startsWith('u-') || !isSafePathSegment(place)) continue;
+      if (placeLocks.has(place)) continue;
+      const wt = join(baseDir, 'sessions', place);
+      try {
+        if (git(['status', '--porcelain'], wt).trim() !== '') continue;
+        git(['merge', '--ff-only', baseRef()], wt);
+      } catch {
+        /* diverged, or something else is going on in there. Leave it. */
+      }
+    }
+  };
+
   const workBusy = () =>
     placeLocks.size > 0 ||
     // A planning turn is a live CLI child of ours, and an auto-update that
@@ -4152,5 +4198,6 @@ export function createWorkManager({
     processAgentPlanJobs,
     processAgentTurnJobs,
     processAgentMergeJobs,
+    freshenManualPlaces,
   };
 }

@@ -820,6 +820,7 @@ export async function runFleetDaemon() {
     processAgentPlanJobs,
     processAgentTurnJobs,
     processAgentMergeJobs,
+    freshenManualPlaces,
     heldSessionIds,
     processPreviewJobs,
     livePreviewIds,
@@ -1631,6 +1632,9 @@ export async function runFleetDaemon() {
     // place's WRITER lock, and writer preference means it goes ahead of any
     // reader queued behind it anyway.
     processAgentMergeJobs(roster.agentMergeJobs);
+    // Catch each person's manual worktree up to base while it is clean. Silent,
+    // fast-forward only, and it never touches an agent's branch.
+    freshenManualPlaces();
     // …and what the SURVIVING ones hold: branch, ahead-of-base, diffstat.
     // Throttled inside, never awaited — a `git status` the human cannot run
     // themselves from a browser, relayed. After retirement so a directory that
