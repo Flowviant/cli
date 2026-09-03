@@ -819,6 +819,7 @@ export async function runFleetDaemon() {
     processPrJobs,
     processAgentPlanJobs,
     processAgentTurnJobs,
+    processAgentMergeJobs,
     heldSessionIds,
     processPreviewJobs,
     livePreviewIds,
@@ -1626,6 +1627,10 @@ export async function runFleetDaemon() {
     // …and an agent's next card. After the plan jobs because a press becoming
     // agents is the thing that produces these.
     processAgentTurnJobs(roster.agentTurnJobs);
+    // …and a branch somebody approved. After the turns: a merge takes the
+    // place's WRITER lock, and writer preference means it goes ahead of any
+    // reader queued behind it anyway.
+    processAgentMergeJobs(roster.agentMergeJobs);
     // …and what the SURVIVING ones hold: branch, ahead-of-base, diffstat.
     // Throttled inside, never awaited — a `git status` the human cannot run
     // themselves from a browser, relayed. After retirement so a directory that

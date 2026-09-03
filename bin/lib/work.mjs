@@ -28,7 +28,7 @@ import {
   mkdirSync,
   cpSync,
 } from 'node:fs';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { join, dirname } from 'node:path';
 import {
   FLEET_URL,
@@ -160,6 +160,9 @@ export function createWorkManager({
   const AGENT_TURN_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/agent-turn-done');
   const AGENT_ACTIVITY_URL = FLEET_URL.replace(/\/agents\/?$/, '/agent-activity');
   const AGENT_PARKED_URL = FLEET_URL.replace(/\/agents\/?$/, '/agent-parked');
+  const AGENT_CHECK_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/agent-check-done');
+  const AGENT_MERGE_CLAIM_URL = FLEET_URL.replace(/\/agents\/?$/, '/agent-merge-claim');
+  const AGENT_MERGE_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/agent-merge-done');
   // What arrived on base, whichever road it took — observed after every beat
   // that can move origin/<base>: the sweep's fetch, a ship's push, a PR merge
   // this daemon performed. See landed.mjs for the seeding and delivery rules.
@@ -3588,9 +3591,14 @@ export function createWorkManager({
   // the place lock prevent — the same discipline `processWorkTurns` keeps.
   const agentTurns = new Set(); // turn ids in flight on this tick
 
+  /** Returns the server's reply, because it carries ONE instruction the machine
+   *  can act on immediately: `review: true` means the agent's queue just
+   *  emptied, so run the project's own check in the worktree we are already
+   *  standing in. A job lane for that would need a claim, a floor and a settle
+   *  to say something this reply already can. */
   const postAgentTurn = async (body) => {
     try {
-      await fetch(AGENT_TURN_DONE_URL, {
+      const res = await fetch(AGENT_TURN_DONE_URL, {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${FLEET_TOKEN}`,
@@ -3600,8 +3608,11 @@ export function createWorkManager({
         signal: AbortSignal.timeout(30_000),
         body: JSON.stringify(body),
       });
+      const j = await res.json().catch(() => null);
+      return j?.data ?? null;
     } catch {
       /* unsettled; the server expires it and the agent lands in Stuck saying so */
+      return null;
     }
   };
 
@@ -3782,7 +3793,7 @@ export function createWorkManager({
         });
         return;
       }
-      await postAgentTurn({
+      const reply = await postAgentTurn({
         turnId,
         outcome: res.outcome,
         answer: envScrub(res.answer ?? '').slice(0, 8000),
@@ -3791,6 +3802,9 @@ export function createWorkManager({
         branch,
         worktree: wt,
       });
+      // The queue just emptied. Run the project's own check HERE, in the
+      // worktree we are already standing in and still hold the lock on.
+      if (reply?.review === true) await runCheck(agentId, wt);
     });
   };
 
@@ -3824,6 +3838,283 @@ export function createWorkManager({
     }
   };
 
+  // ── THE PROJECT'S OWN CHECK, and the MERGE ─────────────────────────────────
+  //
+  // The check runs in the agent's own worktree the moment its queue empties, so
+  // a reviewer knows before they start reading whether they are reviewing
+  // working code. It LABELS the review row; it never blocks it.
+  //
+  // IT IS THE REPO'S COMMAND, DECLARED IN THE REPO. `.flowviant/check.json`,
+  // beside `deploy.json`, because a check travels with the code and changes
+  // with it — a setting in the app would go stale the first time somebody
+  // renamed a script. An absent file is a MEASURED answer ('none'), not a nag:
+  // plenty of projects have no single command that means "is this alright".
+  //
+  // It runs through a shell, and that is no wider than what already happens in
+  // that directory: every turn in this worktree spawns a CLI with build
+  // permissions, so a repository that can run arbitrary code during a turn can
+  // run it here too. What this is NOT is the deleted dev-run supervisor —
+  // nothing here resolves a command, guesses a stack, or starts a server.
+  const CHECK_TIMEOUT_MS = 10 * 60_000;
+  const CHECK_OUTPUT_CAP = 4000;
+
+  const readCheckCommand = () => {
+    try {
+      const raw = readFileSync(join(repoRoot, '.flowviant', 'check.json'), 'utf8');
+      const cfg = JSON.parse(raw);
+      const cmd = typeof cfg?.command === 'string' ? cfg.command.trim() : '';
+      return cmd ? cmd.slice(0, 500) : null;
+    } catch {
+      return null; // absent, unreadable or not JSON — all mean "no check"
+    }
+  };
+
+  const postCheck = async (body) => {
+    try {
+      await fetch(AGENT_CHECK_DONE_URL, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${FLEET_TOKEN}`,
+          'User-Agent': USER_AGENT,
+          'Content-Type': 'application/json',
+        },
+        signal: AbortSignal.timeout(30_000),
+        body: JSON.stringify(body),
+      });
+    } catch {
+      /* the row simply keeps its previous answer, which is null the first time */
+    }
+  };
+
+  const runCheck = async (agentId, wt) => {
+    const cmd = readCheckCommand();
+    const headSha = (git(['rev-parse', 'HEAD'], wt) || '').trim() || undefined;
+    if (!cmd) {
+      await postCheck({ agentId, status: 'none', ...(headSha ? { headSha } : {}) });
+      return;
+    }
+    const out = await new Promise((resolve) => {
+      let text = '';
+      let done = false;
+      const finish = (status) => {
+        if (done) return;
+        done = true;
+        resolve({ status, text });
+      };
+      let child;
+      try {
+        child = spawn(cmd, { cwd: wt, shell: true, stdio: ['ignore', 'pipe', 'pipe'] });
+      } catch (e) {
+        finish('failed');
+        text = String(e?.message || e);
+        return;
+      }
+      // The TAIL, not the head: a failing check says why at the end.
+      const keep = (buf) => {
+        text = (text + buf.toString()).slice(-CHECK_OUTPUT_CAP);
+      };
+      child.stdout?.on('data', keep);
+      child.stderr?.on('data', keep);
+      const timer = setTimeout(() => {
+        try {
+          child.kill('SIGKILL');
+        } catch {
+          /* already gone */
+        }
+        text += '\n[flowviant] the check ran past ten minutes and was stopped';
+        finish('failed');
+      }, CHECK_TIMEOUT_MS);
+      child.on('error', (e) => {
+        clearTimeout(timer);
+        text += String(e?.message || e);
+        finish('failed');
+      });
+      child.on('close', (code) => {
+        clearTimeout(timer);
+        finish(code === 0 ? 'passed' : 'failed');
+      });
+    });
+    await postCheck({
+      agentId,
+      status: out.status,
+      output: envScrub(out.text).slice(-CHECK_OUTPUT_CAP),
+      ...(headSha ? { headSha } : {}),
+    });
+  };
+
+  // ── THE MERGE ──────────────────────────────────────────────────────────────
+  //
+  // LEASED, because two `git merge --no-ff` and two pushes over one branch is
+  // the loudest duplicate this system can produce. It reuses `mergeOutward`
+  // verbatim — the same throwaway-worktree merge, the same once-only retry when
+  // two people land at the same moment — because an agent's branch is not
+  // special: it is a branch, and this repo already knows how to land one.
+  //
+  // A SUCCESS CLOSES NOTHING. Done stays OBSERVED: the merge reaches base, the
+  // landed observer's own fetch sees it, and the cards close there.
+  const agentMerges = new Set(); // agent ids in flight on this tick
+
+  const claimAgentMerge = async (agentId) => {
+    try {
+      const res = await fetch(AGENT_MERGE_CLAIM_URL, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${FLEET_TOKEN}`,
+          'User-Agent': USER_AGENT,
+          'Content-Type': 'application/json',
+        },
+        signal: AbortSignal.timeout(15_000),
+        body: JSON.stringify({ agentId, instance: DAEMON_INSTANCE }),
+      });
+      const j = await res.json().catch(() => null);
+      return j?.data?.claimed === true;
+    } catch {
+      return false; // the peer may hold it; doing nothing is the safe answer
+    }
+  };
+
+  const postAgentMerge = async (body) => {
+    try {
+      await fetch(AGENT_MERGE_DONE_URL, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${FLEET_TOKEN}`,
+          'User-Agent': USER_AGENT,
+          'Content-Type': 'application/json',
+        },
+        signal: AbortSignal.timeout(30_000),
+        body: JSON.stringify({ ...body, instance: DAEMON_INSTANCE }),
+      });
+    } catch {
+      /* the lease lapses and the job is re-offered — a merge is idempotent
+         against an already-merged branch, which mergeOutward detects */
+    }
+  };
+
+  /**
+   * A merge COMMIT needs a git identity and the machine may have none. Prefer
+   * the operator's own config; fall back to the daemon's, the same fallback
+   * `checkpointWip` and ship both use, so a bare machine does not fail the fold
+   * with "Please tell me who you are".
+   */
+  const gitMerge = (args, cwd) => {
+    let idEnv = null;
+    try {
+      git(['config', 'user.email'], repoRoot);
+    } catch {
+      idEnv = {
+        GIT_AUTHOR_NAME: 'Flowviant',
+        GIT_AUTHOR_EMAIL: 'daemon@flowviant.com',
+        GIT_COMMITTER_NAME: 'Flowviant',
+        GIT_COMMITTER_EMAIL: 'daemon@flowviant.com',
+      };
+    }
+    return execFileSync('git', args, {
+      cwd,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      ...(idEnv ? { env: { ...process.env, ...idEnv } } : {}),
+    });
+  };
+
+  const runAgentMerge = async (job) => {
+    const agentId = String(job.agentId);
+    const place = String(job.placeId || '');
+    if (!isSafePathSegment(place)) {
+      await postAgentMerge({ agentId, ok: false, detail: 'the agent has no worktree here' });
+      return;
+    }
+    if (!(await claimAgentMerge(agentId))) return;
+
+    // A WRITER on the place, exactly as a ship is. It folds base in and pushes
+    // with git in that directory, and no CLI can coordinate with something it
+    // does not know exists.
+    await inPlace(place, true, async () => {
+      const wt = join(baseDir, 'sessions', place);
+      if (!existsSync(wt)) {
+        await postAgentMerge({ agentId, ok: false, detail: 'the worktree is gone' });
+        return;
+      }
+      try {
+        git(['fetch', 'origin', '--quiet'], repoRoot);
+      } catch {
+        /* offline — the merge fails honestly below */
+      }
+      // STALE means base moved under this branch while it sat in review. Fold
+      // base IN first so the merge that follows is against what is actually
+      // there; a conflict here is the same conflict the merge would hit, found
+      // one step earlier and in the agent's own directory where it can be
+      // resolved.
+      if (job.stale) {
+        try {
+          gitMerge(['merge', '--no-edit', baseRef()], wt);
+        } catch (e) {
+          await postAgentMerge({
+            agentId,
+            ok: false,
+            detail: envScrub(String(e?.message || e)).slice(0, 2000),
+          });
+          return;
+        }
+        // The branch changed, so the previous check answered about a different
+        // tree. Re-run it before anything merges.
+        await runCheck(agentId, wt);
+      }
+      const branch = (git(['symbolic-ref', '--quiet', '--short', 'HEAD'], wt) || '').trim();
+      if (!branch) {
+        // A detached HEAD names no branch, so there is nothing to merge and
+        // nothing to record. An ambiguity in git, not a rule of ours.
+        await postAgentMerge({ agentId, ok: false, detail: 'this worktree is on a detached HEAD' });
+        return;
+      }
+      const tip = (git(['rev-parse', 'HEAD'], wt) || '').trim();
+      const countOut = git(['rev-list', '--count', `${baseRef()}..HEAD`], wt);
+      const count = Number((countOut || '0').trim()) || 0;
+      if (count === 0) {
+        // Already on base — an idempotent re-offer, or an agent that changed
+        // nothing. Reported as a SUCCESS: the branch's work is on base, which
+        // is what the caller is asking about.
+        await postAgentMerge({ agentId, ok: true, sha: tip || undefined });
+        return;
+      }
+      try {
+        shipMergeOutward({
+          tip,
+          count,
+          branch,
+          label: job.agentName || place.slice(0, 12),
+          git,
+          gitMerge,
+          repoRoot,
+          tmpDir: join(baseDir, 'ship', place),
+          baseRef,
+          workingTree: wt,
+          warn,
+        });
+      } catch (e) {
+        await postAgentMerge({
+          agentId,
+          ok: false,
+          detail: envScrub(String(e?.message || e)).slice(0, 2000),
+        });
+        return;
+      }
+      await postAgentMerge({ agentId, ok: true, sha: tip });
+      onRepoChanged();
+      landed.observe();
+    });
+  };
+
+  const processAgentMergeJobs = (jobs) => {
+    if (!Array.isArray(jobs) || jobs.length === 0) return;
+    for (const job of jobs.slice(0, 2)) {
+      const id = String(job?.agentId || '');
+      if (!id || agentMerges.has(id)) continue;
+      agentMerges.add(id);
+      void runAgentMerge(job).finally(() => agentMerges.delete(id));
+    }
+  };
+
   const workBusy = () =>
     placeLocks.size > 0 ||
     // A planning turn is a live CLI child of ours, and an auto-update that
@@ -3834,6 +4125,7 @@ export function createWorkManager({
     // leaves uncommitted edits and a turn the server will eventually expire
     // into a card nobody can explain.
     agentTurns.size > 0 ||
+    agentMerges.size > 0 ||
     shipping.size > 0 ||
     workChildren.size > 0 ||
     workAnswering.size > 0 ||
@@ -3859,5 +4151,6 @@ export function createWorkManager({
     workBusy,
     processAgentPlanJobs,
     processAgentTurnJobs,
+    processAgentMergeJobs,
   };
 }
