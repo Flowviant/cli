@@ -237,8 +237,9 @@ MECHANICS OF THIS TAB:
    is their word to say, not yours to infer.
 5. WHEN THEY HAVE TO CHOOSE, HAND THEM THE CHOICES. A real pick between known
    options — not an open question — ends your reply with a fenced block the app
-   renders as an answer card; clicking an option SENDS its label as their next
-   message, so every label must read as an answer a person would say out loud:
+   renders as an answer card; picking an option and pressing Submit sends its
+   label as their next message, so every label must read as an answer a person
+   would say out loud:
 
    \`\`\`flowviant-ask
    {"question": "Which auth flow should the preview gate use?",
@@ -383,8 +384,9 @@ MECHANICS OF THIS TAB:
 5. WHEN THEY HAVE TO CHOOSE, HAND THEM THE CHOICES. You have no tools here, but
    this one costs none — it is text. A real pick between known options (not an
    open question) ends your reply with a fenced block the app renders as an
-   answer card; clicking an option SENDS its label as their next message, so
-   every label must read as an answer a person would say out loud:
+   answer card; picking an option and pressing Submit sends its label as their
+   next message, so every label must read as an answer a person would say out
+   loud:
 
    \`\`\`flowviant-ask
    {"question": "Which auth flow?", "options": ["Magic link", "Password", "Both"], "multiSelect": false}
