@@ -3486,16 +3486,21 @@ export function createWorkManager({
   const runAgentPlan = async (job) => {
     const id = String(job.id);
     const tasks = Array.isArray(job.tasks) ? job.tasks : [];
+    // CLAIM BEFORE ANYTHING — including before the cheap refusal below.
+    //
+    // The settle is rejected unless the caller HOLDS the lease, so posting an
+    // error first meant the server discarded it and the press sat open forever,
+    // holding its cards out of Deploy. That is the opposite of the ordering a
+    // kill keeps (refuse cheaply, then claim) and it is because these two
+    // lanes settle differently: a kill's settle does not check a lease for the
+    // not-found case, and a plan's always does.
+    if (!(await claimAgentPlan(id))) return;
     if (tasks.length === 0) {
-      // The press named cards the doc no longer has. A real answer, and one
-      // the board can explain, rather than a turn that plans nothing.
+      // The press named cards the doc no longer has. A real answer, and one the
+      // board can explain, rather than a turn that plans nothing.
       await postAgentPlan({ id, error: 'those cards are no longer on the board' });
       return;
     }
-    // CLAIM BEFORE SPENDING ANYTHING. Two daemons share one credential and are
-    // handed the same array; planning twice bills the operator twice to produce
-    // two proposals over one selection, only one of which anybody ever sees.
-    if (!(await claimAgentPlan(id))) return;
 
     /**
      * WHICH CLI PLANS. `pickRuntimeFor('consult')`, the same picker every other
@@ -3519,6 +3524,10 @@ export function createWorkManager({
     }));
 
     let out = '';
+    /** REMOVED IN A `finally`. `workChildren` is what `workBusy()` counts, and
+     *  a leaked entry keeps the daemon permanently "busy" — which blocks every
+     *  auto-update from that moment on, silently, until a restart. */
+    let planChild = null;
     try {
       await inPlace(REPO_PLACE, false, async () => {
         out = await runTurn({
@@ -3536,12 +3545,17 @@ export function createWorkManager({
           streamJson: true,
           answerFromResult: true,
           label: c.cyan('[plan]'),
-          onSpawn: (ch) => workChildren.set(ch, null),
+          onSpawn: (ch) => {
+            planChild = ch;
+            workChildren.set(ch, null);
+          },
         });
       });
     } catch (e) {
       await postAgentPlan({ id, error: envScrub(String(e?.message || e)).slice(0, 500) });
       return;
+    } finally {
+      if (planChild) workChildren.delete(planChild);
     }
 
     const proposal = parseProposal(out);
@@ -3596,7 +3610,14 @@ export function createWorkManager({
    *  emptied, so run the project's own check in the worktree we are already
    *  standing in. A job lane for that would need a claim, a floor and a settle
    *  to say something this reply already can. */
+  /** Turn ids whose work is DONE but whose report has not landed. The same
+   *  skip-guard `pendingWorkReports` is for a tab, and for the same reason: a
+   *  settle that fails to POST must not re-run the turn — that is a second CLI,
+   *  a second set of commits, and the operator's quota spent again. */
+  const agentReported = new Set();
+
   const postAgentTurn = async (body) => {
+    agentReported.add(String(body.turnId));
     try {
       const res = await fetch(AGENT_TURN_DONE_URL, {
         method: 'POST',
@@ -3609,9 +3630,14 @@ export function createWorkManager({
         body: JSON.stringify(body),
       });
       const j = await res.json().catch(() => null);
+      // Landed. Forgetting it keeps the guard from growing without bound; a
+      // re-offer of a settled turn is refused server-side anyway.
+      if (res.ok) agentReported.delete(String(body.turnId));
       return j?.data ?? null;
     } catch {
-      /* unsettled; the server expires it and the agent lands in Stuck saying so */
+      // Unsettled, and the id STAYS in the guard: the server expires the turn
+      // and the agent lands in Stuck saying nobody ran it, which is far better
+      // than running it again for six hours.
       return null;
     }
   };
@@ -3663,7 +3689,16 @@ export function createWorkManager({
    *  asserted — this is the whole reason an agent is not asked for its own. */
   const commitsBetween = (wt, from) => {
     if (!from) return [];
-    const out = git(['log', '--format=%H', `${from}..HEAD`], wt);
+    /**
+     * `--not <base>` and `--no-merges`, because `from..HEAD` alone reports
+     * BASE'S commits as this turn's receipts the moment anything folds base in
+     * — which the stale path does on purpose before a merge. A receipt naming
+     * somebody else's commit is worse than a missing one.
+     */
+    const out = git(
+      ['log', '--format=%H', '--no-merges', `${from}..HEAD`, '--not', baseRef()],
+      wt
+    );
     return typeof out === 'string'
       ? out.split('\n').map((x) => x.trim()).filter(Boolean).slice(0, 50)
       : [];
@@ -3709,7 +3744,16 @@ export function createWorkManager({
       // Workbench (many tabs, one place) cannot arise. The marker is what
       // distinguishes the first turn from every later one across restarts.
       const ranMarker = sessionMetaPath(wt, 'flowviant-agent-ran');
-      const resume = Boolean(ranMarker && existsSync(ranMarker));
+      /**
+       * RESUME IS CLAUDE-ONLY, and that is a correctness rule rather than a
+       * preference. Claude's `--continue` is CWD-keyed and one agent is one
+       * directory, so it resumes exactly this agent. Codex's `resume --last` is
+       * MACHINE-GLOBAL: it would cross-resume whichever conversation spoke most
+       * recently anywhere on the box, which is the bug the Workbench fixed in
+       * 0.69.0 by pinning per-tab ids. Until an agent pins its own thread id,
+       * a codex agent starts fresh each turn — a worse turn, not a wrong one.
+       */
+      const resume = rt === 'claude' && Boolean(ranMarker && existsSync(ranMarker));
 
       let out = '';
       let child = null;
@@ -3767,7 +3811,18 @@ export function createWorkManager({
       }
 
       const commits = commitsBetween(wt, before);
-      const limit = limitLine(out);
+      const res = parseTurnResult(out);
+      /**
+       * A LIMIT IS ONLY A LIMIT WHEN THE TURN PRODUCED NOTHING.
+       *
+       * `limitLine` is a literal phrase match over the CLI's output, and the
+       * output of a successful turn contains whatever the agent wrote — so a
+       * card about rate limiting, or a summary mentioning one, parked every
+       * agent on the project. Gating on "the turn declared no outcome" is what
+       * makes the match mean what it says: the CLI failed and this is the
+       * sentence it failed with.
+       */
+      const limit = res ? null : limitLine(out);
       if (limit) {
         // EVERY agent parks, because the account is shared: one hitting the
         // limit means all of them have. The turn itself is reported as
@@ -3777,7 +3832,6 @@ export function createWorkManager({
         return;
       }
 
-      const res = parseTurnResult(out);
       if (!res) {
         await postAgentTurn({
           turnId,
@@ -3832,6 +3886,9 @@ export function createWorkManager({
     for (const job of jobs.slice(0, 4)) {
       const id = String(job?.id || '');
       if (!id || agentTurns.has(id)) continue;
+      // Already RAN here; only the report is outstanding. Re-running it would
+      // spend the operator's quota again and write a second set of commits.
+      if (agentReported.has(id)) continue;
       if (!job.agentId || !job.placeId) continue;
       agentTurns.add(id);
       void runAgentTurn(job).finally(() => agentTurns.delete(id));
@@ -3903,10 +3960,22 @@ export function createWorkManager({
       };
       let child;
       try {
-        child = spawn(cmd, { cwd: wt, shell: true, stdio: ['ignore', 'pipe', 'pipe'] });
+        // DETACHED, so the child's pid is its PROCESS GROUP. A check is almost
+        // always a shell that spawns the real runner, and signalling the shell
+        // alone leaves the runner holding the worktree — and this place's
+        // WRITER lock — for as long as it likes.
+        child = spawn(cmd, {
+          cwd: wt,
+          shell: true,
+          detached: true,
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
       } catch (e) {
-        finish('failed');
+        // TEXT BEFORE FINISH: `finish` captures `text` by value into the
+        // resolved object, so assigning afterwards threw the spawn error away
+        // and the surface showed an empty failure.
         text = String(e?.message || e);
+        finish('failed');
         return;
       }
       // The TAIL, not the head: a failing check says why at the end.
@@ -3917,11 +3986,20 @@ export function createWorkManager({
       child.stderr?.on('data', keep);
       const timer = setTimeout(() => {
         try {
-          child.kill('SIGKILL');
+          // The GROUP, not the child: killing the shell leaves whatever it
+          // started running, which is the thing actually taking ten minutes.
+          process.kill(-child.pid, 'SIGKILL');
         } catch {
-          /* already gone */
+          try {
+            child.kill('SIGKILL');
+          } catch {
+            /* already gone */
+          }
         }
         text += '\n[flowviant] the check ran past ten minutes and was stopped';
+        // RESOLVE HERE TOO. Waiting for 'close' after a kill is the shape that
+        // hangs: if the group is already gone the event never arrives, and this
+        // promise holds the place's writer lock forever.
         finish('failed');
       }, CHECK_TIMEOUT_MS);
       child.on('error', (e) => {
@@ -4060,7 +4138,15 @@ export function createWorkManager({
         // tree. Re-run it before anything merges.
         await runCheck(agentId, wt);
       }
-      const branch = (git(['symbolic-ref', '--quiet', '--short', 'HEAD'], wt) || '').trim();
+      // `git()` THROWS on a non-zero exit, and `symbolic-ref` exits non-zero on
+      // a detached HEAD — so the guard below was unreachable and the throw
+      // escaped the claimed merge, leaving it unsettled until its lease lapsed.
+      let branch = '';
+      try {
+        branch = (git(['symbolic-ref', '--quiet', '--short', 'HEAD'], wt) || '').trim();
+      } catch {
+        branch = '';
+      }
       if (!branch) {
         // A detached HEAD names no branch, so there is nothing to merge and
         // nothing to record. An ambiguity in git, not a rule of ours.

@@ -666,6 +666,11 @@ WHAT TO DO:
    becomes its own card so a person can see it happened rather than finding it
    in the diff.
 
+COMMIT TRAILER: every commit you make must end with a line reading
+Flowviant-Task: <the card id you were given>
+It is how the board attaches your commits to the card; a commit without it is
+work nobody can trace back.
+
 END YOUR TURN WITH ONE JSON OBJECT AND NOTHING AFTER IT, in a \`\`\`json fence:
 
 \`\`\`json
@@ -701,13 +706,32 @@ read from git.`;
  * three more cards are coming leaves the ground ready for them.
  */
 export const AGENT_TASK_KICKOFF = ({ agentName, task, position, total }) =>
-  `You are the agent "${agentName || 'agent'}", working card ${position} of ${total} ` +
+  `You are the agent "${safeName(agentName)}", working card ${position} of ${total} ` +
   `on this branch. Everything you commit here is reviewed and merged TOGETHER with ` +
   `the other cards in this run.\n\n` +
   `${fence('THE CARD', taskBlock(task))}\n\n` +
+  `When you commit, put this trailer on the LAST line of each commit message so ` +
+  `the card can find its own commits:\n` +
+  `Flowviant-Task: ${task?.id ?? ''}\n\n` +
   `Do it, commit it, and end with the JSON object.`;
 
+/**
+ * An agent's NAME is model-authored — the planner chose it — and it is
+ * interpolated at the head of the prompt, OUTSIDE the fence, where a sentence
+ * would read as an instruction from us. Fencing the name would be absurd (it is
+ * two words in the middle of ours), so it is reduced to something that cannot
+ * be a sentence: one line, no fence delimiters, and short.
+ */
+const safeName = (n) =>
+  String(n ?? '')
+    .replace(/[\r\n]+/g, ' ')
+    .replace(/<<<|>>>/g, '')
+    .replace(/"/g, "'")
+    .trim()
+    .slice(0, 60) || 'agent';
+
 const taskBlock = (task) =>
+  `id: ${task?.id ?? ''}\n` +
   `title: ${task?.title ?? ''}\n` +
   (task?.brief ? `\nbrief:\n${task.brief}\n` : '') +
   (task?.criteria?.length ? `\ndone when:\n${task.criteria.map((c) => `- ${c}`).join('\n')}\n` : '') +
@@ -721,7 +745,7 @@ const taskBlock = (task) =>
  * or blocks again, and those are the only two things the board can act on.
  */
 export const AGENT_HUMAN_KICKOFF = ({ agentName, message, askedByName, task, position, total }) =>
-  `You are the agent "${agentName || 'agent'}"` +
+  `You are the agent "${safeName(agentName)}"` +
   (task ? `, working card ${position} of ${total} on this branch` : '') +
   `.\n\n` +
   `${fence('WHO IS TALKING', askedByName || 'a member of this project')}\n\n` +
