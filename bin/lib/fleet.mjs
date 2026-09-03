@@ -817,6 +817,7 @@ export async function runFleetDaemon() {
     processDiffJobs,
     processKillJobs,
     processPrJobs,
+    processAgentPlanJobs,
     heldSessionIds,
     processPreviewJobs,
     livePreviewIds,
@@ -1616,6 +1617,11 @@ export async function runFleetDaemon() {
     // `gh` credential; a settle never closes a card (done is observed by the
     // landed walk when the merge reaches base).
     processPrJobs(roster.prJobs);
+    // A Deploy press waiting for a plan. AFTER the job lanes above and before
+    // the worktree report, for no reason other than that it reads directories
+    // those lanes may still be writing — it measures, so a stale read is a
+    // slightly worse hint and never a wrong action.
+    processAgentPlanJobs(roster.agentPlanJobs);
     // …and what the SURVIVING ones hold: branch, ahead-of-base, diffstat.
     // Throttled inside, never awaited — a `git status` the human cannot run
     // themselves from a browser, relayed. After retirement so a directory that

@@ -501,3 +501,126 @@ export const REGROUND_KICKOFF = ({ sha, title, files, vaultDir, predictedPages =
   `chapter that covers them), append the feature-history entry to log.md,\n` +
   `then output REGROUND_DONE.`;
 
+
+/**
+ * THE PLANNER — the scratch agent behind a Deploy press (2026-09-03).
+ *
+ * Somebody selected cards and pressed Deploy. This turn's whole job is to
+ * decide HOW THAT WORK SHOULD BE SPLIT across agents, and then stop. It writes
+ * no code, edits no files and starts nothing: a person reads what it proposes,
+ * edits it on the board, and accepting is what spawns anything.
+ *
+ * It runs READ-ONLY IN THE CHECKOUT under CONSULT_PERM — no Write, no Edit, no
+ * mkdir, no rm, and no MCP at all. The proposal comes back as its final
+ * message, not through a tool, which is what lets that permission set be this
+ * narrow. A planner authors a decision, and there is no file on this machine it
+ * has any business touching.
+ *
+ * The two facts it is asked to weigh are the only two that are actually
+ * knowable here: what the cards SAY, and what each live agent has already
+ * TOUCHED. Everything else — how long something will take, who should own it,
+ * whether it is a good idea — is not a question a planner can answer from a
+ * repository, and asking for it produces confident invention.
+ */
+export const SYSTEM_PLAN = `You are the human's own Claude, planning a batch of work in their repository.
+
+You are READ-ONLY. You cannot write, edit or create files, and you have no tools
+beyond reading the repo. Do not try. Your entire output is a plan.
+
+WHAT YOU ARE DECIDING: a set of task cards has been selected. Split them across
+one or more AGENTS. An agent is one CLI in one git worktree on one branch,
+working its cards ONE AT A TIME in the order you give, and landing all of them
+as a single reviewable branch.
+
+THE RULES THAT MATTER:
+
+1. SEQUENTIAL WORK BELONGS IN ONE AGENT. If B needs A's code to exist, put them
+   in the same agent, A first. Splitting a chain across agents means the second
+   one waits for the first to MERGE before it can even start.
+
+2. SPLIT ONLY WHAT CAN GENUINELY RUN AT THE SAME TIME. Two agents editing the
+   same files land two branches that conflict, and somebody resolves it by hand.
+   Read the repo to find out whether they collide — do not guess from titles.
+
+3. AN AGENT IS ONE REVIEWABLE BRANCH. Everything you put in one agent gets
+   approved or rejected TOGETHER. Cards a person would want to judge separately
+   belong in separate agents.
+
+4. FEWER, LARGER AGENTS BEAT MANY SMALL ONES. Only a limited number run at once;
+   past that they queue, and a queue of tiny agents is slower than a few real
+   ones. Never propose more agents than the cap you were given.
+
+5. NAME EACH AGENT AFTER THE WORK ("auth", "billing webhooks"), not after a
+   number. People say these names out loud.
+
+6. A POINTS BUDGET bounds how far an agent may grow while it works — it files
+   its own follow-up cards when it finds things, and the budget is where it
+   stops and asks. Set it from the size of what you put in, leaving some room.
+   Omit it if the cards carry no sizes.
+
+7. YOU MAY ADD CARDS TO A LIVE AGENT instead of creating a new one, when the
+   work needs what that agent has already built and has not merged yet. Use its
+   id in "intoAgentId".
+
+ANSWER WITH ONE JSON OBJECT AND NOTHING ELSE — no prose before it, no prose
+after it. Wrap it in a \`\`\`json fence:
+
+\`\`\`json
+{
+  "note": "one sentence on why you split it this way",
+  "agents": [
+    {
+      "tempId": "a1",
+      "name": "auth",
+      "taskIds": ["<card id>", "<card id>"],
+      "pointsBudget": 8,
+      "waitsOn": [],
+      "intoAgentId": null
+    }
+  ]
+}
+\`\`\`
+
+Every selected card id must appear EXACTLY ONCE across all agents. Use the ids
+exactly as given. "waitsOn" holds tempIds of agents that must MERGE first.`;
+
+/**
+ * The planner's turn.
+ *
+ * The cards and the live agents are FENCED: their titles, briefs and criteria
+ * are written by whoever files cards in this project and by agents themselves,
+ * and this turn reads a repository afterwards. The instruction that matters —
+ * "split this" — is ours and sits outside the fence.
+ */
+export const AGENT_PLAN_KICKOFF = ({ tasks, liveAgents, agentCap }) => {
+  const cards = tasks
+    .map(
+      (t) =>
+        `- id: ${t.id}\n  title: ${t.title}\n` +
+        (t.points ? `  points: ${t.points}\n` : '') +
+        (t.anchors?.length ? `  owns: ${t.anchors.join(', ')}\n` : '') +
+        (t.brief ? `  brief: ${t.brief}\n` : '') +
+        (t.criteria?.length ? `  done when:\n${t.criteria.map((c) => `    - ${c}`).join('\n')}\n` : '')
+    )
+    .join('\n');
+  const live = liveAgents.length
+    ? liveAgents
+        .map(
+          (a) =>
+            `- id: ${a.id}\n  name: ${a.name || '(unnamed)'}\n  status: ${a.status}\n` +
+            (a.changedFiles?.length
+              ? `  has already changed:\n${a.changedFiles.map((f) => `    - ${f}`).join('\n')}\n`
+              : '  has changed nothing yet\n')
+        )
+        .join('\n')
+    : '(none)';
+  return (
+    `Split this batch of work across agents.\n\n` +
+    `At most ${agentCap} agent${agentCap === 1 ? '' : 's'} run at once on this machine; ` +
+    `propose no more than that.\n\n` +
+    `${fence('THE SELECTED CARDS', cards)}\n\n` +
+    `${fence('AGENTS ALREADY RUNNING (you may add to one)', live)}\n\n` +
+    `Read whatever you need from the repository to decide whether these collide. ` +
+    `Then answer with the JSON object and nothing else.`
+  );
+};

@@ -44,6 +44,7 @@ import { listenersIn, measureListeners, listenersSupported } from './listeners.m
 import { measureProcesses, liveGroups, processesSupported } from './processes.mjs';
 import { mutateRegistry, processAlive, readRegistry } from './procRegistry.mjs';
 import { createPlaceLock } from './placeLock.mjs';
+import { parseProposal } from './agentPlan.mjs';
 import { sweepMergedBranch } from './shipSweep.mjs';
 import { mergeOutward as shipMergeOutward } from './shipMerge.mjs';
 import { openTunnel } from './preview.mjs';
@@ -54,9 +55,18 @@ import {
   WORK_TURN_KICKOFF,
   SYSTEM_WORK_PLAIN,
   WORK_TURN_KICKOFF_PLAIN,
+  SYSTEM_PLAN,
+  AGENT_PLAN_KICKOFF,
 } from './prompts.mjs';
 import { materializeInto, hasMaterialized, excludeInWorktree, scrub as envScrub } from './env.mjs';
-import { detectRuntimes, canRun, recordSkills, toolEventOf, RUNTIMES } from './runtimes.mjs';
+import {
+  detectRuntimes,
+  canRun,
+  pickRuntimeFor,
+  recordSkills,
+  toolEventOf,
+  RUNTIMES,
+} from './runtimes.mjs';
 
 /** The place id meaning "the checkout", not a worktree. Must match the
  *  server's REPO_PLACE — it is a wire value, not a local convention. */
@@ -142,6 +152,8 @@ export function createWorkManager({
   const ATTACHMENT_URL = FLEET_URL.replace(/\/agents\/?$/, '/attachment');
   const PR_CLAIM_URL = FLEET_URL.replace(/\/agents\/?$/, '/pr-claim');
   const PR_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/pr-done');
+  const AGENT_PLAN_CLAIM_URL = FLEET_URL.replace(/\/agents\/?$/, '/agent-plan-claim');
+  const AGENT_PLAN_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/agent-plan-done');
   // What arrived on base, whichever road it took — observed after every beat
   // that can move origin/<base>: the sweep's fetch, a ship's push, a PR merge
   // this daemon performed. See landed.mjs for the seeding and delivery rules.
@@ -3375,8 +3387,188 @@ export function createWorkManager({
    * self-delete when a place goes quiet); the other collections are belt over
    * braces for the windows around it.
    */
+  // ── AGENT PLAN JOBS: the Deploy press ──────────────────────────────────────
+  //
+  // Somebody selected cards and pressed Deploy. This turn works out HOW THE
+  // WORK SHOULD BE SPLIT across agents and stops — a person edits what it
+  // proposes on the board, and ACCEPTING is what spawns anything. Nothing here
+  // creates a worktree, a branch or a card.
+  //
+  // READ-ONLY IN THE CHECKOUT. `readOnly: true` selects CONSULT_PERM (Read,
+  // Grep, Glob and a few `git` reads — no Write, no Edit, no mkdir, no rm) and
+  // NO MCP is passed at all, so this turn has no control plane to reach even if
+  // the repository it reads tries to steer it. The proposal comes back as the
+  // turn's final message rather than through a tool, which is exactly what lets
+  // that permission set be this narrow.
+  //
+  // It takes the checkout's place lock as a READER, beside the operator's own
+  // tabs. It writes nothing, so a writer lock would only starve real work.
+  const planning = new Set(); // press ids in flight on this tick
+
+  const postAgentPlan = async (body) => {
+    try {
+      await fetch(AGENT_PLAN_DONE_URL, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${FLEET_TOKEN}`,
+          'User-Agent': USER_AGENT,
+          'Content-Type': 'application/json',
+        },
+        signal: AbortSignal.timeout(30_000),
+        body: JSON.stringify({ ...body, instance: DAEMON_INSTANCE }),
+      });
+    } catch {
+      /* unsettled, and the server expires it — the asker is told, never spun */
+    }
+  };
+
+  const claimAgentPlan = async (id) => {
+    try {
+      const res = await fetch(AGENT_PLAN_CLAIM_URL, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${FLEET_TOKEN}`,
+          'User-Agent': USER_AGENT,
+          'Content-Type': 'application/json',
+        },
+        signal: AbortSignal.timeout(15_000),
+        body: JSON.stringify({ id, instance: DAEMON_INSTANCE }),
+      });
+      const j = await res.json().catch(() => null);
+      return j?.data?.claimed === true;
+    } catch {
+      return false; // the peer may hold it; doing nothing is the safe answer
+    }
+  };
+
+  /**
+   * What a live agent has already TOUCHED, measured here rather than sent.
+   *
+   * The server could have shipped a copy of this, and deliberately does not:
+   * these are directories on THIS machine, and a server-side copy would be a
+   * second, staler source of truth for a fact the daemon is standing on top of.
+   *
+   * Uncommitted work AND commits against base, because a planner asking "will
+   * these collide" cares about both — a file this agent has already rewritten
+   * and merged into its own branch collides exactly as hard as one it is
+   * editing now.
+   */
+  const agentChangedFiles = (placeId) => {
+    if (!placeId || !isSafePathSegment(placeId)) return [];
+    const wt = join(baseDir, 'sessions', placeId);
+    if (!existsSync(wt)) return [];
+    const out = new Set();
+    for (const args of [
+      ['diff', '--name-only', 'HEAD'],
+      ['diff', '--name-only', `${baseRef()}...HEAD`],
+      ['ls-files', '--others', '--exclude-standard'],
+    ]) {
+      const r = git(args, wt);
+      if (typeof r !== 'string') continue;
+      for (const line of r.split('\n')) {
+        const f = line.trim();
+        if (f) out.add(f);
+        if (out.size >= 60) return [...out];
+      }
+    }
+    return [...out];
+  };
+
+  const runAgentPlan = async (job) => {
+    const id = String(job.id);
+    const tasks = Array.isArray(job.tasks) ? job.tasks : [];
+    if (tasks.length === 0) {
+      // The press named cards the doc no longer has. A real answer, and one
+      // the board can explain, rather than a turn that plans nothing.
+      await postAgentPlan({ id, error: 'those cards are no longer on the board' });
+      return;
+    }
+    // CLAIM BEFORE SPENDING ANYTHING. Two daemons share one credential and are
+    // handed the same array; planning twice bills the operator twice to produce
+    // two proposals over one selection, only one of which anybody ever sees.
+    if (!(await claimAgentPlan(id))) return;
+
+    /**
+     * WHICH CLI PLANS. `pickRuntimeFor('consult')`, the same picker every other
+     * turn nobody @mentioned already uses — Claude when it is here (the prompts
+     * were written against it), otherwise whatever can express the profile.
+     *
+     * Deliberately NOT the project's runtime order: that order is about AGENTS,
+     * which hold a conversation across many turns and whose value is that held
+     * context. A planner runs once and reads; it takes what the machine has.
+     */
+    const rt = pickRuntimeFor('consult');
+    if (!rt) {
+      await postAgentPlan({ id, error: 'no CLI on this machine can run a read-only turn' });
+      return;
+    }
+    const liveAgents = (Array.isArray(job.liveAgents) ? job.liveAgents : []).map((a) => ({
+      id: String(a?.id ?? ''),
+      name: String(a?.name ?? ''),
+      status: String(a?.status ?? ''),
+      changedFiles: agentChangedFiles(a?.placeId),
+    }));
+
+    let out = '';
+    try {
+      await inPlace(REPO_PLACE, false, async () => {
+        out = await runTurn({
+          prompt: AGENT_PLAN_KICKOFF({
+            tasks,
+            liveAgents,
+            agentCap: Number.isInteger(job.agentCap) && job.agentCap > 0 ? job.agentCap : 3,
+          }),
+          system: SYSTEM_PLAN,
+          // READ-ONLY, and no MCP: `mcpArgs` is omitted entirely rather than
+          // passed empty, so there is no control plane on this turn at all.
+          readOnly: true,
+          cwd: repoRoot,
+          runtime: rt,
+          streamJson: true,
+          answerFromResult: true,
+          label: c.cyan('[plan]'),
+          onSpawn: (ch) => workChildren.set(ch, null),
+        });
+      });
+    } catch (e) {
+      await postAgentPlan({ id, error: envScrub(String(e?.message || e)).slice(0, 500) });
+      return;
+    }
+
+    const proposal = parseProposal(out);
+    if (!proposal) {
+      await postAgentPlan({
+        id,
+        // The CLI's own words when it has any — a turn that explained why it
+        // could not plan is far more use than "planning failed".
+        error: out.trim()
+          ? `the plan did not come back as JSON: ${envScrub(out).slice(0, 300)}`
+          : 'the planning turn produced no output — the CLI may be signed out',
+      });
+      return;
+    }
+    await postAgentPlan({ id, proposal, sessionRef: repoRoot });
+  };
+
+  const processAgentPlanJobs = (jobs) => {
+    if (!Array.isArray(jobs) || jobs.length === 0) return;
+    // ONE AT A TIME, and the cap is 1 rather than 5: a planning turn is a real
+    // model call, and a machine handed three at once would run three CLIs to
+    // answer questions nobody asked in that order.
+    for (const job of jobs.slice(0, 1)) {
+      const id = String(job?.id || '');
+      if (!id || planning.has(id)) continue;
+      planning.add(id);
+      void runAgentPlan(job).finally(() => planning.delete(id));
+    }
+  };
+
   const workBusy = () =>
     placeLocks.size > 0 ||
+    // A planning turn is a live CLI child of ours, and an auto-update that
+    // SIGTERMs it mid-flight would leave a press claimed, unsettled and
+    // waiting out its lease while somebody watches a spinner.
+    planning.size > 0 ||
     shipping.size > 0 ||
     workChildren.size > 0 ||
     workAnswering.size > 0 ||
@@ -3400,5 +3592,6 @@ export function createWorkManager({
     reportWorktrees,
     shutdownWork,
     workBusy,
+    processAgentPlanJobs,
   };
 }
