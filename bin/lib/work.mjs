@@ -3747,10 +3747,31 @@ export function createWorkManager({
         return;
       }
       const wt = dir.wt;
+      /**
+       * NEITHER OF THESE MAY THROW. `git()` throws on a non-zero exit, and both
+       * of these exit non-zero in states a real worktree reaches: `symbolic-ref`
+       * on a DETACHED HEAD (an agent that ran `git checkout <sha>`, a rebase
+       * left half-done), and `rev-parse HEAD` on a branch with no commits yet.
+       * An escape here happens BEFORE any settle, so the turn stays pending
+       * until the six-hour expiry while the agent sits in Working with nothing
+       * behind it — the wedge this whole lane exists to avoid.
+       *
+       * `runAgentMerge` learned this two commits ago and says so in its own
+       * comment; this is the same call, in the same file, left unguarded. Both
+       * facts are OPTIONAL to a turn — they describe the branch, they do not
+       * gate the work — so failing to read them costs a null, not the turn.
+       */
+      const readGit = (args) => {
+        try {
+          return (git(args, wt) || '').trim() || null;
+        } catch {
+          return null;
+        }
+      };
       // WHERE THE BRANCH WAS BEFORE THIS TURN, so the commits reported are the
       // ones this turn actually made.
-      const before = (git(['rev-parse', 'HEAD'], wt) || '').trim() || null;
-      const branch = (git(['symbolic-ref', '--quiet', '--short', 'HEAD'], wt) || '').trim() || null;
+      const before = readGit(['rev-parse', 'HEAD']);
+      const branch = readGit(['symbolic-ref', '--quiet', '--short', 'HEAD']);
 
       const rt = job.runtime || 'claude';
       if (!canRun(RUNTIMES[rt], 'build')) {
@@ -4209,7 +4230,15 @@ export function createWorkManager({
        */
       if (job.prMode) {
         try {
-          execFileSync('gh', ['auth', 'status'], { stdio: ['ignore', 'pipe', 'pipe'] });
+          // EVERY `gh` CALL IS TIMED OUT. `execFileSync` blocks the daemon's
+          // whole event loop, and this one runs INSIDE the place writer lock —
+          // so a `gh` that hangs (an expired token prompting, a network black
+          // hole, a hung credential helper) stops every turn on the machine,
+          // not merely this merge, and holds the lock while it does.
+          execFileSync('gh', ['auth', 'status'], {
+            stdio: ['ignore', 'pipe', 'pipe'],
+            timeout: 20_000,
+          });
         } catch (e) {
           await postAgentMerge({
             agentId,
@@ -4233,7 +4262,12 @@ export function createWorkManager({
         try {
           git(['push', '-u', 'origin', branch], wt);
         } catch (e) {
-          await postAgentMerge({ agentId, ok: false, detail: ghFirstLine(e) });
+          // SCRUBBED. Every other failure on this path relays `gh`'s own words,
+          // but a push writes the REMOTE URL to stderr and a remote can carry a
+          // token in its userinfo — so this one line is the only place on the
+          // agent merge path that can leak a credential into a stored,
+          // team-visible `mergeError`.
+          await postAgentMerge({ agentId, ok: false, detail: envScrub(ghFirstLine(e)) });
           return;
         }
         let prUrl = null;
@@ -4242,6 +4276,7 @@ export function createWorkManager({
             execFileSync('gh', ['pr', 'view', branch, '--json', 'url,state'], {
               cwd: repoRoot,
               stdio: ['ignore', 'pipe', 'pipe'],
+              timeout: 30_000,
             }).toString()
           );
           if (j?.state === 'OPEN' && typeof j?.url === 'string') prUrl = j.url.trim();
@@ -4254,7 +4289,7 @@ export function createWorkManager({
               'gh',
               // baseBranchName, not baseRef: gh 422s on a remote-tracking name.
               ['pr', 'create', '--head', branch, '--base', prBase, '--fill'],
-              { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] }
+              { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000 }
             )
               .toString()
               .trim();
@@ -4268,6 +4303,7 @@ export function createWorkManager({
           execFileSync('gh', ['pr', 'merge', branch, '--merge'], {
             cwd: repoRoot,
             stdio: ['ignore', 'pipe', 'pipe'],
+            timeout: 120_000,
           });
         } catch (e) {
           const line = ghFirstLine(e);
