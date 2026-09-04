@@ -3712,6 +3712,31 @@ export function createWorkManager({
       await postAgentTurn({ turnId, outcome: 'nothing' });
       return;
     }
+    /**
+     * A TASK TURN WITH NO CARD IS REFUSED, NOT IMPROVISED.
+     *
+     * The kickoff below branches on `job.kind === 'task' && job.task` and falls
+     * through to the HUMAN kickoff otherwise — and a task turn's body is empty
+     * by design, because the daemon composes the prompt from the card's own
+     * spec. So a card deleted while its agent held it spawned a real CLI on a
+     * prompt whose entire content was "a member of this project said: (nothing).
+     * Carry on, and end with the JSON object." Nothing on either side refused
+     * it, and an ordinary gesture reached it: the board's Delete.
+     *
+     * The server now declines to hand out such a job at all. This is the
+     * backstop, and it is worth having on its own: it costs one comparison and
+     * it is the layer that cannot be skipped by a server on an older deploy.
+     * `nothing` is the honest outcome — the agent goes to Stuck saying the turn
+     * produced nothing, which is exactly what happened.
+     */
+    if (job.kind === 'task' && !job.task) {
+      await postAgentTurn({
+        turnId,
+        outcome: 'nothing',
+        answer: 'the card this turn was for no longer exists',
+      });
+      return;
+    }
 
     await inPlace(place, false, async () => {
       const dir = placeWtFor(place);
@@ -4161,6 +4186,110 @@ export function createWorkManager({
         // nothing. Reported as a SUCCESS: the branch's work is on base, which
         // is what the caller is asking about.
         await postAgentMerge({ agentId, ok: true, sha: tip || undefined });
+        return;
+      }
+      /**
+       * THIS PROJECT MERGES THROUGH A PULL REQUEST.
+       *
+       * PR mode existed for sessions and was simply not honoured for agents:
+       * nothing read the project's merge mode on this path and the direct
+       * merge below ran unconditionally. On the repos PR mode exists FOR —
+       * branch protection refuses a direct push of a merge commit — every
+       * agent approval failed at the push and came back to review carrying
+       * git's refusal, forever.
+       *
+       * PUSH, CREATE, MERGE, in that order, and each step's reasoning is the
+       * session PR job's: push first because GitHub merges the REMOTE tip;
+       * `--fill` titles from the branch's own commits so nothing is invented;
+       * `--merge` and never squash, because the cards' receipts are commit
+       * shas and a squash rewrites them off base, orphaning every receipt and
+       * blinding the landed observer's trailer read. Adopt only an OPEN PR:
+       * gh's branch finder falls back to the most recent merged one, and
+       * adopting a dead PR would report success over work that never moves.
+       */
+      if (job.prMode) {
+        try {
+          execFileSync('gh', ['auth', 'status'], { stdio: ['ignore', 'pipe', 'pipe'] });
+        } catch (e) {
+          await postAgentMerge({
+            agentId,
+            ok: false,
+            detail:
+              e?.code === 'ENOENT'
+                ? 'this project merges through pull requests, and the GitHub CLI (gh) is not installed on this machine'
+                : `this project merges through pull requests, and gh is not signed in here: ${ghFirstLine(e)}`,
+          });
+          return;
+        }
+        const prBase = baseBranchName(baseRef());
+        if (branch === prBase) {
+          await postAgentMerge({
+            agentId,
+            ok: false,
+            detail: `this agent is on the base branch (${prBase}) — there is nothing to open a pull request from`,
+          });
+          return;
+        }
+        try {
+          git(['push', '-u', 'origin', branch], wt);
+        } catch (e) {
+          await postAgentMerge({ agentId, ok: false, detail: ghFirstLine(e) });
+          return;
+        }
+        let prUrl = null;
+        try {
+          const j = JSON.parse(
+            execFileSync('gh', ['pr', 'view', branch, '--json', 'url,state'], {
+              cwd: repoRoot,
+              stdio: ['ignore', 'pipe', 'pipe'],
+            }).toString()
+          );
+          if (j?.state === 'OPEN' && typeof j?.url === 'string') prUrl = j.url.trim();
+        } catch {
+          /* no PR for this branch at all — created below */
+        }
+        if (!prUrl) {
+          try {
+            const out = execFileSync(
+              'gh',
+              // baseBranchName, not baseRef: gh 422s on a remote-tracking name.
+              ['pr', 'create', '--head', branch, '--base', prBase, '--fill'],
+              { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] }
+            )
+              .toString()
+              .trim();
+            prUrl = out.split('\n').filter(Boolean).pop() ?? null;
+          } catch (e) {
+            await postAgentMerge({ agentId, ok: false, detail: ghFirstLine(e) });
+            return;
+          }
+        }
+        try {
+          execFileSync('gh', ['pr', 'merge', branch, '--merge'], {
+            cwd: repoRoot,
+            stdio: ['ignore', 'pipe', 'pipe'],
+          });
+        } catch (e) {
+          const line = ghFirstLine(e);
+          // Already merged is a SUCCESS: a re-offered job, or somebody merged
+          // it in the browser. The observer closes the cards either way.
+          if (!/already merged/i.test(line)) {
+            await postAgentMerge({
+              agentId,
+              ok: false,
+              detail:
+                prUrl && PR_URL_RE.test(prUrl) ? `${line} — the pull request is at ${prUrl}` : line,
+            });
+            return;
+          }
+        }
+        // THE TIP, not a merge commit: the merge commit was made on GitHub and
+        // this machine has not fetched it. It identifies the state we asked to
+        // be merged, which is what the receipt is for — the cards themselves
+        // close when the landed observer sees the commits arrive on base.
+        await postAgentMerge({ agentId, ok: true, sha: tip });
+        onRepoChanged();
+        landed.observe();
         return;
       }
       try {
