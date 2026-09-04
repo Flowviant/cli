@@ -254,18 +254,53 @@ function forgetPreviewPid(pid) {
   mutateRegistry((list) => list.filter((e) => e.pid !== pid));
 }
 
-// Only kill a pid we can VERIFY is still one of ours — its /proc cmdline must
-// still contain the signature we stored. A reused pid belonging to something
-// unrelated won't match, so we never kill a stranger. Linux-only (that's where
-// /proc + process groups work); elsewhere we just clear the registry.
+/**
+ * Only kill a pid we can VERIFY is still one of ours — its command line must
+ * still contain the signature we stored. A reused pid belonging to something
+ * unrelated won't match, so we never kill a stranger.
+ *
+ * MACOS READS IT THROUGH `ps`, because "Linux-only, elsewhere just clear the
+ * registry" was the worst of both. A macOS daemon killed ungracefully leaves
+ * cloudflared running — it is spawned detached — so the public hostname keeps
+ * resolving to this machine while the gate dies with the daemon. The reaper
+ * then verified nothing, killed nothing, and DELETED the entry, so no later run
+ * could ever find that process. The tunnel served 502 until anything else on
+ * the box bound the gate's old port, which `startAuthProxy` obtained with
+ * `listen(0)` and is therefore squarely inside the kernel's ephemeral reuse
+ * pool — at which point a live public hostname forwarded straight to an
+ * unrelated local service with no gate, no password and no grant check. Exactly
+ * what this file's header says the reap exists to prevent.
+ *
+ * Three states, not two: `true` (ours), `false` (verified NOT ours, or gone),
+ * and `null` (we could not look — the caller keeps the record rather than
+ * dropping it).
+ */
 function stillOurs(pid, sig) {
-  if (platform() !== 'linux') return false;
-  try {
-    const cmd = readFileSync(`/proc/${pid}/cmdline`, 'utf8').replace(/\0/g, ' ');
-    return typeof sig === 'string' && sig.length > 0 && cmd.includes(sig);
-  } catch {
-    return false; // process gone / unreadable
+  if (typeof sig !== 'string' || sig.length === 0) return false;
+  if (platform() === 'linux') {
+    try {
+      const cmd = readFileSync(`/proc/${pid}/cmdline`, 'utf8').replace(/\0/g, ' ');
+      return cmd.includes(sig);
+    } catch {
+      return false; // process gone / unreadable
+    }
   }
+  if (platform() === 'darwin') {
+    try {
+      const cmd = execFileSync('ps', ['-p', String(pid), '-o', 'command='], {
+        encoding: 'utf8',
+        timeout: 5_000,
+      });
+      return cmd.includes(sig);
+    } catch {
+      // `ps` exits non-zero when the pid is gone — which is a real answer.
+      return false;
+    }
+  }
+  // Windows: no way to check from here. UNKNOWN, never "not ours" — see the
+  // caller, which keeps the record so a later run on a platform that can look
+  // is still able to.
+  return null;
 }
 
 /** Reap tunnel process groups left behind by a previously-crashed daemon.
@@ -283,8 +318,19 @@ export function reapOrphanPreviews(log) {
   const handled = new Set();
   for (const { pid, sig, owner } of list) {
     if (Number.isInteger(owner) && owner !== process.pid && processAlive(owner)) continue;
+    const ours = stillOurs(pid, sig);
+    /**
+     * THE RECORD OUTLIVES A REAP THAT COULD NOT LOOK. `handled.add` ran BEFORE
+     * this check, so an entry was dropped whether or not anything was killed —
+     * and on any platform `stillOurs` could not read, that deleted the only
+     * trace of a tunnel still serving the public internet. Kept on `null`
+     * (unknown); removed on `true` (we killed it) and on `false` (the process
+     * is gone, or the pid now belongs to somebody else and the entry is stale
+     * either way).
+     */
+    if (ours === null) continue;
     handled.add(pid);
-    if (!stillOurs(pid, sig)) continue;
+    if (!ours) continue;
     try {
       process.kill(-pid, 'SIGKILL'); // whole group
       killed++;
