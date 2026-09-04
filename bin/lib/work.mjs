@@ -567,6 +567,21 @@ export function createWorkManager({
   const worktreeSeen = new Set();
   let lastWorktreeFetch = 0;
   let sweepingWorktrees = false;
+  /**
+   * WHERE THE NEXT SWEEP STARTS.
+   *
+   * A safety valve with a rotation, and the rotation is the load-bearing half.
+   * The sweep used to take `activeIds.slice(0, 20)` — a silent truncation of a
+   * list the server builds tabs-first and agent places LAST, so on a project
+   * with twenty live tabs no agent was EVER measured: no branch diff, no head
+   * sha, and none of their trailered commits ever reached a card. Permanently,
+   * because the same twenty won every pass.
+   *
+   * Chunking removes the cut for any realistic project (see below). The cursor
+   * is what makes the residual cap fair rather than arbitrary: past it, the
+   * places that missed one sweep are the ones that lead the next.
+   */
+  let worktreeCursor = 0;
   const postWorktrees = async (reports) => {
     if (!reports.length) return;
     try {
@@ -800,12 +815,46 @@ export function createWorkManager({
           // landed. Best-effort like everything in this sweep.
           void landed.observe().catch(() => {});
         }
+        /**
+         * MEASURED IN CHUNKS, not truncated to one.
+         *
+         * The server's endpoint takes twenty entries per request, and this read
+         * that bound as "measure twenty places" — so everything past the
+         * twentieth was silently never measured, and the server builds that
+         * list with agent places at the END. A project with twenty live tabs
+         * therefore measured no agent at all: their review pane showed no
+         * branch diff, `checkIsStale` had no head to compare against, and their
+         * commits never reached the cards they name.
+         *
+         * The cap on a REQUEST is not a cap on the WORK. Several requests of
+         * twenty cost several round trips and each is validated per entry
+         * exactly as before, so no contract changes and no floor is needed.
+         *
+         * `SWEEP_MAX_PLACES` is a bound on the MACHINE — each place costs a
+         * `git diff`, a listener scan and a process scan — and the cursor
+         * rotates so a project past it still measures everything, just across
+         * successive sweeps instead of one.
+         */
+        const SWEEP_MAX_PLACES = 60;
+        const CHUNK = 20;
+        const total = activeIds.length;
+        const start = total > SWEEP_MAX_PLACES ? worktreeCursor % total : 0;
+        const take = Math.min(total, SWEEP_MAX_PLACES);
+        // Rotated slice, so the tail of a long list leads the next sweep rather
+        // than never being reached.
+        const order = Array.from({ length: take }, (_, i) => activeIds[(start + i) % total]);
+        worktreeCursor = total > SWEEP_MAX_PLACES ? (start + take) % total : 0;
         const reports = [];
-        for (const id of activeIds.slice(0, 20)) {
+        for (const id of order) {
           const r = sessionWorktreeReport(id);
           if (r) reports.push(r);
         }
-        await postWorktrees(reports);
+        // One POST per chunk. Awaited in sequence rather than fired together:
+        // this runs on the machine's own poll beat and a burst of parallel
+        // writes to the same rows buys nothing.
+        for (let i = 0; i < reports.length; i += CHUNK) {
+          await postWorktrees(reports.slice(i, i + CHUNK));
+        }
       } finally {
         sweepingWorktrees = false;
       }
