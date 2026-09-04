@@ -1309,6 +1309,23 @@ export function createWorkManager({
     const pid = Number(job.pid);
     const signal = job.signal === 'KILL' ? 'SIGKILL' : 'SIGTERM';
 
+    /**
+     * CLAIM FIRST, EVEN FOR THE ANSWERS THAT SIGNAL NOTHING.
+     *
+     * `unsupported` and `not_found` cost nothing to produce, which is exactly
+     * why they must be leased: two daemons on one credential are handed the
+     * same job, and the one holding NOTHING reaches these branches without
+     * measuring anything or making a round trip — so it would answer first,
+     * settle the row, and the machine that could actually have signalled would
+     * find the job already closed and never touch the process. The person reads
+     * "the pid is no longer one of this tab's", which is a real sentence, over a
+     * watcher that is still running.
+     *
+     * The server enforces holder-only settles again (it briefly accepted these
+     * two unclaimed, which is the bug above), so an unclaimed post here would
+     * simply be dropped. One extra round trip on a path nobody is waiting on.
+     */
+    if (!(await claimKill(id))) return;
     if (!processesSupported()) {
       await postKill({ id, outcome: 'unsupported' });
       return;
@@ -1324,7 +1341,6 @@ export function createWorkManager({
       await remeasureAfterKill(sessionId);
       return;
     }
-    if (!(await claimKill(id))) return;
     try {
       process.kill(pid, signal);
       // WHAT HAPPENED, not what we did. "We sent a signal" is a fact about us;
