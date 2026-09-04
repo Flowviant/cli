@@ -2275,6 +2275,36 @@ export function createWorkManager({
     for (const id of ids) {
       if (live.has(id)) continue;
       if (peers.has(id)) continue; // another daemon's tab — not ours to retire
+      /**
+       * A HARD STOP REACHES THE CLI HERE, and this is the whole of it.
+       *
+       * `stopAgent` marked the agent abandoned in D1 and nothing on the wire
+       * told the machine, so the CLI went on working, editing the worktree and
+       * spending the operator's quota — while the confirm dialog said the agent
+       * was stopped. It also never got cleaned up, because the check below
+       * skips any place whose lock is held and a running turn holds it: a
+       * stopped agent mid-turn kept its directory forever.
+       *
+       * No new wire field and no version floor: an abandoned agent simply drops
+       * out of `activeWorkSessions` (that list is built from LIVE statuses), so
+       * the server ALREADY says everything needed. Absence means "nothing here
+       * is live any more", and the honest response to that is to stop what we
+       * are running in it and then take the directory.
+       *
+       * SIGTERM the CHILD, never its group — the rule teardown keeps, so an
+       * unattended sweep cannot take the driver's dev server with it. The lock
+       * is released when the child exits, so the removal happens on the next
+       * pass rather than this one.
+       */
+      const running = agentChildren.get(id);
+      if (running) {
+        try {
+          running.kill('SIGTERM');
+        } catch {
+          /* already gone */
+        }
+        agentChildren.delete(id);
+      }
       // Asked of the PLACE, not the session: the lock is keyed by directory,
       // and a session sharing one with a busy peer is not ours to retire
       // either — its worktree is the peer's working directory.
@@ -3604,6 +3634,15 @@ export function createWorkManager({
   // do is run a CLI twice in one worktree, which is what this in-flight set and
   // the place lock prevent — the same discipline `processWorkTurns` keeps.
   const agentTurns = new Set(); // turn ids in flight on this tick
+  /**
+   * The CLI a live agent turn is running in, by PLACE.
+   *
+   * `workChildren` is keyed by the child itself, which answers "kill everything
+   * at teardown" and cannot answer "kill THIS agent's". Keyed by place rather
+   * than by agent id because the one consumer — the retire sweep — walks
+   * directory names, and those are places.
+   */
+  const agentChildren = new Map(); // placeId -> child process
 
   /** Returns the server's reply, because it carries ONE instruction the machine
    *  can act on immediately: `review: true` means the agent's queue just
@@ -3843,10 +3882,15 @@ export function createWorkManager({
             child = ch;
             workChildren.set(ch, null);
             noteSessionGroup(agentId, ch.pid);
+            // Keyed by PLACE, because the retire sweep iterates directory names
+            // and a place id IS one. It is what lets a hard stop actually reach
+            // the CLI — see `retireWorkSessions`.
+            agentChildren.set(place, ch);
           },
         });
       } finally {
         if (child) workChildren.delete(child);
+        if (agentChildren.get(place) === child) agentChildren.delete(place);
         if (ranMarker) {
           try {
             writeFileSync(ranMarker, '1');
