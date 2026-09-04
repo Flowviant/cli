@@ -1736,7 +1736,10 @@ export async function runFleetDaemon() {
     // runs queued deploy jobs (the server only sends deployJobs to authorized
     // machines). Config report is cheap + dedup'd; jobs are single-flight.
     if (roster.env?.deployAuthorized) {
-      void reportDeployConfig(repoRoot);
+      // The BASE branch's copy, not the working tree's — see readDeployConfig.
+      // Reporting the working tree would advertise targets the runner will not
+      // find, which is the same lie in the other direction.
+      void reportDeployConfig(repoRoot, getBaseRef());
       processDeployJobs(roster.deployJobs, { repoRoot, baseRef: getBaseRef(), myPubB64 });
     }
 

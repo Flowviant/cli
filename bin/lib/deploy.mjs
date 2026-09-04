@@ -10,13 +10,14 @@
  * wrangler output routinely echoes secrets.
  */
 
-import { readFileSync, existsSync } from 'node:fs';
+
 import { spawn } from 'node:child_process';
 import { join } from 'node:path';
 import { FLEET_URL, FLEET_TOKEN, USER_AGENT, DAEMON_INSTANCE } from './config.mjs';
 import { c, note, ok, warn } from './ui.mjs';
 import { deployCreds, appSecretsFor, scrub, myPubB64 } from './env.mjs';
 import { childEnv } from './childEnv.mjs';
+import { git } from './git.mjs';
 
 const deployUrl = (tail) => FLEET_URL.replace(/\/agents\/?$/, `/${tail}`);
 
@@ -38,27 +39,64 @@ async function post(tail, body) {
   return json?.data;
 }
 
-/** Read + parse .flowviant/deploy.json from the repo root. Returns [] if none. */
-export function readDeployConfig(repoRoot) {
-  const path = join(repoRoot, '.flowviant', 'deploy.json');
-  if (!existsSync(path)) return [];
+/**
+ * Read + parse `.flowviant/deploy.json` AS IT IS ON THE BASE BRANCH. Returns []
+ * if the branch has none.
+ *
+ * IT USED TO READ THE WORKING TREE, which made the feature's one stated bound
+ * false. `deploy_target`'s own description says "only ids already declared in
+ * `.flowviant/deploy.json` on MAIN can be named (the daemon reads and runs from
+ * the repo ROOT, never a session worktree, so an agent cannot author the command
+ * it triggers without shipping it first)" — and the repo root's WORKING TREE is
+ * exactly where the machine operator's tabs stand (their place is the checkout).
+ * So an agent that had read an injected instruction could write an uncommitted
+ * `.flowviant/deploy.json` naming any shell command, call `deploy_target`, and
+ * have the daemon run it from the repo root with `CLOUDFLARE_API_TOKEN` and
+ * every other deploy-scope credential in its environment. Nothing about that
+ * needed a commit, a review, or an owner.
+ *
+ * Reading the COMMITTED tree is what makes the sentence true: authoring the
+ * command now requires landing it on base, which is a reviewed act. The file is
+ * read through git rather than the filesystem, so an uncommitted edit is simply
+ * not there.
+ *
+ * A base ref that does not resolve yields NO TARGETS, and says so once. That is
+ * the withholding direction and it is the right one here — a deploy is
+ * irreversible and running the wrong file is worse than running nothing.
+ */
+export function readDeployConfig(repoRoot, baseRef) {
+  let raw;
+  if (baseRef) {
+    try {
+      raw = git(['show', `${baseRef}:.flowviant/deploy.json`], repoRoot);
+    } catch {
+      // No such file on base, or a base ref that does not resolve. Both mean
+      // "this branch declares no targets", which is a real answer.
+      return [];
+    }
+  } else {
+    // No base ref in hand (a caller that has not been updated). Refuse rather
+    // than silently falling back to the working tree — that fallback IS the bug.
+    warn('deploy: no base branch resolved, so no deploy targets were read.');
+    return [];
+  }
   try {
-    const parsed = JSON.parse(readFileSync(path, 'utf8'));
+    const parsed = JSON.parse(raw);
     const targets = Array.isArray(parsed?.targets) ? parsed.targets : [];
     // Keep only fields the server + runner need; the daemon holds the commands.
     return targets
       .filter((t) => t && typeof t.id === 'string' && typeof t.command === 'string')
       .slice(0, 20);
   } catch (e) {
-    warn(`deploy: .flowviant/deploy.json is not valid JSON — ${e.message}`);
+    warn(`deploy: .flowviant/deploy.json on the base branch is not valid JSON — ${e.message}`);
     return [];
   }
 }
 
 /** Report the parsed config to the server (only when it changed). */
 let lastConfigJson = null;
-export async function reportDeployConfig(repoRoot) {
-  const targets = readDeployConfig(repoRoot);
+export async function reportDeployConfig(repoRoot, baseRef) {
+  const targets = readDeployConfig(repoRoot, baseRef);
   const json = JSON.stringify(targets);
   if (json === lastConfigJson) return;
   // Scrub command strings before the server sees them — a command line can embed
@@ -188,7 +226,7 @@ export function processDeployJobs(jobs, ctx) {
         beat = setInterval(() => {
           void post('deploy-heartbeat', { jobId: job.id, pubkey: ctx.myPubB64() }).catch(() => {});
         }, 60_000);
-        const targets = readDeployConfig(ctx.repoRoot);
+        const targets = readDeployConfig(ctx.repoRoot, ctx.baseRef);
         const target = targets.find((t) => t.id === job.targetId);
         if (!target) {
           await report(job, ctx, { ok: false, message: `target "${job.targetId}" not in .flowviant/deploy.json` });
