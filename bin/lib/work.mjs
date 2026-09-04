@@ -3783,10 +3783,30 @@ export function createWorkManager({
      * — which the stale path does on purpose before a merge. A receipt naming
      * somebody else's commit is worse than a missing one.
      */
-    const out = git(
-      ['log', '--format=%H', '--no-merges', `${from}..HEAD`, '--not', baseRef()],
-      wt
-    );
+    /**
+     * IT CANNOT THROW, and that guard is the whole point of it being here.
+     *
+     * `git()` throws on a non-zero exit, and `baseRef()` is built from the
+     * project's Base branch setting — free text an owner types, never verified
+     * against the remote. Point it at a branch with no tracking ref (`develop`
+     * on a repo whose remote branch is `dev`) and this exits "fatal: ambiguous
+     * argument". The throw escaped `runAgentTurn` AFTER the CLI had already run
+     * the card, so `postAgentTurn` was never reached, the server never settled
+     * the turn, and the next poll handed back the identical turn — the same
+     * card re-run every poll for six hours, on the operator's shared account,
+     * piling commits onto the review branch, silently.
+     *
+     * An unreadable range means we cannot MEASURE the receipts, which is a
+     * smaller failure than not settling: the turn still reports, and ship-time
+     * reconciliation books whatever no card claimed. Missing beats fabricated
+     * and both beat a stall.
+     */
+    let out;
+    try {
+      out = git(['log', '--format=%H', '--no-merges', `${from}..HEAD`, '--not', baseRef()], wt);
+    } catch {
+      return [];
+    }
     return typeof out === 'string'
       ? out.split('\n').map((x) => x.trim()).filter(Boolean).slice(0, 50)
       : [];
@@ -4109,6 +4129,18 @@ export function createWorkManager({
           detached: true,
           stdio: ['ignore', 'pipe', 'pipe'],
         });
+        /**
+         * …AND IT IS TRACKED, so a stop or a takeover takes it with them.
+         *
+         * A check is a full test or build run in the agent's worktree, and it
+         * was the one long-lived child the daemon spawned without telling its
+         * own teardown about it. `shutdownWork` signalled the CLI children and
+         * left this one — so restarting the daemon, or a same-repo takeover,
+         * orphaned a running test suite inside a worktree the sweep may then
+         * try to remove. The ten-minute timer would eventually kill it, but by
+         * then it belongs to no daemon and nothing on any surface names it.
+         */
+        workChildren.set(child, null);
       } catch (e) {
         // TEXT BEFORE FINISH: `finish` captures `text` by value into the
         // resolved object, so assigning afterwards threw the spawn error away
@@ -4117,9 +4149,32 @@ export function createWorkManager({
         finish('failed');
         return;
       }
-      // The TAIL, not the head: a failing check says why at the end.
+      /**
+       * The TAIL, not the head: a failing check says why at the end. And
+       * SCRUBBED BEFORE IT IS CUT, which is the order that matters.
+       *
+       * It used to slice first: `text = (text + buf).slice(-CAP)`, with a
+       * single `envScrub` at the very end. `envScrub` replaces EXACT full
+       * values, so any credential straddling either boundary — the rolling
+       * window's, or a chunk's — was already cut in half by the time it was
+       * looked at, matched nothing, and the surviving tail was written to
+       * `agent.checkOutput` and shown to every member of the project. A failing
+       * integration test that dumps its environment is an ordinary way to reach
+       * that, and the partial is enough where the prefix of the key is a
+       * publicly known constant.
+       *
+       * Scrubbing on every chunk fixes both straddles at once: the accumulated
+       * text always holds the previous kept tail plus the whole new chunk, so a
+       * value split across chunks is whole here, and a value near the window
+       * edge is redacted before anything is discarded. Bounded work — the
+       * string is never longer than the cap plus one chunk.
+       *
+       * The one case it cannot cover is a secret LONGER than the cap itself,
+       * which can never sit in the window whole. The final scrub below stays as
+       * the second pass over what actually ships.
+       */
       const keep = (buf) => {
-        text = (text + buf.toString()).slice(-CHECK_OUTPUT_CAP);
+        text = envScrub(text + buf.toString()).slice(-CHECK_OUTPUT_CAP);
       };
       child.stdout?.on('data', keep);
       child.stderr?.on('data', keep);
@@ -4143,11 +4198,13 @@ export function createWorkManager({
       }, CHECK_TIMEOUT_MS);
       child.on('error', (e) => {
         clearTimeout(timer);
+        workChildren.delete(child);
         text += String(e?.message || e);
         finish('failed');
       });
       child.on('close', (code) => {
         clearTimeout(timer);
+        workChildren.delete(child);
         finish(code === 0 ? 'passed' : 'failed');
       });
     });
