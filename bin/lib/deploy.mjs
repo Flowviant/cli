@@ -192,6 +192,23 @@ async function verifyHealth(url, status) {
 }
 
 const claiming = new Set(); // in-flight guard (single-flight per daemon process)
+/**
+ * JOBS THIS PROCESS HAS ALREADY RUN, whatever the server thinks.
+ *
+ * A deploy is IRREVERSIBLE and the report is not: a transient 5xx, a DNS blip
+ * or the 30s timeout meant the outcome never landed, the heartbeat stopped,
+ * and three minutes later the server requeued the job and this same daemon ran
+ * `wrangler rollback` — or a full prod deploy with every pushSecret re-pushed —
+ * a SECOND time, leaving production two versions behind the intended one with
+ * nothing recording that it happened twice.
+ *
+ * So the process remembers. Not a substitute for the report (see the retry
+ * below, which is the real fix); a floor under it, for the case where the
+ * report never lands at all. It does not survive a restart — nothing local
+ * could be trusted to — which is why the retry has to keep the heartbeat alive
+ * while it runs.
+ */
+const ran = new Set();
 
 /**
  * Process queued deploy jobs from the roster. `ctx` = { repoRoot, baseRef,
@@ -206,6 +223,7 @@ export function processDeployJobs(jobs, ctx) {
     // reconcile loop, since this runs unguarded from the fleet tick.
     if (!job || typeof job.id !== 'string') continue;
     if (claiming.has(job.id)) continue;
+    if (ran.has(job.id)) continue; // already executed here — never twice
     claiming.add(job.id);
     void (async () => {
       let beat = null;
@@ -234,13 +252,19 @@ export function processDeployJobs(jobs, ctx) {
         }
         note(`${c.cyan('deploy')} ${c.dim(`— ${job.kind} ${job.targetId} → ${job.env}…`)}`);
         const outcome = await runDeploy(job, target, ctx);
-        await report(job, ctx, outcome);
+        // From here the work is DONE. Whatever the report does, this job must
+        // never run again in this process.
+        ran.add(job.id);
+        await report(job, ctx, outcome, () => beat != null);
         if (outcome.ok) ok(`${c.cyan('deploy')} ${c.dim(`— ${job.targetId} → ${job.env} done${outcome.healthOk === false ? ' (health failed)' : ''}`)}`);
         else warn(`deploy: ${job.targetId} → ${job.env} failed — ${outcome.message}`);
       } catch (e) {
         warn(`deploy job ${job.id} errored: ${e.message}`);
         await report(job, ctx, { ok: false, message: e.message }).catch(() => {});
       } finally {
+        // Stopped only AFTER the report has landed or given up — the requeue is
+        // gated on heartbeat staleness, so beating through the retries is what
+        // stops the server handing this job out again mid-retry.
         if (beat) clearInterval(beat);
         claiming.delete(job.id);
       }
@@ -316,13 +340,49 @@ async function runDeploy(job, target, ctx) {
   };
 }
 
-function report(job, ctx, outcome) {
-  return post('deploy-report', {
+/**
+ * THE OUTCOME IS RETRIED, because losing it re-runs the deploy.
+ *
+ * One `post` with a `.catch(warn)` was the whole of this: a transient 5xx, a
+ * DNS blip or the 30s timeout dropped the outcome, the `finally` stopped the
+ * heartbeat, and the server — which requeues a running job after three minutes
+ * without one — handed the SAME job back to the SAME daemon, which ran it
+ * again. For a rollback that is production two versions behind the intended
+ * one; for a prod deploy it is every pushSecret pushed twice. Nothing recorded
+ * that it had happened at all.
+ *
+ * The heartbeat keeps running throughout (the caller's `finally` is what stops
+ * it), so the requeue window stays shut for as long as we are still trying.
+ * Bounded: six attempts over roughly a minute, then a warning and the local
+ * `ran` guard as the floor.
+ */
+async function report(job, ctx, outcome, stillBeating = () => true) {
+  const body = {
     jobId: job.id,
     pubkey: ctx.myPubB64(),
     ok: !!outcome.ok,
     deploymentId: outcome.deploymentId ?? null,
     healthOk: outcome.healthOk ?? null,
     message: scrub(outcome.message || ''),
-  }).catch((e) => warn(`deploy: could not report outcome — ${e.message}`));
+  };
+  for (let attempt = 0; attempt < 6; attempt++) {
+    try {
+      await post('deploy-report', body);
+      return;
+    } catch (e) {
+      // The last attempt says so; the ones before it are noise on a path that
+      // usually recovers.
+      if (attempt === 5) {
+        warn(`deploy: could not report outcome after 6 tries — ${e.message}`);
+        return;
+      }
+      // If the heartbeat is already gone the requeue window is open and
+      // retrying buys nothing — the job may have been handed to somebody else.
+      if (!stillBeating()) {
+        warn(`deploy: could not report outcome — ${e.message}`);
+        return;
+      }
+      await new Promise((r) => setTimeout(r, 2000 * (attempt + 1)));
+    }
+  }
 }
