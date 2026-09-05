@@ -241,8 +241,33 @@ export function processDeployJobs(jobs, ctx) {
         // Keep the claim fresh while we run — a long deploy must never be
         // re-queued out from under us (that would double-deploy). The async
         // run() below keeps the event loop free so this fires.
+        /**
+         * …AND IT CAN DIE, which is what makes the `stillBeating` predicate
+         * below mean anything.
+         *
+         * `report` is handed `() => beat != null` so it stops retrying once the
+         * claim is certainly stale — but `beat` only ever held a timer handle
+         * and was never nulled, so that predicate could not return false and
+         * `report` retried into a job another daemon may already own.
+         *
+         * The server re-queues a deploy whose heartbeat is older than three
+         * minutes, and this fires every sixty seconds — so three consecutive
+         * failures is exactly the point past which the claim cannot be assumed.
+         * A single blip does not count: only an unbroken run does.
+         */
+        let missed = 0;
         beat = setInterval(() => {
-          void post('deploy-heartbeat', { jobId: job.id, pubkey: ctx.myPubB64() }).catch(() => {});
+          void post('deploy-heartbeat', { jobId: job.id, pubkey: ctx.myPubB64() })
+            .then(() => {
+              missed = 0;
+            })
+            .catch(() => {
+              missed += 1;
+              if (missed >= 3 && beat) {
+                clearInterval(beat);
+                beat = null;
+              }
+            });
         }, 60_000);
         const targets = readDeployConfig(ctx.repoRoot, ctx.baseRef);
         const target = targets.find((t) => t.id === job.targetId);

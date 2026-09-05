@@ -1035,6 +1035,7 @@ export async function runFleetDaemon() {
   const REGROUND_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/reground-done');
   const WIKI_VAULT_URL = FLEET_URL.replace(/\/agents\/?$/, '/wiki-vault');
   const WIKI_PROGRESS_URL = FLEET_URL.replace(/\/agents\/?$/, '/wiki-progress');
+  const WIKI_ABANDONED_URL = FLEET_URL.replace(/\/agents\/?$/, '/wiki-abandoned');
   const wikiQueue = [];
   let wikiBusy = false;
   let wikiChild = null; // the wiki turn's Claude process — tracked so teardown can kill it
@@ -1089,6 +1090,32 @@ export async function runFleetDaemon() {
       });
     } catch {
       /* best-effort — a dropped frame is harmless, the next one supersedes it */
+    }
+  };
+
+  /**
+   * Tell the server this daemon has stopped retrying the pending sweep.
+   *
+   * The retry budget is a `let` in this process; `regen_requested_at` is a
+   * durable column with a 24-hour TTL. Without this the two disagreed — the
+   * daemon had permanently given up while every surface went on calling the
+   * sweep queued, for the rest of the day. Best-effort: an older server 404s
+   * once and the TTL is still the backstop it always was.
+   */
+  const postWikiAbandoned = async () => {
+    try {
+      await fetch(WIKI_ABANDONED_URL, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${FLEET_TOKEN}`,
+          'User-Agent': USER_AGENT,
+          'Content-Type': 'application/json',
+        },
+        signal: AbortSignal.timeout(15_000),
+        body: '{}',
+      });
+    } catch {
+      /* best-effort — the request's own TTL still expires it */
     }
   };
 
@@ -1243,6 +1270,18 @@ export async function runFleetDaemon() {
         // thinking block or slow tool (which emit nothing until they finish) —
         // otherwise the cover would flap back to the empty state mid-sweep.
         let heartbeat = null;
+        /**
+         * Did THIS sweep finish? Read by the `finally` below, which owns the
+         * retry decision for every way out of this block.
+         *
+         * It used to be decided inline on the one branch where the turn
+         * returned without its sentinel — so the two OTHER ways a sweep fails,
+         * `pickRuntimeFor` finding no CLI and the catch around the whole turn,
+         * left the request pinned and never retried at all. Those are the
+         * failures most worth retrying: a missing runtime is fixed by
+         * installing one, and a thrown turn is exactly the transient case.
+         */
+        let sweepCompleted = false;
         try {
           // Immediate frame so the cover shows the daemon feed right away (the
           // "reading your code" phase), not a static message, while Claude warms up.
@@ -1328,20 +1367,10 @@ export async function runFleetDaemon() {
             });
             const complete = sawSentinel(out, 'WIKI_DONE');
             if (complete) {
-              sweepAttempts = 0;
+              sweepCompleted = true;
               ok(`${c.cyan('wiki')} ${c.dim('— vault regenerated from your code.')}`);
-            } else if (sweepAttempts < MAX_SWEEP_ATTEMPTS) {
-              // Let the roster re-offer this same request. Partial pages are
-              // already synced below (merge, never prune), so a retry resumes
-              // rather than starting from nothing.
-              lastSweepAt = null;
-              warn(
-                `wiki sweep ended without WIKI_DONE — partial pages synced; retrying (${sweepAttempts}/${MAX_SWEEP_ATTEMPTS})`
-              );
             } else {
-              warn(
-                `wiki sweep ended without WIKI_DONE ${sweepAttempts} times — giving up on this request; click Regenerate to try again.`
-              );
+              warn('wiki sweep ended without WIKI_DONE — partial pages synced');
             }
             await runSync(complete);
           } else {
@@ -1409,6 +1438,34 @@ export async function runFleetDaemon() {
         } finally {
           wikiChild = null;
           if (heartbeat) clearInterval(heartbeat);
+          /**
+           * THE RETRY DECISION, IN ONE PLACE, FOR EVERY WAY OUT OF THIS BLOCK.
+           *
+           * Deciding it inline on the no-sentinel branch covered one of the
+           * three ways a sweep fails and silently declined the other two. Here
+           * it covers the thrown turn and the no-runtime return as well, which
+           * are the two most worth retrying.
+           *
+           * A successful sweep resets the budget. A failed one with budget left
+           * clears `lastSweepAt` so the roster's next offer of the SAME request
+           * is accepted — partial pages are synced without pruning either way,
+           * so a retry resumes rather than starting over. A failed one with the
+           * budget spent tells the SERVER, because the counter is process-local
+           * and the request it bounds is durable for 24 hours.
+           */
+          if (task.type === 'sweep') {
+            if (sweepCompleted) {
+              sweepAttempts = 0;
+            } else if (sweepAttempts < MAX_SWEEP_ATTEMPTS) {
+              lastSweepAt = null;
+              warn(`wiki sweep failed — retrying (${sweepAttempts}/${MAX_SWEEP_ATTEMPTS})`);
+            } else {
+              warn(
+                `wiki sweep failed ${sweepAttempts} times — giving up on this request; press Regenerate to try again.`
+              );
+              await postWikiAbandoned();
+            }
+          }
           // Terminal frame so the app cover clears promptly (don't wait for the
           // freshness window to lapse). force-sent past the throttle.
           await postWikiProgress(frame({ done: true }), true);
