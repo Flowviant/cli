@@ -1037,6 +1037,17 @@ export async function runFleetDaemon() {
   let wikiBusy = false;
   let wikiChild = null; // the wiki turn's Claude process — tracked so teardown can kill it
   let lastSweepAt = null; // dedup: run each Regenerate request once
+  // …UNLESS IT FAILED. A sweep that ends without WIKI_DONE never finalizes, so
+  // the server's `regen_requested_at` stays set and the roster keeps offering
+  // the same `requestedAt` — which this dedup then swallowed forever. The
+  // console said "retry from the app", to a console nobody reads. Bounded the
+  // same way the re-ground path is: a full sweep is an expensive model turn, so
+  // a repo that fails one every time must not be able to loop-burn quota.
+  let sweepAttempts = 0;
+  // Which request the counter belongs to, so a NEW Regenerate click starts with
+  // a full budget rather than inheriting an exhausted one.
+  let sweepAttemptsFor = null;
+  const MAX_SWEEP_ATTEMPTS = 3;
   const groundedIntents = new Set(); // dedup: re-ground each delivery once
   // The vault is keyed by the server project this fleet credential serves
   // (learned from the roster); until the first poll names it, fall back to a
@@ -1081,6 +1092,10 @@ export async function runFleetDaemon() {
 
   const enqueueSweep = (job) => {
     if (!job || job.requestedAt === lastSweepAt) return;
+    if (job.requestedAt !== sweepAttemptsFor) {
+      sweepAttemptsFor = job.requestedAt;
+      sweepAttempts = 0;
+    }
     lastSweepAt = job.requestedAt;
     // A full sweep is expensive — never stack two. One queued sweep already
     // covers any newer Regenerate click (it reads the repo fresh when it runs).
@@ -1285,6 +1300,7 @@ export async function runFleetDaemon() {
           }
           const wikiLabel = RUNTIMES[wikiRt].label;
           if (task.type === 'sweep') {
+            sweepAttempts++;
             note(`${c.cyan('wiki')} ${c.dim(`— regenerating: your ${wikiLabel} is reading the repo…`)}`);
             const out = await runTurn({
               prompt: WIKI_KICKOFF(sha, vaultDir),
@@ -1309,9 +1325,22 @@ export async function runFleetDaemon() {
               },
             });
             const complete = sawSentinel(out, 'WIKI_DONE');
-            if (complete) ok(`${c.cyan('wiki')} ${c.dim('— vault regenerated from your code.')}`);
-            else
-              warn('wiki sweep ended without WIKI_DONE — partial pages synced; retry from the app.');
+            if (complete) {
+              sweepAttempts = 0;
+              ok(`${c.cyan('wiki')} ${c.dim('— vault regenerated from your code.')}`);
+            } else if (sweepAttempts < MAX_SWEEP_ATTEMPTS) {
+              // Let the roster re-offer this same request. Partial pages are
+              // already synced below (merge, never prune), so a retry resumes
+              // rather than starting from nothing.
+              lastSweepAt = null;
+              warn(
+                `wiki sweep ended without WIKI_DONE — partial pages synced; retrying (${sweepAttempts}/${MAX_SWEEP_ATTEMPTS})`
+              );
+            } else {
+              warn(
+                `wiki sweep ended without WIKI_DONE ${sweepAttempts} times — giving up on this request; click Regenerate to try again.`
+              );
+            }
             await runSync(complete);
           } else {
             const files = changedFilesForShas(task.shas);
