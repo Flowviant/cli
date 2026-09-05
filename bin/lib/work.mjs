@@ -2307,15 +2307,41 @@ export function createWorkManager({
    * the pid lives and clears the lock once it is dead.
    */
   const workChildren = new Map(); // child process -> lockPath | null
+  /**
+   * Children whose whole PROCESS GROUP must go, not just the child.
+   *
+   * The standing rule is the opposite — teardown SIGTERMs the CLI child and
+   * never its group, precisely so an unattended auto-update does not kill the
+   * driver's dev server, which a turn started INTO the CLI's group. That rule
+   * is about the CLI's group and stays.
+   *
+   * A project CHECK is a different group entirely: the daemon spawns it itself,
+   * `detached` with `shell: true`, so its group holds the check command and
+   * nothing else — no dev server of anybody's. And `shell: true` is exactly
+   * what makes signalling only the child useless: a compound command like
+   * `npm run lint && npm test` leaves `/bin/sh` as the child, so SIGTERM killed
+   * the shell and the test runner underneath it carried on holding the
+   * worktree — and that place's WRITER lock — through every stop, takeover and
+   * auto-update. The check's own ten-minute timer already kills `-child.pid`
+   * for this reason; teardown simply did not.
+   */
+  const groupKillChildren = new Set();
   const shutdownWork = () => {
     for (const [ch] of workChildren) {
       try {
-        ch.kill('SIGTERM');
+        if (groupKillChildren.has(ch) && ch.pid) process.kill(-ch.pid, 'SIGTERM');
+        else ch.kill('SIGTERM');
       } catch {
-        /* best-effort */
+        // A group that has already gone, or a pid that is no longer a leader.
+        try {
+          ch.kill('SIGTERM');
+        } catch {
+          /* best-effort */
+        }
       }
     }
     workChildren.clear();
+    groupKillChildren.clear();
   };
 
   /**
@@ -4220,8 +4246,15 @@ export function createWorkManager({
          * orphaned a running test suite inside a worktree the sweep may then
          * try to remove. The ten-minute timer would eventually kill it, but by
          * then it belongs to no daemon and nothing on any surface names it.
+         *
+         * Registered for a GROUP kill: with `shell: true` the child is
+         * `/bin/sh`, and signalling it leaves the runner it started behind —
+         * which is the process actually holding the worktree. See
+         * `groupKillChildren` for why this one is exempt from the
+         * never-signal-the-group rule.
          */
         workChildren.set(child, null);
+        groupKillChildren.add(child);
       } catch (e) {
         // TEXT BEFORE FINISH: `finish` captures `text` by value into the
         // resolved object, so assigning afterwards threw the spawn error away
