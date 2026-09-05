@@ -482,11 +482,29 @@ export const WORK_TURN_KICKOFF_PLAIN = ({ sessionName, message, askedByName }) =
   });
 
 
+/**
+ * THE FEATURE NAME AND THE FILE LIST ARE FENCED, and they were the only two
+ * unfenced strings left in this file.
+ *
+ * A card title is member-authored, and worse: ticket triage falls back to the
+ * REPORTER's ticket title verbatim, so a stranger can put words in it. That
+ * string rides the ship report into `code_map_reground_jobs`, comes back on the
+ * roster, and landed here as a bare `Feature: <text>` line — no delimiter, no
+ * instruction not to obey it. This turn runs UNATTENDED under `WIKI_PERM`,
+ * which grants Write, Edit, `Bash(mkdir:*)` and `Bash(rm:*)`, and whose own
+ * comment concedes that Write/Edit cannot be path-scoped here — the worktree
+ * reset is the backstop, and it only cleans the wiki worktree. Anything written
+ * outside it survives.
+ *
+ * Every other kickoff in this file already fences its untrusted input; this one
+ * was simply missed. The file list is fenced for the same reason at lower
+ * stakes — a path is attacker-influenceable too, and there is no cost to it.
+ */
 export const REGROUND_KICKOFF = ({ sha, title, files, vaultDir, predictedPages = [] }) =>
   `A feature just merged. Re-ground the knowledge vault (${vaultDir}) for it.\n\n` +
-  `Feature: ${title}\n` +
+  `Feature:\n${fence('FEATURE NAME', title)}\n` +
   `Grounded commit: ${sha}\n` +
-  `Changed files:\n${files.map((f) => `- ${f}`).join('\n')}\n\n` +
+  `Changed files:\n${fence('CHANGED FILES', files.map((f) => `- ${f}`).join('\n'))}\n\n` +
   // The plan's own prediction, made when this work was drafted. Overlapping
   // changed files against each page's frontmatter finds most of what moved, but
   // misses a page whose file list has drifted or that documents a CONCEPT rather
