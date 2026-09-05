@@ -3658,7 +3658,28 @@ export function createWorkManager({
       ['diff', '--name-only', `${baseRef()}...HEAD`],
       ['ls-files', '--others', '--exclude-standard'],
     ]) {
-      const r = git(args, wt);
+      /**
+       * `git()` THROWS; it does not return a non-string.
+       *
+       * The guard below was `if (typeof r !== 'string') continue`, which is a
+       * value `execFileSync` can never produce — so every one of these calls
+       * was effectively unguarded. And this runs over the LIVE AGENTS a plan
+       * job carries, which include agents still in `planning`: they have no
+       * worktree yet, so `git diff` in a directory that does not exist exits
+       * non-zero and throws straight out of `runAgentPlan` — after the press
+       * has been claimed and before the try/finally below. The press then sat
+       * `planning` until its expiry, having spent nothing and explained
+       * nothing, on what would be an ordinary second Deploy.
+       *
+       * An agent whose files cannot be read contributes none. That is the
+       * honest answer and it is what the planner should be told.
+       */
+      let r;
+      try {
+        r = git(args, wt);
+      } catch {
+        continue;
+      }
       if (typeof r !== 'string') continue;
       for (const line of r.split('\n')) {
         const f = line.trim();
@@ -3706,7 +3727,15 @@ export function createWorkManager({
       id: String(a?.id ?? ''),
       name: String(a?.name ?? ''),
       status: String(a?.status ?? ''),
-      changedFiles: agentChangedFiles(a?.placeId),
+      // Belt: `agentChangedFiles` is defensive internally, but it resolves a
+      // place first and this whole block sits outside the try below.
+      changedFiles: (() => {
+        try {
+          return agentChangedFiles(a?.placeId);
+        } catch {
+          return [];
+        }
+      })(),
     }));
 
     let out = '';
@@ -4409,18 +4438,37 @@ export function createWorkManager({
     const agentId = String(job.agentId);
     const place = String(job.placeId || '');
     if (!isSafePathSegment(place)) {
+      // Before the claim, and before `report` exists — this one is not covered
+      // by the belt below because there is nothing yet to be un-reported.
       await postAgentMerge({ agentId, ok: false, detail: 'the agent has no worktree here' });
       return;
     }
     if (!(await claimAgentMerge(agentId))) return;
 
+    /**
+     * NO EXIT PATH MAY LEAVE A CLAIMED MERGE UNREPORTED — the same belt the
+     * ship path carries, and this function did not.
+     *
+     * Every branch below reports, but an UNEXPECTED throw reports nothing:
+     * several `git()` calls in here are bare, and `git()` is `execFileSync`,
+     * which throws on any non-zero exit. The agent then sits in `merging`,
+     * which refuses Stop and refuses an answer, until an expiry fires — with
+     * nothing anywhere saying what went wrong.
+     */
+    let reported = false;
+    const report = async (body) => {
+      reported = true;
+      await postAgentMerge(body);
+    };
+
     // A WRITER on the place, exactly as a ship is. It folds base in and pushes
     // with git in that directory, and no CLI can coordinate with something it
     // does not know exists.
-    await inPlace(place, true, async () => {
+    try {
+      await inPlace(place, true, async () => {
       const wt = join(baseDir, 'sessions', place);
       if (!existsSync(wt)) {
-        await postAgentMerge({ agentId, ok: false, detail: 'the worktree is gone' });
+        await report({ agentId, ok: false, detail: 'the worktree is gone' });
         return;
       }
       try {
@@ -4437,7 +4485,7 @@ export function createWorkManager({
         try {
           gitMerge(['merge', '--no-edit', baseRef()], wt);
         } catch (e) {
-          await postAgentMerge({
+          await report({
             agentId,
             ok: false,
             detail: envScrub(String(e?.message || e)).slice(0, 2000),
@@ -4460,7 +4508,7 @@ export function createWorkManager({
       if (!branch) {
         // A detached HEAD names no branch, so there is nothing to merge and
         // nothing to record. An ambiguity in git, not a rule of ours.
-        await postAgentMerge({ agentId, ok: false, detail: 'this worktree is on a detached HEAD' });
+        await report({ agentId, ok: false, detail: 'this worktree is on a detached HEAD' });
         return;
       }
       const tip = (git(['rev-parse', 'HEAD'], wt) || '').trim();
@@ -4470,7 +4518,7 @@ export function createWorkManager({
         // Already on base — an idempotent re-offer, or an agent that changed
         // nothing. Reported as a SUCCESS: the branch's work is on base, which
         // is what the caller is asking about.
-        await postAgentMerge({ agentId, ok: true, sha: tip || undefined });
+        await report({ agentId, ok: true, sha: tip || undefined });
         return;
       }
       /**
@@ -4504,7 +4552,7 @@ export function createWorkManager({
             timeout: 20_000,
           });
         } catch (e) {
-          await postAgentMerge({
+          await report({
             agentId,
             ok: false,
             detail:
@@ -4516,7 +4564,7 @@ export function createWorkManager({
         }
         const prBase = baseBranchName(baseRef());
         if (branch === prBase) {
-          await postAgentMerge({
+          await report({
             agentId,
             ok: false,
             detail: `this agent is on the base branch (${prBase}) — there is nothing to open a pull request from`,
@@ -4531,7 +4579,7 @@ export function createWorkManager({
           // token in its userinfo — so this one line is the only place on the
           // agent merge path that can leak a credential into a stored,
           // team-visible `mergeError`.
-          await postAgentMerge({ agentId, ok: false, detail: envScrub(ghFirstLine(e)) });
+          await report({ agentId, ok: false, detail: envScrub(ghFirstLine(e)) });
           return;
         }
         let prUrl = null;
@@ -4559,7 +4607,7 @@ export function createWorkManager({
               .trim();
             prUrl = out.split('\n').filter(Boolean).pop() ?? null;
           } catch (e) {
-            await postAgentMerge({ agentId, ok: false, detail: ghFirstLine(e) });
+            await report({ agentId, ok: false, detail: ghFirstLine(e) });
             return;
           }
         }
@@ -4574,7 +4622,7 @@ export function createWorkManager({
           // Already merged is a SUCCESS: a re-offered job, or somebody merged
           // it in the browser. The observer closes the cards either way.
           if (!/already merged/i.test(line)) {
-            await postAgentMerge({
+            await report({
               agentId,
               ok: false,
               detail:
@@ -4587,7 +4635,7 @@ export function createWorkManager({
         // this machine has not fetched it. It identifies the state we asked to
         // be merged, which is what the receipt is for — the cards themselves
         // close when the landed observer sees the commits arrive on base.
-        await postAgentMerge({ agentId, ok: true, sha: tip });
+        await report({ agentId, ok: true, sha: tip });
         onRepoChanged();
         landed.observe();
         return;
@@ -4607,17 +4655,29 @@ export function createWorkManager({
           warn,
         });
       } catch (e) {
-        await postAgentMerge({
+        await report({
           agentId,
           ok: false,
           detail: envScrub(String(e?.message || e)).slice(0, 2000),
         });
         return;
       }
-      await postAgentMerge({ agentId, ok: true, sha: tip });
+      await report({ agentId, ok: true, sha: tip });
       onRepoChanged();
       landed.observe();
-    });
+      });
+    } finally {
+      if (!reported) {
+        // Belt over braces. A merge this daemon claimed and cannot account for
+        // is a FAILURE, said out loud, so the agent goes back to Review with a
+        // reason instead of waiting out an expiry that blames nobody.
+        await postAgentMerge({
+          agentId,
+          ok: false,
+          detail: 'the merge did not complete — check the daemon log',
+        }).catch(() => {});
+      }
+    }
   };
 
   const processAgentMergeJobs = (jobs) => {
