@@ -1486,7 +1486,18 @@ export function createWorkManager({
     // outcome because "the machine cannot do this at all" and "GitHub said
     // no" read differently to the person who asked.
     try {
-      execFileSync('gh', ['auth', 'status'], { stdio: ['ignore', 'pipe', 'pipe'] });
+      // TIMED OUT, like every other `gh` call. `execFileSync` blocks the whole
+      // event loop, so a hung `gh` — an expired token whose refresh hits a
+      // black hole, a credential helper waiting on a keyring prompt that has
+      // no terminal — stops the roster poll, every in-flight settle, the
+      // worktree sweep and the deploy heartbeat (whose 3-minute staleness
+      // window then re-queues a deploy this daemon is still running). The
+      // AGENT merge path was given exactly these timeouts in 0.77.1; this
+      // copy, forty lines of the same logic, was missed.
+      execFileSync('gh', ['auth', 'status'], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 20_000,
+      });
     } catch (e) {
       const missing = e?.code === 'ENOENT';
       await settlePr({
@@ -1546,6 +1557,7 @@ export function createWorkManager({
           execFileSync('gh', ['pr', 'view', branch, '--json', 'url,state'], {
             cwd: repoRoot,
             stdio: ['ignore', 'pipe', 'pipe'],
+            timeout: 30_000,
           }).toString()
         );
         return j?.state === 'OPEN' && typeof j?.url === 'string' ? j.url.trim() : null;
@@ -1571,7 +1583,7 @@ export function createWorkManager({
             // call, nothing invented. baseBranchName, not baseRef: gh 422s on
             // a remote-tracking name like origin/main.
             ['pr', 'create', '--head', branch, '--base', baseName, '--fill'],
-            { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] }
+            { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000 }
           )
             .toString()
             .trim();
@@ -1606,6 +1618,7 @@ export function createWorkManager({
       execFileSync('gh', ['pr', 'merge', branch, '--merge'], {
         cwd: repoRoot,
         stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 120_000,
       });
     } catch (e) {
       const line = ghFirstLine(e);

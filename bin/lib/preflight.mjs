@@ -20,7 +20,7 @@ function present(cmd) {
 
 function ghAuthed() {
   try {
-    execFileSync('gh', ['auth', 'status'], { stdio: 'ignore' });
+    execFileSync('gh', ['auth', 'status'], { stdio: 'ignore', timeout: 20_000 });
     return true;
   } catch {
     return false;

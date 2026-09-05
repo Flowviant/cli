@@ -894,6 +894,7 @@ export async function runFleetDaemon() {
               execFileSync('gh', ['pr', 'edit', job.prUrl, '--base', baseBranchName(baseRef)], {
                 cwd: repoRoot,
                 stdio: ['ignore', 'pipe', 'pipe'],
+                timeout: 30_000,
               });
             } catch (e) {
               // Already targeting base is the common no-op; anything else is
@@ -914,6 +915,7 @@ export async function runFleetDaemon() {
             execFileSync('gh', ['pr', 'merge', job.prUrl, '--squash', '--delete-branch'], {
               cwd: repoRoot,
               stdio: ['ignore', 'pipe', 'pipe'],
+              timeout: 120_000,
             });
             merged = true;
           } catch (e) {
@@ -991,7 +993,7 @@ export async function runFleetDaemon() {
                   'Task restarted in Flowviant — this attempt was discarded.',
                   '--delete-branch',
                 ],
-                { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] }
+                { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000 }
               );
             } catch (e) {
               // Already closed/merged/missing = fine; anything else we still
