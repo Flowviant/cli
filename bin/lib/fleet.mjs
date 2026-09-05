@@ -85,7 +85,7 @@ import {
   RUNTIMES,
 } from './runtimes.mjs';
 import { createWorkManager } from './work.mjs';
-import { scanLocalSessions } from './localSessions.mjs';
+import { scanLocalSessions, ourConversationIds } from './localSessions.mjs';
 import { repoState } from './repoState.mjs';
 
 async function fetchRoster(
@@ -253,7 +253,7 @@ let localSessionsUnsupported = false; // the server 404'd — quiet until restar
 let localSessionsScanAt = 0;
 let localSessionsSent = null; // last payload the server ACCEPTED, stringified
 let localSessionsSentAt = 0;
-async function maybeReportLocalSessions({ repoRoot, excludeDirs }) {
+async function maybeReportLocalSessions({ repoRoot, excludeDirs, excludeIds }) {
   if (localSessionsUnsupported) return;
   if (Date.now() - localSessionsScanAt < LOCAL_SESSIONS_SCAN_MS) return;
   localSessionsScanAt = Date.now();
@@ -261,7 +261,9 @@ async function maybeReportLocalSessions({ repoRoot, excludeDirs }) {
   try {
     // scanLocalSessions orders deterministically, so this string only changes
     // when the facts on disk do — the dedup below compares whole payloads.
-    payload = JSON.stringify({ sessions: scanLocalSessions({ repoRoot, excludeDirs }) });
+    payload = JSON.stringify({
+      sessions: scanLocalSessions({ repoRoot, excludeDirs, excludeIds }),
+    });
   } catch {
     return; // presence must never throw into the poll loop
   }
@@ -1643,7 +1645,15 @@ export async function runFleetDaemon() {
     // Terminal-session presence, throttled + dedup'd inside; never awaited —
     // the daemon's own worktrees are carved out (a session the daemon spawned
     // is already a tab, not something to offer adopting).
-    void maybeReportLocalSessions({ repoRoot, excludeDirs: [baseDir] });
+    void maybeReportLocalSessions({
+      repoRoot,
+      excludeDirs: [baseDir],
+      // …and our OWN tabs' conversations. Only the CHECKOUT needs this: every
+      // other place is under `baseDir` and already fenced by directory, while
+      // the operator's tabs share the checkout with real terminal sessions and
+      // cannot be. See `ourConversationIds`.
+      excludeIds: ourConversationIds(repoRoot),
+    });
     // …and the repo itself: every worktree and every branch, ours and not.
     // Never awaited, throttled inside, and silent on an older server.
     void maybeReportRepoState({ repoRoot, baseRef });

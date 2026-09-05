@@ -259,7 +259,17 @@ function handleStreamLine(line, { cwd, emit, onActivity, onToolEvent, appendText
       // permission, an aborted run). Under `answerFromResult` this is the only
       // stdout that would have said so, and a caller whose `out` is the answer
       // must not report "no output" for a turn that explained itself.
-      const msg = ev.error?.message ?? ev.error ?? ev.subtype;
+      // `errors[]` FIRST, because it is where the real sentence is. Claude
+      // Code reports a dead `--resume` id as
+      // `{subtype:'error_during_execution', errors:['No conversation found
+      // with session ID: …']}` — reading only `error`/`subtype` dropped that
+      // and appended the literal string `error_during_execution`, which told
+      // the driver nothing and hid the one phrase the caller needs to
+      // recognise a lost conversation.
+      const listed = Array.isArray(ev.errors)
+        ? ev.errors.filter((e) => typeof e === 'string' && e.trim()).join('; ')
+        : '';
+      const msg = listed || ev.error?.message || ev.error || ev.subtype;
       appendText(`${typeof msg === 'string' ? msg : JSON.stringify(msg)}\n`);
     }
   }

@@ -83,6 +83,37 @@ import { worktreeDiff } from './worktreeDiff.mjs';
 import { homedir } from 'node:os';
 
 /**
+ * A RESUME THAT FOUND NO CONVERSATION, in the CLI's own words.
+ *
+ * "Produced nothing" was the only signal the retry backstop had, and it is not
+ * the signal these failures give: Claude Code answers a dead `--resume` id with
+ * a result event carrying `errors: ['No conversation found with session ID: …']`
+ * AND writes the same line to stderr, so `out` is non-empty, the backstop never
+ * fired, and the turn SETTLED SUCCESSFULLY with the error as its answer. Every
+ * later message in that tab replied the same way — the marker file still held
+ * the dead id, nothing rewrote it (that only happens when an init event is
+ * seen, and there is none), and no surface offered a way to clear it. A tab
+ * bricked forever by its own CLI pruning its history, which it does on its own
+ * schedule.
+ *
+ * Matched on the CLI's phrasing rather than a code, because neither runtime
+ * gives one. Deliberately narrow: it must not swallow a rate limit or a
+ * permission refusal, both of which are real answers that should stand.
+ */
+const RESUME_LOST = [
+  /no conversation found/i,
+  /no session found/i,
+  /session .{0,80}not found/i,
+  /conversation .{0,80}not found/i,
+  /thread .{0,80}not found/i,
+  /trajectory not found/i,
+];
+const resumeConversationLost = (text) => {
+  const t = String(text || '');
+  return t.length > 0 && RESUME_LOST.some((re) => re.test(t));
+};
+
+/**
  * The shape a per-tab model name must have before it rides argv as
  * `--model <name>`. Conservative for the same reason the codex thread id is
  * (below): it comes off the wire and lands in a child process's arguments —
@@ -2832,6 +2863,7 @@ export function createWorkManager({
             toolLog.ev.length > 0 ? toolLog : undefined
           );
 
+
           // THE COMMAND AUDIT — every `$ …` the CLI's stream reports, batched
           // to the server verbatim so an admin can read what actually ran on
           // this box. Same events the narrator renders and forgets; this is
@@ -2989,8 +3021,28 @@ export function createWorkManager({
             // loud): a fresh conversation would silently discard the adoption
             // and answer as a new session wearing its name — the empty adopt
             // turn settles failed below instead.
-            if (!adopting && resume && !(out || '').trim())
+            /**
+             * …OR PRODUCED ONLY THE CLI SAYING THE CONVERSATION IS GONE.
+             *
+             * "Produced nothing" was the whole test, and it is not the shape
+             * these failures take: Claude Code answers a dead `--resume` id
+             * with a result event carrying `errors: ['No conversation found
+             * with session ID: …']` and writes the same line to stderr, so
+             * `out` is non-empty. The backstop never fired, the turn settled
+             * SUCCESSFULLY with that error as its answer, and — because the
+             * marker is only rewritten when an init event is seen, and there
+             * was none — the dead id stayed pinned. Every later message in
+             * that tab replied identically, with nothing on any surface able
+             * to clear it. A tab bricked forever by its own CLI pruning its
+             * history, which it does on its own schedule.
+             */
+            if (
+              !adopting &&
+              resume &&
+              (!(out || '').trim() || resumeConversationLost(out))
+            ) {
               out = await runTurn({ ...turnArgs, resume: false });
+            }
           } finally {
             // The CLI has stopped printing, so stop relaying. The LINE itself
             // is cleared server-side at settle — clearing it here would race

@@ -235,6 +235,72 @@ function firstCwdRecord(file) {
 }
 
 /**
+ * THE MARKER NAMES THE DAEMON PINS A TAB'S CONVERSATION UNDER.
+ *
+ * One owner, because two things read them and a drift here is silent: `work.mjs`
+ * WRITES them (`sessionMetaPath(wt, <name>, sessionId)`) and this file READS
+ * them to know which conversations are its own.
+ */
+export const SESSION_MARKERS = [
+  'flowviant-claude-session',
+  'flowviant-codex-thread',
+  'flowviant-agy-conversation',
+];
+
+/**
+ * EVERY CONVERSATION THIS DAEMON STARTED, so the adopt strip never offers you
+ * your own reflection.
+ *
+ * The machine OPERATOR's tabs work in the checkout itself (their place is
+ * `'repo'`), so their CLI transcripts land in `~/.claude/projects/<munge(repoRoot)>/`
+ * — the very directory this scan reads. The `excludeDirs` fence cannot help:
+ * repoRoot is the scan ROOT, not something under it. So the daemon's own tabs
+ * were reported as adoptable "terminal sessions", and two things followed:
+ * the `+` menu offered to adopt a tab you already have open (accepting FORKS
+ * that conversation and copies the checkout's uncommitted and untracked files
+ * into a new worktree), and — because the ended walk keeps only the newest row
+ * per directory, and a live tab's transcript is always the freshest thing in
+ * the checkout — a REAL terminal session started in the repo root could never
+ * be offered at all.
+ *
+ * Excluded by conversation ID rather than by directory, because the directory
+ * is shared with exactly the sessions we want to keep offering.
+ */
+export function ourConversationIds(repoRoot, gitDirs = []) {
+  const ids = new Set();
+  const dirs = new Set(gitDirs.filter(Boolean));
+  try {
+    dirs.add(
+      execFileSync('git', ['rev-parse', '--absolute-git-dir'], {
+        cwd: repoRoot,
+        encoding: 'utf8',
+        timeout: 5_000,
+      }).trim()
+    );
+  } catch {
+    /* not a repo, or git unavailable — the fence is simply empty */
+  }
+  for (const dir of dirs) {
+    let names = [];
+    try {
+      names = readdirSync(dir);
+    } catch {
+      continue;
+    }
+    for (const n of names) {
+      if (!SESSION_MARKERS.some((m) => n === m || n.startsWith(`${m}-`))) continue;
+      try {
+        const v = readFileSync(join(dir, n), 'utf8').trim();
+        if (v) ids.add(v);
+      } catch {
+        /* unreadable marker: nothing to fence */
+      }
+    }
+  }
+  return ids;
+}
+
+/**
  * Every Claude terminal session belonging to this repo: LIVE ones from the
  * liveness registry, ENDED ones from the transcript store. Returns
  * [{ id, cwd, live, lastActiveAt, branch? }], live first, then newest ended,
@@ -245,7 +311,11 @@ function firstCwdRecord(file) {
  * itself spawned are tabs already, and offering to adopt one would be the
  * product offering the user their own reflection.
  */
-export function scanLocalSessions({ repoRoot, excludeDirs = [] }) {
+export function scanLocalSessions({ repoRoot, excludeDirs = [], excludeIds }) {
+  /** Conversations this daemon started — never offered for adoption. See
+   *  `ourConversationIds`: the operator's tabs share the checkout with real
+   *  terminal sessions, so the fence has to be by id, not by directory. */
+  const mine = excludeIds instanceof Set ? excludeIds : new Set(excludeIds ?? []);
   const live = [];
   const ended = [];
   try {
@@ -311,6 +381,7 @@ export function scanLocalSessions({ repoRoot, excludeDirs = [] }) {
         /* no transcript yet */
       }
       if (!liveTitle && typeof rec.name === 'string' && rec.name.trim()) liveTitle = rec.name.trim();
+      if (mine.has(rec.sessionId)) continue; // our own tab, not a terminal session
       live.push({
         id: rec.sessionId,
         cwd,
@@ -387,6 +458,13 @@ export function scanLocalSessions({ repoRoot, excludeDirs = [] }) {
         continue;
       }
       if (!ours(cwd)) continue;
+      /**
+       * OUR OWN TAB IS NOT A CANDIDATE, and it is skipped BEFORE `seenCwds`
+       * claims the directory — otherwise the daemon's transcript (always the
+       * freshest thing in the checkout) took the one slot that directory gets
+       * and a genuine terminal session there could never be offered at all.
+       */
+      if (mine.has(cand.id)) continue;
       if (seenCwds.has(cwd)) continue; // newest per directory; a live one owns its cwd
       seenCwds.add(cwd);
       const title = transcriptTitle(cand.file, cand.mtimeMs);
@@ -405,7 +483,7 @@ export function scanLocalSessions({ repoRoot, excludeDirs = [] }) {
   const claude = [...live.slice(0, REPORT_CAP), ...ended];
   // agy rides in whatever room the cap leaves — Claude sessions first, they
   // are the ones adoption serves best (fork, never move).
-  const agy = scanAgyConversations({ repoRoot, excludeDirs }).slice(
+  const agy = scanAgyConversations({ repoRoot, excludeDirs, excludeIds: mine }).slice(
     0,
     Math.max(0, REPORT_CAP - claude.length)
   );
@@ -511,7 +589,8 @@ export function isAgyConversationLive(id) {
 
 /** The repo's agy conversations, via the cwd registry — see the section
  *  comment for why this is deliberately a subset. */
-function scanAgyConversations({ repoRoot, excludeDirs = [] }) {
+function scanAgyConversations({ repoRoot, excludeDirs = [], excludeIds }) {
+  const mine = excludeIds instanceof Set ? excludeIds : new Set(excludeIds ?? []);
   const out = [];
   try {
     let realRoot;
@@ -537,6 +616,9 @@ function scanAgyConversations({ repoRoot, excludeDirs = [] }) {
     const processUp = agyProcessAlive();
     for (const [cwd, id] of Object.entries(map)) {
       if (typeof id !== 'string' || !AGY_UUID_RE.test(id)) continue;
+      // The operator's own agy TAB, whose conversation is registered against
+      // the checkout exactly as a terminal one would be.
+      if (mine.has(id)) continue;
       let real;
       try {
         real = realpathSync(cwd);
