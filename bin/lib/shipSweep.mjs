@@ -19,11 +19,15 @@ import { baseBranchName } from './git.mjs';
  *
  * `git branch -d` IS THE GUARD, deliberately, rather than a stack of checks
  * of our own. It refuses an UNMERGED branch and it refuses one CHECKED OUT in
- * any worktree — which are two of the three conditions, enforced by the tool
- * that owns the truth instead of by our reading of it. Never `-D`: if git
- * objects, git is right and we stop. The third condition is ours and is the
- * name: only `session/<id>` exactly, so a branch the agent cut is never in
- * scope no matter what it was merged into.
+ * any worktree — enforced by the tool that owns the truth instead of by our
+ * reading of it. Never `-D`: if git objects, git is right and we stop. Two
+ * conditions are ours on top of it. The NAME: only `session/<id>` exactly, so
+ * a branch the agent cut is never in scope no matter what it was merged into.
+ * And ANCESTRY OF BASE: `-d` with no upstream judges "merged" against HEAD,
+ * so an operator parked on an experimental branch that merged the session
+ * work would get the delete while the narration below claimed "merged into
+ * <base>" for commits base has never seen — the claim is checked against the
+ * thing it names before git is asked at all.
  *
  * ORDERING IS LOAD-BEARING. This must not run while a ship report is still
  * undelivered. Ship's idempotency path recovers from a lost report by asking
@@ -44,6 +48,13 @@ export function sweepMergedBranch(sessionId, { git, repoRoot, baseRef, note, isR
     git(['rev-parse', '--verify', '--quiet', `refs/heads/${name}`], repoRoot);
   } catch {
     return false; // already gone, or never existed
+  }
+  try {
+    git(['merge-base', '--is-ancestor', `refs/heads/${name}`, baseRef], repoRoot);
+  } catch {
+    // Not on base — merged into something, perhaps, but not into the thing the
+    // narration names, and not ours to retire on HEAD's say-so.
+    return false;
   }
   try {
     git(['branch', '-d', name], repoRoot);

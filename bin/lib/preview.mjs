@@ -367,14 +367,17 @@ const TAIL_BYTES = 2000;
  * origin with 502, so without this the product would report "live" over a 502 —
  * Flowviant asserting a state it never measured.
  *
- * `stillServing` (optional, async → boolean) is the ATTRIBUTION re-check the
- * probe runs instead of a bare TCP connect. Ports are global to a box and a
- * worktree is not: when the driver's dev server dies and anything else — a
- * teammate's worktree, a database — binds the same number, a bare
- * `isListening` keeps the probe green and the existing URL+password serve the
- * NEW process, outside every consent gate. The caller passes the same
- * `listenersIn(worktree)` check the open path uses, so "the origin is alive"
- * keeps meaning "THIS session's origin".
+ * `stillServing` (optional, async → boolean) is the ATTRIBUTION check — the
+ * same `listenersIn(worktree)` predicate the caller ran at the boundary —
+ * and it guards EVERY gate in here, not just the probe: the open-time
+ * re-validation, one more look immediately before cloudflared spawns, and the
+ * recurring probe. Ports are global to a box and a worktree is not: when the
+ * driver's dev server dies and anything else — a teammate's worktree, a
+ * database — binds the same number, a bare `isListening` answers yes and the
+ * URL+password serve the NEW process, outside every consent gate. Three gates
+ * on one predicate, so "the origin is alive" always means "THIS session's
+ * origin"; a bare TCP connect stands in only when no predicate was given (an
+ * older caller).
  *
  * `onAbuse` fires when the gate closes itself after repeated failed password
  * attempts — AFTER the share is torn down locally — so the caller can report
@@ -400,10 +403,21 @@ export async function openTunnel({
   shareId,
   authorizeUrl,
 }) {
+  // ONE predicate for every liveness question this function asks. Attribution
+  // when the caller gave it, a bare TCP connect only when it did not; an
+  // attribution check that errors is not a "yes".
+  const serving = async () => {
+    try {
+      return stillServing ? await stillServing() : await isListening(port);
+    } catch {
+      return false;
+    }
+  };
+
   // Re-validate at the machine. The server checked this port against the last
   // report; reports are up to a minute old and a dev server is a process a
   // human can stop at any moment.
-  if (!(await isListening(port))) {
+  if (!(await serving())) {
     return { error: `nothing is listening on port ${port} in this worktree any more.` };
   }
 
@@ -464,6 +478,17 @@ export async function openTunnel({
     return { error: 'could not start the password gate for this preview, so nothing was published.' };
   }
 
+  // The last look BEFORE anything becomes public. Between the check above and
+  // here sit a possible cloudflared download and the gate's own bind — long
+  // enough for the dev server to die and an unrelated process to take the
+  // port, which a check that ran only at the top would never see again until
+  // the probe's first beat, up to probeMs later. Same predicate, so the moment
+  // the hostname exists it can only be pointing at THIS session's origin.
+  if (!(await serving())) {
+    stop();
+    return { error: `nothing is listening on port ${port} in this worktree any more.` };
+  }
+
   const args = ['tunnel', '--url', `http://localhost:${gate.port}`];
   // Send the origin the Host it expects. Vite and Next reject a Host they do
   // not recognise, so without this the tunnel resolves and then 403s.
@@ -513,13 +538,7 @@ export async function openTunnel({
       // share would keep serving a process nobody consented to publish.
       probe = setInterval(async () => {
         if (stopped) return;
-        let serving;
-        try {
-          serving = stillServing ? await stillServing() : await isListening(port);
-        } catch {
-          serving = false; // an attribution check that errors is not a "yes"
-        }
-        if (!serving) {
+        if (!(await serving())) {
           const dead = onDead;
           stop();
           try {

@@ -23,18 +23,19 @@
  * report nothing — ignorance is never turned into a state.
  */
 
+import { execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { git, baseBranchName } from './git.mjs';
-import { taskIdsFromMessage } from './worktreeDiff.mjs';
+import { stripDelims, taskIdsFromMessage } from './worktreeDiff.mjs';
 import { warn } from './ui.mjs';
 import { FLEET_URL, FLEET_TOKEN, USER_AGENT } from './config.mjs';
 
 const LANDED_URL = FLEET_URL.replace(/\/agents\/?$/, '/base-landed');
 /** The server accepts 50 per report. A bigger range walks OLDEST-FIRST in
- *  batches: the persisted tip advances to the last commit actually reported,
+ *  batches: the persisted tip advances to the last commit actually walked,
  *  so the remainder is picked up on the next beat rather than skipped forever
  *  — a trailered card in commit 51 of a big catch-up still closes. */
 const MAX_COMMITS = 50;
@@ -74,27 +75,64 @@ export function createLandedObserver({ repoRoot, baseRef }) {
     }
   };
 
-  /** New non-merge commits in from..to, OLDEST FIRST. `--no-merges` for the
-   *  same reason branchCommits keeps it: a merge commit describes a range
-   *  rather than doing work, and its constituents are walked as themselves. */
+  /** git with the buffer the WALK needs. git.mjs's call takes execFileSync's
+   *  default 1MiB cap, and a catch-up range's `%B` bodies blew through it —
+   *  the throw landed in the reseed catch below, which skipped the whole range
+   *  and silently lost every trailer in it. 8MB is repoState's number for the
+   *  same reason; rev-list output at 41 bytes a commit clears ~200k commits
+   *  before it matters. */
+  const gitWide = (args) =>
+    execFileSync('git', args, {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      maxBuffer: 8 * 1024 * 1024,
+    }).trim();
+
+  /** New non-merge commits in from..to, OLDEST FIRST — the next batch of at
+   *  most MAX_COMMITS, plus the tip the state should advance to when the range
+   *  held more. `--no-merges` for the same reason branchCommits keeps it: a
+   *  merge commit describes a range rather than doing work, and its
+   *  constituents are walked as themselves.
+   *
+   *  THE SHA LIST COMES FROM REV-LIST, NEVER FROM THE FORMATTED LOG. Git
+   *  preserves the 0x1e/0x1f delimiter bytes inside a commit BODY (verified
+   *  empirically), so a crafted message can fabricate whole records — an
+   *  arbitrary sha plus Flowviant-Task ids that /fleet/base-landed would close
+   *  cards on. rev-list prints nothing an author controls, so its output is
+   *  the set of commits that exist: a parsed record whose sha is not in the
+   *  batch is a forgery and is dropped, a repeated sha is the same forgery
+   *  wearing a real commit's name, and the delimiter bytes are stripped from
+   *  every surviving field.
+   *
+   *  BOUNDING THE BODY FETCH TO THE BATCH is what makes the header's batching
+   *  contract true at any range size: `%B` over the whole range grows without
+   *  bound, so the formatted log runs over exactly the shas being reported
+   *  this beat (`--no-walk=unsorted` shows precisely the commits named, in
+   *  argv order — measured). */
   const walk = (from, to) => {
-    const raw = git(
-      ['log', '--reverse', '--no-merges', '--format=%H%x1f%s%x1f%B%x1e', `${from}..${to}`],
-      repoRoot
-    );
+    const shas = gitWide(['rev-list', '--reverse', '--no-merges', `${from}..${to}`])
+      .split('\n')
+      .filter((s) => SHA_RE.test(s));
+    const batch = shas.slice(0, MAX_COMMITS);
+    const tipAfter = shas.length > MAX_COMMITS ? batch[batch.length - 1] : null;
+    if (batch.length === 0) return { commits: [], tipAfter };
+    const real = new Set(batch);
+    const raw = gitWide(['log', '--no-walk=unsorted', '--format=%H%x1f%s%x1f%B%x1e', ...batch]);
     const out = [];
     for (const rec of raw.split('\x1e')) {
       const line = rec.replace(/^\n+/, '');
       if (!line.trim()) continue;
-      const [sha, subject, body] = line.split('\x1f');
-      if (!SHA_RE.test(sha || '')) continue;
+      const [sha, subject, ...bodyParts] = line.split('\x1f');
+      if (!real.has(sha)) continue;
+      real.delete(sha);
       out.push({
         sha,
-        subject: String(subject || '').slice(0, 200),
-        taskIds: taskIdsFromMessage(body).slice(0, 8),
+        subject: stripDelims(subject).slice(0, 200),
+        taskIds: taskIdsFromMessage(stripDelims(bodyParts.join('\n'))).slice(0, 8),
       });
     }
-    return out;
+    return { commits: out, tipAfter };
   };
 
   /** Look at the base tip; if it moved, report the range. Call after anything
@@ -112,21 +150,30 @@ export function createLandedObserver({ repoRoot, baseRef }) {
       return;
     }
     if (st.tip === tip) return;
-    let all;
+    let walked;
     try {
-      all = walk(st.tip, ref);
+      walked = walk(st.tip, ref);
     } catch {
-      // The old tip is no longer answerable (force-push, gc) — reseed and
-      // report nothing rather than guess at a range.
-      writeState({ ref, tip });
+      // Two failures land here and only one may reseed. Probe the range
+      // directly: if rev-list cannot COUNT it, the old tip is genuinely gone
+      // (force-push, gc) and observation reseeds at the new one — ignorance is
+      // never turned into a state. Anything else (a transient spawn failure,
+      // an over-buffer) keeps the stored tip so the next beat retries the same
+      // range; reseeding on those was what skipped a whole catch-up range and
+      // permanently lost every trailer in it.
+      try {
+        git(['rev-list', '--count', `${st.tip}..${ref}`], repoRoot);
+      } catch {
+        writeState({ ref, tip });
+      }
       return;
     }
     // Oldest-first BATCH: a range past the server's cap advances the tip only
-    // to the last commit reported, so the remainder rides the next beat —
+    // to the last commit walked, so the remainder rides the next beat —
     // nothing is skipped forever. (A range of nothing but merge commits still
     // reports, tip-only: the tip moving is the fact deploy-on-merge rides.)
-    const commits = all.slice(0, MAX_COMMITS);
-    const reportedTip = all.length > MAX_COMMITS ? commits[commits.length - 1].sha : tip;
+    const commits = walked.commits;
+    const reportedTip = walked.tipAfter ?? tip;
     inFlight = true;
     try {
       const res = await fetch(LANDED_URL, {

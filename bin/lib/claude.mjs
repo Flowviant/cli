@@ -12,10 +12,7 @@
  */
 
 import { spawn } from 'node:child_process';
-import { mkdtempSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { SAFE, MODEL } from './config.mjs';
+import { SAFE } from './config.mjs';
 import { runtimeById, humanizeClaudeTool } from './runtimes.mjs';
 
 // Every prompt/kickoff constant lives in prompts.mjs and is re-exported here:
@@ -140,20 +137,6 @@ export const blockedId = (out) => {
   const m = out.match(/^\s*BLOCKED:(\S+)\s*$/m);
   return m ? m[1] : null;
 };
-
-export function mcpConfigFor(token, mcpUrl) {
-  const dir = mkdtempSync(join(tmpdir(), 'flowviant-'));
-  const p = join(dir, 'mcp.json');
-  writeFileSync(
-    p,
-    JSON.stringify({
-      mcpServers: {
-        flowviant: { type: 'http', url: mcpUrl, headers: { Authorization: `Bearer ${token}` } },
-      },
-    })
-  );
-  return { dir, path: p };
-}
 
 /**
  * Hand a runtime the flowviant MCP server, however that runtime wants it.

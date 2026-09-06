@@ -27,7 +27,7 @@
 
 import { existsSync, statSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { git } from './git.mjs';
+import { git, gitRaw, splitNul } from './git.mjs';
 
 /** Rows reported. The rail shows a handful; the totals below cover the rest. */
 const MAX_FILES = 20;
@@ -71,6 +71,14 @@ export function taskIdsFromMessage(body) {
 }
 
 /**
+ * The %x1e/%x1f record delimiters, removed from any field that survives
+ * parsing. Splitting alone is not enough: git PRESERVES both bytes in a commit
+ * body, so a surviving field can still carry a fragment of a forged record,
+ * and a stripped field can never re-assemble one downstream.
+ */
+export const stripDelims = (s) => String(s ?? '').replace(/[\x1e\x1f]/g, '');
+
+/**
  * The commits this branch has that base does not, with the cards they name.
  *
  * Only commits carrying a trailer are RETURNED: an untrailered commit belongs
@@ -81,14 +89,27 @@ export function taskIdsFromMessage(body) {
  * `--no-merges`, because a merge commit describes a range rather than doing
  * work, and its trailer (if it has one) would double-book the range's own
  * commits.
+ *
+ * THE SHA LIST COMES FROM REV-LIST, NEVER FROM THE FORMATTED LOG. The %x1e and
+ * %x1f delimiters are formatting, not a fence: git preserves both bytes inside
+ * a commit BODY (verified empirically), so a crafted message can fabricate
+ * whole records — a self-named sha carrying task ids, exactly the receipt this
+ * product refuses to let an agent write about itself. rev-list prints nothing
+ * an author controls, so its output is the set of commits that exist: a parsed
+ * record whose sha is not in that set is a forgery and is dropped, a repeated
+ * sha is the same forgery wearing a real commit's name, and the delimiter
+ * bytes are stripped from every surviving field.
  */
 function branchCommits(wt, base) {
   if (!base) return [];
   const out = [];
   try {
-    // %x1e between records, %x1f between fields — a subject and a body can
-    // contain anything a person can type, so the delimiters must be bytes they
-    // cannot.
+    const real = new Set(
+      git(['rev-list', '--no-merges', '-n', String(MAX_COMMITS), `${base}..HEAD`], wt)
+        .split('\n')
+        .filter(Boolean)
+    );
+    if (real.size === 0) return [];
     const raw = git(
       [
         'log',
@@ -103,9 +124,10 @@ function branchCommits(wt, base) {
     for (const rec of raw.split('\x1e')) {
       const line = rec.replace(/^\n+/, '');
       if (!line.trim()) continue;
-      const [sha, subject, author, at, body] = line.split('\x1f');
-      if (!sha) continue;
-      const taskIds = taskIdsFromMessage(body);
+      const [sha, subject, author, at, ...bodyParts] = line.split('\x1f');
+      if (!real.has(sha)) continue;
+      real.delete(sha);
+      const taskIds = taskIdsFromMessage(stripDelims(bodyParts.join('\n')));
       if (taskIds.length === 0) continue;
       let additions = 0;
       let deletions = 0;
@@ -125,9 +147,9 @@ function branchCommits(wt, base) {
         // Clamped to the server's zod caps, same rule as everything else in
         // this file: one over-cap string 400s the whole batch.
         sha: sha.slice(0, 64),
-        subject: (subject ?? '').slice(0, 200),
-        author: (author ?? '').slice(0, 80),
-        at: (at ?? '').slice(0, 40),
+        subject: stripDelims(subject).slice(0, 200),
+        author: stripDelims(author).slice(0, 80),
+        at: stripDelims(at).slice(0, 40),
         additions,
         deletions,
         taskIds: taskIds.slice(0, 8),
@@ -202,13 +224,25 @@ export function worktreeDiff(wt, baseRef) {
   };
 
   // Tracked: working tree vs base. `git diff <base>` (no --cached, no second
-  // ref) is exactly "everything this session did", committed or not.
+  // ref) is exactly "everything this session did", committed or not. `-z`, for
+  // the reason gitRaw exists: git's LINE-based output C-quotes any path that
+  // is not plain ASCII, so an accented filename arrives as "n\303\251w.txt" —
+  // a string that is not the path and reads as escaped garbage in the rail.
   try {
-    const raw = git(['diff', '--numstat', base || 'HEAD'], wt);
-    for (const line of raw.split('\n')) {
-      if (!line.trim()) continue;
-      const [a, d, ...rest] = line.split('\t');
-      const path = rest.join('\t');
+    // `--numstat -z` frames a normal change as one field, "added\tdeleted\tpath",
+    // but a RENAME as three: "added\tdeleted\t" (empty path), then the old path,
+    // then the new one. An empty path is therefore the rename marker and the
+    // next two fields belong to it — read line-wise, a rename would report a
+    // file literally named "old => new".
+    const fields = splitNul(gitRaw(['diff', '--numstat', '-z', base || 'HEAD', '--'], wt));
+    for (let i = 0; i < fields.length; i++) {
+      const [a, d, ...rest] = fields[i].split('\t');
+      let path = rest.join('\t');
+      if (!path) {
+        path = fields[i + 2] ?? fields[i + 1]; // the post-rename name is what exists now
+        i += 2;
+        if (!path) continue;
+      }
       const binary = a === '-' || d === '-';
       push(path, binary ? 0 : Number(a) || 0, binary ? 0 : Number(d) || 0, binary);
     }
@@ -217,11 +251,12 @@ export function worktreeDiff(wt, baseRef) {
   }
 
   // Untracked, minus everything gitignored — new files are the most visible
-  // work a session does and they would otherwise show as nothing at all.
+  // work a session does and they would otherwise show as nothing at all. `-z`
+  // here is not cosmetic: a C-quoted untracked name fails the statSync below,
+  // and the catch swallowed the row — a session's brand-new `café.txt` simply
+  // vanished from the rail.
   try {
-    const others = git(['ls-files', '--others', '--exclude-standard'], wt)
-      .split('\n')
-      .filter(Boolean);
+    const others = splitNul(gitRaw(['ls-files', '--others', '--exclude-standard', '-z'], wt));
     for (const path of others.slice(0, MAX_UNTRACKED_SCAN)) {
       try {
         const full = join(wt, path);

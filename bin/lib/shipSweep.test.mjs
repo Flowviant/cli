@@ -77,6 +77,27 @@ test('a branch CHECKED OUT in a worktree survives, merged or not', (t) => {
   assert.ok(refs(dir).includes('session/abc'));
 });
 
+test("merged into the OPERATOR'S branch but not into base — kept", (t) => {
+  const dir = repo();
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  branchWithWork(dir, 'abc');
+  // The operator parks on an experimental branch and merges the session work
+  // THERE. `git branch -d` judges "merged" against HEAD when a branch has no
+  // upstream — session branches never do — so without the explicit
+  // is-ancestor-of-base check this deleted the branch and narrated "merged
+  // into main" for commits main has never seen.
+  git(['checkout', '-q', '-b', 'experiment'], dir);
+  git(['merge', '--no-ff', '--no-edit', '-q', 'session/abc'], dir);
+  assert.equal(sweep(dir, 'abc'), false);
+  assert.ok(refs(dir).includes('session/abc'));
+  // …and once base really has it, the same call retires it, wherever HEAD is.
+  git(['checkout', '-q', 'main'], dir);
+  git(['merge', '--no-ff', '--no-edit', '-q', 'session/abc'], dir);
+  git(['checkout', '-q', 'experiment'], dir);
+  assert.equal(sweep(dir, 'abc'), true);
+  assert.ok(!refs(dir).includes('session/abc'));
+});
+
 test('a branch we did not create is never in scope', (t) => {
   const dir = repo();
   t.after(() => rmSync(dir, { recursive: true, force: true }));
