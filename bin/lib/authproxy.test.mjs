@@ -373,6 +373,66 @@ test('NC6 — a forged grant does not count toward the abuse kill switch', async
   assert.equal(res.status, 200);
 });
 
+test('NC7 — wrong passwords from ONE source block that source, never the share', async () => {
+  // The hostname is known to every past member, tester and password recipient,
+  // whose access cannot be recalled — so one URL holder's 25 wrong guesses
+  // must not tear the tunnel down for everyone. cloudflared forwards the real
+  // client address in Cf-Connecting-Ip, which the tests set directly.
+  const bad = 'Basic ' + Buffer.from(`${gate.user}:not-the-password`).toString('base64');
+  for (let i = 0; i < 25; i++) {
+    const r = await get('/x', { authorization: bad, 'cf-connecting-ip': '203.0.113.7' });
+    assert.equal(r.status, 401);
+  }
+  // The tripped source is refused outright — even a correct password now: a
+  // block that still graded guesses would let the brute force run to a hit.
+  const auth = 'Basic ' + Buffer.from(`${gate.user}:${gate.password}`).toString('base64');
+  const blocked = await get('/x', { authorization: auth, 'cf-connecting-ip': '203.0.113.7' });
+  assert.equal(blocked.status, 429);
+  // Everybody else's share is untouched: the password from another address …
+  const other = await get('/x', { authorization: auth, 'cf-connecting-ip': '203.0.113.8' });
+  assert.equal(other.status, 200);
+  // … and the grant path, which never counted and never blocks.
+  const cookie = await get('/ok', { cookie: `${GRANT_COOKIE}=${mint()}` });
+  assert.equal(cookie.status, 200);
+});
+
+test('the global backstop still self-closes a DISTRIBUTED guessing run', async () => {
+  let closed = 0;
+  const g2 = await startAuthProxy({
+    targetPort: originPort,
+    grantSecret: SECRET,
+    shareId: SHARE,
+    authorizeUrl: 'https://app.flowviant.com/api/v2/preview/authorize',
+    onAbuse: () => {
+      closed += 1;
+    },
+  });
+  assert.ok(g2);
+  const bad = 'Basic ' + Buffer.from(`${g2.user}:wrong`).toString('base64');
+  const attempt = (ip) =>
+    fetch(`http://127.0.0.1:${g2.port}/x`, {
+      headers: { authorization: bad, 'cf-connecting-ip': ip },
+      redirect: 'manual',
+    });
+  try {
+    // One source hammers 100 times: 25 count, 75 are refused WITHOUT counting
+    // — a blocked source must stop feeding the total, or a single abuser
+    // reaches the backstop alone and the per-source split bought nothing.
+    for (let i = 0; i < 100; i++) await attempt('198.51.100.1');
+    // Six more sources burn their full allowance: 25 + 150 = 175 < 200.
+    for (let s = 2; s <= 7; s++) {
+      for (let i = 0; i < 25; i++) await attempt(`198.51.100.${s}`);
+    }
+    assert.equal(closed, 0, 'the backstop must not fire below MAX_FAILED_TOTAL counted failures');
+    // The eighth source is the 200th counted failure — a genuinely
+    // distributed run still self-closes the share.
+    for (let i = 0; i < 25; i++) await attempt('198.51.100.8');
+    assert.equal(closed, 1);
+  } finally {
+    g2.stop();
+  }
+});
+
 test('an EXPIRED grant re-bounces rather than counting as an attempt', async () => {
   const stale = mint({ exp: Math.floor(Date.now() / 1000) - 7200, k: 't', r: 'tok-1' });
   const res = await get('/x', { accept: 'text/html', cookie: `${GRANT_COOKIE}=${stale}` });

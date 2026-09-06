@@ -483,8 +483,8 @@ export const WORK_TURN_KICKOFF_PLAIN = ({ sessionName, message, askedByName }) =
 
 
 /**
- * THE FEATURE NAME AND THE FILE LIST ARE FENCED, and they were the only two
- * unfenced strings left in this file.
+ * EVERY SERVER-CARRIED STRING HERE IS FENCED — the feature name, the file
+ * list, and the predicted-page list.
  *
  * A card title is member-authored, and worse: ticket triage falls back to the
  * REPORTER's ticket title verbatim, so a stranger can put words in it. That
@@ -496,9 +496,11 @@ export const WORK_TURN_KICKOFF_PLAIN = ({ sessionName, message, askedByName }) =
  * reset is the backstop, and it only cleans the wiki worktree. Anything written
  * outside it survives.
  *
- * Every other kickoff in this file already fences its untrusted input; this one
- * was simply missed. The file list is fenced for the same reason at lower
- * stakes — a path is attacker-influenceable too, and there is no cost to it.
+ * The predicted pages come off the roster exactly as the title does — a
+ * planner wrote them from card text, and card text is member-authored — so an
+ * unfenced `- <page>` line was the same injection lane with a different field
+ * name. The file list is fenced for the same reason at lower stakes: a path is
+ * attacker-influenceable too, and there is no cost to it.
  */
 export const REGROUND_KICKOFF = ({ sha, title, files, vaultDir, predictedPages = [] }) =>
   `A feature just merged. Re-ground the knowledge vault (${vaultDir}) for it.\n\n` +
@@ -510,10 +512,10 @@ export const REGROUND_KICKOFF = ({ sha, title, files, vaultDir, predictedPages =
   // misses a page whose file list has drifted or that documents a CONCEPT rather
   // than a directory. This is a hint to CHECK, never a list to trust.
   (predictedPages.length
-    ? `When this work was planned, these vault pages were expected to go stale.\n` +
-      `Treat it as a lead, not a fact — verify each against the code before\n` +
-      `editing, and ignore any that turned out to be unaffected:\n` +
-      `${predictedPages.map((p) => `- ${p}`).join('\n')}\n\n`
+    ? `When this work was planned, the vault pages listed below were expected\n` +
+      `to go stale. Treat the list as a lead, not a fact — verify each against\n` +
+      `the code before editing, and ignore any that turned out to be unaffected:\n` +
+      `${fence('PREDICTED PAGES', predictedPages.map((p) => `- ${p}`).join('\n'))}\n\n`
     : '') +
   `Follow your instructions: update the touched vault pages (and any docs/\n` +
   `chapter that covers them), append the feature-history entry to log.md,\n` +

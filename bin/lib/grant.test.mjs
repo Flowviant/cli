@@ -147,3 +147,22 @@ test('safeRelative refuses anything a browser reads as an origin', () => {
   assert.equal(safeRelative('/app?x=1'), '/app?x=1');
   assert.equal(safeRelative(''), '/');
 });
+
+test('safeRelative refuses the characters a browser strips BEFORE parsing', () => {
+  // Browsers delete tab, CR and LF from a URL before parsing, so a lexical
+  // "second char is not a slash" guard passes `/\t/evil.com` and the browser
+  // then navigates to `//evil.com` — the audit case the structural rewrite
+  // closed. Every C0 control, space and DEL is refused whole.
+  for (const bad of ['/\t/evil.com', '/\tevil.com', '/\x00x', '/a b', '/\x7f']) {
+    assert.equal(safeRelative(bad), '/');
+  }
+});
+
+test('safeRelative survives the re-parse round trip on honest paths', () => {
+  // The returned value is what the URL parser produced, so a same-origin path
+  // with query and hash must come back whole, not truncated.
+  assert.equal(safeRelative('/deep/path?q=1#frag'), '/deep/path?q=1#frag');
+  // A backslash later in the path is normalised by the parser exactly as the
+  // browser would normalise it — still same-origin, never `/`-then-surprise.
+  assert.equal(safeRelative('/a\\b'), '/a/b');
+});

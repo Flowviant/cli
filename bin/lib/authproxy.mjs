@@ -92,11 +92,27 @@ import { createServer, request } from 'node:http';
 import { randomBytes, createHash, timingSafeEqual } from 'node:crypto';
 import { GRANT_COOKIE, cookieValues, safePathname, safeRelative, stripCookie, verifyGrant } from './grant.mjs';
 
-/** Failed attempts before the proxy stops answering at all. A quick tunnel's
- *  hostname is unguessable, so this is not the primary control — it is what
- *  turns a discovered URL from an offline guessing target into a visible,
- *  self-closing incident. */
+/** Wrong-password attempts from ONE source before that source's Basic
+ *  attempts are refused outright. A quick tunnel's hostname is unguessable,
+ *  so this is not the primary control — but it is KNOWN to every past
+ *  member, tester and password recipient, whose access cannot be recalled.
+ *  The threshold is per source because one global counter made 25 wrong
+ *  guesses from any URL holder a kill switch on everyone else's share. */
 const MAX_FAILED = 25;
+
+/** Counted failures across ALL sources before the whole share tears down.
+ *  The per-source block above answers a single abuser; this answers a
+ *  DISTRIBUTED guessing run (addresses rotating to stay under MAX_FAILED
+ *  each) — the original self-closing-incident property, kept at a threshold
+ *  ordinary use cannot reach: a blocked source stops counting, so getting
+ *  here takes eight independent sources each burning their full allowance. */
+const MAX_FAILED_TOTAL = 200;
+
+/** Bound on the per-source map — a rotating attacker must not grow daemon
+ *  memory without limit. Eviction is oldest-first and CAN un-block an evicted
+ *  source, but cycling 500 fresh sources costs at least 500 counted failures,
+ *  and the global backstop closes the share long before that. */
+const MAX_SOURCES = 500;
 
 const digest = (s) => createHash('sha256').update(String(s)).digest();
 
@@ -116,8 +132,10 @@ function sameSecret(a, b) {
  * hard failure. Binds loopback only; cloudflared connects locally, and the
  * password is what gates the public hostname.
  *
- * `onAbuse` fires once, after MAX_FAILED rejected attempts, so the caller can
- * tear the whole share down rather than leaving a URL under attack.
+ * `onAbuse` fires once, after MAX_FAILED_TOTAL rejected attempts across all
+ * sources, so the caller can tear the whole share down rather than leaving a
+ * URL under attack. A single source is blocked on its own, at MAX_FAILED,
+ * without ending anybody else's share.
  */
 export function startAuthProxy({ targetPort, log, onAbuse, grantSecret, shareId, authorizeUrl }) {
   // ALL THREE OR NONE. Two of the three is a gate that cannot bounce anybody:
@@ -134,44 +152,82 @@ export function startAuthProxy({ targetPort, log, onAbuse, grantSecret, shareId,
   const password = randomBytes(24).toString('base64url');
   const expected = 'Basic ' + Buffer.from(`${user}:${password}`).toString('base64');
 
-  let failed = 0;
+  let failedTotal = 0;
   let abused = false;
+  /** source → wrong-password count, insertion-ordered so eviction below is
+   *  oldest-first. A source at MAX_FAILED is BLOCKED: its Basic attempts are
+   *  refused BEFORE the comparison and stop counting toward the total. */
+  const failedBySource = new Map();
   /** The payload of the last validly-signed but EXPIRED grant seen, so a
    *  tester can be re-bounced with the token inside it. */
   let lastExpired = null;
+
+  /** cloudflared forwards the real client address in Cf-Connecting-Ip; a
+   *  direct local connection (the machine's own curl, the tests) has only the
+   *  socket. The header is attacker-writable in principle, but lying in it
+   *  only SPREADS one attacker across per-source counters — which is exactly
+   *  the shape MAX_FAILED_TOTAL exists to answer. */
+  const sourceOf = (req) =>
+    String(req.headers['cf-connecting-ip'] || req.socket?.remoteAddress || 'unknown');
+
+  const sourceBlocked = (req) => (failedBySource.get(sourceOf(req)) ?? 0) >= MAX_FAILED;
+
+  const noteFailure = (req) => {
+    const src = sourceOf(req);
+    const count = (failedBySource.get(src) ?? 0) + 1;
+    // Delete-then-set so Map insertion order tracks recency, making the
+    // eviction below an LRU rather than "whoever failed first".
+    failedBySource.delete(src);
+    failedBySource.set(src, count);
+    if (failedBySource.size > MAX_SOURCES) {
+      failedBySource.delete(failedBySource.keys().next().value);
+    }
+    if (count === MAX_FAILED) {
+      log?.(`preview gate: ${count} failed attempts from ${src} — refusing that source.`);
+    }
+    // MONOTONE, never reset by a success: a distributed run has no successes
+    // to hide behind, and a legitimate share cannot reach the backstop —
+    // every source stops counting at MAX_FAILED, so 200 needs eight distinct
+    // sources each exhausting their own allowance.
+    failedTotal += 1;
+    if (failedTotal >= MAX_FAILED_TOTAL && !abused) {
+      abused = true;
+      log?.(`preview gate: ${failedTotal} failed attempts across sources — closing the share.`);
+      try {
+        onAbuse?.();
+      } catch {
+        /* the caller's teardown is best-effort */
+      }
+    }
+  };
 
   /**
    * A PURE CREDENTIAL PREDICATE — no method, no Accept, no path. That is what
    * lets the websocket upgrade handler reuse it verbatim, and it is why routing
    * decisions live in the request handler instead.
    *
-   * Tristate-plus: 'ok' | 'none' | 'expired' | 'forged' | 'badpass'.
+   * Tristate-plus: 'ok' | 'none' | 'expired' | 'forged' | 'badpass' | 'blocked'.
    */
   const credential = (req) => {
     if (abused) return 'badpass';
-    if (sameSecret(req.headers['authorization'], expected)) {
-      failed = 0;
-      return 'ok';
-    }
     // ONLY A WRONG PASSWORD COUNTS AS AN ATTEMPT, and this is a reason rather
     // than a preference. A forged HMAC is not brute-forceable, so counting it
     // buys nothing — while counting it would hand any stranger who finds the
-    // hostname a 25-request KILL SWITCH on the owner's share, because onAbuse
-    // tears the whole thing down. An expired-but-validly-signed grant must
-    // never count either, or a viewer who left a tab open overnight closes the
-    // share on their own reload. MAX_FAILED keeps its exact meaning, which is
-    // also why the 'abuse' ended-reason sentence stays true.
+    // hostname a kill switch on the owner's share, because onAbuse tears the
+    // whole thing down. An expired-but-validly-signed grant must never count
+    // either, or a viewer who left a tab open overnight closes the share on
+    // their own reload.
     if (req.headers['authorization']) {
-      failed += 1;
-      if (failed >= MAX_FAILED && !abused) {
-        abused = true;
-        log?.(`preview gate: ${failed} failed attempts — closing the share.`);
-        try {
-          onAbuse?.();
-        } catch {
-          /* the caller's teardown is best-effort */
-        }
+      // A blocked source is refused BEFORE the comparison — a block that
+      // still grades guesses would let the brute force run to a correct hit.
+      if (sourceBlocked(req)) return 'blocked';
+      if (sameSecret(req.headers['authorization'], expected)) {
+        // Per-source only: a shared NAT recovers when one person behind it
+        // gets the password right; failedTotal stays monotone (see above).
+        failedBySource.delete(sourceOf(req));
+        return 'ok';
       }
+      noteFailure(req);
       return 'badpass';
     }
 
@@ -187,8 +243,6 @@ export function startAuthProxy({ targetPort, log, onAbuse, grantSecret, shareId,
     }
     return String(req.headers.cookie ?? '').includes(GRANT_COOKIE) ? 'forged' : 'none';
   };
-
-  const authed = (req) => credential(req) === 'ok';
 
   /**
    * The CSRF backstop for the partitioned cookie (header rule 4a): a browser
@@ -388,6 +442,14 @@ export function startAuthProxy({ targetPort, log, onAbuse, grantSecret, shareId,
     }
     // 3. One predicate.
     const verdict = credential(req);
+    // A blocked source gets 429, not the challenge — a WWW-Authenticate here
+    // would invite the retry the block exists to end. Only that source's
+    // Basic attempts are refused; every other viewer's share is untouched.
+    if (verdict === 'blocked') {
+      res.writeHead(429, { 'Content-Type': 'text/plain', ...noStore });
+      res.end('too many failed attempts from this address');
+      return;
+    }
     if (verdict !== 'ok') {
       if (grants && verdict !== 'badpass' && isBrowserNav(req)) return bounce(req, res, verdict);
       return challenge(res);
@@ -435,10 +497,17 @@ export function startAuthProxy({ targetPort, log, onAbuse, grantSecret, shareId,
     }
     // NEVER 302 HERE — browsers fail an upgrade rather than following a 3xx, so
     // a bounce would read as a dead dev server. The cookie IS sent on a
-    // same-origin handshake, so `authed` works unchanged; a cookie-less upgrade
-    // stays a 401 and the page's HMR client reconnects once the human has
-    // re-authenticated in the main document.
-    if (!authed(req)) {
+    // same-origin handshake, so the predicate works unchanged; a cookie-less
+    // upgrade stays a 401 and the page's HMR client reconnects once the human
+    // has re-authenticated in the main document. A blocked source's Basic
+    // handshake gets the same 429 the request path sends, and no challenge.
+    const upgradeVerdict = credential(req);
+    if (upgradeVerdict === 'blocked') {
+      socket.write('HTTP/1.1 429 Too Many Requests\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+    if (upgradeVerdict !== 'ok') {
       socket.write('HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm="Flowviant preview"\r\n\r\n');
       socket.destroy();
       return;

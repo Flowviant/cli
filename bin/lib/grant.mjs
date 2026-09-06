@@ -171,12 +171,33 @@ export function safePathname(url) {
  * `//evil.com` and `/\evil.com` are protocol-relative to a browser, so a naive
  * "starts with /" check turns the callback into an open redirect on the tunnel
  * origin. Anything that is not a single-slash relative path becomes '/'.
+ *
+ * STRUCTURAL, NOT LEXICAL, and that distinction is the whole fix. This used to
+ * be `/^\/(?![/\\])/` plus a CR/LF check — and an audit walked through it with
+ * a TAB: browsers STRIP tab, CR and LF out of a URL before parsing, so
+ * `"/\t/evil.com"` passed the guard, was written verbatim into Location by the
+ * callback, and navigated to `//evil.com`. Parsing against a dummy base and
+ * re-serialising reproduces exactly what the browser will do — there is no
+ * second implementation of URL parsing here to drift, and the value returned
+ * is the one the parser produced. The lexical checks stay in front of it as
+ * the cheap first line; the origin comparison is the guarantee. Ported from
+ * the server twins (previewAuthorize.routes.ts, preview-relay util.ts), which
+ * closed the same hole the same way.
  */
 export function safeRelative(raw) {
   if (!raw) return '/';
   const s = String(raw);
   if (s.length > 512) return '/';
-  if (/[\r\n]/.test(s)) return '/';
-  if (!/^\/(?![/\\])/.test(s)) return '/';
-  return s;
+  if (!s.startsWith('/')) return '/';
+  if (/^\/[/\\]/.test(s)) return '/';
+  // Every C0 control, space and DEL — not just CR/LF.
+  // eslint-disable-next-line no-control-regex
+  if (/[\x00-\x20\x7f]/.test(s)) return '/';
+  try {
+    const u = new URL(s, 'https://x.invalid');
+    if (u.origin !== 'https://x.invalid') return '/';
+    return u.pathname + u.search + u.hash;
+  } catch {
+    return '/';
+  }
 }

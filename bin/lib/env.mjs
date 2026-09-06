@@ -249,7 +249,9 @@ export async function loadCachedEnv(projectId) {
   if (!cached) return false;
   values = cached.values ?? [];
   bundleVersion = cached.bundleVersion ?? -1;
-  knownTargetFiles = new Set(cached.knownFiles ?? values.map((v) => v.targetFile));
+  // Filtered even though we wrote the cache: this set feeds removeStaleEnvFile,
+  // and a cache file predates whatever rules the running daemon enforces.
+  knownTargetFiles = new Set((cached.knownFiles ?? values.map((v) => v.targetFile)).filter(isSafeTarget));
   cachedProjectId = projectId;
   return values.length > 0;
 }
@@ -264,8 +266,8 @@ export async function loadCachedEnv(projectId) {
  * only and never touches the user's repo". Git does not read that file: it
  * resolves `info/exclude` against $GIT_COMMON_DIR — the main `.git` — so in
  * every linked worktree the daemon creates, the exclusion did nothing at all.
- * The plaintext secret files stayed visible to `git add -A`, which is what
- * `checkpointWip` runs before force-pushing a WIP commit to the remote.
+ * The plaintext secret files stayed visible to `git add -A` — the first thing
+ * an agent runs before committing and pushing the branch it is working on.
  *
  * `--git-common-dir` is asked of git rather than derived, because that is the
  * one answer that cannot drift from what git itself will consult. The file is
@@ -307,13 +309,25 @@ export function excludeInWorktree(wt, relPaths) {
   }
 }
 
+/** MUST match the server's isSafeEnvTargetFile (env.schema.ts) — the server
+ *  validates at intake, but this file also refills paths from the on-disk
+ *  cache and hands them to rmSync, so the daemon holds its own line rather
+ *  than trusting either source. `.git` is refused at ANY depth and
+ *  case-insensitively (git treats `.GIT` the same on case-insensitive
+ *  filesystems): a target of `.git/hooks/pre-commit` would turn a
+ *  materialized value into code git runs on the operator's next commit —
+ *  check-ignore alone must not be the only thing standing there. The control
+ *  range subsumes the old bare `\0` check and keeps a newline out of a PATH,
+ *  where nothing downstream expects one. */
 const isSafeTarget = (p) =>
-  p &&
+  typeof p === 'string' &&
+  p.length > 0 &&
   p.length <= 200 &&
   !p.includes('\\') &&
-  !p.includes('\0') &&
+  // eslint-disable-next-line no-control-regex
+  !/[\x00-\x1f\x7f]/.test(p) &&
   !p.startsWith('/') &&
-  p.split('/').every((s) => s.length > 0 && s !== '.' && s !== '..');
+  p.split('/').every((s) => s.length > 0 && s !== '.' && s !== '..' && s.toLowerCase() !== '.git');
 
 /** Is this path TRACKED in the repo? info/exclude only hides UNTRACKED files —
  *  materializing secrets into a tracked file would make them stageable and
@@ -406,8 +420,16 @@ function renderEnvFile(list) {
 }
 
 /** Delete a materialized file from a worktree, but ONLY if it's ours (carries
- *  our header) and not git-tracked — never touch a file we didn't write. */
+ *  our header) and not git-tracked — never touch a file we didn't write.
+ *
+ *  `rel` gets the SAME gate the write path has: it arrives via
+ *  knownTargetFiles, which is refilled from the server bundle and from the
+ *  on-disk cache, and this function joins it to a worktree and calls rmSync.
+ *  The isTrackedInGit check cannot stand in for validation — `ls-files` on a
+ *  path outside the worktree THROWS, the catch reads as "not tracked", and
+ *  the deletion proceeds. A delete primitive validates its own input. */
 function removeStaleEnvFile(wt, rel) {
+  if (!isSafeTarget(rel)) return;
   if (isTrackedInGit(wt, rel)) return;
   const abs = join(wt, rel);
   try {
@@ -460,8 +482,8 @@ export function materializeInto(wt) {
 
   // Exclude BEFORE writing, not after. The old order wrote plaintext first and
   // tried to hide it afterwards, so every failure mode — and the exclude file
-  // being the wrong one, which it was — left a readable secret in a tree that
-  // `checkpointWip` force-pushes.
+  // being the wrong one, which it was — left a readable secret sitting where
+  // the next `git add -A` in that tree would stage it for a push.
   excludeInWorktree(wt, [...byFile.keys()]);
 
   const written = [];
@@ -477,9 +499,9 @@ export function materializeInto(wt) {
       anyProblem = true;
       continue;
     }
-    // The load-bearing check. A materialized secret sits in a worktree whose
-    // whole tree gets `git add -A`'d and force-pushed by the WIP checkpoint, so
-    // "git cannot see this file" is a precondition for writing it, not a nicety.
+    // The load-bearing check. A materialized secret sits in a worktree where an
+    // agent runs `git add -A` and pushes as a matter of course, so "git cannot
+    // see this file" is a precondition for writing it, not a nicety.
     if (!isIgnoredInGit(wt, file)) {
       warn(`env: "${file}" is not gitignored — refusing to write secrets there. Add it to .gitignore. Its keys are NOT materialized.`);
       refusedForGit.push(file);
@@ -557,17 +579,6 @@ export function materializeInto(wt) {
   everMaterialized = true;
 }
 
-/**
- * The secret files this daemon has materialized into `wt`.
- *
- * Exists so anything that stages the whole tree can subtract them by pathspec.
- * Belt to the check-ignore braces: `git add -A` obeys .gitignore, so a properly
- * ignored file is already safe — but "already safe" was the assumption that put
- * plaintext on a remote branch, and a second, independent mechanism is cheap.
- */
-export function materializedFiles(wt) {
-  return [...(lastFilesByWorktree.get(wt) ?? [])];
-}
 
 // ── Uplink scrubbing ───────────────────────────────────────────────────────
 
@@ -704,7 +715,9 @@ export async function handleRosterEnv(env, { projectId } = {}) {
       bundleVersion = bundle.bundleVersion;
       // Fold the current target files into the persisted known set so stale
       // cleanup survives a restart (a key deleted while down still gets swept).
-      for (const v of values) knownTargetFiles.add(v.targetFile);
+      // Filtered at the fill, not just at the delete: this set is persisted,
+      // so an unsafe path admitted here would outlive the bundle that sent it.
+      for (const v of values) if (isSafeTarget(v.targetFile)) knownTargetFiles.add(v.targetFile);
       if (cachedProjectId) writeCache(cachedProjectId, { values, bundleVersion, knownFiles: [...knownTargetFiles] });
       ok(`${c.cyan('env')} ${c.dim(`— synced ${values.length} secret${values.length === 1 ? '' : 's'} (env v${bundleVersion})`)}`);
       return { changed: true };
