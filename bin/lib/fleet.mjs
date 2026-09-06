@@ -38,7 +38,6 @@ import { handleVersionSignal } from './update.mjs';
 import {
   git,
   resetWorktree,
-  ensureWorktree,
   repoRootOrDie,
   detectBaseRef,
   originSlug,
@@ -46,7 +45,6 @@ import {
   isValidPrUrl,
   isValidBranch,
   isSafePathSegment,
-  worktreeDiffstat,
 } from './git.mjs';
 import { c, info, note, ok, warn, fail } from './ui.mjs';
 import { revertPatch, withPatchLock } from './patch.mjs';
@@ -321,7 +319,13 @@ async function maybeReportRepoState({ repoRoot, baseRef }) {
   repoStateScanAt = Date.now();
   let payload;
   try {
-    const state = repoState(repoRoot, getBaseRef());
+    // The PARAM, and nothing else: this function sits at MODULE scope, where
+    // runFleetDaemon's `getBaseRef` closure does not exist. An earlier version
+    // reached for it anyway, the ReferenceError landed in the catch below —
+    // written for an unreadable repo, silent by design — and this endpoint was
+    // never once posted to. The caller reads the loop's live `baseRef` at call
+    // time, so the value here is always current.
+    const state = repoState(repoRoot, baseRef);
     if (!state) return; // not readable — say nothing rather than say "none"
     payload = JSON.stringify(state);
   } catch {
@@ -773,33 +777,6 @@ export async function runFleetDaemon() {
     return run;
   };
 
-  /** A clean detached checkout at base — what "the real code" has to mean for a
-   *  question about the repo, rather than whatever half-finished state an agent
-   *  worktree happens to be in. Shared by the plan check and consults. */
-  const ensureWikiWorktree = () => {
-    if (!existsSync(wikiWt)) {
-      try {
-        git(['worktree', 'add', '--detach', wikiWt, baseRef], repoRoot);
-      } catch {
-        git(['worktree', 'prune'], repoRoot);
-        git(['worktree', 'add', '--detach', wikiWt, baseRef], repoRoot);
-      }
-      return;
-    }
-    // It already exists — which means it is pinned to whatever base pointed at
-    // when it was FIRST created, possibly weeks ago. "Reads the real code" has
-    // to mean the current base, so re-point it. Best-effort: a stale answer
-    // beats no answer, and the next turn tries again.
-    try {
-      git(['fetch', 'origin', '--quiet'], repoRoot);
-      git(['checkout', '--detach', baseRef], wikiWt);
-      git(['reset', '--hard', baseRef], wikiWt);
-      git(['clean', '-fd'], wikiWt);
-    } catch {
-      /* offline, or a turn left it dirty — read what we have */
-    }
-  };
-
   // Machine telemetry — what the box is doing with itself, for the admin view.
   const MACHINE_URL = FLEET_URL.replace(/\/agents\/?$/, '/machine');
 
@@ -1146,7 +1123,24 @@ export async function runFleetDaemon() {
       // the turn still reads the real changed files; this catches pages whose
       // frontmatter file list has drifted, or that document a concept rather
       // than a directory.
-      dirtiesPages: Array.isArray(dirtiesPages) ? dirtiesPages : [],
+      //
+      // SANITIZED AT THE INTAKE, because every entry is server-supplied text
+      // that ends up interpolated into a prompt and printed by the drain's
+      // narration: a control byte can repaint the console it lands on, a
+      // newline can break out of the prompt's own list framing, and an
+      // unbounded array of unbounded strings is an unbounded prompt. This is
+      // the belt at the intake; the prompt keeps its own fence at the
+      // interpolation.
+      dirtiesPages: (Array.isArray(dirtiesPages) ? dirtiesPages : [])
+        .filter((p) => typeof p === 'string')
+        .slice(0, 40)
+        .map((p) =>
+          p
+            .replace(/[\u0000-\u001f\u007f]/g, ' ')
+            .trim()
+            .slice(0, 300)
+        )
+        .filter(Boolean),
       // THE COMMITS THAT SHIPPED — what changedFilesForShas resolves against.
       // Dropping this here was the whole 0.54.0/0.54.1 defect: the server sent
       // shas on every reground job, this function never stored them, and the
@@ -1686,12 +1680,7 @@ export async function runFleetDaemon() {
     // tab. Without this the daemon that lost the lease removes the worktree the
     // winner is working in — absence would mean "somebody else won" instead of
     // "the tab closed".
-    retireWorkSessions(
-      Array.isArray(roster.activeWorkSessions)
-        ? roster.activeWorkSessions
-        : roster.activeWorkSessions,
-      roster.sessionsHeldElsewhere
-    );
+    retireWorkSessions(roster.activeWorkSessions, roster.sessionsHeldElsewhere);
     // Diffs somebody has open and is waiting on. Project-scoped rather than
     // per-session: `git show` runs from the repo ROOT, which can see a closed
     // tab's branch and a shipped commit on main alike.

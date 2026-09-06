@@ -574,8 +574,11 @@ export function createWorkManager({
       // path), but a server bug or compromise sending `../../etc` would
       // otherwise point a session's measured directory anywhere on the box and
       // defeat the port attribution. `sessionWorktreeReport` and `placeWtFor`
-      // already reject an unsafe segment; doing it here covers every consumer
-      // (the preview-claim `placeDir` did not re-check). REPO_PLACE resolves to
+      // already reject an unsafe segment; checking at the intake covers the
+      // consumers that do not (the preview-claim `placeDir` did not re-check).
+      // NOT the only writer: `processWorkTurns` stores a turn job's place too,
+      // and keeps the same check — validating one intake and not the other is
+      // one deploy away from validating neither. REPO_PLACE resolves to
       // repoRoot, so it is allowed through despite not being a path segment.
       if (typeof place === 'string' && place && (place === REPO_PLACE || isSafePathSegment(place)))
         sessionPlaces.set(sid, place);
@@ -2480,9 +2483,26 @@ export function createWorkManager({
       // run it again while the report is merely undelivered.
       if (pendingWorkReports.has(job.id)) continue;
       workAnswering.add(job.id);
-      // Serialized by PLACE: two tabs sharing a worktree take turns in it
-      // rather than editing the same files at the same time.
       const place = job.place || job.sessionId;
+      /**
+       * VALIDATED AT THE TRUST BOUNDARY, exactly as `learnPlaces` validates
+       * the roster's map — this is the OTHER writer of `sessionPlaces`, in the
+       * same reconcile tick, BEFORE the preview jobs and the sweep read it. An
+       * unchecked value stored here reaches every `placeDir` consumer: the
+       * turn is spawned in it, `burstListeners` measures it, and a share would
+       * publicly tunnel a directory OUTSIDE the checkout — the exact traversal
+       * the preview feature's port attribution exists to prevent. Settled out
+       * loud rather than skipped, because a silently dropped turn strands the
+       * tab for the server's whole expiry window.
+       */
+      if (place !== REPO_PLACE && !isSafePathSegment(place)) {
+        void settleWorkTurn(job.id, {
+          ok: false,
+          answer:
+            'the server named a working directory this machine refuses to use — close and reopen the tab, then send the message again',
+        }).finally(() => workAnswering.delete(job.id));
+        continue;
+      }
       // Remembered for every other beat — the sweep, ship, the preview
       // re-check — so they all ask the same directory this turn runs in.
       sessionPlaces.set(job.sessionId, place);
@@ -3346,7 +3366,7 @@ export function createWorkManager({
           };
           // The machine may have no git identity, and a merge COMMIT needs
           // one. Prefer the user's own config; fall back to the daemon's (the
-          // same fallback checkpointWip uses) so a bare machine doesn't fail
+          // same fallback ship's merge keeps) so a bare machine doesn't fail
           // the fold with "Please tell me who you are".
           let idEnv = null;
           try {
@@ -3816,8 +3836,13 @@ export function createWorkManager({
   // UNLEASED, unlike a plan or a kill. The server hands out at most one turn
   // per agent per poll and its settle is conditional on the row still being
   // pending, so a second daemon cannot advance the queue twice. What it could
-  // do is run a CLI twice in one worktree, which is what this in-flight set and
-  // the place lock prevent — the same discipline `processWorkTurns` keeps.
+  // do is run a CLI twice in one worktree. The in-flight set below cannot
+  // prevent that alone: it is keyed by TURN id, so it never sees the
+  // DIFFERENT turn the server's TTL-skip hands out while an expired turn's
+  // CLI is still running — and a reader lock would run the two side by side.
+  // So an agent turn takes its place's lock as a WRITER: an agent is ONE
+  // process by definition, and its `a-<id>` place is its own — no tab ever
+  // stands there, so the tabs' turns-run-concurrently law is untouched.
   const agentTurns = new Set(); // turn ids in flight on this tick
   /**
    * The CLI a live agent turn is running in, by PLACE.
@@ -3834,14 +3859,29 @@ export function createWorkManager({
    *  emptied, so run the project's own check in the worktree we are already
    *  standing in. A job lane for that would need a claim, a floor and a settle
    *  to say something this reply already can. */
-  /** Turn ids whose work is DONE but whose report has not landed. The same
-   *  skip-guard `pendingWorkReports` is for a tab, and for the same reason: a
-   *  settle that fails to POST must not re-run the turn — that is a second CLI,
-   *  a second set of commits, and the operator's quota spent again. */
-  const agentReported = new Set();
+  /**
+   * Turns whose work is DONE but whose settle has not landed, keyed to the
+   * finished BODY. The delivery half of what `pendingWorkReports` is for a
+   * tab: a settle that fails to POST must not re-run the turn — that is a
+   * second CLI, a second set of commits, and the operator's quota spent again
+   * — but a guard that only SKIPPED left the other half undone. One failed
+   * POST parked the agent for the server's whole six-hour expiry, holding a
+   * cap slot the entire time, and then expired into "nobody ran it" — a false
+   * sentence about a turn this machine finished. The server's settle is
+   * idempotent (conditional on the row still being pending), so a re-offer of
+   * a held turn re-POSTs the stored body instead: safe, and it lands the
+   * moment the network heals rather than six hours later.
+   *
+   * BOUNDED by the roster itself: a held body's clock is refreshed while the
+   * server keeps offering its turn, and once offering stops — settled by the
+   * re-POST, or expired server-side — the grace below is all that keeps it.
+   */
+  const agentReported = new Map(); // turnId -> { body, at }
+  const AGENT_REPORT_GRACE_MS = 30 * 60_000;
 
   const postAgentTurn = async (body) => {
-    agentReported.add(String(body.turnId));
+    const turnId = String(body.turnId);
+    agentReported.set(turnId, { body, at: Date.now() });
     try {
       const res = await fetch(AGENT_TURN_DONE_URL, {
         method: 'POST',
@@ -3854,14 +3894,19 @@ export function createWorkManager({
         body: JSON.stringify(body),
       });
       const j = await res.json().catch(() => null);
-      // Landed. Forgetting it keeps the guard from growing without bound; a
-      // re-offer of a settled turn is refused server-side anyway.
-      if (res.ok) agentReported.delete(String(body.turnId));
+      // Landed, or REFUSED: a 4xx is the server saying this settle will never
+      // be accepted (expired, already settled, unknown turn), and re-POSTing a
+      // refusal forever is the wedge wearing a retry's clothes. 408/429 stay
+      // retryable, the same split `postSettle` makes for a tab.
+      if (
+        res.ok ||
+        (res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429)
+      )
+        agentReported.delete(turnId);
       return j?.data ?? null;
     } catch {
-      // Unsettled, and the id STAYS in the guard: the server expires the turn
-      // and the agent lands in Stuck saying nobody ran it, which is far better
-      // than running it again for six hours.
+      // Unsettled — a network error, so the body STAYS held and the next
+      // re-offer retries the POST rather than the CLI.
       return null;
     }
   };
@@ -3982,7 +4027,10 @@ export function createWorkManager({
       return;
     }
 
-    await inPlace(place, false, async () => {
+    // A WRITER on the agent's own place — see the lane header. Only `a-<id>`
+    // places: those are agents' by construction, and anything else here would
+    // be a tab's directory, where a turn is a reader by the product's own law.
+    await inPlace(place, place.startsWith('a-'), async () => {
       const dir = placeWtFor(place);
       if (!dir) {
         // No worktree and none could be cut. `nothing` rather than an invented
@@ -4177,13 +4225,46 @@ export function createWorkManager({
   };
 
   const processAgentTurnJobs = (jobs) => {
-    if (!Array.isArray(jobs) || jobs.length === 0) return;
-    for (const job of jobs.slice(0, 4)) {
+    const list = Array.isArray(jobs) ? jobs : [];
+    if (agentReported.size) {
+      // The roster is the held bodies' clock: an offered turn is still pending
+      // server-side and worth retrying; one the roster stopped naming was
+      // settled or expired, and holding its body past a generous grace would
+      // grow this map for the life of the process. The server's own expiry is
+      // the true bound — the grace only covers its POST racing a final offer.
+      const offered = new Set(list.map((j) => String(j?.id || '')));
+      const now = Date.now();
+      for (const [id, held] of agentReported) {
+        if (offered.has(id)) held.at = now;
+        else if (now - held.at > AGENT_REPORT_GRACE_MS) agentReported.delete(id);
+      }
+    }
+    for (const job of list.slice(0, 4)) {
       const id = String(job?.id || '');
       if (!id || agentTurns.has(id)) continue;
-      // Already RAN here; only the report is outstanding. Re-running it would
-      // spend the operator's quota again and write a second set of commits.
-      if (agentReported.has(id)) continue;
+      const held = agentReported.get(id);
+      if (held) {
+        // Already RAN here; only the settle is outstanding. Re-POST the held
+        // body — never the CLI, which would spend the operator's quota again
+        // and write a second set of commits. The reply can still carry the one
+        // instruction a settle can (`review: true`, the queue just emptied),
+        // so the project's check runs from here too, under the same writer
+        // lock the turn itself would have held.
+        agentTurns.add(id);
+        void (async () => {
+          const reply = await postAgentTurn(held.body);
+          const place = String(job.placeId || '');
+          const wt = typeof held.body.worktree === 'string' ? held.body.worktree : null;
+          if (reply?.review === true && isSafePathSegment(place) && wt && existsSync(wt)) {
+            await inPlace(place, place.startsWith('a-'), () =>
+              runCheck(String(job.agentId || ''), wt)
+            );
+          }
+        })()
+          .catch(() => {})
+          .finally(() => agentTurns.delete(id));
+        continue;
+      }
       if (!job.agentId || !job.placeId) continue;
       agentTurns.add(id);
       void runAgentTurn(job).finally(() => agentTurns.delete(id));
@@ -4411,8 +4492,8 @@ export function createWorkManager({
   /**
    * A merge COMMIT needs a git identity and the machine may have none. Prefer
    * the operator's own config; fall back to the daemon's, the same fallback
-   * `checkpointWip` and ship both use, so a bare machine does not fail the fold
-   * with "Please tell me who you are".
+   * ship's merge keeps, so a bare machine does not fail the fold with
+   * "Please tell me who you are".
    */
   const gitMerge = (args, cwd) => {
     let idEnv = null;
@@ -4585,13 +4666,28 @@ export function createWorkManager({
         let prUrl = null;
         try {
           const j = JSON.parse(
-            execFileSync('gh', ['pr', 'view', branch, '--json', 'url,state'], {
+            execFileSync('gh', ['pr', 'view', branch, '--json', 'url,state,baseRefName'], {
               cwd: repoRoot,
               stdio: ['ignore', 'pipe', 'pipe'],
               timeout: 30_000,
             }).toString()
           );
-          if (j?.state === 'OPEN' && typeof j?.url === 'string') prUrl = j.url.trim();
+          if (j?.state === 'OPEN' && typeof j?.url === 'string') {
+            // Adoptable only when it points at the project's own base. A PR
+            // somebody opened by hand against another branch would otherwise
+            // be merged INTO that branch, and the ok settle would claim work
+            // reached base that landed somewhere else entirely. Refused only
+            // on a MEASURED mismatch — an absent field adopts as before.
+            if (typeof j?.baseRefName === 'string' && j.baseRefName !== prBase) {
+              await report({
+                agentId,
+                ok: false,
+                detail: `the open pull request for ${branch} targets ${j.baseRefName}, not ${prBase} — retarget or close it, then approve again`,
+              });
+              return;
+            }
+            prUrl = j.url.trim();
+          }
         } catch {
           /* no PR for this branch at all — created below */
         }
@@ -4631,10 +4727,45 @@ export function createWorkManager({
             return;
           }
         }
-        // THE TIP, not a merge commit: the merge commit was made on GitHub and
-        // this machine has not fetched it. It identifies the state we asked to
-        // be merged, which is what the receipt is for — the cards themselves
-        // close when the landed observer sees the commits arrive on base.
+        // VERIFY before reporting ok: modern gh exits 0 on an already-MERGED
+        // PR, and on a repo with a merge queue or auto-merge it exits 0 after
+        // ENQUEUEING — in both, "merged" is a claim about the future. The tip
+        // being an ancestor of base is the fact `ok` asserts, and the server
+        // closes every delivered card on this sha the moment it hears it — so
+        // measure it, with one short retry for the fetch racing GitHub's
+        // merge commit. The same guard the session PR path carries.
+        const tipOnBase = () => {
+          try {
+            git(['merge-base', '--is-ancestor', tip, baseRef()], repoRoot);
+            return true;
+          } catch {
+            return false;
+          }
+        };
+        let landedOnBase = false;
+        for (let attempt = 0; attempt < 2 && !landedOnBase; attempt++) {
+          if (attempt > 0) await new Promise((r) => setTimeout(r, 2000));
+          try {
+            git(['fetch', 'origin', '--quiet'], repoRoot);
+          } catch {
+            /* offline — the check below answers from what we have */
+          }
+          landedOnBase = tipOnBase();
+        }
+        if (!landedOnBase) {
+          await report({
+            agentId,
+            ok: false,
+            detail:
+              "GitHub accepted the merge, but this branch's tip is not on the base branch — a merge queue may still be running it, or the PR that merged was an older one. Approve again once it lands." +
+              (prUrl && PR_URL_RE.test(prUrl) ? ` The pull request is at ${prUrl}.` : ''),
+          });
+          return;
+        }
+        // THE TIP, not the merge commit GitHub made: the tip identifies the
+        // state we asked to be merged, which is what the receipt is for — the
+        // cards themselves close when the landed observer sees the commits
+        // arrive on base.
         await report({ agentId, ok: true, sha: tip });
         onRepoChanged();
         landed.observe();
@@ -4747,6 +4878,10 @@ export function createWorkManager({
     // into a card nobody can explain.
     agentTurns.size > 0 ||
     agentMerges.size > 0 ||
+    // A finished agent turn whose settle has not landed lives only in this
+    // process; a restart here is the six-hour park the held body exists to
+    // prevent. Same reason the tab's report queues are below.
+    agentReported.size > 0 ||
     shipping.size > 0 ||
     workChildren.size > 0 ||
     workAnswering.size > 0 ||
