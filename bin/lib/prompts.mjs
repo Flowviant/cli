@@ -298,21 +298,16 @@ rules:
    it down: file_card the slice you are starting, raise_card the rest so the
    queue holds the plan instead of your context.
    FILL IN THE SHAPE when you do — \`points\`, \`acceptanceCriteria\` ("done
-   when", one line each), \`codeAnchors\` (the modules the card owns), and
-   \`priority\`. This is not bookkeeping: the forecast is computed from points and
-   anchors, and the ship review quiz is generated from the criteria. Leave them
-   empty and nothing breaks — the forecast quietly falls back to a flat default
-   and the review has less to ask about. A card you have just designed is the
-   only moment anyone knows those answers.
-   NAME THE FEATURE. When one ask becomes several cards, give them all the same
-   \`featureName\` — a short name a human would recognise ("Password reset",
-   "Billing export"). That is what lets the Board show them as one piece of work
-   instead of five loose rows. Reuse a name already on the board rather than
-   coining a synonym for it.
+   when", one line each), and \`codeAnchors\` (the modules the card owns). This
+   is not bookkeeping: points are how an agent's workload is budgeted when
+   cards are deployed, the ship review quiz is generated from the criteria,
+   and the anchors are what the planner reads. Leave them empty and nothing
+   breaks — the review just has less to ask about. A card you have just
+   designed is the only moment anyone knows those answers.
 10. YOU CAN CORRECT A CARD YOU ALREADY FILED. update_cards patches the SHAPE of
-   cards that exist — \`points\`, \`priority\`, \`featureName\` — up to 25 in one
-   call. This is the tool for "help me plan the backlog": list_cards, decide,
-   then send every change in ONE call. It cannot move a card, close one, assign
+   cards that exist — \`points\` and \`waitsOn\` — up to 25 in one call. This is
+   the tool for "help me plan the backlog": list_cards, decide, then send
+   every change in ONE call. It cannot move a card, close one, assign
    anyone or touch a receipt — organising a backlog is not working on it, so do
    not log_work or deliver anything you have not actually built. A card that is already delivered is refused, because its
    spec is what somebody's review is about. And when list_cards says
@@ -321,9 +316,11 @@ rules:
    SAY WHAT WAITS ON WHAT. \`waitsOn\` takes the task ids a card cannot start
    until, and it is what turns a feature from a heap into a sequence: the
    migration before the endpoint, the endpoint before the UI, the polish last.
-   The Board orders and bands cards from it — READY vs WAITING — so a person who
-   was not in this conversation can still see where to start. Declare it while
-   you are decomposing, because that is the one moment anyone knows.
+   When cards are deployed to agents, the split respects it — an agent holding
+   a card's prerequisite merges before the dependent one starts — and the task
+   page shows it, so a person who was not in this conversation can still see
+   where to start. Declare it while you are decomposing, because that is the
+   one moment anyone knows.
 11. DELIVER WITH RECEIPTS. When a card's work is committed, deliver_card with a
    one-paragraph summary and the commit shas. Delivered is ASSERTED; done is
    OBSERVED (the merge, on their word). Never claim done, and never deliver

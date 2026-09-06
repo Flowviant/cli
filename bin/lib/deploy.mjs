@@ -257,7 +257,13 @@ export function processDeployJobs(jobs, ctx) {
          */
         let missed = 0;
         beat = setInterval(() => {
-          void post('deploy-heartbeat', { jobId: job.id, pubkey: ctx.myPubB64() })
+          void post('deploy-heartbeat', {
+            jobId: job.id,
+            pubkey: ctx.myPubB64(),
+            // Instance rides the heartbeat too, or a same-box sibling's beat
+            // could keep a dead claimer's job "running" past the stale sweep.
+            instance: DAEMON_INSTANCE,
+          })
             .then(() => {
               missed = 0;
             })
@@ -385,6 +391,12 @@ async function report(job, ctx, outcome, stillBeating = () => true) {
   const body = {
     jobId: job.id,
     pubkey: ctx.myPubB64(),
+    // The same term the claim carries, for the same reason: the pubkey is one
+    // keypair per home directory, so two daemons on one box share it, and a
+    // stale holder's late report would otherwise settle the RECLAIMER's
+    // running job. The server matches it when present; an older server
+    // ignores the extra key.
+    instance: DAEMON_INSTANCE,
     ok: !!outcome.ok,
     deploymentId: outcome.deploymentId ?? null,
     healthOk: outcome.healthOk ?? null,
