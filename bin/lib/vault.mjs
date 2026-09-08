@@ -6,7 +6,7 @@
  * private `git init` so every pass is versioned locally for free — the user's
  * repository is never touched.
  *
- * Sync protocol (POST /api/v2/fleet/wiki-vault, fleet-token auth): only files
+ * Sync protocol (POST /api/fleet/wiki-vault, fleet-token auth): only files
  * whose sha256 changed since the last successful sync are uploaded, chunked;
  * the LAST request carries the finalize.manifest of a completed full sweep so
  * the server prunes pages the sweep no longer has. The last-synced hashes live

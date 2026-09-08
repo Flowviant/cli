@@ -41,7 +41,28 @@ function argFlag(name) {
   return i >= 0 ? process.argv[i + 1] : undefined;
 }
 
-const API_BASE = process.env.FLOWVIANT_API_URL || 'https://api.flowviant.com/api/v2';
+/**
+ * THE SERVER'S API ROOT.
+ *
+ * `/api`, not `/api/v2`. The server collapsed its two prefixes into one
+ * namespace on 2026-09-08 — they had held DISJOINT resources and neither was
+ * ever a version of the other, so there was nothing to choose between.
+ *
+ * ── DEPLOY ORDER IS NOW LOAD-BEARING FOR THIS LINE ──
+ *
+ * A daemon on this version calls `/api/fleet/agents`. An older SERVER does not
+ * serve that path, so publishing this release before the server that answers it
+ * 404s the roster poll for anyone who updates. The order in the app repo's
+ * ARCHITECTURE.md already says it and now it matters: deploy `flowviant-api`
+ * FIRST, publish this SECOND. The same applies to a rollback — rolling the
+ * server back past that merge strands every daemon at this version or newer.
+ *
+ * The other direction is safe and needs nothing: the server keeps `/api/v2` as
+ * an alias onto the same router precisely because every daemon published before
+ * this one has that string baked in and cannot be upgraded by a deploy. That
+ * alias retires when the app's `DAEMON_MIN_VERSION` clears this release.
+ */
+const API_BASE = process.env.FLOWVIANT_API_URL || 'https://api.flowviant.com/api';
 export const MCP_URL = process.env.FLOWVIANT_MCP_URL || `${API_BASE}/mcp`;
 export const FLEET_URL = process.env.FLOWVIANT_FLEET_URL || `${API_BASE}/fleet/agents`;
 // Push channel: the daemon holds this WebSocket open and the server nudges it

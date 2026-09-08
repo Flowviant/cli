@@ -1,6 +1,6 @@
 /**
  * Fleet daemon. Install ONCE with a fleet credential; manage everything from
- * Flowviant. The daemon polls GET /api/v2/fleet/agents, reconciles one persistent
+ * Flowviant. The daemon polls GET /api/fleet/agents, reconciles one persistent
  * git worktree + worker loop per roster agent, rotates each worker's short-lived
  * MCP token, and only spawns Claude when the server says an agent has work.
  */

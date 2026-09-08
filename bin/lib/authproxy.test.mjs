@@ -70,7 +70,7 @@ const gate = await startAuthProxy({
   targetPort: originPort,
   grantSecret: SECRET,
   shareId: SHARE,
-  authorizeUrl: 'https://app.flowviant.com/api/v2/preview/authorize',
+  authorizeUrl: 'https://app.flowviant.com/api/preview/authorize',
 });
 assert.ok(gate, 'the gate must bind');
 
@@ -402,7 +402,7 @@ test('the global backstop still self-closes a DISTRIBUTED guessing run', async (
     targetPort: originPort,
     grantSecret: SECRET,
     shareId: SHARE,
-    authorizeUrl: 'https://app.flowviant.com/api/v2/preview/authorize',
+    authorizeUrl: 'https://app.flowviant.com/api/preview/authorize',
     onAbuse: () => {
       closed += 1;
     },

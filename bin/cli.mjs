@@ -26,7 +26,7 @@
  * running?", which otherwise ends in a pid hunt through `ps`.
  *
  * The daemon: install ONCE with a machine credential, then work entirely from
- * Flowviant. It polls GET /api/v2/fleet/agents, and the roster hands it the
+ * Flowviant. It polls GET /api/fleet/agents, and the roster hands it the
  * project's SESSIONS — the Workbench's tabs. Each session gets one persistent
  * git worktree on its own `session/<id>` branch, held across turns (never reset
  * to base: the branch outlives the tab). A turn spawns the session's CLI with a
@@ -44,7 +44,7 @@
  *
  * Env:
  *   FLOWVIANT_FLEET     the machine credential (or use `flowviant login`).
- *   FLOWVIANT_API_URL   default https://api.flowviant.com/api/v2
+ *   FLOWVIANT_API_URL   default https://api.flowviant.com/api
  *   FLOWVIANT_MCP_URL   default <API_URL>/mcp
  *   FLOWVIANT_FLEET_URL default <API_URL>/fleet/agents
  *   RECONCILE_SECONDS   roster poll cadence (default 10)
