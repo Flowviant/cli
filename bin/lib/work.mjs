@@ -188,6 +188,7 @@ export function createWorkManager({
   const PR_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/pr-done');
   const AGENT_PLAN_CLAIM_URL = FLEET_URL.replace(/\/agents\/?$/, '/agent-plan-claim');
   const AGENT_PLAN_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/agent-plan-done');
+  const AGENT_PLAN_ACTIVITY_URL = FLEET_URL.replace(/\/agents\/?$/, '/agent-plan-activity');
   const AGENT_TURN_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/agent-turn-done');
   const AGENT_ACTIVITY_URL = FLEET_URL.replace(/\/agents\/?$/, '/agent-activity');
   const AGENT_PARKED_URL = FLEET_URL.replace(/\/agents\/?$/, '/agent-parked');
@@ -3637,6 +3638,65 @@ export function createWorkManager({
     }
   };
 
+  /**
+   * WHAT THE PLANNER IS DOING, RELAYED — the agent turn's narration channel,
+   * on a PRESS instead of an agent.
+   *
+   * This turn was already streaming and the daemon was already reading it:
+   * `streamJson` humanizes every read, grep, command and thought and prints
+   * it behind `[plan]` on the operator's terminal. Every one of those lines
+   * was then thrown away, so a Deploy press said "planning" on the board and
+   * nothing else for as long as it took — which on an overnight queue is the
+   * whole night. Forwarding the CLI's own tail costs nothing that is not
+   * already being computed.
+   *
+   * IT IS THE CLI'S WORDS, OR THE MACHINE'S — never a stage, a percentage or
+   * an estimate of how far along a model is. Flowviant relays.
+   *
+   * SCRUBBED AND CAPPED HERE rather than at each call site, so a phase marker
+   * added later cannot skip either. Fire-and-forget with every failure
+   * swallowed: narration is a readout, and it must never fail or delay the
+   * turn it describes. A daemon that never calls this is a machine that has
+   * not narrated, which is the only thing an absent line can mean.
+   */
+  const postAgentPlanActivity = async (planId, line) => {
+    const text = envScrub(String(line ?? '')).slice(0, 400);
+    if (!text) return;
+    try {
+      await fetch(AGENT_PLAN_ACTIVITY_URL, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${FLEET_TOKEN}`,
+          'User-Agent': USER_AGENT,
+          'Content-Type': 'application/json',
+        },
+        signal: AbortSignal.timeout(15_000),
+        body: JSON.stringify({ planId, line: text }),
+      });
+    } catch {
+      /* a readout — losing a line costs nothing */
+    }
+  };
+
+  /**
+   * A WEDGED PLANNING CLI IS STOPPED AT FIFTEEN MINUTES.
+   *
+   * `runTurn` has no timer of its own. A CLI that hangs — a login prompt
+   * nobody is there to answer, a model client stalled on a socket — therefore
+   * runs until something else kills it, holding `planning`, which is what
+   * blocks every auto-update on this machine, and spending whatever the
+   * operator's account is charged for a live session.
+   *
+   * FIFTEEN because the server fails a claimed press at THIRTY (its
+   * `PLAN_JOB_TTL_MS`, measured from `claimedAt`): half of that leaves this
+   * side — the only side that knows the CLI is still running — time to stop it
+   * and have its settle land, instead of the press expiring into a sentence
+   * that blames a machine which never spoke. Nothing legitimate is cut off
+   * either way: this turn reads a card selection and writes nothing, and the
+   * shape of it is minutes.
+   */
+  const PLAN_TURN_TIMEOUT_MS = 15 * 60_000;
+
   const claimAgentPlan = async (id) => {
     try {
       const res = await fetch(AGENT_PLAN_CLAIM_URL, {
@@ -3743,6 +3803,36 @@ export function createWorkManager({
       await postAgentPlan({ id, error: 'no CLI on this machine can run a read-only turn' });
       return;
     }
+
+    /**
+     * ONE LINE AT A TIME, AT MOST ONE EVERY TWO SECONDS — the throttle the
+     * agent turn's narration keeps, for the same reason: a turn emits hundreds
+     * of lines and only the latest is ever rendered. Held per RUN rather than
+     * in a map keyed by press, because one press is one turn and there is
+     * nothing for the clock to outlive.
+     */
+    let lastPlanBeat = 0;
+    const narrate = (line) => {
+      const now = Date.now();
+      if (now - lastPlanBeat < 2_000) return;
+      lastPlanBeat = now;
+      void postAgentPlanActivity(id, line);
+    };
+    /**
+     * THE MACHINE'S OWN VOICE, for the moments only this side can see — the
+     * CLI process actually starting, and this press waiting its turn for the
+     * checkout. Both are FACTS measured here, not a reading of the model's
+     * progress, and both are invisible from a browser: a press held behind a
+     * ship's writer lock looks exactly like a press whose CLI is thinking.
+     *
+     * Never dropped by the throttle above — these are moments, not a stream —
+     * and they stamp its clock so the next model line does not overwrite one
+     * the instant it lands.
+     */
+    const say = (line) => {
+      lastPlanBeat = Date.now();
+      void postAgentPlanActivity(id, line);
+    };
     const liveAgents = (Array.isArray(job.liveAgents) ? job.liveAgents : []).map((a) => ({
       id: String(a?.id ?? ''),
       name: String(a?.name ?? ''),
@@ -3763,9 +3853,29 @@ export function createWorkManager({
      *  a leaked entry keeps the daemon permanently "busy" — which blocks every
      *  auto-update from that moment on, silently, until a restart. */
     let planChild = null;
+    let planTimer = null;
+    /** The cap fired: the CLI was still running when this machine stopped it. */
+    let wedged = false;
+    // Said BEFORE the lock is asked for, because a reader only waits when a
+    // writer holds the checkout or is queued ahead of it — which is exactly
+    // this condition, read one line before we join the queue.
+    const busy = placeLocks.get(REPO_PLACE);
+    if (busy && (busy.writing || busy.waiters.some((w) => w.write)))
+      say('waiting for the checkout — a ship or another turn on this machine is holding it');
     try {
       await inPlace(REPO_PLACE, false, async () => {
-        out = await runTurn({
+        /**
+         * THE CAP RESOLVES THE WAIT ITSELF rather than waiting for `close`
+         * after the kill — the shape the project check's timeout already
+         * keeps. A SIGKILLed process whose stdio a grandchild still holds can
+         * be slow to emit `close`, or never emit it, and this promise is what
+         * holds the claimed press open.
+         */
+        let stopWaiting = () => {};
+        const capped = new Promise((r) => {
+          stopWaiting = r;
+        });
+        const turn = runTurn({
           prompt: AGENT_PLAN_KICKOFF({
             tasks,
             liveAgents,
@@ -3780,17 +3890,59 @@ export function createWorkManager({
           streamJson: true,
           answerFromResult: true,
           label: c.cyan('[plan]'),
+          // The CLI's own tail, forwarded to the press. Same rule as an agent
+          // turn's: throttled, overwritten rather than appended, and never
+          // awaited by the turn.
+          onActivity: (a) => {
+            if (a?.label) narrate(String(a.label));
+          },
           onSpawn: (ch) => {
             planChild = ch;
             workChildren.set(ch, null);
+            say(`${RUNTIMES[rt]?.label ?? rt} started on this machine`);
+            /**
+             * ARMED AT THE SPAWN, not at the claim: time spent waiting for the
+             * checkout is not a wedged CLI, and a press that never got to run
+             * is what the server's own clock is for.
+             *
+             * The CHILD, never its group — the rule teardown keeps. A
+             * read-only planning turn starts no dev server, so there is
+             * nothing behind it worth signalling and everything to lose by
+             * signalling somebody else's.
+             */
+            planTimer = setTimeout(() => {
+              wedged = true;
+              try {
+                ch.kill('SIGKILL');
+              } catch {
+                /* already gone */
+              }
+              stopWaiting('');
+            }, PLAN_TURN_TIMEOUT_MS);
+            planTimer.unref?.();
           },
         });
+        out = await Promise.race([turn, capped]);
       });
     } catch (e) {
       await postAgentPlan({ id, error: envScrub(String(e?.message || e)).slice(0, 500) });
       return;
     } finally {
+      if (planTimer) clearTimeout(planTimer);
       if (planChild) workChildren.delete(planChild);
+    }
+
+    if (wedged) {
+      // NEVER LEAVE A CLAIMED PRESS UNREPORTED — the belt the merge lane wears
+      // beneath this one. The machine's own words, because the machine is the
+      // only side that knows: the server would have expired this press in
+      // another fifteen minutes with a sentence blaming a daemon that had in
+      // fact answered.
+      await postAgentPlan({
+        id,
+        error: 'the planning turn ran past fifteen minutes on this machine and was stopped',
+      });
+      return;
     }
 
     const proposal = parseProposal(out);
@@ -4151,6 +4303,20 @@ export function createWorkManager({
             /* a missing marker only costs one un-resumed turn */
           }
         }
+        /**
+         * AN ACTION THAT CHANGES WHAT THE MACHINE WOULD MEASURE MUST CAUSE A
+         * NEW MEASUREMENT — the rule every session settle keeps, and the one
+         * lane that did not. An agent's branch diff, head sha and trailered
+         * commits only refreshed on the ≤60s sweep, so review opened right
+         * after a turn described the branch as it was BEFORE the work.
+         *
+         * Here rather than after the settle POST because the CLI has exited,
+         * so the tree is final — and because a queue that just emptied runs
+         * the project's check next, which may hold this function for ten
+         * minutes. Fire-and-forget on an endpoint that already exists, so no
+         * floor: it must never delay the settle behind it.
+         */
+        void reportSessionWorktree(place).catch(() => {});
       }
 
       const commits = commitsBetween(wt, before);

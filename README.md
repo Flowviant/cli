@@ -47,7 +47,11 @@ Launch with `@latest` so each start pulls the newest published version — a bar
 
 Each tab in the Workbench is a persistent Claude session with its own worktree, and it stays where you left it — the branch outlives the tab. The daemon runs each turn in event mode and relays what the CLI is printing (thinking, reads, greps, commands) back to the tab, reports the worktree's branch and diffstat after every turn, and fetches a commit's patch when you click a sha in the app.
 
-Nothing starts work except you opening a tab and typing in it.
+Nothing starts a session except you opening a tab and typing in it.
+
+## Agents
+
+Press **Deploy** on the board and this machine runs a read-only scratch turn that proposes how the selected cards should be split across agents; accepting the proposal is what cuts worktrees and starts work. From **0.79.0** that planning turn is relayed the same way a session turn is — the reads, greps and thoughts the daemon was already printing behind `[plan]` now reach the press itself, along with the two facts only this side can see: the CLI actually starting, and the press waiting for the checkout while a ship or another turn holds it. A planning CLI that wedges is stopped after fifteen minutes and the press is reported failed in the machine's own words, rather than sitting silent until the server expires it half an hour later.
 
 ## Sharing a preview
 
