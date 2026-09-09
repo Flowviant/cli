@@ -85,6 +85,7 @@ import {
 import { createWorkManager } from './work.mjs';
 import { scanLocalSessions, ourConversationIds } from './localSessions.mjs';
 import { repoState } from './repoState.mjs';
+import { claudeAuthContext } from './claudeAuth.mjs';
 
 async function fetchRoster(
   haveIds,
@@ -327,7 +328,29 @@ async function maybeReportRepoState({ repoRoot, baseRef }) {
     // time, so the value here is always current.
     const state = repoState(repoRoot, baseRef);
     if (!state) return; // not readable — say nothing rather than say "none"
-    payload = JSON.stringify(state);
+    /**
+     * WHICH CREDENTIAL THIS MACHINE'S CLI RESOLVES, on the same beat.
+     *
+     * It rides this report rather than getting an endpoint of its own because
+     * it is the same KIND of fact — something only the machine can see, pushed
+     * because a pull client can never be asked — and it inherits this
+     * function's three economies for free: scanned once a minute, deduped
+     * against the last ACCEPTED payload, and silent forever once an older
+     * server 404s.
+     *
+     * The dedup keeps it cheap: `claudeAuthContext` is presence plus two dates,
+     * so the string is stable across scans and only moves when something about
+     * the credential actually moves. It DOES move when the CLI refreshes its
+     * access token — that stamp is carried for diagnostics — which costs a
+     * write roughly twice a day and is the whole of the extra traffic. The
+     * WARNING is built on the 22-day refresh clock instead, so a note never
+     * fires on the ~12h cycle.
+     *
+     * NO VERSION FLOOR, and none is possible to need: this is a daemon→server
+     * report, and an older SERVER strips the unknown key in its zod parse and
+     * stores the rest exactly as before.
+     */
+    payload = JSON.stringify({ ...state, auth: claudeAuthContext() });
   } catch {
     return; // a readout must never throw into the poll loop
   }
