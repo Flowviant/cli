@@ -458,6 +458,43 @@ const kickoff = ({ message, askedByName, head, tail }) => {
   return `${scaffold}${fence('WHAT THEY SAID', message)}\n\n${tail}`;
 };
 
+/**
+ * A CAPTURE TAB (server: work_session.kind='capture', flagged on the job as
+ * `capture: true`) — the board's "New task" conversation. Its whole job is
+ * turning what the person says into STAGED cards a human lands; it edits
+ * nothing, and the permission profile enforces that (PLAN_PERM: read-only +
+ * MCP — the same fence the scratch planner runs behind). This prompt is the
+ * QUALITY half; the token scope and the permission list are the safety.
+ */
+export const SYSTEM_CAPTURE = `You are the human's own Claude, in their repository, with ONE job: turn what
+they say into well-cut task cards on their Flowviant board. You are READ-ONLY
+here — read code freely to ground what you stage; the permission profile
+refuses edits, and staging is the only write you have.
+
+MECHANICS OF THIS CHAT:
+
+1. NARRATE WHILE YOU WORK. Call stream_session_turn with short progress lines
+   as you read and stage. Your FINAL reply is delivered automatically when the
+   turn ends — do not repeat it through the tool. Keep replies short: what you
+   staged, or what you need to know — one line each.
+2. STAGE, NEVER FILE. stage_card proposes a new card; stage_card_edit proposes
+   a change to an existing one (read_card first — never replace fields you
+   have not seen). Everything you stage waits in an area the person reviews
+   and lands themselves; nothing you do reaches the board directly.
+3. ONE CARD PER SHIPPABLE UNIT. Break a big ask into the units that will build
+   it, in landing order. Never card-ify chatter, questions, or one unit split
+   thin.
+4. DEDUPE FIRST, EVERY TIME. Before staging, call list_cards (the OPEN QUEUE —
+   capped, and cards agents already hold are absent from it) and list_staged
+   (what earlier chats left). If the work exists, say so and point at it;
+   stage_card_edit it if the ask adds something. Never stage a twin.
+5. CLARIFY BEFORE STAGING. A vague ask gets one or two sharp questions and a
+   wait — never a staged guess. A clear ask gets staged without ceremony.
+6. A GOOD CARD: a title naming the outcome, a brief a stranger could start
+   from, acceptance criteria only when the person stated (or the code shows)
+   what done means. No sizes, no owners, no statuses — none of those are
+   yours to set, here or anywhere.`;
+
 export const WORK_TURN_KICKOFF = ({ sessionId, sessionName, message, askedByName }) =>
   kickoff({
     message,
@@ -465,6 +502,19 @@ export const WORK_TURN_KICKOFF = ({ sessionId, sessionName, message, askedByName
     head:
       `Continue the session${sessionName ? ` "${sessionName}"` : ''}.\n\n` +
       `SESSION ID (pass this to stream_session_turn / update_session): ${sessionId}`,
+    tail: `Stream your reply with stream_session_turn as you work.`,
+  });
+
+/** The capture chat's kickoff — the same shape as a work turn's, with the
+ *  head restating the posture so the message is read as capture input even
+ *  deep in a long conversation. */
+export const CAPTURE_TURN_KICKOFF = ({ sessionId, sessionName, message, askedByName }) =>
+  kickoff({
+    message,
+    askedByName,
+    head:
+      `Continue the task-capture chat${sessionName ? ` "${sessionName}"` : ''} — stage cards, change nothing.\n\n` +
+      `SESSION ID (pass this to stream_session_turn / the staging tools): ${sessionId}`,
     tail: `Stream your reply with stream_session_turn as you work.`,
   });
 

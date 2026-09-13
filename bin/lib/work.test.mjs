@@ -277,3 +277,32 @@ test('fleet.mjs and its whole import graph resolve — a stale named import fail
   assert.equal(typeof fleet.runFleetDaemon, 'function');
   assert.equal(typeof fleet.shouldStop, 'function');
 });
+
+test('a capture turn runs its own prompt pair and the read-only profile (0.82.0)', async () => {
+  // THE CAPTURE CHAT (server 2026-09-13): `job.capture === true` must swap in
+  // SYSTEM_CAPTURE, the capture kickoff, AND `planPerm` — the scratch
+  // planner's read-only permission list — because "read-only" as prose in a
+  // prompt is only an instruction, and instructions are exactly what an
+  // injected repo file competes with. A daemon that ran a capture job under
+  // SYSTEM_WORK with build permissions would be the silent substitution
+  // DAEMON_CAPTURE_MIN exists to keep unreachable.
+  const src = workSource();
+  assert.ok(src.includes('const captureTab = job.capture === true;'));
+  assert.ok(/captureTab\s*\?\s*CAPTURE_TURN_KICKOFF/.test(src));
+  assert.ok(/captureTab \? SYSTEM_CAPTURE : SYSTEM_WORK/.test(src));
+  assert.ok(src.includes('planPerm: captureTab,'));
+  const prompts = await import('./prompts.mjs');
+  // The system prompt may only name tools the capture scope actually has —
+  // telling the model to file_card/log_work (SYSTEM_WORK's vocabulary) walks
+  // it into refusals all turn.
+  for (const banned of ['file_card', 'log_work', 'deliver_card', 'update_session', 'ship']) {
+    assert.ok(
+      !prompts.SYSTEM_CAPTURE.includes(banned),
+      `SYSTEM_CAPTURE must not name ${banned}`
+    );
+  }
+  for (const needed of ['stage_card', 'stage_card_edit', 'read_card', 'list_staged', 'list_cards', 'stream_session_turn']) {
+    assert.ok(prompts.SYSTEM_CAPTURE.includes(needed), `SYSTEM_CAPTURE must name ${needed}`);
+  }
+  assert.ok(!prompts.SYSTEM_CAPTURE.toLowerCase().includes('points'));
+});

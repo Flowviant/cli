@@ -52,7 +52,9 @@ import { c, note, ok, warn } from './ui.mjs';
 import { mcpFor, runTurn } from './claude.mjs';
 import {
   SYSTEM_WORK,
+  SYSTEM_CAPTURE,
   WORK_TURN_KICKOFF,
+  CAPTURE_TURN_KICKOFF,
   SYSTEM_WORK_PLAIN,
   WORK_TURN_KICKOFF_PLAIN,
   SYSTEM_PLAN,
@@ -2982,6 +2984,14 @@ export function createWorkManager({
             const message = [job.body, filesNote, adoptNote, carryNote]
               .filter(Boolean)
               .join('\n\n');
+            // A CAPTURE chat (the board's New task conversation): its own
+            // system prompt, its own kickoff, and the scratch planner's
+            // READ-ONLY permission profile — the prompt says stage-never-file
+            // and the profile is what makes "read-only" true rather than
+            // asserted. Server-flagged per job; a server too old to flag it
+            // simply runs an ordinary tab, which the web's version floor
+            // prevents ever being offered.
+            const captureTab = job.capture === true;
             const turnArgs = {
               // A plain tab has no tools to name and no session id to pass —
               // its kickoff asks for one complete report instead of a stream.
@@ -2991,18 +3001,26 @@ export function createWorkManager({
                     message,
                     askedByName: job.askedByName,
                   })
-                : WORK_TURN_KICKOFF({
+                : captureTab
+                  ? CAPTURE_TURN_KICKOFF({
+                      sessionId: job.sessionId,
+                      sessionName: job.sessionName,
+                      message,
+                      askedByName: job.askedByName,
+                    })
+                  : WORK_TURN_KICKOFF({
                     sessionId: job.sessionId,
                     sessionName: job.sessionName,
                     message,
                     askedByName: job.askedByName,
                   }),
+              planPerm: captureTab,
               // The adopt turn resumes the TERMINAL conversation by forking it
               // into this cwd (claude: --resume <id> --fork-session). After it
               // speaks once, the fork lives natively here and turn 2+ is the
               // ordinary --continue resume path, unchanged.
               ...(adopting ? { adoptResumeId: job.adopt.id } : {}),
-              system: plainTab ? SYSTEM_WORK_PLAIN : SYSTEM_WORK,
+              system: plainTab ? SYSTEM_WORK_PLAIN : captureTab ? SYSTEM_CAPTURE : SYSTEM_WORK,
               // Present only when the tab named one — see brainFor.
               ...brain,
               // The tab watches the CLI work. Claude needs the flag to speak
