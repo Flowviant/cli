@@ -4585,6 +4585,21 @@ export function createWorkManager({
        */
       const doubledKinds = RUNTIMES[rt]?.parse ? null : CLAUDE_TOOL_PROSE_KINDS;
 
+      /**
+       * WHICH BRAIN THIS CONTAINER WAS PINNED TO — the same `brainFor` the tab
+       * lane runs, on the same two job keys, because an agent turn and a
+       * session turn differ in who is watching and in nothing else that a model
+       * name touches. Every guard lives in `brainFor`: a second copy here would
+       * be a second answer to "is this a model we can spell", and the two would
+       * drift the first time one of them learned a new effort.
+       *
+       * Absent stays genuinely absent — an agent nobody pinned produces the
+       * byte-identical argv it produced yesterday, on the machine's own
+       * default. That is also what an OLDER server yields, since it sends
+       * neither key.
+       */
+      const brain = brainFor(job);
+
       let out = '';
       let child = null;
       try {
@@ -4609,6 +4624,8 @@ export function createWorkManager({
           cwd: wt,
           runtime: rt,
           resume,
+          // Present only when the container named one — see brainFor.
+          ...brain,
           streamJson: true,
           answerFromResult: true,
           label: c.cyan('[agent]'),

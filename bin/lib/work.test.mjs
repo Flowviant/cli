@@ -275,6 +275,40 @@ test('an agent turn re-measures its worktree when its CLI exits', () => {
   assert.ok(/void reportSessionWorktree\(place\)\.catch/.test(turn));
 });
 
+test('an agent turn carries the container\'s pinned brain into its CLI, on brainFor\'s guards alone (0.85.0)', () => {
+  /**
+   * `agentTurnJobs[].model/effort` (server, DAEMON_AGENT_KNOBS_MIN) reach the
+   * CLI only if this lane spreads them. The failure it guards is the silent
+   * substitution every floor in this product exists for: the board asserts a
+   * pin, the daemon drops the keys, and the turn runs on the machine default
+   * with nothing on either side saying so.
+   *
+   * A source pin rather than a behavioural one because the only path that
+   * reaches `runTurn` spawns a real CLI — every settle this suite can reach
+   * (unknown runtime, missing card, the begun-guard) returns strictly BEFORE
+   * the call whose arguments are the thing under test.
+   */
+  const turn = fnBody(workSource(), 'runAgentTurn');
+  const brainAt = turn.indexOf('const brain = brainFor(job);');
+  const callAt = turn.indexOf('out = await runTurn({');
+  assert.ok(brainAt > -1, 'the agent lane must resolve a brain');
+  assert.ok(callAt > brainAt, 'a brain resolved after the call is a brain the turn never wore');
+  const args = turn.slice(callAt);
+  assert.ok(args.includes('...brain,'), 'the pin must reach runTurn');
+  // ONE VALIDATOR. brainFor drops a model this machine cannot spell and an
+  // effort no CLI accepts, so a copy of either rule here would be a second
+  // answer to the same question — and the two would disagree the first time
+  // one of them learned a new effort.
+  assert.ok(
+    !/WORK_MODEL_RE|WORK_EFFORTS/.test(turn),
+    'validation lives in brainFor; a second copy is a second answer'
+  );
+  // Absent stays ABSENT: a null reaching the builders is a value, and Claude's
+  // `model || MODEL` is the only one that survives it — which is how an
+  // unpinned agent stops running on the machine pin. See brainFor's docblock.
+  assert.ok(!/model: job\.model|effort: job\.effort/.test(turn));
+});
+
 test('fleet.mjs and its whole import graph resolve — a stale named import fails HERE, not at daemon start', async () => {
   // `node --check` cannot see a named import of an export a sibling module
   // deleted; only linking can. This is the load that a published daemon does
