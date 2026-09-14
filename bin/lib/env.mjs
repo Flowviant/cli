@@ -98,15 +98,36 @@ export function pubkeyEmoji(pubkeyB64) {
 export async function ensureKeypair() {
   await sodium.ready;
   if (keypair) return keypair;
+  let raw = null;
   try {
-    const stored = JSON.parse(readFileSync(KEYPAIR_PATH, 'utf8'));
+    raw = readFileSync(KEYPAIR_PATH, 'utf8');
+  } catch (e) {
+    /**
+     * ONLY "THERE IS NO FILE" IS A FIRST RUN, and the bare catch that used to
+     * stand here said every failure was one.
+     *
+     * This keypair is the box's DURABLE IDENTITY — it is what the project's
+     * private key is sealed to, and since 2026-09-14 it is also what tells two
+     * computers apart when the server decides which of them is this project's
+     * machine. Regenerating it on a truncated file or an unreadable one
+     * OVERWRITES that identity: the wraps stop opening, and the box arrives at
+     * the roster as a stranger and stands itself down as a standby of itself.
+     *
+     * A file we cannot read is not a file we may replace. Rethrown, the caller
+     * that can survive it does: `envQueryParams` is wrapped, so the poll simply
+     * carries no `envpub`, and a poll with no envpub is EXEMPT from arbitration
+     * — the documented fail-open arm, reached honestly instead of by minting a
+     * new box every restart.
+     */
+    if (e?.code !== 'ENOENT') throw e;
+  }
+  if (raw !== null) {
+    const stored = JSON.parse(raw);
     keypair = {
       publicKey: sodium.from_base64(stored.pub, B64()),
       privateKey: sodium.from_base64(stored.priv, B64()),
     };
     return keypair;
-  } catch {
-    /* first run */
   }
   keypair = sodium.crypto_box_keypair();
   mkdirSync(dirname(KEYPAIR_PATH), { recursive: true });

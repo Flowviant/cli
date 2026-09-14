@@ -4,7 +4,7 @@ import { randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { cpus, totalmem } from 'node:os';
+import { cpus, hostname, totalmem } from 'node:os';
 
 // Read the daemon's version from its OWN package.json (always shipped in the npm
 // tarball) — never hardcode it. The hardcoded constant drifted: it sat at
@@ -198,6 +198,43 @@ export const USER_AGENT = `flowviant/${VERSION}`;
  * like, and the server hands preview work to nobody who cannot name themselves.
  */
 export const DAEMON_INSTANCE = randomBytes(12).toString('hex');
+
+/**
+ * WHICH BOX, in words a person recognises — and nothing else.
+ *
+ * Identity for arbitration is the env keypair's public key (`envpub`), which is
+ * durable per box and already on every poll. This is the LABEL beside it: the
+ * app has to be able to say "your machine is mac-mini" rather than "your machine
+ * is a base64 string", and a box that cannot be named is the one thing a
+ * standby daemon's whole sentence is about.
+ *
+ * Capped like every other bounded write that leaves this process — a query
+ * string is not a log — and null rather than '' when the host has no name, so
+ * the param is ABSENT and reads as an older daemon instead of as a box called
+ * nothing.
+ */
+export const MACHINE_HOST = (() => {
+  try {
+    return String(hostname() || '').trim().slice(0, 64) || null;
+  } catch {
+    return null;
+  }
+})();
+
+/**
+ * "MOVE THIS PROJECT'S MACHINE HERE" — an explicit claim, `--claim-machine`.
+ *
+ * A project has ONE machine, and the server hands holdership to whichever box
+ * asks for it while the current holder is silent. That auto-handover is slow on
+ * purpose (it must not outrun an agent lease), so this is the way to say "yes,
+ * now, I am at this keyboard" and take it from a holder that is still polling.
+ *
+ * UNRELATED TO `--takeover`, which is the local single-instance lock: that one
+ * arbitrates PROCESSES on this box, this one moves the PROJECT'S machine across
+ * boxes. `--no-takeover` does not affect it, and neither implies the other.
+ */
+export const CLAIM_MACHINE =
+  process.argv.includes('--claim-machine') || process.env.FLOWVIANT_CLAIM_MACHINE === '1';
 
 // The ONE credential. `tokens` (FLOWVIANT_TOKEN / FLOWVIANT_TOKENS / --token /
 // --tokens) stood beside it and carried WORKER tokens into the pre-daemon loop;

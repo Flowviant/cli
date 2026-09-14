@@ -479,7 +479,14 @@ test('the roster relays the churn ADMISSION, and says so positively when fine', 
   assert.ok(region.includes("'-'"), 'nothing-holding is a fact the server can clear a stale reason with');
   // The one caller asks the SAME `admit` the unattended lanes ask, so what the
   // board is told and what the machine then does cannot disagree.
-  assert.ok(fleetSrc.includes("admit('churn')\n      );"));
+  // Asserted over the CALL, not over one exact line: the poll grew a `take`
+  // argument beside this one, and a pin keyed on the closing paren would have
+  // failed on an addition that changes nothing about which `admit` is asked.
+  assert.ok(
+    between(fleetSrc, 'roster = await fetchRoster(', '\n      );', 'the roster call').includes(
+      "admit('churn')"
+    )
+  );
   // And it no longer reaches round the admission to the raw reading — a poll
   // that measured pressure but not its own ceiling is the bug above.
   assert.ok(!fleetSrc.includes('pressureVerdict('), 'the poll asks the admission, never the verdict');

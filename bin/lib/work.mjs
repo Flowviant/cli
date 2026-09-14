@@ -36,6 +36,7 @@ import {
   USER_AGENT,
   REFRESH_BEFORE_SECONDS,
   DAEMON_INSTANCE,
+  MACHINE_HOST,
   MODEL,
 } from './config.mjs';
 import { git, gitRaw, splitNul, baseBranchName, isSafePathSegment } from './git.mjs';
@@ -63,7 +64,13 @@ import {
   AGENT_TASK_KICKOFF,
   AGENT_HUMAN_KICKOFF,
 } from './prompts.mjs';
-import { materializeInto, hasMaterialized, excludeInWorktree, scrub as envScrub } from './env.mjs';
+import {
+  materializeInto,
+  hasMaterialized,
+  excludeInWorktree,
+  myPubB64,
+  scrub as envScrub,
+} from './env.mjs';
 import {
   detectRuntimes,
   canRun,
@@ -707,9 +714,31 @@ export function createWorkManager({
     // `wrangler dev` alone opens nine, so the old cap of eight was already
     // dropping a row on an ordinary stack with nothing on the wire to say so.
     const lis = measureListeners(wt);
+    /**
+     * WHICH BOX MEASURED THIS — on an agent's report only.
+     *
+     * The server stores it on the agent row so a LATER turn can be checked
+     * against the box that actually holds the work: an agent's branch and its
+     * conversation exist on one machine's disk until somebody approves it, and
+     * two boxes on one credential can both be offered its turns. The daemon
+     * reports what it is; the server does the comparing.
+     *
+     * A daemon→server report on an endpoint that already exists, so no floor —
+     * an older daemon sends no key and the agent is left UNATTRIBUTED, which is
+     * a third state the server reads as "nobody said" rather than as "not this
+     * box". `envpub` is the identity for the same reason the poll uses it: it is
+     * durable per box, and the hostname beside it is only a label for a person
+     * to read. Absent when the keypair is unreadable — that machine is exempt
+     * from arbitration entirely, which is the fail-open direction.
+     *
+     * TABS GET NOTHING. A tab's place is shared by design and its work is a
+     * human's own directory; attributing one would be a fact with no reader.
+     */
+    const pub = sessionId.startsWith('a-') && sessionId.length > 2 ? myPubB64() : null;
     return {
       sessionId,
       ...d,
+      ...(pub ? { box: { id: pub, name: MACHINE_HOST } } : {}),
       listening: lis.rows,
       listeningTotal: lis.total,
       listeningSupported: listenersSupported(),
@@ -4400,6 +4429,76 @@ export function createWorkManager({
     // places: those are agents' by construction, and anything else here would
     // be a tab's directory, where a turn is a reader by the product's own law.
     await inPlace(place, place.startsWith('a-'), async () => {
+      /**
+       * WORK THAT HAS BEGUN LIVES ON EXACTLY ONE BOX, AND THIS MAY NOT BE IT.
+       *
+       * A project has ONE machine credential and every device is handed the same
+       * raw token, so two boxes can both be polling for the same agents. Nothing
+       * pushes an agent's branch before approve, so a turn that has already run
+       * somewhere has its worktree, its branch and its CONVERSATION on that box's
+       * disk and nowhere else. `placeWtFor` cannot tell the difference: it finds
+       * no directory, cuts a fresh `session/a-<id>` off base, and the CLI starts
+       * with no memory of the card — a confident, context-free redo of work
+       * somebody is in the middle of, on the operator's shared account, landing
+       * on a rival branch of the same name.
+       *
+       * So: if the server says this agent has BEGUN and this box holds neither
+       * its directory nor its branch, refuse before anything is cut. `nothing` is
+       * the honest outcome — this machine did not run the turn — and the sentence
+       * says what was measured (two absences here, and the box name only when the
+       * server recorded one; inferring where the work is would be invention).
+       *
+       * THE BRANCH ALONE IS ENOUGH TO CONTINUE. `placeWtFor`'s attach fallback
+       * re-attaches a worktree to a surviving branch, so a directory somebody
+       * cleaned up on THIS box is same-box recovery of real committed work and
+       * behaves exactly as it did before this guard existed.
+       *
+       * The remedy is the stop path and nothing else. "Reconnect the other
+       * machine" is not reachable from here once holdership has moved, and a
+       * remedy somebody cannot carry out is worse than none.
+       */
+      if (job.begun) {
+        const wtDir = join(baseDir, 'sessions', place);
+        let hasBranch = false;
+        /**
+         * THREE STATES, AND THE MIDDLE ONE IS WHY THIS IS NOT A BARE CATCH.
+         *
+         * `rev-parse --verify --quiet` exits 1 and prints nothing for a ref that
+         * is not there — that exit code IS the measurement, and it is the one
+         * this guard acts on. Any OTHER failure (128 for "not a repository",
+         * ENOENT for no git at all, a momentary index lock) measured nothing;
+         * collapsing it onto "the branch is absent" would make the daemon assert
+         * "this machine does not hold this agent's branch" off a repo it could
+         * not read — the guard inventing the very fact it exists to relay.
+         *
+         * So an unmeasured branch stands the guard DOWN. That re-enters the path
+         * this guard is a belt for, which is the fail-open direction it wants;
+         * `placeWtFor` is about to fail on the same unreadable repo and say so
+         * in its own words, which is the honest sentence.
+         */
+        let branchMeasured = true;
+        try {
+          hasBranch = Boolean(
+            git(['rev-parse', '--verify', '--quiet', `refs/heads/session/${place}`], repoRoot)
+          );
+        } catch (e) {
+          if (e?.status === 1) hasBranch = false;
+          else branchMeasured = false;
+        }
+        if (branchMeasured && !existsSync(wtDir) && !hasBranch) {
+          const on = typeof job.begunOn === 'string' && job.begunOn.trim()
+            ? job.begunOn.trim().slice(0, 64)
+            : null;
+          await postAgentTurn({
+            turnId,
+            outcome: 'nothing',
+            answer:
+              `This machine does not hold this agent's worktree or branch${on ? ` — its work is on ${on}` : ''}. ` +
+              'Stop the agent to re-plan it here.',
+          });
+          return;
+        }
+      }
       const dir = placeWtFor(place);
       if (!dir) {
         // No worktree and none could be cut. `nothing` rather than an invented
@@ -4743,6 +4842,37 @@ export function createWorkManager({
         agentTurns.delete(id);
       });
     }
+  };
+
+  /**
+   * SETTLE EVERYTHING IN FLIGHT, because this process is about to go away.
+   *
+   * The one caller is the displacement stand-down: the project's machine moved
+   * to another box, so nothing here will be re-offered to us and nothing else
+   * knows these turns were running. An abandoned turn sits pending until the
+   * server's six-hour expiry while the board shows an agent working on a machine
+   * that has gone — the wedge every settle path in this lane exists to avoid.
+   *
+   * A HELD BODY OUTRANKS THE SENTENCE, and that is not an optimisation. A turn
+   * whose CLI already FINISHED has a real answer queued (delivered, a question,
+   * its commits); posting `nothing` over it would be this daemon lying about
+   * work it actually did, and the settle is conditional on the row still being
+   * pending, so whichever POST lands first is the one the board believes. The
+   * held bodies are retried here for the same reason the commanded stop flushes
+   * the tab queues: they exist only in this process.
+   *
+   * Bounded by what is in flight, and awaited by the caller behind a clock —
+   * a wedged uplink must not hold the stand-down open.
+   */
+  const settleAgentTurns = async (sentence) => {
+    const answer = String(sentence ?? '').slice(0, 1000);
+    const posts = [];
+    for (const turnId of agentTurns) {
+      if (agentReported.has(turnId)) continue; // its own answer goes below
+      posts.push(postAgentTurn({ turnId, outcome: 'nothing', answer }));
+    }
+    for (const [, held] of agentReported) posts.push(postAgentTurn(held.body));
+    await Promise.allSettled(posts);
   };
 
   // ── THE PROJECT'S OWN CHECK, and the MERGE ─────────────────────────────────
@@ -5388,6 +5518,10 @@ export function createWorkManager({
     liveTurnCount,
     processAgentPlanJobs,
     processAgentTurnJobs,
+    // Only the displacement stand-down calls this — see its comment. Exported
+    // rather than hooked into `shutdownWork` because the signal handlers cannot
+    // await, and a settle that is not awaited is a settle that did not happen.
+    settleAgentTurns,
     processAgentMergeJobs,
     freshenManualPlaces,
   };

@@ -24,6 +24,8 @@ import {
   MCP_URL,
   SAFE,
   DAEMON_INSTANCE,
+  MACHINE_HOST,
+  CLAIM_MACHINE,
   POLL_SECONDS,
   MAX_CONCURRENT,
   IDLE_SECONDS,
@@ -87,6 +89,9 @@ import { scanLocalSessions, ourConversationIds } from './localSessions.mjs';
 import { repoState } from './repoState.mjs';
 import { claudeAuthContext } from './claudeAuth.mjs';
 
+/** Said once per process — see the catch around `envQueryParams` below. */
+let warnedEnvIdentity = false;
+
 async function fetchRoster(
   haveIds,
   livePreviewSessionIds = [],
@@ -95,7 +100,11 @@ async function fetchRoster(
    *  every unattended lane asks — see the `pr` param below for why it is the
    *  admission and not the pressure reading alone. Undefined where the caller
    *  has no admission to offer, which reads exactly like an older daemon. */
-  churnHold = undefined
+  churnHold = undefined,
+  /** Whether an explicit `--claim-machine` is still outstanding — see the
+   *  `take` param below. The watch owns the answer, so the loop cannot keep
+   *  asking after the server has already handed this box the machine. */
+  claiming = false
 ) {
   const url = new URL(FLEET_URL);
   if (haveIds.length) url.searchParams.set('have', haveIds.join(','));
@@ -120,6 +129,17 @@ async function fetchRoster(
   // WHICH PROCESS, so the server can lease preview work to exactly one of two
   // daemons on one credential. Older servers ignore unknown params.
   url.searchParams.set('di', DAEMON_INSTANCE);
+  // WHICH BOX, by name, so the app can say "your machine is mac-mini" instead
+  // of naming a public key. Display only: arbitration is keyed on `envpub`,
+  // which is durable per box, while a hostname is neither unique nor stable.
+  // Absent when the host has no readable name — an older daemon looks the same,
+  // and both mean "nobody said", which is what the nameless fallback renders.
+  if (MACHINE_HOST) url.searchParams.set('mh', MACHINE_HOST);
+  // "MOVE THE MACHINE HERE." Sent only while an explicit `--claim-machine` is
+  // outstanding, and it stops the moment the server answers that this box holds
+  // it — a claim that kept riding every poll would be a standing instruction to
+  // displace whoever asked next, which is not what a one-off command means.
+  if (claiming) url.searchParams.set('take', '1');
   // Which shares this machine is still serving. It rides the poll rather than
   // taking an endpoint of its own: one beat, no floor, and the stale window is
   // the reconcile interval instead of minutes — which matters, because a share
@@ -179,8 +199,28 @@ async function fetchRoster(
     for (const [k, v] of Object.entries(await envQueryParams())) {
       if (v != null) url.searchParams.set(k, v);
     }
-  } catch {
+  } catch (e) {
     /* env identity is best-effort — the poll must never fail on it */
+    /**
+     * …BUT IT IS NOT SILENT, because since 2026-09-14 losing it costs
+     * something visible. `envpub` is how the server tells two computers apart,
+     * so a poll without one is EXEMPT from arbitration — it is served in full,
+     * which is right — and nothing stamps `holder_heard_at`, which is the
+     * column presence is now read from. The app therefore says the machine is
+     * offline while this daemon is sitting here answering turns, and before
+     * this line the only evidence anywhere was a keypair file nobody looks at.
+     *
+     * Once per process: it is the same failure on every poll, and a reason
+     * repeated every few seconds is a reason nobody reads.
+     */
+    if (!warnedEnvIdentity) {
+      warnedEnvIdentity = true;
+      console.warn(
+        `[flowviant] could not read ${'~/.flowviant/env-keypair.json'} (${e?.message ?? e}).\n` +
+          '  This machine cannot identify itself, so the app may show it as offline while it works.\n' +
+          '  It has NOT been replaced — that file is what the project secrets are sealed to.'
+      );
+    }
   }
   /**
    * WHY THIS MACHINE IS NOT TAKING NEW WORK, in its own measured words.
@@ -472,6 +512,192 @@ export function shouldStop(rosterDaemon) {
   return { stop: true, reason };
 }
 
+/**
+ * HOW LONG AGO, in the words the standby sentence needs. Milliseconds in, one
+ * short label out; anything that is not a finite, non-negative number renders
+ * NOTHING and the caller drops the clause rather than printing "heard NaN ago".
+ * The three-state rule applied to a duration: measured, or say nothing.
+ */
+export function agoLabel(ms) {
+  // `typeof`, not `Number()`: `Number(null)` is 0, so a coercing guard turns
+  // "the server said nothing" into "heard 0s ago" — a measurement nobody took,
+  // printed at the one moment the person is deciding whether to wait.
+  if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < 0) return null;
+  const s = Math.round(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m}m`;
+  const h = Math.round(m / 60);
+  if (h < 48) return `${h}h`;
+  return `${Math.round(h / 24)}d`;
+}
+
+/**
+ * WHOSE MACHINE THIS IS — read off the roster, said once, and never a refusal.
+ *
+ * A project has ONE machine credential and `device/approve` hands every device
+ * the same raw token, so two boxes running `npx flowviant` are two daemons that
+ * both believe they are the machine. The old behaviour was a silent race: the
+ * loser could not see the winner at all, and the moment the winner went quiet
+ * long enough for a lease to lapse it cut a FRESH branch for an agent whose work
+ * exists only on the other box's disk, then ran a CLI with no conversation
+ * behind it. A confident, context-free redo of work somebody was mid-way
+ * through.
+ *
+ * The server arbitrates (it is the only party that can see both boxes) and the
+ * answer rides the poll RESPONSE as `holder`. This turns that answer into what
+ * the person at the keyboard needs to know, and nothing more:
+ *
+ *   · ABSENT        -> this server does not arbitrate machines. Behave exactly
+ *                      as every daemon before 0.84.0 did — zero new paths — and
+ *                      if a claim was asked for, say the claim cannot be served
+ *                      rather than letting silence read as success.
+ *   · mine: true    -> we are the machine. Announce it only if we have been
+ *                      standing by, so an ordinary daemon prints nothing new.
+ *   · mine: false   -> STAND BY. Keep polling quietly; the restricted roster
+ *                      serves us nothing, the auto-handover makes this box the
+ *                      machine when the holder dies, and `--claim-machine` is
+ *                      the way to stop waiting. Never exit: a standby that quits
+ *                      is a box somebody has to go and restart by hand.
+ *
+ * Printed ONCE PER DISTINCT HOLDER rather than per poll — a true sentence
+ * restated every ten seconds is a scrolling console nobody reads, and the fact
+ * only CHANGES when the holder does.
+ *
+ * Pure except for the injected `say`, so the whole decision can be proved
+ * without a credential, a server or a second box.
+ */
+export function createHolderWatch({ claiming = false, say = () => {} } = {}) {
+  let standbyKey = null; // the holder we last announced, or null while we serve
+  let claimPending = Boolean(claiming);
+  let saidUnarbitrated = false;
+  return {
+    /** Whether the poll should still carry `take=1`. */
+    claiming: () => claimPending,
+    /** Returns 'absent' | 'mine' | 'standby' — the state, for the caller's
+     *  own gating and for tests that must not read the console. */
+    observe(holder) {
+      if (!holder || typeof holder !== 'object' || Array.isArray(holder)) {
+        // An older server, or a poll it did not arbitrate. A claim asked of a
+        // server that cannot answer it must be SAID: the alternative is a flag
+        // that silently does nothing forever.
+        if (claimPending && !saidUnarbitrated) {
+          saidUnarbitrated = true;
+          claimPending = false;
+          say('this server does not arbitrate machines — --claim-machine has nothing to claim.');
+        }
+        return 'absent';
+      }
+      if (holder.mine === true) {
+        claimPending = false;
+        if (standbyKey !== null) {
+          standbyKey = null;
+          say('this machine now serves the project.');
+        }
+        return 'mine';
+      }
+      // The NAME is all the response carries about the other box, so it is also
+      // the only thing "a distinct holder" can be keyed on. An unnamed holder
+      // keys on the empty string, which is stable — one announcement, not one
+      // per poll.
+      const name = typeof holder.name === 'string' && holder.name.trim()
+        ? holder.name.trim().slice(0, 64)
+        : null;
+      const key = name ?? '';
+      if (key !== standbyKey) {
+        standbyKey = key;
+        const ago = agoLabel(holder.heardAgo);
+        say(
+          `This project's machine is ${name ?? 'another machine'}${ago ? ` (heard ${ago} ago)` : ''}. ` +
+            'It moves here automatically once that machine has been quiet 10 minutes ' +
+            '— or run flowviant --claim-machine.'
+        );
+      }
+      return 'standby';
+    },
+  };
+}
+
+/** The sentence an in-flight agent turn is settled with when the machine moves
+ *  out from under it. MEASURED, not inferred: the server named the box that
+ *  took over, and an unnamed one says so rather than guessing. */
+export function displacedTurnSentence(by) {
+  const name = typeof by === 'string' && by.trim() ? by.trim().slice(0, 64) : 'another machine';
+  return `The project's machine moved to ${name} while this turn was running.`;
+}
+
+/**
+ * THE MACHINE MOVED. STAND DOWN.
+ *
+ * The server sends `displaced` only when it is aimed at THIS box (it matches the
+ * poll's own `envpub`) and only inside a short window, so there is nothing to
+ * re-derive here and nothing to honour from last week — the same shape, and the
+ * same reasoning, as the commanded stop above.
+ *
+ * Unlike the signal handlers this path is poll-response-driven, so it CAN await:
+ * every in-flight agent turn is settled first, because a turn this daemon
+ * abandons silently sits pending until the server's six-hour expiry while the
+ * board shows an agent working on a machine that has gone. `nothing` is the
+ * honest outcome and the sentence says what happened.
+ *
+ * EXIT 0, for the reason the two existing terminal paths (the commanded stop,
+ * and the revoked credential above it) both document: under `Restart=on-failure`
+ * a nonzero code has systemd relaunch this daemon immediately, where it would
+ * poll, be told again that it is not the machine, and stand down again — a
+ * restart loop fighting a decision somebody made on purpose.
+ *
+ * Every dependency is injected so the whole stand-down can be proved without a
+ * server, a repo or a process to kill.
+ */
+export async function standDownDisplaced({
+  by,
+  settleAgentTurns,
+  flushReports,
+  teardown,
+  exit,
+  log = { warn: () => {}, note: () => {} },
+}) {
+  /** A bound on a wedged uplink, and never a reason to hang: the timer is
+   *  unref'd, so the only thing that keeps this process alive is the work. */
+  const bounded = (p, seconds) =>
+    Promise.race([
+      p,
+      new Promise((resolve) => {
+        const t = setTimeout(resolve, seconds * 1000);
+        t.unref?.();
+      }),
+    ]);
+  const name = typeof by === 'string' && by.trim() ? by.trim().slice(0, 64) : null;
+  log.warn(
+    name
+      ? `this project's machine moved to ${name} — standing down.`
+      : "this project's machine moved to another box — standing down."
+  );
+  // FIRST, and awaited: an unsettled turn is the one thing here that no later
+  // poll from anybody can fix — this process holds the only copy of the fact
+  // that it was running.
+  try {
+    await bounded(settleAgentTurns(displacedTurnSentence(by)), 10);
+  } catch {
+    /* an unsettled turn expires server-side with words of its own */
+  }
+  // THEN the queued settles, bounded exactly as the commanded stop bounds them:
+  // a queued report is a COMPLETED turn whose side effects already happened, and
+  // dropping it re-runs the whole turn somewhere else.
+  try {
+    await bounded(flushReports(), 5);
+  } catch {
+    /* undelivered reports re-run; delivering them was best-effort */
+  }
+  // NOT optional, for the reason the commanded stop states: detached preview
+  // tunnels survive this process by design, and a public hostname pointed into a
+  // worktree on a box that no longer serves the project is the worst thing this
+  // path can leave behind.
+  teardown();
+  log.note('worktrees are kept — the branches here are the only copy of this box\'s work.');
+  exit(0);
+}
+
 // One roster agent's loop: persistent worktree, one intent per turn, reset to
 // base between tasks (fresh conversation), resume in place while on a blocker.
 
@@ -516,6 +742,12 @@ export async function runFleetDaemon() {
   // across them. See instance.mjs for why that lock is not enough on its own.
   // Same repo -> this run replaces whatever was serving it. Different repo ->
   // refused, and nothing is signalled. See instance.mjs's header for the rule.
+  //
+  // `--takeover` AND `--claim-machine` ARE UNRELATED, and the names invite the
+  // confusion. These flags arbitrate PROCESSES on THIS box — which daemon serves
+  // this repo. `--claim-machine` (config.mjs) moves the PROJECT'S machine from
+  // another box to this one, and the server decides it. Neither implies the
+  // other, and `--no-takeover` does not affect a claim.
   const instance = acquireInstanceLock(FLEET_TOKEN, repoRoot, {
     takeover:
       process.argv.includes('--takeover') || process.argv.includes('--takeover-downgrade'),
@@ -883,6 +1115,7 @@ export async function runFleetDaemon() {
     retireWorkSessions,
     reportWorktrees,
     shutdownWork,
+    settleAgentTurns,
     workBusy,
     admit,
     liveTurns,
@@ -1603,6 +1836,12 @@ export async function runFleetDaemon() {
   let rosterSig = null; // last roster membership, to log changes only
   let idleBeatAt = 0; // throttle the "still alive" idle heartbeat
   let cappedWarned = false; // say once, not every reconcile, why extra lanes idle
+  // WHOSE MACHINE THIS IS, as of the last poll the server arbitrated. 'absent'
+  // is the reserved meaning — an older server, or a poll with no envpub — and
+  // everything downstream of it must read exactly as it did before 0.84.0.
+  const holderWatch = createHolderWatch({ claiming: CLAIM_MACHINE, say: (m) => note(m) });
+  let holderState = 'absent';
+  if (CLAIM_MACHINE) note('claim  · asking for this project\'s machine (--claim-machine)');
 
   // ── Push channel: a server wake short-circuits the reconcile sleep so a job is
   // picked up in ~a round trip instead of on the next poll. The socket only
@@ -1659,7 +1898,8 @@ export async function runFleetDaemon() {
         buildHave(),
         livePreviewIds(),
         heldSessionIds(),
-        admit('churn')
+        admit('churn'),
+        holderWatch.claiming()
       );
     } catch (e) {
       if (e.auth) {
@@ -1738,6 +1978,38 @@ export async function runFleetDaemon() {
       // minutes later comes up clean instead of stopping itself forever.
       process.exit(0);
     }
+    /**
+     * THE MACHINE MOVED OUT FROM UNDER US — checked BEFORE the version signal
+     * for the reason the stop above is: `handleVersionSignal` can re-exec this
+     * process, and a box that has just been displaced coming back up wearing a
+     * newer version is the one outcome nobody asked for.
+     *
+     * The key's PRESENCE is the command, exactly as it is for a stop: the server
+     * sends it only when it names THIS box's `envpub` and only inside its own
+     * window, so there is no TTL to re-evaluate here and no way for a relaunch
+     * to obey a displacement aimed at somebody else.
+     */
+    if (roster.displaced && typeof roster.displaced === 'object' && !Array.isArray(roster.displaced)) {
+      await standDownDisplaced({
+        by: roster.displaced.by,
+        settleAgentTurns,
+        flushReports: flushWorkReports,
+        teardown,
+        exit: (code) => process.exit(code),
+        log: { warn, note },
+      });
+      return;
+    }
+    /**
+     * WHOSE MACHINE THIS IS. Absent = a server that does not arbitrate, and then
+     * this is a no-op and the daemon behaves exactly as 0.83.0 did.
+     *
+     * A standby keeps polling and keeps everything the restricted roster still
+     * drives — its `activeWorkSessions` is credential-scoped and correct, so the
+     * sweep below is unchanged behaviour and must not be skipped, or a standby
+     * would start deleting worktrees it cannot see the tabs for.
+     */
+    holderState = holderWatch.observe(roster.holder);
     // Keep the daemon current. Safe = no worker mid-task (true at startup, since
     // no workers are spawned yet). If it self-updates it re-execs into the new
     // version and this process becomes a proxy — stop the loop.
@@ -1880,7 +2152,11 @@ export async function runFleetDaemon() {
       // first poll. It used to point at the Cockpit, a surface deleted
       // 2026-08-04 that now redirects to the Board. Say what is actually true
       // instead: the machine is up, and work starts in a tab.
-      info('Machine online. Open a tab in Flowviant → Workbench to start working.');
+      // …unless another box holds the machine. A standby IS connected and IS
+      // polling, and saying "machine online" over a daemon the server hands
+      // nothing would contradict the standby line printed a moment earlier.
+      if (holderState !== 'standby')
+        info('Machine online. Open a tab in Flowviant → Workbench to start working.');
     }
     // Heartbeat so a quiet daemon visibly stays alive. Gated on REAL work —
     // `rosterIds` is built from `roster.agents`, which the server sends
@@ -1889,7 +2165,11 @@ export async function runFleetDaemon() {
     // there session turns, ships or unsettled reports in flight?
     if (!workBusy() && Date.now() - idleBeatAt > 60_000) {
       idleBeatAt = Date.now();
-      info('machine online — nothing running right now.');
+      info(
+        holderState === 'standby'
+          ? 'standing by — another machine holds this project.'
+          : 'machine online — nothing running right now.'
+      );
     }
 
     // Living-wiki work (runs under its own minted wiki token — no agent

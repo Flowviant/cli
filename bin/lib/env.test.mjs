@@ -121,3 +121,51 @@ test('a hostile cache path never reaches rmSync, and .git never gets a secret', 
   assert.equal(existsSync(join(wt, '.git', 'planted')), true, 'a .git path must never be rmSync-ed');
   assert.equal(existsSync(join(wt, '.git', 'hooks', 'pre-commit')), false, 'a .git target must never be written');
 });
+
+/**
+ * A KEYPAIR WE CANNOT READ IS NOT A KEYPAIR WE MAY REPLACE (2026-09-14).
+ *
+ * `ensureKeypair` read the file inside a bare catch commented "first run", so
+ * EVERY failure — a truncated file, bad JSON, EACCES — was treated as a first
+ * run and the box silently MINTED A NEW IDENTITY over the old one. Two things
+ * ride that identity: the project's private key is sealed to it (a new one
+ * cannot open any wrap, and re-enrolment CAS-es on `project_pub IS NULL`), and
+ * since holdership it is what tells two computers apart — so the same physical
+ * box arrives at the roster as a stranger and stands itself down as a standby
+ * of itself for the whole claim window.
+ *
+ * Only ENOENT is a first run. Anything else throws, and the one caller that has
+ * to survive it already does: `envQueryParams` is wrapped in the poll, so the
+ * poll simply carries no `envpub` — which is the documented EXEMPT arm, reached
+ * honestly instead of by re-keying the box every restart.
+ *
+ * A subprocess, because the module memoizes the keypair after its first read.
+ */
+test('a corrupt keypair is refused, never overwritten', () => {
+  const home = mkdtempSync(join(tmpdir(), 'fv-corrupt-'));
+  const path = join(home, '.flowviant', 'env-keypair.json');
+  mkdirSync(join(home, '.flowviant'), { recursive: true });
+  writeFileSync(path, '{"pub":"AAA');
+
+  let threw = false;
+  try {
+    execFileSync(
+      process.execPath,
+      ['-e', "const e = await import(process.argv[1]); await e.ensureKeypair();", join(process.cwd(), 'bin/lib/env.mjs')],
+      { env: { ...process.env, HOME: home }, stdio: ['ignore', 'pipe', 'pipe'] }
+    );
+  } catch {
+    threw = true;
+  }
+  assert.ok(threw, 'an unreadable keypair must fail rather than mint a new identity');
+  assert.equal(readFileSync(path, 'utf8'), '{"pub":"AAA', 'the file must be exactly as it was');
+
+  // …and the ENOENT half still works: an empty home IS a first run.
+  const fresh = mkdtempSync(join(tmpdir(), 'fv-fresh-'));
+  execFileSync(
+    process.execPath,
+    ['-e', "const e = await import(process.argv[1]); await e.ensureKeypair();", join(process.cwd(), 'bin/lib/env.mjs')],
+    { env: { ...process.env, HOME: fresh }, stdio: ['ignore', 'pipe', 'pipe'] }
+  );
+  assert.ok(existsSync(join(fresh, '.flowviant', 'env-keypair.json')), 'a first run still mints one');
+});

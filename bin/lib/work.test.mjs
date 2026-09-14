@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createWorkManager } from './work.mjs';
@@ -29,7 +29,9 @@ function repo() {
   return dir;
 }
 
-function manager(t) {
+/** The manager AND the two directories it is standing in — the begun-guard is
+ *  about what is on disk, so its tests have to be able to put things there. */
+function managerIn(t) {
   const dir = repo();
   const baseDir = mkdtempSync(join(tmpdir(), 'fv-work-base-'));
   t.after(() => {
@@ -43,7 +45,11 @@ function manager(t) {
     getMcpUrl: () => 'http://127.0.0.1:0/mcp',
     getLeaseTtl: () => 60,
   });
-  return m;
+  return { m, repoRoot: dir, baseDir };
+}
+
+function manager(t) {
+  return managerIn(t).m;
 }
 
 /**
@@ -305,4 +311,180 @@ test('a capture turn runs its own prompt pair and the read-only profile (0.82.0)
     assert.ok(prompts.SYSTEM_CAPTURE.includes(needed), `SYSTEM_CAPTURE must name ${needed}`);
   }
   assert.ok(!prompts.SYSTEM_CAPTURE.toLowerCase().includes('points'));
+});
+
+/**
+ * THE BEGUN-GUARD (0.84.0) — the whole point is what does NOT happen.
+ *
+ * Two boxes can hold the same machine credential, and an agent's worktree, its
+ * branch and its conversation exist on exactly one of them until somebody
+ * approves it. Before this guard, the second box answered a begun agent's turn
+ * by cutting a FRESH `session/a-<id>` off base and running a CLI with no memory
+ * of the card — so the observable failures were a new branch on disk and a real
+ * model turn, and both are asserted as absences here.
+ *
+ * `runtime: 'nope'` is how the not-firing cases stop short of a CLI: `canRun`
+ * refuses an unknown runtime, which settles with a sentence of its own and is
+ * reached ONLY past the guard. A test that depended on which CLIs happen to be
+ * installed on the machine running the suite would prove nothing.
+ */
+const GUARD_SENTENCE = "This machine does not hold this agent's worktree or branch";
+
+test('a begun agent turn on a box holding neither its worktree nor its branch is refused before anything is cut', async (t) => {
+  const { m, repoRoot, baseDir } = managerIn(t);
+  const { calls } = stubFetch(t);
+  m.processAgentTurnJobs([
+    {
+      id: 'at-g1',
+      agentId: 'ag-g1',
+      placeId: 'a-ag-g1',
+      kind: 'task',
+      task: { id: 'card-g1', title: 'T' },
+      begun: true,
+      begunOn: 'mac-mini',
+    },
+  ]);
+  await until(() => calls.some((c) => c.url.includes('agent-turn-done')));
+  await tick();
+  const settle = calls.find((c) => c.url.includes('agent-turn-done'));
+  assert.equal(settle.body.outcome, 'nothing');
+  // The box name is a RELAY of what the server measured, so it is quoted
+  // exactly and only appears because the job carried one.
+  assert.equal(
+    settle.body.answer,
+    "This machine does not hold this agent's worktree or branch — its work is on mac-mini. Stop the agent to re-plan it here."
+  );
+  // Nothing was cut and nothing was run: no directory, no branch, no CLI.
+  assert.equal(existsSync(join(baseDir, 'sessions', 'a-ag-g1')), false);
+  assert.equal(
+    git(['branch', '--list', 'session/a-ag-g1'], repoRoot),
+    '',
+    'a rival branch of the same name is the damage this guard exists to prevent'
+  );
+  await until(() => !m.workBusy());
+});
+
+test('an unattributed begun turn says the two things it measured and guesses at no third', async (t) => {
+  const { m } = managerIn(t);
+  const { calls } = stubFetch(t);
+  // No `begunOn`: the server has no box recorded for this agent (pre-0.84.0
+  // data). Naming one anyway would be the daemon inventing where the work is.
+  m.processAgentTurnJobs([
+    { id: 'at-g2', agentId: 'ag-g2', placeId: 'a-ag-g2', kind: 'task', task: { id: 'c', title: 'T' }, begun: true },
+  ]);
+  await until(() => calls.some((c) => c.url.includes('agent-turn-done')));
+  const settle = calls.find((c) => c.url.includes('agent-turn-done'));
+  assert.equal(
+    settle.body.answer,
+    "This machine does not hold this agent's worktree or branch. Stop the agent to re-plan it here."
+  );
+  await until(() => !m.workBusy());
+});
+
+test('the guard does not fire when the BRANCH survives here — that is same-box recovery', async (t) => {
+  const { m, repoRoot } = managerIn(t);
+  const { calls } = stubFetch(t);
+  // A directory somebody removed, with the committed work still on its branch.
+  // `placeWtFor`'s attach fallback re-opens it, which is today's behaviour and
+  // must stay reachable.
+  git(['branch', 'session/a-ag-g3', 'main'], repoRoot);
+  m.processAgentTurnJobs([
+    {
+      id: 'at-g3',
+      agentId: 'ag-g3',
+      placeId: 'a-ag-g3',
+      kind: 'task',
+      task: { id: 'c', title: 'T' },
+      begun: true,
+      runtime: 'nope',
+    },
+  ]);
+  await until(() => calls.some((c) => c.url.includes('agent-turn-done')));
+  const settle = calls.find((c) => c.url.includes('agent-turn-done'));
+  assert.match(settle.body.answer, /cannot run nope/, 'the turn ran past the guard');
+  assert.ok(!String(settle.body.answer).includes(GUARD_SENTENCE));
+  await until(() => !m.workBusy());
+});
+
+test('the guard does not fire when the WORKTREE is here, nor when the turn has not begun', async (t) => {
+  const { m, baseDir } = managerIn(t);
+  const { calls } = stubFetch(t);
+  mkdirSync(join(baseDir, 'sessions', 'a-ag-g4'), { recursive: true });
+  const job = (id, place, extra) => ({
+    id,
+    agentId: `ag-${place}`,
+    placeId: place,
+    kind: 'task',
+    task: { id: 'c', title: 'T' },
+    runtime: 'nope',
+    ...extra,
+  });
+  m.processAgentTurnJobs([job('at-g4', 'a-ag-g4', { begun: true })]);
+  await until(() => calls.filter((c) => c.url.includes('agent-turn-done')).length >= 1);
+  // …and a turn the server does NOT call begun is untouched by any of this: a
+  // first turn has no worktree and no branch anywhere, which is exactly the
+  // shape the guard refuses, so gating on `begun` is what keeps a fresh agent
+  // startable.
+  m.processAgentTurnJobs([job('at-g5', 'a-ag-g5', {})]);
+  await until(() => calls.filter((c) => c.url.includes('agent-turn-done')).length >= 2);
+  for (const c of calls.filter((x) => x.url.includes('agent-turn-done'))) {
+    assert.match(c.body.answer, /cannot run nope/);
+  }
+  await until(() => !m.workBusy());
+});
+
+test('the guard is read BEFORE the worktree can be cut, and a begun turn is the only thing it reads', () => {
+  const turn = fnBody(workSource(), 'runAgentTurn');
+  const guardAt = turn.indexOf('if (job.begun)');
+  const cutAt = turn.indexOf('const dir = placeWtFor(place);');
+  assert.ok(guardAt > -1, 'the begun guard must exist');
+  assert.ok(cutAt > guardAt, 'placeWtFor cuts a branch — checking after it is checking too late');
+  // The branch it looks for is built from the PLACE, the same string placeWtFor
+  // would name, so the two can never drift into checking for one branch and
+  // cutting another.
+  assert.ok(turn.includes('`refs/heads/session/${place}`'));
+  assert.ok(turn.includes('--verify'), 'a missing ref must be an exit code, not a parse');
+  /**
+   * AN UNREADABLE REPO IS NOT AN ABSENT BRANCH. `--verify --quiet` exits 1 for a
+   * ref that is not there, and that exit code IS the measurement. Every other
+   * failure — 128 for "not a repository", ENOENT for no git, a momentary index
+   * lock — measured nothing, and collapsing it onto "absent" would have the
+   * daemon assert "this machine does not hold this agent's branch" off a repo it
+   * could not read: the guard inventing the fact it exists to relay.
+   */
+  assert.ok(turn.includes('e?.status === 1'), 'exit 1 is the ref-absent measurement');
+  assert.ok(turn.includes('branchMeasured && !existsSync(wtDir) && !hasBranch'));
+});
+
+test('the stand-down settles what is in flight and never overwrites a finished answer', async (t) => {
+  const { m } = managerIn(t);
+  const { calls, state } = stubFetch(t);
+  // A finished turn whose settle POST failed: its real answer is held here and
+  // nowhere else, so the stand-down must RETRY it rather than posting `nothing`
+  // over work this machine actually did.
+  state.mode = 'down';
+  m.processAgentTurnJobs([{ id: 'at-s1', agentId: 'ag-s1', placeId: 'a-s1', kind: 'task' }]);
+  await until(() => calls.some((c) => c.url.includes('agent-turn-done')));
+  await until(() => m.workBusy());
+  const held = calls.find((c) => c.url.includes('agent-turn-done')).body;
+  state.mode = 'ok';
+  const before = calls.length;
+  await m.settleAgentTurns('The project\'s machine moved to box-b while this turn was running.');
+  const after = calls.slice(before).filter((c) => c.url.includes('agent-turn-done'));
+  assert.equal(after.length, 1);
+  assert.deepEqual(after[0].body, held, 'a held body outranks the stand-down sentence');
+});
+
+test('an agent worktree report names the box that measured it — and a tab report does not', () => {
+  const report = fnBody(workSource(), 'sessionWorktreeReport');
+  // The server stores this on the agent row so a LATER turn can be checked
+  // against the box that actually holds the work. Keyed on `envpub`, the same
+  // identity the poll arbitrates on, because it is durable per box; the
+  // hostname beside it is a label for a person and nothing else.
+  assert.ok(report.includes("sessionId.startsWith('a-') && sessionId.length > 2 ? myPubB64() : null"));
+  assert.ok(report.includes('...(pub ? { box: { id: pub, name: MACHINE_HOST } } : {})'));
+  // THREE STATES. An unreadable keypair sends no key at all, which the server
+  // reads as "nobody said" — never as "not this box", which would refuse a turn
+  // on a machine that is exempt from arbitration by construction.
+  assert.ok(!report.includes("box: { id: pub ?? ''"));
 });
