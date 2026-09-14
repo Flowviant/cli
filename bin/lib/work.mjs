@@ -70,8 +70,11 @@ import {
   pickRuntimeFor,
   recordSkills,
   toolEventOf,
+  CLAUDE_TOOL_PROSE_KINDS,
   RUNTIMES,
 } from './runtimes.mjs';
+import { createAdmission } from './admission.mjs';
+import { makeTraceRelay } from './trace.mjs';
 
 /** The place id meaning "the checkout", not a worktree. Must match the
  *  server's REPO_PLACE — it is a wire value, not a local convention. */
@@ -162,6 +165,15 @@ export function createWorkManager({
   getLeaseTtl,
   /** "The repo picture changed — look again." See the caller in fleet.mjs. */
   onRepoChanged = () => {},
+  /**
+   * CLI turns this manager did not spawn — today exactly one, the wiki
+   * cartographer, which lives in fleet.mjs's own closure. A callback for the
+   * same reason `onRepoChanged` is one: work.mjs is imported BY fleet.mjs and
+   * cannot import back. It exists because the concurrency bound is a bound on
+   * the MACHINE: a count that can see three lanes out of four is a ceiling with
+   * a hole in it.
+   */
+  extraLiveTurns = () => 0,
 }) {
   /**
    * WHERE SHIP LANDS, read fresh every time rather than captured at startup.
@@ -193,6 +205,7 @@ export function createWorkManager({
   const AGENT_PLAN_ACTIVITY_URL = FLEET_URL.replace(/\/agents\/?$/, '/agent-plan-activity');
   const AGENT_TURN_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/agent-turn-done');
   const AGENT_ACTIVITY_URL = FLEET_URL.replace(/\/agents\/?$/, '/agent-activity');
+  const AGENT_TRACE_URL = FLEET_URL.replace(/\/agents\/?$/, '/agent-trace');
   const AGENT_PARKED_URL = FLEET_URL.replace(/\/agents\/?$/, '/agent-parked');
   const AGENT_CHECK_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/agent-check-done');
   const AGENT_MERGE_CLAIM_URL = FLEET_URL.replace(/\/agents\/?$/, '/agent-merge-claim');
@@ -2311,8 +2324,18 @@ export function createWorkManager({
    * restarted daemon a green light to spawn a second CLI into the same held
    * context. turnLockedByLivePid already covers both outcomes: it waits while
    * the pid lives and clears the lock once it is dead.
+   *
+   * THE VALUE IS THE ID THE CHILD SERVES, and it used to be the pid-lock path —
+   * which nothing in this file has ever read. A write-only value is not free:
+   * the machine snapshot's per-task RSS (`/fleet/machine`) is the one readout
+   * that answers "which task is holding nine gigabytes", and it was being built
+   * from the dispatch-era `workers` map, which nothing has `.set()` since that
+   * lane was deleted — so the column its own server handler calls the
+   * load-bearing half of the report had never been populated once. This map is
+   * the only place that knows both the pid and whose work it is, so it carries
+   * both. `null` where there is no id to name (a Deploy press is not a task).
    */
-  const workChildren = new Map(); // child process -> lockPath | null
+  const workChildren = new Map(); // child process -> sessionId | agentId | null
   /**
    * Children whose whole PROCESS GROUP must go, not just the child.
    *
@@ -2349,6 +2372,42 @@ export function createWorkManager({
     workChildren.clear();
     groupKillChildren.clear();
   };
+
+  /**
+   * HOW MANY CLIs THIS MACHINE IS RUNNING RIGHT NOW — the number
+   * `MAX_CONCURRENT` is a ceiling on, and the thing that had no counter.
+   *
+   * Every lane, because the bound is on the BOX and not on a lane: session
+   * turns, an agent's turn, a Deploy press's planner, a project check — all of
+   * them land in `workChildren` — plus whatever the caller reports on top of it
+   * (the wiki cartographer, which fleet.mjs owns).
+   *
+   * THE PROJECT CHECK COUNTS, deliberately. It is not a model turn, but it is a
+   * full test or build run in a worktree, which is exactly the kind of process
+   * this ceiling exists to stop stacking. Nothing gates a check, so counting it
+   * cannot deadlock: it only ever delays the NEXT spawn.
+   */
+  const liveTurnCount = () => {
+    const extra = Number(extraLiveTurns() ?? 0);
+    return workChildren.size + (Number.isFinite(extra) && extra > 0 ? extra : 0);
+  };
+
+  /** The live turn children with the id each one serves — what the machine
+   *  snapshot charges its per-task RSS to. Children with no id (the planner)
+   *  are still counted above; they just have nothing to be charged TO. */
+  const liveTurns = () => {
+    const out = [];
+    for (const [ch, id] of workChildren) if (ch?.pid) out.push({ id: id ?? null, pid: ch.pid });
+    return out;
+  };
+
+  /**
+   * WHETHER TO START ONE MORE. See admission.mjs for the whole argument: a
+   * runaway bound on a machine, read at the spawn, surfaced only as the
+   * machine's own measured sentence at the thing that is waiting, and never a
+   * reason to settle a job — a deferred job is re-offered next poll.
+   */
+  const admit = createAdmission({ liveTurnCount });
 
   /**
    * Retire the worktrees of sessions the server says are CLOSED.
@@ -2478,6 +2537,47 @@ export function createWorkManager({
     }
   };
 
+  /**
+   * TELL THE TAB IT IS WAITING ON THE BOX, not on its Claude.
+   *
+   * A deferred turn is invisible from a browser: the composer says "working…"
+   * and the machine simply does not spawn, which looks exactly like a slow
+   * model. So the deferral rides the narration channel the turn would have used
+   * anyway — the turn is still pending, so the server accepts the line — and
+   * says the measured reason and what happens next. The machine's own voice,
+   * for a moment only this side can see; the same shape the planner's "waiting
+   * for the checkout" already keeps.
+   *
+   * ONCE PER SESSION PER WINDOW, because the roster re-offers the same turn on
+   * every poll and restating an unchanged sentence every ten seconds is a POST
+   * loop, not a readout. The clock is cleared the moment a turn for that session
+   * actually starts, so the next stall speaks immediately rather than inheriting
+   * a window from an unrelated one.
+   */
+  const DEFER_SAY_MS = 30_000;
+  const lastDeferSaid = new Map(); // sessionId -> ms
+  const sayTurnDeferred = (sessionId, turnId, reason) => {
+    const now = Date.now();
+    if (now - (lastDeferSaid.get(sessionId) ?? 0) < DEFER_SAY_MS) return;
+    lastDeferSaid.set(sessionId, now);
+    void fetch(ACTIVITY_URL, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${FLEET_TOKEN}`,
+        'User-Agent': USER_AGENT,
+        'Content-Type': 'application/json',
+      },
+      signal: AbortSignal.timeout(10_000),
+      body: JSON.stringify({
+        sessionId,
+        turnId,
+        lines: [`Deferred — ${reason}. The machine retries on its next poll.`],
+      }),
+    }).catch(() => {
+      /* a readout — a dropped line is not an incident */
+    });
+  };
+
   const processWorkTurns = (jobs) => {
     for (const job of jobs ?? []) {
       if (!job || typeof job.id !== 'string' || !job.body || !job.sessionId) continue;
@@ -2485,6 +2585,30 @@ export function createWorkManager({
       // The turn already RAN and its answer sits in the delivery queue — never
       // run it again while the report is merely undelivered.
       if (pendingWorkReports.has(job.id)) continue;
+      /**
+       * THE BOX IS ABOUT TO FALL OVER, OR THIS MACHINE IS ALREADY AT ITS
+       * CEILING. Defer: return without settling and without consuming an
+       * attempt — the shape the live-CLI lock below uses, for the same reason.
+       * The job stays pending and the server re-offers it next poll; settling
+       * it would tell the human their message failed when nothing ran.
+       *
+       * `interactive`, not `churn`: somebody is watching a composer they just
+       * pressed enter in, so this holds out until the box is genuinely about to
+       * die rather than yielding early the way the unattended lanes do.
+       *
+       * AND THE SLOT IS RESERVED BEFORE THE NEXT ITERATION ASKS. This loop is
+       * synchronous and every spawn under it is not — `inPlace` resolves its
+       * callback in a later microtask — so `liveTurnCount()` could not move
+       * between jobs and a roster offering eight turns admitted all eight
+       * against a ceiling of one. See admission.mjs.
+       */
+      const hold = admit('interactive');
+      if (hold) {
+        sayTurnDeferred(job.sessionId, job.id, hold.reason);
+        continue;
+      }
+      const releaseSlot = admit.reserve();
+      lastDeferSaid.delete(job.sessionId);
       workAnswering.add(job.id);
       const place = job.place || job.sessionId;
       /**
@@ -2504,6 +2628,7 @@ export function createWorkManager({
           answer:
             'the server named a working directory this machine refuses to use — close and reopen the tab, then send the message again',
         }).finally(() => workAnswering.delete(job.id));
+        releaseSlot();
         continue;
       }
       // Remembered for every other beat — the sweep, ship, the preview
@@ -3066,7 +3191,13 @@ export function createWorkManager({
               onSpawn: (ch) => {
                 if (!ch) return;
                 spawned.push(ch);
-                workChildren.set(ch, lockPath ?? null);
+                // Keyed to the SESSION it serves — that id is what the machine
+                // snapshot charges this child's memory to.
+                workChildren.set(ch, job.sessionId);
+                // The process exists, so the reserved slot is now counted by
+                // the registry itself. Idempotent — the `finally` below releases
+                // it again for every path that never got here.
+                releaseSlot();
                 // The CLI is spawned `detached`, so its pid IS its process
                 // group id — and every process it starts inherits that, through
                 // `nohup` and `setsid` alike. Remembered per SESSION rather
@@ -3240,6 +3371,10 @@ export function createWorkManager({
           warn(`session turn failed: ${e?.message ?? e}`);
         } finally {
           workAnswering.delete(job.id);
+          // Nothing spawned, or everything already has: releasing twice is the
+          // normal case and costs nothing. A reservation that leaked would
+          // shrink this machine's ceiling for the life of the process.
+          releaseSlot();
           // The turn just changed the directory — say what it looks like now,
           // whether it succeeded or blew up (a failed turn can still have
           // written half a file, and the tab should show that honestly). NOT
@@ -3788,7 +3923,9 @@ export function createWorkManager({
     return [...out];
   };
 
-  const runAgentPlan = async (job) => {
+  /** See `runAgentTurn` — the admission reservation, released the moment the
+   *  planner's CLI exists. */
+  const runAgentPlan = async (job, releaseSlot = () => {}) => {
     const id = String(job.id);
     const tasks = Array.isArray(job.tasks) ? job.tasks : [];
     // CLAIM BEFORE ANYTHING — including before the cheap refusal below.
@@ -3916,7 +4053,11 @@ export function createWorkManager({
           },
           onSpawn: (ch) => {
             planChild = ch;
+            // No id: a Deploy press is not a task, and the snapshot's per-task
+            // rows must not invent one. It still COUNTS against the machine's
+            // ceiling — see liveTurnCount.
             workChildren.set(ch, null);
+            releaseSlot();
             say(`${RUNTIMES[rt]?.label ?? rt} started on this machine`);
             /**
              * ARMED AT THE SPAWN, not at the claim: time spent waiting for the
@@ -3986,8 +4127,27 @@ export function createWorkManager({
     for (const job of jobs.slice(0, 1)) {
       const id = String(job?.id || '');
       if (!id || planning.has(id)) continue;
+      /**
+       * BEFORE THE CLAIM, and that ordering is the whole point: `runAgentPlan`
+       * claims the press as its first act, and a claimed press must be settled
+       * or it sits open holding its cards out of Deploy. NOT claiming is how
+       * this lane declines — the press stays queued, the server offers it
+       * again next poll, and nobody is told their Deploy failed.
+       */
+      const hold = admit('churn');
+      if (hold) {
+        note(`${c.cyan('plan')} ${c.dim(`— holding off: ${hold.reason}`)}`);
+        continue;
+      }
+      // One press a tick, so this lane cannot burst on its own — but the slot
+      // it is about to take has to be visible to the agent-turn lane that runs
+      // moments later in the same reconcile. See admission.mjs.
+      const releaseSlot = admit.reserve();
       planning.add(id);
-      void runAgentPlan(job).finally(() => planning.delete(id));
+      void runAgentPlan(job, releaseSlot).finally(() => {
+        releaseSlot();
+        planning.delete(id);
+      });
     }
   };
 
@@ -4081,6 +4241,42 @@ export function createWorkManager({
     }
   };
 
+  /**
+   * ONE BATCH OF A TURN'S TRACE. See trace.mjs for the whole contract.
+   *
+   * Resolves TRUE for a permanent refusal as well as a success, and that is
+   * deliberate: a server with no such route 404s every batch, and a relay that
+   * held them would fill its buffer, shed the turn's real steps and retry the
+   * same rejected body for the life of the turn. There is no version floor here
+   * — this is a daemon→server report, so an older server simply never learns
+   * the trace and the board renders what it always did.
+   */
+  const postAgentTrace = async (body) => {
+    try {
+      const res = await fetch(AGENT_TRACE_URL, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${FLEET_TOKEN}`,
+          'User-Agent': USER_AGENT,
+          'Content-Type': 'application/json',
+        },
+        signal: AbortSignal.timeout(15_000),
+        body: JSON.stringify(body),
+      });
+      return (
+        res.ok ||
+        (res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429)
+      );
+    } catch {
+      return false; // a blip — the same entries go again at the same seq
+    }
+  };
+
+  /** How long the final flush may hold the settle. Bounded because the settle
+   *  is the turn's contract and the trace is a readout: a wedged uplink costs
+   *  the tail of a trace, never the answer behind it. */
+  const TRACE_FINAL_FLUSH_MS = 8_000;
+
   const postAgentActivity = async (agentId, text) => {
     try {
       await fetch(AGENT_ACTIVITY_URL, {
@@ -4163,7 +4359,10 @@ export function createWorkManager({
       : [];
   };
 
-  const runAgentTurn = async (job) => {
+  /** `releaseSlot` hands back the admission reservation the caller took on this
+   *  turn's behalf, at the moment the CLI actually exists. Idempotent and
+   *  optional — a caller with no reservation passes nothing. */
+  const runAgentTurn = async (job, releaseSlot = () => {}) => {
     const turnId = String(job.id);
     const agentId = String(job.agentId || '');
     const place = String(job.placeId || '');
@@ -4263,6 +4462,30 @@ export function createWorkManager({
        */
       const resume = rt === 'claude' && Boolean(ranMarker && existsSync(ranMarker));
 
+      /**
+       * THE WHOLE STREAM, not just its latest line — see trace.mjs.
+       *
+       * The pulse below is untouched and still sent: it carries staleness (how
+       * long the machine has been quiet), which an append-only list of steps
+       * cannot say, because a list that stopped growing looks exactly like a
+       * list that is finished.
+       */
+      const trace = makeTraceRelay({
+        agentId,
+        turnId,
+        post: postAgentTrace,
+        scrub: envScrub,
+      });
+      /**
+       * Prose the structured event will carry anyway, dropped so a read does
+       * not render twice — but ONLY on a runtime whose stream reaches
+       * `onToolEvent` at all. Codex and agy have their own parsers and never
+       * call it, so dropping their tool prose would blank their agents' traces.
+       * `parse: null` is exactly the claude.mjs stream path. See
+       * CLAUDE_TOOL_PROSE_KINDS.
+       */
+      const doubledKinds = RUNTIMES[rt]?.parse ? null : CLAUDE_TOOL_PROSE_KINDS;
+
       let out = '';
       let child = null;
       try {
@@ -4296,14 +4519,31 @@ export function createWorkManager({
           onActivity: (a) => {
             const line = a?.label;
             if (!line) return;
+            // THE TRACE TAKES EVERY LINE; the pulse takes one every two
+            // seconds. Two channels, one stream, and the drop-sampler stays a
+            // drop-sampler — buffering the pulse would make a stale line look
+            // fresh, which is the one thing it exists to answer.
+            if (!doubledKinds || !doubledKinds.has(a.kind)) trace.prose(a.kind, line);
             const now = Date.now();
             if (now - (lastAgentBeat.get(agentId) ?? 0) < 2_000) return;
             lastAgentBeat.set(agentId, now);
             void postAgentActivity(agentId, envScrub(String(line)).slice(0, 400));
           },
+          // The structured twin of the line above — the same `tool_use` the
+          // Workbench's tool cards are built from, scrubbed at collection by
+          // the builder itself (bounded window BEFORE its caps; see
+          // toolEventOf). A tool it does not know pushes nothing.
+          onToolEvent: (name, input) => {
+            trace.tool(toolEventOf(name, input, wt, envScrub));
+          },
           onSpawn: (ch) => {
             child = ch;
-            workChildren.set(ch, null);
+            // The AGENT it serves — what the machine snapshot charges this
+            // child's memory to.
+            workChildren.set(ch, agentId);
+            // …and the registry now counts what the reservation was standing
+            // in for.
+            releaseSlot();
             noteSessionGroup(agentId, ch.pid);
             // Keyed by PLACE, because the retire sweep iterates directory names
             // and a place id IS one. It is what lets a hard stop actually reach
@@ -4312,6 +4552,18 @@ export function createWorkManager({
           },
         });
       } finally {
+        /**
+         * THE TAIL, BEFORE THE SETTLE — so the last thing the agent did is on
+         * the record by the time the board is told the turn is over.
+         *
+         * The server deliberately does NOT require a pending turn to accept a
+         * trace batch (a late tail is still that turn's record), so a race here
+         * is survivable rather than lossy; flushing first simply means it
+         * almost never happens. Bounded, and the settle is what matters: an
+         * uplink that will not answer costs the tail and nothing else.
+         */
+        trace.stop();
+        await trace.flush(TRACE_FINAL_FLUSH_MS);
         if (child) workChildren.delete(child);
         if (agentChildren.get(place) === child) agentChildren.delete(place);
         if (ranMarker) {
@@ -4423,6 +4675,8 @@ export function createWorkManager({
         else if (now - held.at > AGENT_REPORT_GRACE_MS) agentReported.delete(id);
       }
     }
+    /** One deferral line per tick, however many turns were offered. */
+    let saidPressure = false;
     for (const job of list.slice(0, 4)) {
       const id = String(job?.id || '');
       if (!id || agentTurns.has(id)) continue;
@@ -4450,8 +4704,44 @@ export function createWorkManager({
         continue;
       }
       if (!job.agentId || !job.placeId) continue;
+      /**
+       * NOT NOW — and NOT SETTLED. An agent turn is the heaviest thing this
+       * machine starts (a CLI with build permissions in its own worktree), and
+       * four of them a tick with nothing looking at memory is how the daemon
+       * froze somebody's computer.
+       *
+       * Deferring costs the job nothing: it is unleased, the server re-offers
+       * it on the next poll, and no attempt is consumed. Settling it would be
+       * the opposite — it would send the agent to Stuck over a turn this
+       * machine never ran.
+       *
+       * Checked here rather than inside `runAgentTurn` so a HELD BODY above
+       * still re-POSTs: that path spawns nothing, and holding a finished
+       * turn's settle because the box is busy would park an agent for the
+       * server's whole expiry. One LOG line per tick, not per job — a console
+       * restating one unchanged fact four times is noise.
+       *
+       * The DECISION, though, is per job and has to be: spawns in this loop are
+       * async, so `workChildren` cannot grow between iterations and four turns
+       * would all be admitted against the same stale count. The reserved slot
+       * is what the next iteration sees. See admission.mjs.
+       */
+      const hold = admit('churn');
+      if (hold) {
+        if (!saidPressure) {
+          saidPressure = true;
+          note(`${c.cyan('agent')} ${c.dim(`— holding off: ${hold.reason}`)}`);
+        }
+        continue;
+      }
+      const releaseSlot = admit.reserve();
       agentTurns.add(id);
-      void runAgentTurn(job).finally(() => agentTurns.delete(id));
+      void runAgentTurn(job, releaseSlot).finally(() => {
+        // Belt for every path that never reached a spawn — the release is
+        // idempotent, so the normal case releases twice.
+        releaseSlot();
+        agentTurns.delete(id);
+      });
     }
   };
 
@@ -4547,7 +4837,7 @@ export function createWorkManager({
          * `groupKillChildren` for why this one is exempt from the
          * never-signal-the-group rule.
          */
-        workChildren.set(child, null);
+        workChildren.set(child, agentId);
         groupKillChildren.add(child);
       } catch (e) {
         // TEXT BEFORE FINISH: `finish` captures `text` by value into the
@@ -5089,6 +5379,13 @@ export function createWorkManager({
     reportWorktrees,
     shutdownWork,
     workBusy,
+    // The machine's own admission answer, and what it is counting. Handed to
+    // the loop so the lanes fleet.mjs owns — the wiki cartographer — ask the
+    // same question, and so the machine snapshot can charge memory to the work
+    // holding it.
+    admit,
+    liveTurns,
+    liveTurnCount,
     processAgentPlanJobs,
     processAgentTurnJobs,
     processAgentMergeJobs,

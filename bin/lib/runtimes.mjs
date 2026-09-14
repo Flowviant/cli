@@ -201,6 +201,31 @@ export function toolEventOf(name, input = {}, cwd = '', scrub = (s) => s) {
   }
 }
 
+/**
+ * THE ACTIVITY KINDS `toolEventOf` ALSO ANSWERS — the dedupe rule, stated once.
+ *
+ * A Claude tool call goes down BOTH paths in claude.mjs: `humanizeClaudeTool`
+ * makes a one-line activity and `toolEventOf` makes a structured event, from
+ * the same `tool_use`. A consumer taking both — the agent turn's trace — would
+ * otherwise render every read twice, once as a sentence and once as a card.
+ *
+ * It is the KINDS the structured builder answers, not every tool kind: `LS`
+ * produces a `list` activity and no tool event, so dropping `list` would delete
+ * it from the trace entirely. And it is only safe to apply on the runtimes
+ * whose stream reaches `onToolEvent` at all — codex and agy have their own
+ * parsers, never call it, and would go silent. Both halves are pinned in
+ * trace.test.mjs, because the two functions are edited independently and the
+ * failure is invisible: a dropped prose line looks exactly like a quiet turn.
+ */
+export const CLAUDE_TOOL_PROSE_KINDS = new Set([
+  'read',
+  'write',
+  'search',
+  'glob',
+  'bash',
+  'plan',
+]);
+
 // ── Codex ──────────────────────────────────────────────────────────────────
 
 /**

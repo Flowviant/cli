@@ -118,9 +118,27 @@ export const MACHINE = machineLimits();
  * tests want, and this process is the only party that can see the cores, the
  * RAM and the fan.
  *
- * Sent to the server on every roster poll so it can grow lanes to meet waiting
- * work UNDER this ceiling, and enforced locally besides — the roster can carry
- * more lanes than this, and a ceiling that only exists as a request is not one.
+ * Sent to the server on every roster poll so it can pace what it offers UNDER
+ * this ceiling, and ENFORCED LOCALLY BESIDES — a ceiling that only exists as a
+ * request is not one, and the roster can always offer more than this.
+ *
+ * That second clause was FALSE for a month and this comment went on asserting
+ * it (found 2026-09-14, after the daemon froze somebody's computer). The local
+ * enforcement lived in the dispatch lane's claim path and was deleted with
+ * dispatch on 2026-08-19; nothing replaced it, so every lane that spawns a CLI
+ * — session turns with no slice at all, four agent turns a tick, the planner,
+ * the cartographer — started whatever it was handed. It is true again:
+ * `admission.mjs` counts the live CLI children across every lane and refuses a
+ * new spawn at this number, deferring the job rather than settling it. A stale
+ * comment describing a guard that is not there reads, to the next person,
+ * exactly like a guard that holds — which is how this survived so long.
+ *
+ * AND IT BINDS WITHIN ONE TICK, which the first cut did not. Every lane loop is
+ * synchronous while every spawn under it is not, so the child registry could
+ * not grow between iterations and a single reconcile still admitted everything
+ * it was offered against the count it started with — a ceiling that only bit on
+ * the NEXT tick, after the box was already loaded. `admission.mjs` reserves the
+ * slot at the decision; the reservation argument lives there.
  *
  * MEMORY is the bound, not cores. Cores oversubscribe gracefully (everything
  * gets slower); memory does not (something dies, and not necessarily the

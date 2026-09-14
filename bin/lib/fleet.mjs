@@ -90,7 +90,12 @@ import { claudeAuthContext } from './claudeAuth.mjs';
 async function fetchRoster(
   haveIds,
   livePreviewSessionIds = [],
-  heldSessionIds = []
+  heldSessionIds = [],
+  /** The churn ADMISSION verdict, taken by the caller from the same `admit`
+   *  every unattended lane asks — see the `pr` param below for why it is the
+   *  admission and not the pressure reading alone. Undefined where the caller
+   *  has no admission to offer, which reads exactly like an older daemon. */
+  churnHold = undefined
 ) {
   const url = new URL(FLEET_URL);
   if (haveIds.length) url.searchParams.set('have', haveIds.join(','));
@@ -176,6 +181,53 @@ async function fetchRoster(
     }
   } catch {
     /* env identity is best-effort — the poll must never fail on it */
+  }
+  /**
+   * WHY THIS MACHINE IS NOT TAKING NEW WORK, in its own measured words.
+   *
+   * Three states, and the third is why this is a param and not a header:
+   *   · a reason  — the churn ADMISSION refused; new unattended work is being
+   *                 deferred, and the board can say so AT the agent that is
+   *                 waiting instead of leaving it looking like a slow model.
+   *   · `-`       — asked, and nothing is holding anything back. A POSITIVE
+   *                 fact, which is what lets the server clear a stale reason
+   *                 rather than letting one sit there being true-looking
+   *                 forever.
+   *   · absent    — an older daemon, or a poll with no admission to ask. The
+   *                 reserved meaning, and the reason nothing is sent in that
+   *                 case: silence must not be readable as "fine".
+   *
+   * `FLOWVIANT_NO_PRESSURE_GUARD` no longer silences the param, and should not:
+   * it turns off the MEMORY AND LOAD half, and the concurrency half it does not
+   * touch is still a true account of why nothing is starting. What the operator
+   * asked for is a box that is not second-guessed about its own memory, not an
+   * agent that sits still with no explanation.
+   *
+   * IT IS THE WHOLE ADMISSION, AND IT USED TO BE THE PRESSURE HALF ONLY. The
+   * argument for narrowing it was that "four turns are running" is a capacity
+   * statement — but the effect was worse than the thing it avoided: a machine
+   * refusing every agent turn at its ceiling sent `pr=-`, which says MEASURED
+   * AND FINE, so the server cleared any stored reason and the board fell
+   * through to "nothing has polled this turn for 12m" over a daemon that was
+   * polling every ten seconds and declining on purpose. The machine positively
+   * asserted health at the one moment it was refusing.
+   *
+   * And CLAUDE.md already carves this exact shape out: queueing is said "AT THE
+   * THING THAT IS WAITING, in the moment, never budgeted for in advance on a
+   * global chip". The relayed sentence is `admission.mjs`'s, and it names
+   * ACTIVITY — "the machine is already running 3 CLI turns" — never the
+   * ceiling, never headroom, and never anywhere but on the row that is stalled.
+   * That is the same shape as a CLI relaying that it hit its own limit.
+   *
+   * `URLSearchParams` does its own encoding; the slice is the belt against a
+   * pathological reason.
+   */
+  try {
+    if (churnHold !== undefined) {
+      url.searchParams.set('pr', churnHold ? String(churnHold.reason).slice(0, 160) : '-');
+    }
+  } catch {
+    /* a readout — the poll must never fail on one */
   }
   // An explicit User-Agent is required: Node's default ("node"/empty) trips
   // Cloudflare Bot Fight Mode (403). A descriptive product UA passes.
@@ -832,12 +884,33 @@ export async function runFleetDaemon() {
     reportWorktrees,
     shutdownWork,
     workBusy,
+    admit,
+    liveTurns,
   } = createWorkManager({
     repoRoot,
     baseDir,
     getBaseRef,
     getMcpUrl: () => mcpUrl,
     getLeaseTtl: () => leaseTtlSeconds,
+    /**
+     * The cartographer is a CLI turn too, and it is the one this manager cannot
+     * see — it lives in this closure, not in `workChildren`. Without it the
+     * machine's ceiling would be a ceiling with a hole in it: a wiki sweep over
+     * a large repo is one of the heaviest turns the daemon runs.
+     *
+     * Read lazily (it is only ever called from the reconcile loop, long after
+     * `wikiChild` is declared below), for the same reason `onRepoChanged` is a
+     * callback: work.mjs is imported BY this file and cannot import back.
+     *
+     * `wikiBusy` COUNTS, not just the live child, and that is the wiki lane's
+     * version of the reservation `admission.mjs` describes: the drain sets the
+     * flag the moment it is admitted and the CLI does not exist until several
+     * awaits later, so counting the child alone left a hole exactly wide enough
+     * for the other lanes to spend the slot this one had already taken. The
+     * drain runs at most one CLI at a time, so the flag and the child are the
+     * same one turn and this can never double-count.
+     */
+    extraLiveTurns: () => (wikiBusy || wikiChild ? 1 : 0),
     /**
      * "THE REPO JUST CHANGED — look again."
      *
@@ -1039,6 +1112,7 @@ export async function runFleetDaemon() {
   const wikiQueue = [];
   let wikiBusy = false;
   let wikiChild = null; // the wiki turn's Claude process — tracked so teardown can kill it
+  let wikiHoldSaidAt = 0; // last time the drain said it was waiting on the box
   let lastSweepAt = null; // dedup: run each Regenerate request once
   // …UNLESS IT FAILED. A sweep that ends without WIKI_DONE never finalizes, so
   // the server's `regen_requested_at` stays set and the roster keeps offering
@@ -1218,6 +1292,28 @@ export async function runFleetDaemon() {
 
   async function drainWiki() {
     if (wikiBusy || wikiQueue.length === 0) return;
+    /**
+     * NOT WHILE THE BOX IS UNDER PRESSURE. A sweep is a CLI reading a whole
+     * repository, which is the heaviest turn the daemon runs and the one
+     * nobody is waiting on — so it is the first thing to yield.
+     *
+     * The queue is left INTACT: nothing is claimed, nothing is consumed, and
+     * the reconcile loop calls this again on its next poll. The one thing that
+     * must not happen is setting `wikiBusy` and returning, which would strand
+     * the drain until a restart.
+     */
+    const hold = admit('churn');
+    if (hold) {
+      // Said at most every five minutes: this runs on every poll, and a queued
+      // sweep can sit through a long stretch of pressure — a line every twenty
+      // seconds would be the console restating one unchanged fact all evening.
+      if (Date.now() - wikiHoldSaidAt > 5 * 60_000) {
+        wikiHoldSaidAt = Date.now();
+        note(`${c.cyan('wiki')} ${c.dim(`— holding off: ${hold.reason}`)}`);
+      }
+      return;
+    }
+    wikiHoldSaidAt = 0;
     wikiBusy = true;
     // Held for the WHOLE drain: this loop resets the worktree between tasks, and
     // a consult reading it mid-reset sees files vanish under it.
@@ -1556,7 +1652,15 @@ export async function runFleetDaemon() {
   for (;;) {
     let roster;
     try {
-      roster = await fetchRoster(buildHave(), livePreviewIds(), heldSessionIds());
+      // The churn admission, asked ONCE here and relayed as `pr`: the same
+      // question every unattended lane asks a few lines later, so what the
+      // board is told and what the machine then does cannot disagree.
+      roster = await fetchRoster(
+        buildHave(),
+        livePreviewIds(),
+        heldSessionIds(),
+        admit('churn')
+      );
     } catch (e) {
       if (e.auth) {
         fail(`${e.message} — credential revoked or invalid. Shutting down.`);
@@ -1831,14 +1935,23 @@ export async function runFleetDaemon() {
     // laptops; that is only true if the machine is visible. Per-task RSS is the
     // load-bearing part — "the box is full" is not actionable, "this task is
     // holding 9GB" is.
+    //
+    // …AND IT HAD NEVER BEEN POPULATED ONCE (fixed 2026-09-14). This read the
+    // dispatch-era `workers` map, which nothing has `.set()` since the lane was
+    // deleted on 2026-08-19 — so the list was permanently empty, the server
+    // stored an empty array every poll, and the column its own handler calls
+    // the load-bearing half of this report was blank on every machine that has
+    // ever run. The same shape as the env rotation two blocks up, which
+    // iterated the same dead map and reached no worktree at all.
+    //
+    // `liveTurns()` is the live registry: every CLI child this daemon is
+    // holding, with the session or agent id it serves. Bounded inside the
+    // snapshot, because each row costs a /proc tree walk.
     void reportMergeOutcome(
       MACHINE_URL,
       machineSnapshot({
         worktreeDir: baseDir,
-        tasks: [...workers].map(([, w]) => ({
-          intentId: w.state.intentId ?? null,
-          pid: w.state.child?.pid,
-        })),
+        tasks: liveTurns().map((t) => ({ intentId: t.id, pid: t.pid })),
       })
     );
 

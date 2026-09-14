@@ -66,6 +66,19 @@ The daemon never executes anything the repository declares. An earlier version r
 | _(stored login)_ or `FLOWVIANT_FLEET` | **the daemon** — the project's machine, serving its sessions |
 | `FLOWVIANT_SAFE=1` | restrict the toolset instead of running unattended |
 
+## Not freezing the box
+
+Since 0.83.0 the daemon looks at the machine before it starts another CLI. It counts the turns it is already running against `FLOWVIANT_MAX_CONCURRENT` (default: what the box's memory and cores can hold), and reads free memory and load. When either says no it simply does not spawn — the job stays queued server-side and is offered again on the next poll, and the app is told the machine's own measured reason ("low memory — 612 MB of 16.0 GB available") at whatever is waiting. Nothing is ever killed, and nothing is parked; pressure clears on its own.
+
+Unattended work (agent turns, a Deploy plan, the wiki sweep) yields first. A Workbench turn — somebody watching a composer — holds out until the box is genuinely about to fall over.
+
+| Env | Default | What it does |
+| --- | --- | --- |
+| `FLOWVIANT_MIN_FREE_MB` | `1024` | free memory below this (or below 6% of total, whichever is larger) defers unattended work |
+| `FLOWVIANT_MAX_LOAD_PER_CORE` | `4` | 1-minute load above `cores × this` defers unattended work |
+| `FLOWVIANT_CRITICAL_FREE_MB` | `400` | free memory below this defers a session turn too |
+| `FLOWVIANT_NO_PRESSURE_GUARD=1` | — | turn the memory/load guard off entirely (the concurrency ceiling still holds) |
+
 ## Security posture
 
 Every project member with edit access can run turns on this machine — a
