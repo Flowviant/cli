@@ -25,7 +25,6 @@ import {
   SAFE,
   DAEMON_INSTANCE,
   MACHINE_HOST,
-  CLAIM_MACHINE,
   POLL_SECONDS,
   MAX_CONCURRENT,
   IDLE_SECONDS,
@@ -100,11 +99,7 @@ async function fetchRoster(
    *  every unattended lane asks — see the `pr` param below for why it is the
    *  admission and not the pressure reading alone. Undefined where the caller
    *  has no admission to offer, which reads exactly like an older daemon. */
-  churnHold = undefined,
-  /** Whether an explicit `--claim-machine` is still outstanding — see the
-   *  `take` param below. The watch owns the answer, so the loop cannot keep
-   *  asking after the server has already handed this box the machine. */
-  claiming = false
+  churnHold = undefined
 ) {
   const url = new URL(FLEET_URL);
   if (haveIds.length) url.searchParams.set('have', haveIds.join(','));
@@ -135,11 +130,9 @@ async function fetchRoster(
   // Absent when the host has no readable name — an older daemon looks the same,
   // and both mean "nobody said", which is what the nameless fallback renders.
   if (MACHINE_HOST) url.searchParams.set('mh', MACHINE_HOST);
-  // "MOVE THE MACHINE HERE." Sent only while an explicit `--claim-machine` is
-  // outstanding, and it stops the moment the server answers that this box holds
-  // it — a claim that kept riding every poll would be a standing instruction to
-  // displace whoever asked next, which is not what a one-off command means.
-  if (claiming) url.searchParams.set('take', '1');
+  // NOTHING HERE ASKS FOR THE MACHINE. A poll reports what this box IS; moving
+  // the project's machine onto it is a gesture a person makes in the app, and
+  // the daemon learns the outcome on its next poll like every other holder fact.
   // Which shares this machine is still serving. It rides the poll rather than
   // taking an endpoint of its own: one beat, no floor, and the stale window is
   // the reconcile interval instead of minutes — which matters, because a share
@@ -549,15 +542,13 @@ export function agoLabel(ms) {
  * the person at the keyboard needs to know, and nothing more:
  *
  *   · ABSENT        -> this server does not arbitrate machines. Behave exactly
- *                      as every daemon before 0.84.0 did — zero new paths — and
- *                      if a claim was asked for, say the claim cannot be served
- *                      rather than letting silence read as success.
+ *                      as every daemon before 0.84.0 did — zero new paths.
  *   · mine: true    -> we are the machine. Announce it only if we have been
  *                      standing by, so an ordinary daemon prints nothing new.
  *   · mine: false   -> STAND BY. Keep polling quietly; the restricted roster
  *                      serves us nothing, the auto-handover makes this box the
- *                      machine when the holder dies, and `--claim-machine` is
- *                      the way to stop waiting. Never exit: a standby that quits
+ *                      machine when the holder dies, and the app is where a
+ *                      person moves it sooner. Never exit: a standby that quits
  *                      is a box somebody has to go and restart by hand.
  *
  * Printed ONCE PER DISTINCT HOLDER rather than per poll — a true sentence
@@ -567,29 +558,18 @@ export function agoLabel(ms) {
  * Pure except for the injected `say`, so the whole decision can be proved
  * without a credential, a server or a second box.
  */
-export function createHolderWatch({ claiming = false, say = () => {} } = {}) {
+export function createHolderWatch({ say = () => {} } = {}) {
   let standbyKey = null; // the holder we last announced, or null while we serve
-  let claimPending = Boolean(claiming);
-  let saidUnarbitrated = false;
   return {
-    /** Whether the poll should still carry `take=1`. */
-    claiming: () => claimPending,
     /** Returns 'absent' | 'mine' | 'standby' — the state, for the caller's
      *  own gating and for tests that must not read the console. */
     observe(holder) {
       if (!holder || typeof holder !== 'object' || Array.isArray(holder)) {
-        // An older server, or a poll it did not arbitrate. A claim asked of a
-        // server that cannot answer it must be SAID: the alternative is a flag
-        // that silently does nothing forever.
-        if (claimPending && !saidUnarbitrated) {
-          saidUnarbitrated = true;
-          claimPending = false;
-          say('this server does not arbitrate machines — --claim-machine has nothing to claim.');
-        }
+        // An older server, or a poll it did not arbitrate. Silence, and not one
+        // new path: this is the 0.83.0 daemon.
         return 'absent';
       }
       if (holder.mine === true) {
-        claimPending = false;
         if (standbyKey !== null) {
           standbyKey = null;
           say('this machine now serves the project.');
@@ -607,10 +587,24 @@ export function createHolderWatch({ claiming = false, say = () => {} } = {}) {
       if (key !== standbyKey) {
         standbyKey = key;
         const ago = agoLabel(holder.heardAgo);
+        // THE SENTENCE POINTS AT THE APP, NEVER AT A COMMAND. The owner's
+        // ruling, verbatim: "i dont intend to run or do anything in the
+        // terminal besides npx flowviant or npx flowviant login." So the
+        // terminal surface is those two commands, full stop — this box waits
+        // or a person moves the machine from project settings, and there is no
+        // third thing to type here. An earlier cut of this sentence ended by
+        // telling the person to re-run this daemon with a claim flag; that flag
+        // is deleted, and the gesture is the app's — where the server can see
+        // both boxes and every daemon learns the outcome on its next poll.
+        //
+        // The ago clause DROPS whole when unmeasured — agoLabel returns null
+        // rather than a zero — because "heard 0s ago" is a measurement nobody
+        // took, printed at the one moment the person is deciding whether to
+        // wait.
         say(
           `This project's machine is ${name ?? 'another machine'}${ago ? ` (heard ${ago} ago)` : ''}. ` +
             'It moves here automatically once that machine has been quiet 10 minutes ' +
-            '— or run flowviant --claim-machine.'
+            "— or move it now from the app's project settings."
         );
       }
       return 'standby';
@@ -743,11 +737,10 @@ export async function runFleetDaemon() {
   // Same repo -> this run replaces whatever was serving it. Different repo ->
   // refused, and nothing is signalled. See instance.mjs's header for the rule.
   //
-  // `--takeover` AND `--claim-machine` ARE UNRELATED, and the names invite the
-  // confusion. These flags arbitrate PROCESSES on THIS box — which daemon serves
-  // this repo. `--claim-machine` (config.mjs) moves the PROJECT'S machine from
-  // another box to this one, and the server decides it. Neither implies the
-  // other, and `--no-takeover` does not affect a claim.
+  // `--takeover` ARBITRATES PROCESSES ON THIS BOX and nothing more — which
+  // daemon serves this repo. It says nothing about which BOX serves the
+  // project: that is holdership, the server decides it because only the server
+  // can see both boxes, and a person moves it from the app.
   const instance = acquireInstanceLock(FLEET_TOKEN, repoRoot, {
     takeover:
       process.argv.includes('--takeover') || process.argv.includes('--takeover-downgrade'),
@@ -1839,9 +1832,8 @@ export async function runFleetDaemon() {
   // WHOSE MACHINE THIS IS, as of the last poll the server arbitrated. 'absent'
   // is the reserved meaning — an older server, or a poll with no envpub — and
   // everything downstream of it must read exactly as it did before 0.84.0.
-  const holderWatch = createHolderWatch({ claiming: CLAIM_MACHINE, say: (m) => note(m) });
+  const holderWatch = createHolderWatch({ say: (m) => note(m) });
   let holderState = 'absent';
-  if (CLAIM_MACHINE) note('claim  · asking for this project\'s machine (--claim-machine)');
 
   // ── Push channel: a server wake short-circuits the reconcile sleep so a job is
   // picked up in ~a round trip instead of on the next poll. The socket only
@@ -1898,8 +1890,7 @@ export async function runFleetDaemon() {
         buildHave(),
         livePreviewIds(),
         heldSessionIds(),
-        admit('churn'),
-        holderWatch.claiming()
+        admit('churn')
       );
     } catch (e) {
       if (e.auth) {

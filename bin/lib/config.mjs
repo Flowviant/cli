@@ -221,21 +221,6 @@ export const MACHINE_HOST = (() => {
   }
 })();
 
-/**
- * "MOVE THIS PROJECT'S MACHINE HERE" — an explicit claim, `--claim-machine`.
- *
- * A project has ONE machine, and the server hands holdership to whichever box
- * asks for it while the current holder is silent. That auto-handover is slow on
- * purpose (it must not outrun an agent lease), so this is the way to say "yes,
- * now, I am at this keyboard" and take it from a holder that is still polling.
- *
- * UNRELATED TO `--takeover`, which is the local single-instance lock: that one
- * arbitrates PROCESSES on this box, this one moves the PROJECT'S machine across
- * boxes. `--no-takeover` does not affect it, and neither implies the other.
- */
-export const CLAIM_MACHINE =
-  process.argv.includes('--claim-machine') || process.env.FLOWVIANT_CLAIM_MACHINE === '1';
-
 // The ONE credential. `tokens` (FLOWVIANT_TOKEN / FLOWVIANT_TOKENS / --token /
 // --tokens) stood beside it and carried WORKER tokens into the pre-daemon loop;
 // that principal owns zero tools since dispatch was deleted, and the kind can no

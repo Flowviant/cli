@@ -7,19 +7,24 @@
  * party that can see both — and this file pins the daemon's half of that
  * contract: what it says, how often, and what it does NOT do.
  *
- * The three properties worth a test are all absences or exact words:
+ * The properties worth a test are all absences or exact words:
  *   · a server that does not arbitrate must produce EXACTLY the 0.83.0 daemon,
  *     with no new code path taken at all;
  *   · a standby says its sentence ONCE per holder and never exits;
  *   · a displaced box settles every turn it is holding BEFORE it goes, and
- *     exits ZERO.
+ *     exits ZERO;
+ *   · NOTHING here asks for the machine. The terminal surface is `npx flowviant`
+ *     and `npx flowviant login`, full stop — the owner's own ruling — so the
+ *     explicit move is a press in the app and the daemon only ever learns the
+ *     answer. Pinned as an absence, because an absence passes every test ever
+ *     written against it.
  *
  * Run: node --test bin/lib/holder.test.mjs
  */
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { hostname } from 'node:os';
 import {
   agoLabel,
@@ -67,8 +72,6 @@ test('the hostname is a bounded LABEL, and an unnamed box sends nothing at all',
   // daemon (nobody said) rather than like a box called nothing.
   const src = fleetSource();
   assert.ok(src.includes("if (MACHINE_HOST) url.searchParams.set('mh', MACHINE_HOST);"));
-  // …and the claim rides the poll only while one is outstanding.
-  assert.ok(src.includes("if (claiming) url.searchParams.set('take', '1');"));
 });
 
 // ── how long ago ─────────────────────────────────────────────────────────────
@@ -84,9 +87,9 @@ test('an unmeasurable duration renders NOTHING rather than a number nobody measu
 
 // ── the watch ────────────────────────────────────────────────────────────────
 
-const watch = (claiming = false) => {
+const watch = () => {
   const said = [];
-  return { w: createHolderWatch({ claiming, say: (m) => said.push(m) }), said };
+  return { w: createHolderWatch({ say: (m) => said.push(m) }), said };
 };
 
 test('a server that does not arbitrate produces the 0.83.0 daemon — no state, no words', () => {
@@ -95,21 +98,6 @@ test('a server that does not arbitrate produces the 0.83.0 daemon — no state, 
     assert.equal(w.observe(holder), 'absent');
   }
   assert.deepEqual(said, [], 'silence is what an older server has always produced');
-  assert.equal(w.claiming(), false);
-});
-
-test('--claim-machine against a server with no holder field says so ONCE and carries on', () => {
-  const { w, said } = watch(true);
-  assert.equal(w.claiming(), true, 'the claim rides the poll until it is answered');
-  assert.equal(w.observe(undefined), 'absent');
-  assert.equal(said.length, 1);
-  assert.match(said[0], /does not arbitrate machines/);
-  // …and it stops asking: a `take=1` on every poll forever would be a standing
-  // instruction to displace whoever asks next, which is not what a one-off
-  // command means. The daemon then behaves exactly as today.
-  assert.equal(w.claiming(), false);
-  assert.equal(w.observe(undefined), 'absent');
-  assert.equal(said.length, 1, 'said once, not once a poll');
 });
 
 test('a standby says its sentence once per DISTINCT holder, and never per poll', () => {
@@ -121,7 +109,8 @@ test('a standby says its sentence once per DISTINCT holder, and never per poll',
   assert.equal(
     said[0],
     "This project's machine is mac-mini (heard 34s ago). It moves here automatically " +
-      'once that machine has been quiet 10 minutes — or run flowviant --claim-machine.'
+      "once that machine has been quiet 10 minutes — or move it now from the app's " +
+      'project settings.'
   );
   // A DIFFERENT box is news; the same one again is not.
   w.observe({ mine: false, name: 'studio', heardAgo: 60_000 });
@@ -139,7 +128,8 @@ test('an unnamed holder gets the nameless fallback and still announces once', ()
   assert.equal(
     said[0],
     "This project's machine is another machine. It moves here automatically " +
-      'once that machine has been quiet 10 minutes — or run flowviant --claim-machine.'
+      "once that machine has been quiet 10 minutes — or move it now from the app's " +
+      'project settings.'
   );
   assert.ok(!said[0].includes('heard'), 'an unmeasured duration drops the clause whole');
 });
@@ -158,14 +148,6 @@ test('the handover is announced only to a box that was standing by', () => {
   // by then it IS news.
   w.observe({ mine: false, name: 'mac-mini', heardAgo: 1_000 });
   assert.equal(said.length, 3);
-});
-
-test('an answered claim stops claiming', () => {
-  const { w } = watch(true);
-  assert.equal(w.observe({ mine: false, name: 'mac-mini', heardAgo: 1_000 }), 'standby');
-  assert.equal(w.claiming(), true, 'still outstanding — the server has not handed it over');
-  assert.equal(w.observe({ mine: true }), 'mine');
-  assert.equal(w.claiming(), false);
 });
 
 // ── the stand-down ───────────────────────────────────────────────────────────
@@ -269,7 +251,7 @@ test('holdership is read in exactly one place, and gates nothing else in the loo
   assert.ok(!after.includes('process.exit'));
 });
 
-test('the standby never exits, and the claim flag is not the local takeover flag', () => {
+test('the standby never exits, and standing by gates nothing but copy', () => {
   const src = fleetSource();
   /**
    * A box that quits is a box somebody has to go and restart by hand, which is
@@ -315,12 +297,64 @@ test('the standby never exits, and the claim flag is not the local takeover flag
   // appearing on it is exactly the regression that would be silent.
   assert.equal(src.split("holderState === 'absent'").length - 1, 0);
   assert.equal(src.split("holderState = 'absent'").length - 1, 1);
-  // The two flags are unrelated and the names invite the confusion, so the
-  // parsing sites say so where somebody would be reading.
-  assert.ok(
-    configSource().includes("process.argv.includes('--claim-machine')") &&
-      configSource().includes("process.env.FLOWVIANT_CLAIM_MACHINE === '1'")
-  );
+});
+
+test('NOTHING in the terminal asks for the machine — the gesture is the app\'s', () => {
+  /**
+   * THE OWNER'S RULING, verbatim: "i dont intend to run or do anything in the
+   * terminal besides npx flowviant or npx flowviant login." So a daemon flag
+   * that moves the project's machine is not a smaller version of the right
+   * answer, it is the wrong surface — the move is a press in project settings,
+   * the server performs it (it is the only party that can see both boxes), and
+   * every daemon learns the outcome on its next poll, exactly like every other
+   * holder fact.
+   *
+   * PINNED AS AN ABSENCE, because an absence passes every test ever written
+   * against it: the only thing that stops a flag like this being re-added is
+   * somebody remembering. Keyed on the BANNED STRINGS over a walk of the whole
+   * daemon — never on an import (deleting the import is what a regression does)
+   * and never on the list of files that happened to carry it, since the next
+   * one will be a file not on that list.
+   */
+  const files = [
+    ...readdirSync(new URL('../', import.meta.url))
+      .filter((n) => n.endsWith('.mjs'))
+      .map((n) => ({ name: `bin/${n}`, url: new URL(`../${n}`, import.meta.url) })),
+    ...readdirSync(new URL('./', import.meta.url))
+      .filter((n) => n.endsWith('.mjs'))
+      .map((n) => ({ name: `bin/lib/${n}`, url: new URL(`./${n}`, import.meta.url) })),
+  ];
+  // THE CANARY: a walk that silently found nothing would pass this test over an
+  // empty set forever, which is the inert-pin shape this repo has been bitten by
+  // three times. Both halves — that there are files, and that the daemon itself
+  // is among them.
+  assert.ok(files.length > 40, `the walk must actually read the daemon — saw ${files.length}`);
+  let sawCanary = false;
+  /**
+   * PATTERNS, not exact spellings — deliberately BROADER than the flag that was
+   * deleted, so `claimMachine`, `--claim machine` or a re-spelled env var is
+   * caught too. A ban keyed on one literal only catches a copy-paste of it.
+   */
+  const banned = [
+    [/claim[-_ ]?machine/i, 'a flag or env var that moves the project machine'],
+    [/searchParams\.set\(\s*['"]take['"]/, "a poll param asking for the machine"],
+  ];
+  for (const f of files) {
+    const text = readFileSync(f.url, 'utf8');
+    if (text.includes('acquireInstanceLock')) sawCanary = true;
+    if (f.name === 'bin/lib/holder.test.mjs') continue; // this file IS the ban
+    for (const [pattern, what] of banned) {
+      assert.ok(!pattern.test(text), `${f.name} must not carry ${what} (${pattern})`);
+    }
+  }
+  assert.ok(sawCanary, 'the walk must reach the daemon it is asserting about');
+  // …and the local lock's flags are untouched: `--takeover` arbitrates PROCESSES
+  // on this box and was never the thing that moved the project's machine, so
+  // deleting the claim must not have taken it with it.
   const lock = readFileSync(new URL('./instance.mjs', import.meta.url), 'utf8');
-  assert.ok(lock.includes('--claim-machine'), 'the lock header must disown the other flag');
+  assert.ok(lock.includes('--no-takeover'), 'the local single-instance flags stand');
+  assert.ok(
+    !/claim[-_ ]?machine/i.test(configSource()),
+    'config.mjs parses no flag that moves the project machine'
+  );
 });

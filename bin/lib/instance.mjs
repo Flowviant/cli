@@ -71,12 +71,12 @@
  * `--no-takeover` (or FLOWVIANT_NO_TAKEOVER=1) makes even the same-repo case
  * refuse, for anyone who wants the old ceremony.
  *
- * NOT `--claim-machine`, which is a different scale of thing and shares none of
- * this machinery. Everything in this file is about PROCESSES on ONE box, decided
- * locally against a lock file. `--claim-machine` (config.mjs) asks the SERVER to
- * move the project's one machine from another box to this one, and the server is
- * the only party that can see both. Neither flag implies the other, and
- * `--no-takeover` does not affect a claim.
+ * EVERYTHING IN THIS FILE IS ABOUT PROCESSES ON ONE BOX, decided locally against
+ * a lock file. It says nothing about WHICH BOX serves the project — a project
+ * has one machine and the SERVER arbitrates that, because it is the only party
+ * that can see both boxes. A standby daemon here is a perfectly healthy holder
+ * of this repo's lock; the two questions never meet, and no flag in this file
+ * moves the project's machine.
  *
  * IT FAILS OPEN. A home directory we cannot write to is not a reason to refuse
  * to start; it is a reason to say so and carry on unguarded.
