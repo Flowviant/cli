@@ -522,3 +522,489 @@ test('an agent worktree report names the box that measured it — and a tab repo
   // on a machine that is exempt from arbitration by construction.
   assert.ok(!report.includes("box: { id: pub ?? ''"));
 });
+
+/**
+ * PUBLISHING AN AGENT'S BRANCH (0.86.0) — against a REAL remote.
+ *
+ * Every one of these runs a real `git push` at a real bare repo in a temp dir,
+ * because the failures this feature can have are git's, not JavaScript's: a
+ * refspec that names the wrong side, a force flag that discards commits, a
+ * delete that survives its own guard. A stub for git would test the stub.
+ *
+ * `runtime: 'nope'` is again how a turn settles without a CLI — `canRun`
+ * refuses an unknown runtime — and it is reached PAST the begun guard and past
+ * the worktree cut, which is exactly where a branch worth publishing exists.
+ */
+function originFor(t, repoRoot) {
+  const bare = mkdtempSync(join(tmpdir(), 'fv-origin-'));
+  git(['init', '-q', '--bare', '-b', 'main'], bare);
+  git(['remote', 'add', 'origin', bare], repoRoot);
+  git(['push', '-q', 'origin', 'main'], repoRoot);
+  t.after(() => rmSync(bare, { recursive: true, force: true }));
+  return bare;
+}
+/** '' for a ref that is not there — the absence IS the assertion in half of
+ *  these, so it must not be an exception. */
+const refIn = (dir, ref) => {
+  try {
+    return git(['rev-parse', '--verify', '--quiet', ref], dir);
+  } catch {
+    return '';
+  }
+};
+const reportsIn = (calls) =>
+  calls.filter((c) => c.url.includes('session-worktrees')).flatMap((c) => c.body?.reports ?? []);
+
+test('an agent turn pushes its branch to the name the server gave it, and reports what it pushed', async (t) => {
+  const { m, repoRoot } = managerIn(t);
+  const bare = originFor(t, repoRoot);
+  const { calls } = stubFetch(t);
+  m.processAgentTurnJobs([
+    {
+      id: 'at-p1',
+      agentId: 'ag-p1',
+      placeId: 'a-ag-p1',
+      kind: 'task',
+      task: { id: 'c', title: 'T' },
+      runtime: 'nope',
+      publishTo: 'flowviant/auth-3f9a21',
+    },
+  ]);
+  await until(() => calls.some((c) => c.url.includes('agent-turn-done')));
+  await until(() => refIn(bare, 'refs/heads/flowviant/auth-3f9a21') !== '');
+  // The remote ref is the LOCAL branch — the same commits, not a new branch cut
+  // off base and not the checkout's HEAD.
+  assert.equal(
+    refIn(bare, 'refs/heads/flowviant/auth-3f9a21'),
+    refIn(repoRoot, 'refs/heads/session/a-ag-p1')
+  );
+  /**
+   * AND THE SERVER IS TOLD, because it stores nothing it was not told: it
+   * composes the target name and sends it, and until a machine reports a push
+   * the agent reads as never published. A push nobody reported is a ref no
+   * surface may name and no later job may fetch or delete.
+   */
+  await until(() => reportsIn(calls).some((r) => r.published));
+  const rep = reportsIn(calls).find((r) => r.published);
+  assert.equal(rep.sessionId, 'a-ag-p1');
+  assert.equal(rep.published.ref, 'flowviant/auth-3f9a21');
+  assert.equal(rep.published.sha, refIn(repoRoot, 'refs/heads/session/a-ag-p1'));
+  assert.ok(!('publishError' in rep), 'a report carries the push or the failure, never both');
+  await until(() => !m.workBusy());
+});
+
+test('a push that fails is reported in git\'s own words and settles the turn anyway', async (t) => {
+  const { m } = managerIn(t);
+  // NO origin at all — the commonest real failure (a box with no push rights
+  // is the same shape). The turn must still settle: a push is tail work.
+  const { calls } = stubFetch(t);
+  m.processAgentTurnJobs([
+    {
+      id: 'at-p2',
+      agentId: 'ag-p2',
+      placeId: 'a-ag-p2',
+      kind: 'task',
+      task: { id: 'c', title: 'T' },
+      runtime: 'nope',
+      publishTo: 'flowviant/auth-3f9a21',
+    },
+  ]);
+  await until(() => calls.some((c) => c.url.includes('agent-turn-done')));
+  const settle = calls.find((c) => c.url.includes('agent-turn-done'));
+  assert.match(settle.body.answer, /cannot run nope/, 'the turn settled on its own terms');
+  assert.ok(
+    !/push|origin|publish/i.test(settle.body.answer),
+    'a failed push may not colour the turn\'s own answer'
+  );
+  await until(() => reportsIn(calls).some((r) => r.publishError));
+  const rep = reportsIn(calls).find((r) => r.publishError);
+  assert.ok(!('published' in rep));
+  assert.match(rep.publishError, /origin/i, 'git\'s own reason, relayed');
+  assert.ok(rep.publishError.length <= 300);
+  await until(() => !m.workBusy());
+});
+
+test('no target means no key — absence keeps its one meaning', async (t) => {
+  const { m, repoRoot } = managerIn(t);
+  originFor(t, repoRoot);
+  const { calls } = stubFetch(t);
+  // A project with publishing OFF, or a server older than this daemon: both
+  // arrive as an absent `publishTo`, and both must leave the agent reading as
+  // never published rather than as a push that failed.
+  m.processAgentTurnJobs([
+    {
+      id: 'at-p3',
+      agentId: 'ag-p3',
+      placeId: 'a-ag-p3',
+      kind: 'task',
+      task: { id: 'c', title: 'T' },
+      runtime: 'nope',
+    },
+  ]);
+  await until(() => calls.some((c) => c.url.includes('agent-turn-done')));
+  await until(() => !m.workBusy());
+  assert.equal(refIn(repoRoot, 'refs/heads/flowviant/auth-3f9a21'), '');
+  // The sweep is where a report comes from when no push happened, so ask for
+  // one directly rather than inferring from silence.
+  m.reportWorktrees(['a-ag-p3']);
+  await until(() => reportsIn(calls).length > 0);
+  const rep = reportsIn(calls).find((r) => r.sessionId === 'a-ag-p3');
+  assert.ok(rep, 'the sweep must still measure an unpublished agent');
+  assert.ok(!('published' in rep) && !('publishError' in rep));
+});
+
+test('a begun agent whose branch was published is CONTINUED here, on the commits it already made', async (t) => {
+  const { m, repoRoot, baseDir } = managerIn(t);
+  const bare = originFor(t, repoRoot);
+  // The work as another box left it: a commit on the remote under the agent's
+  // published name, and nothing on this box — no worktree, no local branch.
+  git(['checkout', '-q', '-b', 'tmp-published'], repoRoot);
+  writeFileSync(join(repoRoot, 'b.txt'), 'the work');
+  git(['add', '-A'], repoRoot);
+  git(['commit', '-qm', 'work from the other box'], repoRoot);
+  const published = git(['rev-parse', 'HEAD'], repoRoot);
+  git(['push', '-q', 'origin', 'tmp-published:refs/heads/flowviant/carry-3f9a21'], repoRoot);
+  git(['checkout', '-q', 'main'], repoRoot);
+  git(['branch', '-qD', 'tmp-published'], repoRoot);
+
+  const { calls } = stubFetch(t);
+  m.processAgentTurnJobs([
+    {
+      id: 'at-f1',
+      agentId: 'ag-f1',
+      placeId: 'a-ag-f1',
+      kind: 'task',
+      task: { id: 'c', title: 'T' },
+      begun: true,
+      begunOn: 'mac-mini',
+      publishedRef: 'flowviant/carry-3f9a21',
+      runtime: 'nope',
+    },
+  ]);
+  await until(() => calls.some((c) => c.url.includes('agent-turn-done')));
+  const settle = calls.find((c) => c.url.includes('agent-turn-done'));
+  assert.match(settle.body.answer, /cannot run nope/, 'the turn ran past the guard');
+  assert.ok(!String(settle.body.answer).includes(GUARD_SENTENCE));
+  // THE COMMITS, not a fresh branch off base. This is the whole difference
+  // between continuing the work and redoing it.
+  assert.equal(refIn(repoRoot, 'refs/heads/session/a-ag-f1'), published);
+  assert.equal(existsSync(join(baseDir, 'sessions', 'a-ag-f1')), true);
+  await until(() => !m.workBusy());
+});
+
+test('a fetch that cannot land falls through to the refusal, extended with git\'s reason', async (t) => {
+  const { m, repoRoot, baseDir } = managerIn(t);
+  originFor(t, repoRoot);
+  const { calls } = stubFetch(t);
+  // The server named a ref this remote does not have — the shape is right, the
+  // branch is not there. Continuing on a fetch that materialized nothing is the
+  // silent redo the guard exists to prevent, wearing this feature's name.
+  m.processAgentTurnJobs([
+    {
+      id: 'at-f2',
+      agentId: 'ag-f2',
+      placeId: 'a-ag-f2',
+      kind: 'task',
+      task: { id: 'c', title: 'T' },
+      begun: true,
+      begunOn: 'mac-mini',
+      publishedRef: 'flowviant/gone-3f9a21',
+      runtime: 'nope',
+    },
+  ]);
+  await until(() => calls.some((c) => c.url.includes('agent-turn-done')));
+  const settle = calls.find((c) => c.url.includes('agent-turn-done'));
+  assert.equal(settle.body.outcome, 'nothing');
+  assert.ok(settle.body.answer.startsWith(GUARD_SENTENCE), 'the existing sentence is the fallback');
+  assert.match(settle.body.answer, /its work is on mac-mini/);
+  assert.match(settle.body.answer, /Its published branch could not be fetched \(.+\)\./);
+  // Nothing was cut and nothing was run — the guard's own assertions, which a
+  // failed fetch must not weaken.
+  assert.equal(refIn(repoRoot, 'refs/heads/session/a-ag-f2'), '');
+  assert.equal(existsSync(join(baseDir, 'sessions', 'a-ag-f2')), false);
+  await until(() => !m.workBusy());
+});
+
+test('a landed merge retires the published ref; a failed one keeps it', async (t) => {
+  const { m, repoRoot, baseDir } = managerIn(t);
+  const bare = originFor(t, repoRoot);
+  git(['push', '-q', 'origin', 'main:refs/heads/flowviant/done-3f9a21'], repoRoot);
+  git(['push', '-q', 'origin', 'main:refs/heads/flowviant/kept-3f9a21'], repoRoot);
+  const { calls } = stubFetch(t);
+  // A branch already on base: `count === 0` is the cheapest success this lane
+  // has, and success is the only thing the delete hangs off.
+  const wt = join(baseDir, 'sessions', 'a-ag-m1');
+  git(['worktree', 'add', '-q', '-b', 'session/a-ag-m1', wt, 'main'], repoRoot);
+  m.processAgentMergeJobs([
+    {
+      agentId: 'ag-m1',
+      placeId: 'a-ag-m1',
+      agentName: 'auth',
+      stale: false,
+      publishedRef: 'flowviant/done-3f9a21',
+    },
+  ]);
+  await until(() => calls.some((c) => c.url.includes('agent-merge-done')));
+  assert.equal(calls.find((c) => c.url.includes('agent-merge-done')).body.ok, true);
+  await until(() => refIn(bare, 'refs/heads/flowviant/done-3f9a21') === '');
+
+  // …and a merge that FAILED keeps its branch, which is the whole point of the
+  // branch. No worktree here, so the lane reports a failure without touching
+  // git at all.
+  m.processAgentMergeJobs([
+    {
+      agentId: 'ag-m2',
+      placeId: 'a-ag-m2',
+      agentName: 'billing',
+      stale: false,
+      publishedRef: 'flowviant/kept-3f9a21',
+    },
+  ]);
+  await until(() => calls.filter((c) => c.url.includes('agent-merge-done')).length >= 2);
+  await tick();
+  const second = calls.filter((c) => c.url.includes('agent-merge-done'))[1];
+  assert.equal(second.body.ok, false);
+  assert.notEqual(refIn(bare, 'refs/heads/flowviant/kept-3f9a21'), '');
+});
+
+test('the publish is tail work: after the settle, and outside the place lock', () => {
+  const turn = fnBody(workSource(), 'runAgentTurn');
+  const lockAt = turn.indexOf('await inPlace(place, place.startsWith(\'a-\')');
+  const lastAt = turn.indexOf('if (reply?.review === true) await runCheck(agentId, wt);');
+  const pubAt = turn.indexOf('await publishAgentBranch(place, job.publishTo)');
+  assert.ok(lockAt > -1, 'the turn must still take its place lock');
+  assert.ok(lastAt > lockAt, 'the check runs inside the lock, as the last thing in it');
+  assert.ok(pubAt > lastAt, 'the publish must exist, after the lock block');
+  /**
+   * A push is a blocking network call that can hang for its whole timeout, and
+   * it is worth nothing beside the turn's answer. INSIDE the lock it would hold
+   * the next turn behind a remote's bad day; BEFORE the settle it would hold the
+   * board behind one. The two slices are what prove both: every settle is above
+   * it, and the lock block CLOSES between the last statement in it and this.
+   */
+  assert.ok(
+    turn.slice(lockAt, pubAt).includes('postAgentTurn('),
+    'the settle must be inside the lock block above'
+  );
+  assert.match(
+    turn.slice(lastAt, pubAt),
+    /\}\);/,
+    'the publish sits after the closing of the inPlace block, not inside it'
+  );
+  // Never able to fail a turn that is already settled.
+  assert.ok(/publishAgentBranch\(place, job\.publishTo\)[\s\S]{0,200}catch/.test(turn));
+  // …and an ABSENT target is an instruction to forget: the sweep republishes
+  // from this process's own memory, so without this a project that turned
+  // publishing off went on pushing for the life of the daemon.
+  assert.ok(turn.includes('if (!job.publishTo) {'), 'the absent target must be handled, not ignored');
+  assert.ok(turn.includes('agentPublished.delete(place);'));
+  assert.ok(turn.includes('agentRemoteAt.delete(place);'));
+});
+
+/**
+ * THE RETIREMENT IS TAIL WORK TOO — the same placement argument the publish
+ * above makes, which this half did not make when it shipped.
+ *
+ * The delete hung off `report`, and every `report` call in `runAgentMerge` is
+ * inside `inPlace(place, true, …)` — the place WRITER lock. `gitNet` is
+ * `execFileSync`, so a stalling remote held this agent's lock and blocked the
+ * event loop for up to a minute AFTER the merge had already settled, with
+ * nothing left that the delay served.
+ */
+test('the published ref is retired after the settle and outside the place lock', () => {
+  const fn = fnBody(workSource(), 'runAgentMerge');
+  const lockAt = fn.indexOf('await inPlace(place, true, async () => {');
+  const finallyAt = fn.indexOf("detail: 'the merge did not complete — check the daemon log',");
+  const delAt = fn.indexOf('publishDeleteArgs(landedRef)');
+  assert.ok(lockAt > -1, 'the merge must still take the place writer lock');
+  assert.ok(finallyAt > lockAt, 'the unreported belt closes the lock block');
+  assert.ok(delAt > finallyAt, 'the delete must sit past the lock block, in the tail');
+  // In the `finally`, so a throw between the ok settle and the end of the
+  // locked block cannot strand a ref no later merge job will ever carry.
+  assert.ok(fn.slice(0, delAt).lastIndexOf('} finally {') > lockAt);
+  // `report` RECORDS the ref and nothing else — one place, so a fourth success
+  // site cannot forget it — and only on a success.
+  assert.ok(fn.includes("if (body?.ok === true) landedRef = job.publishedRef ?? null;"));
+  // The record goes with the ref, or the next sweep pushes it straight back as
+  // an orphan no later merge job can ever carry.
+  assert.ok(fn.slice(delAt - 400, delAt).includes('agentPublished.delete(place);'));
+});
+
+/**
+ * THE PULL REQUEST'S HEAD IS THE PUBLISHED REF (0.86.0).
+ *
+ * PR mode pushed `session/a-<uuid>` and opened the PR on it, so on the projects
+ * this feature is most for — the ones where people read branches in a host UI —
+ * the branch under review was the opaque name the feature exists to replace,
+ * the readable `flowviant/*` ref was the one the cleanup retired, and the uuid
+ * ref outlived every merge. Pinned in the source because `gh` is not runnable
+ * here, and pinned as all four call sites because three of four would leave the
+ * PR pointing at a head nobody pushed.
+ */
+test('a PR-mode merge reviews and retires ONE ref — the published one', () => {
+  const fn = fnBody(workSource(), 'runAgentMerge');
+  const prAt = fn.indexOf('if (job.prMode) {');
+  const verifyAt = fn.indexOf('const tipOnBase = () => {');
+  assert.ok(prAt > -1 && verifyAt > prAt, 'the PR block must still exist, above the verify');
+  const pr = fn.slice(prAt, verifyAt);
+  assert.ok(
+    pr.includes('ownBranch && isPublishRef(job.publishedRef) ? job.publishedRef : branch'),
+    'the head is the published ref, and only for this agent’s own branch'
+  );
+  assert.ok(pr.includes("const ownBranch = branch === `session/${place}`;"));
+  for (const call of [
+    "execFileSync('gh', ['pr', 'view', head,",
+    "['pr', 'create', '--head', head,",
+    "execFileSync('gh', ['pr', 'merge', head,",
+  ]) {
+    assert.ok(pr.includes(call), `the PR head is not carried into: ${call}`);
+  }
+  // The push that precedes them carries the same lease the publish lane uses,
+  // and is TIMED — it runs inside the writer lock.
+  assert.ok(pr.includes('publishPushArgs(place, head, seen?.ref === head ? seen.sha : null)'));
+  assert.ok(/gitNet\(\s*publishPushArgs\(place, head/.test(pr));
+});
+
+test('a fetch is only a continue once the branch is MEASURED here', () => {
+  const fn = fnBody(workSource(), 'fetchPublishedBranch');
+  /**
+   * A fetch that exits 0 having created nothing is not a failure git reports —
+   * and continuing on one walks straight into `placeWtFor` cutting a fresh
+   * branch off base, which is the context-free redo the begun guard exists to
+   * prevent, wearing this feature's name. So the ref is re-READ before `ok`,
+   * and `ok` is the only answer the caller continues on.
+   */
+  const fetchAt = fn.indexOf('gitNet(args');
+  const verifyAt = fn.indexOf('const sha = agentBranchSha(place);');
+  const okAt = fn.indexOf('return { ok: true }');
+  assert.ok(fetchAt > -1 && verifyAt > fetchAt, 'the ref must be re-read after the fetch');
+  assert.ok(okAt > verifyAt, 'ok may only be returned past the measurement');
+  // Three answers, because two would lie: nothing to try, a measured failure,
+  // and a measured success. `null` must leave the refusal sentence untouched.
+  assert.ok(fn.includes('if (!args) return null;'));
+  /**
+   * AND THE FETCH IS AN OBSERVATION OF THE REMOTE, recorded as one. A box that
+   * continues an agent it never started has seen that ref exactly once — here —
+   * and without recording it, its own first push would carry no lease.
+   */
+  const seenAt = fn.indexOf('agentRemoteAt.set(place, { ref, sha })');
+  assert.ok(seenAt > verifyAt && seenAt < okAt, 'a measured fetch must record what it saw');
+});
+
+/**
+ * THE LEASE IS THIS PROCESS'S OWN SIGHTING — proven against a real remote, with
+ * this daemon's own `git fetch` in the middle of it.
+ *
+ * The bare `--force-with-lease` expects the remote-tracking ref, and the
+ * worktree sweep refreshes that ref itself. The sequence below is what that
+ * costs: a rival box publishes over the same name, OUR fetch learns it, and the
+ * next push then overwrites the rival's commits with the lease still nominally
+ * held. With the explicit lease the same push is refused and REPORTED, which is
+ * the promise `agentPublish.mjs` makes in its own comment.
+ */
+test('a rival push is refused even after this daemon has fetched the ref', async (t) => {
+  const { m, repoRoot, baseDir } = managerIn(t);
+  const bare = originFor(t, repoRoot);
+  const { calls } = stubFetch(t);
+  const job = (id) => ({
+    id,
+    agentId: 'ag-l1',
+    placeId: 'a-ag-l1',
+    kind: 'task',
+    task: { id: 'c', title: 'T' },
+    runtime: 'nope',
+    publishTo: 'flowviant/lease-3f9a21',
+  });
+  m.processAgentTurnJobs([job('at-l1')]);
+  await until(() => refIn(bare, 'refs/heads/flowviant/lease-3f9a21') !== '');
+  await until(() => !m.workBusy());
+  const ours = refIn(repoRoot, 'refs/heads/session/a-ag-l1');
+
+  // ANOTHER BOX publishes over the same name. Its commit is the one this must
+  // not discard.
+  git(['checkout', '-q', '-b', 'tmp-rival'], repoRoot);
+  writeFileSync(join(repoRoot, 'rival.txt'), 'the other box');
+  git(['add', '-A'], repoRoot);
+  git(['commit', '-qm', 'from the other box'], repoRoot);
+  const rival = git(['rev-parse', 'HEAD'], repoRoot);
+  git(['push', '-q', '--force', 'origin', 'tmp-rival:refs/heads/flowviant/lease-3f9a21'], repoRoot);
+  git(['checkout', '-q', 'main'], repoRoot);
+  git(['branch', '-qD', 'tmp-rival'], repoRoot);
+  // …AND THIS DAEMON LEARNS OF IT, exactly as the worktree sweep does on its own
+  // beat. This one line is what launders a bare lease.
+  git(['fetch', 'origin', '--quiet'], repoRoot);
+  assert.notEqual(rival, ours);
+
+  // Our branch moves on, and the next turn publishes it.
+  const wt = join(baseDir, 'sessions', 'a-ag-l1');
+  writeFileSync(join(wt, 'ours.txt'), 'our work');
+  git(['add', '-A'], wt);
+  git(['commit', '-qm', 'our later work'], wt);
+  const before = calls.length;
+  m.processAgentTurnJobs([job('at-l2')]);
+  await until(() => calls.slice(before).some((c) => c.url.includes('agent-turn-done')));
+  await until(() => !m.workBusy());
+
+  // THE RIVAL'S COMMIT IS STILL THERE. A rival writer is a failure we report,
+  // never work we silently discard.
+  assert.equal(refIn(bare, 'refs/heads/flowviant/lease-3f9a21'), rival);
+  await until(() => reportsIn(calls).some((r) => r.publishError));
+  assert.match(reportsIn(calls).find((r) => r.publishError).publishError, /stale info|rejected/i);
+});
+
+/**
+ * TURNING THE SWITCH OFF STOPS THE PUSHING, and the sweep is where it did not.
+ *
+ * The settle path reads `job.publishTo` and so honours the switch immediately;
+ * the SWEEP republishes from this process's own memory, which no toggle ever
+ * cleared — so an already-publishing agent went on pushing every commit it made
+ * for the life of the daemon, while the settings copy said "publishes nothing
+ * further". The absent key is the instruction to forget.
+ */
+test('an absent target makes the sweep forget the agent, not keep pushing it', async (t) => {
+  const { m, repoRoot, baseDir } = managerIn(t);
+  const bare = originFor(t, repoRoot);
+  const { calls } = stubFetch(t);
+  m.processAgentTurnJobs([
+    {
+      id: 'at-o1',
+      agentId: 'ag-o1',
+      placeId: 'a-ag-o1',
+      kind: 'task',
+      task: { id: 'c', title: 'T' },
+      runtime: 'nope',
+      publishTo: 'flowviant/off-3f9a21',
+    },
+  ]);
+  await until(() => refIn(bare, 'refs/heads/flowviant/off-3f9a21') !== '');
+  await until(() => !m.workBusy());
+  const published = refIn(bare, 'refs/heads/flowviant/off-3f9a21');
+
+  // The owner turns publishing off; the branch moves on regardless.
+  const wt = join(baseDir, 'sessions', 'a-ag-o1');
+  writeFileSync(join(wt, 'after.txt'), 'work done after the switch');
+  git(['add', '-A'], wt);
+  git(['commit', '-qm', 'after the switch'], wt);
+  m.processAgentTurnJobs([
+    {
+      id: 'at-o2',
+      agentId: 'ag-o1',
+      placeId: 'a-ag-o1',
+      kind: 'task',
+      task: { id: 'c', title: 'T' },
+      runtime: 'nope',
+    },
+  ]);
+  await until(() => calls.filter((c) => c.url.includes('agent-turn-done')).length >= 2);
+  await until(() => !m.workBusy());
+  // The sweep is the leak's road — ask for one directly rather than waiting a
+  // minute for the beat.
+  m.reportWorktrees(['a-ag-o1']);
+  await until(() => reportsIn(calls).some((r) => r.sessionId === 'a-ag-o1'));
+  await tick();
+  assert.equal(
+    refIn(bare, 'refs/heads/flowviant/off-3f9a21'),
+    published,
+    'a switched-off project must not keep pushing an agent it already published'
+  );
+});

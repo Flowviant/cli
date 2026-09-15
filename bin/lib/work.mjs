@@ -40,6 +40,13 @@ import {
   MODEL,
 } from './config.mjs';
 import { git, gitRaw, splitNul, baseBranchName, isSafePathSegment } from './git.mjs';
+import {
+  isPublishRef,
+  publishPushArgs,
+  publishFetchArgs,
+  publishDeleteArgs,
+  publishErrorText,
+} from './agentPublish.mjs';
 import { createLandedObserver } from './landed.mjs';
 import { listenersIn, measureListeners, listenersSupported } from './listeners.mjs';
 import { measureProcesses, liveGroups, processesSupported } from './processes.mjs';
@@ -619,6 +626,182 @@ export function createWorkManager({
     return place === REPO_PLACE ? repoRoot : join(baseDir, 'sessions', place);
   };
 
+  // ── PUBLISHING AN AGENT'S BRANCH ───────────────────────────────────────────
+  //
+  // The server names the target (`agentTurnJobs[].publishTo`) and this machine
+  // pushes to it. Two laws hold the whole lane up:
+  //
+  // A PUSH NEVER BLOCKS OR FAILS A TURN. It is tail work after the settle, it
+  // is try/catch'd like every sweep, and a failure is REPORTED in git's own
+  // words rather than thrown. An agent whose remote push fails has still done
+  // its work, still committed it, and still settled.
+  //
+  // THE SERVER LEARNS OF A PUSH ONLY BY BEING TOLD. Nothing here composes a
+  // name: an absent `publishTo` is a project that has publishing off, or a
+  // server older than this daemon, and in both the honest behaviour is to push
+  // nothing and report nothing. Absence keeps one meaning.
+  /**
+   * WHAT THIS MACHINE LAST DID WITH EACH AGENT'S BRANCH, by place —
+   * `{ ref, sha }` for a push that landed, `{ ref, error, at, tried }` for one
+   * that did not. Mutually exclusive by construction, which is what makes the
+   * report's two keys mutually exclusive without a second rule.
+   *
+   * Process-local on purpose: it is a record of what THIS daemon pushed, so a
+   * restart re-pushes once and re-reports — a push of the same sha to the same
+   * ref is a no-op at the remote, and re-learning beats trusting a file about
+   * something a rebase can invalidate.
+   */
+  const agentPublished = new Map();
+  /**
+   * WHAT THIS PROCESS HAS SEEN AT EACH AGENT'S REMOTE REF — `{ ref, sha }`, and
+   * the ONLY input to the push's lease.
+   *
+   * It is deliberately NOT `agentPublished`: that map is the REPORT record (what
+   * this machine pushed, and what the server may be told), while this one is an
+   * observation of the REMOTE's own position, which a box also gets by FETCHING
+   * a ref it never pushed. A box that fetch-continues an agent has seen the ref
+   * and must be able to lease against it; a box that has seen nothing pushes
+   * with no force flag at all.
+   *
+   * Process-local for the same reason the record beside it is: a restart has
+   * observed nothing, and an unforced push is the honest thing to do about that
+   * — it lands, or it refuses and says so.
+   */
+  const agentRemoteAt = new Map();
+  /** A failed push retries on the next sweep, but not FOREVER at sweep cadence:
+   *  a remote that refuses (no credentials on this box, a protected prefix)
+   *  would otherwise cost a blocking network call per agent per minute for the
+   *  life of the daemon. A moved branch always retries immediately — the
+   *  throttle is on repeating the SAME attempt, never on new work. */
+  const PUBLISH_RETRY_MS = 5 * 60_000;
+  /**
+   * A NETWORK GIT CALL, TIMED AND NON-INTERACTIVE.
+   *
+   * `execFileSync` blocks the daemon's whole event loop — the reason every `gh`
+   * call on the merge path carries a timeout — and a push is the call most
+   * likely to hang: a credential helper with nothing to answer it, a remote
+   * black hole. Unattended tail work nobody asked for must not be able to stop
+   * every turn on the machine, so it is bounded here and `GIT_TERMINAL_PROMPT=0`
+   * turns a prompt into an immediate, reportable failure.
+   */
+  const gitNet = (args, ms) =>
+    execFileSync('git', args, {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: ms,
+      env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+    });
+  /** The tip of an agent's local branch, or null when this box does not hold it
+   *  — which is a perfectly ordinary state (the begun-guard's whole subject) and
+   *  means there is nothing to publish, never that a push failed. */
+  const agentBranchSha = (place) => {
+    try {
+      return (
+        git(['rev-parse', '--verify', '--quiet', `refs/heads/session/${place}`], repoRoot) || null
+      );
+    } catch {
+      return null;
+    }
+  };
+  /**
+   * PUSH ONE AGENT'S BRANCH TO THE NAME THE SERVER GAVE IT.
+   *
+   * Returns TRUE when the recorded state CHANGED, because the caller's next act
+   * is a worktree report and a report that says what the last one said is a
+   * write per minute restating a fact. The rule this serves is the one every
+   * settle keeps: an action that changes what the machine would measure must
+   * cause a new measurement — and only then.
+   *
+   * Never throws.
+   */
+  const publishAgentBranch = async (place, target) => {
+    const sha = agentBranchSha(place);
+    if (!sha) return false;
+    const prev = agentPublished.get(place);
+    if (prev?.ref === target && prev.sha === sha) return false; // already there
+    if (
+      prev?.ref === target &&
+      prev.error &&
+      prev.tried === sha &&
+      Date.now() - (prev.at ?? 0) < PUBLISH_RETRY_MS
+    )
+      return false; // the same attempt failed moments ago
+    // THE LEASE IS THIS PROCESS'S OWN LAST SIGHTING of that ref, and nothing
+    // else — never git's remote-tracking ref, which this daemon's own sweep
+    // fetch refreshes (the argument is in `publishPushArgs`). An expectation
+    // recorded against a DIFFERENT ref is no expectation for this one.
+    const seen = agentRemoteAt.get(place);
+    // A ref that is not the server's shape never reaches argv. Silent, because
+    // a refusal here is a feature not happening on this turn, not a failure of
+    // it — and a `publishError` about a value we declined to use would be this
+    // machine reporting on a push it never attempted.
+    const args = publishPushArgs(place, target, seen?.ref === target ? seen.sha : null);
+    if (!args) return false;
+    try {
+      gitNet(args, 60_000);
+      agentPublished.set(place, { ref: target, sha });
+      agentRemoteAt.set(place, { ref: target, sha });
+      return true;
+    } catch (e) {
+      const error = publishErrorText(envScrub(e?.stderr?.toString?.() || e?.message || ''));
+      agentPublished.set(place, { ref: target, error, at: Date.now(), tried: sha });
+      // A repeat of a failure already reported is not news; the server's stored
+      // sentence is already this one.
+      return !(prev?.error === error && prev.ref === target);
+    }
+  };
+  /**
+   * BRING A PUBLISHED BRANCH BACK DOWN — the other half of the durability
+   * promise, and the only thing that lets an agent's work outlive its box.
+   *
+   * Reached from ONE place: the begun-guard's refusal arm, where this machine
+   * has just MEASURED that it holds neither the agent's worktree nor its branch.
+   * The server only sends `publishedRef` when it heard about a real push, so
+   * this is not a guess at a remote branch — it is a fetch of one a machine
+   * reported writing.
+   *
+   * ── WHAT IT RECOVERS, AND WHAT IT CANNOT ──
+   *
+   * COMMITS COME BACK. The CONVERSATION DOES NOT: the CLI's held context lives
+   * in the box that ran it and nothing here transports it. The turn kickoff
+   * re-prompts from the card, which is the honest continuation — an agent that
+   * picks up its own commits and re-reads its own card, never one that remembers
+   * the argument. Nothing this returns may be phrased as if it did.
+   *
+   * THREE ANSWERS, because two would lie. `null` is "there was nothing to try"
+   * (no ref, or one whose shape this machine will not put in argv), and it must
+   * leave the existing refusal EXACTLY as it was — a sentence about a fetch
+   * nobody attempted is worse than the plain refusal. `{ ok: false, why }` is a
+   * measured failure, relayed in git's own words. `{ ok: true }` is only ever
+   * returned after re-reading the ref: a fetch that exits 0 having created
+   * nothing would otherwise walk straight into `placeWtFor` cutting a fresh
+   * branch off base — the context-free redo the guard above exists to prevent,
+   * wearing this feature's name.
+   */
+  const fetchPublishedBranch = (place, ref) => {
+    const args = publishFetchArgs(ref, place);
+    if (!args) return null;
+    try {
+      gitNet(args, 120_000);
+    } catch (e) {
+      return {
+        ok: false,
+        why: publishErrorText(envScrub(e?.stderr?.toString?.() || e?.message || '')),
+      };
+    }
+    const sha = agentBranchSha(place);
+    if (!sha) return { ok: false, why: 'the fetch reported nothing and left no local branch' };
+    // WHAT THIS PROCESS HAS NOW SEEN AT THAT REMOTE REF. A fetch is an
+    // observation of the remote's own position, and for a box that continues an
+    // agent it never started it is the ONLY one it will ever have — without it
+    // this box's first push would carry no lease and would have to go unforced.
+    // It is not a `publishAgentBranch` record: this machine pushed nothing, so
+    // the server is told nothing.
+    agentRemoteAt.set(place, { ref, sha });
+    return { ok: true };
+  };
+
   let lastWorktreeSweep = 0;
   /** Sessions this process has already tried to measure. See `reportWorktrees`. */
   const worktreeSeen = new Set();
@@ -735,10 +918,29 @@ export function createWorkManager({
      * human's own directory; attributing one would be a fact with no reader.
      */
     const pub = sessionId.startsWith('a-') && sessionId.length > 2 ? myPubB64() : null;
+    /**
+     * …AND WHAT THIS MACHINE PUSHED OF IT (0.86.0).
+     *
+     * The ONE road by which the server learns a push happened: it composes the
+     * target name and sends it, and stores nothing until a machine reports
+     * back. So an unreported push renders nothing and no surface can name a ref
+     * nobody can pull — the same "never assert what you did not observe" rule
+     * the box id beside it keeps.
+     *
+     * NO KEY AT ALL until a target arrives, which is what lets absence keep its
+     * one meaning: an older server, or a project with publishing off, leaves
+     * the agent reading as never published rather than as failed.
+     *
+     * Mutually exclusive without a rule of its own, because the state it reads
+     * holds a sha or an error and never both.
+     */
+    const pushed = sessionId.startsWith('a-') ? agentPublished.get(sessionId) : null;
     return {
       sessionId,
       ...d,
       ...(pub ? { box: { id: pub, name: MACHINE_HOST } } : {}),
+      ...(pushed?.sha ? { published: { ref: pushed.ref, sha: pushed.sha } } : {}),
+      ...(pushed?.error ? { publishError: pushed.error } : {}),
       listening: lis.rows,
       listeningTotal: lis.total,
       listeningSupported: listenersSupported(),
@@ -876,6 +1078,12 @@ export function createWorkManager({
     const live = new Set(activeIds);
     for (const id of worktreeSeen) if (!live.has(id)) worktreeSeen.delete(id);
     for (const id of activeIds) worktreeSeen.add(id);
+    // The publish record is bounded the same way and for the same reason: an
+    // agent the roster has stopped naming is done, its ref is the server's
+    // business now (the merge lane deletes it when the work lands), and a
+    // long-running daemon must not accumulate a row per agent that ever ran.
+    for (const id of agentPublished.keys()) if (!live.has(id)) agentPublished.delete(id);
+    for (const id of agentRemoteAt.keys()) if (!live.has(id)) agentRemoteAt.delete(id);
     sweepingWorktrees = true;
     lastWorktreeSweep = Date.now();
     void (async () => {
@@ -925,6 +1133,23 @@ export function createWorkManager({
         worktreeCursor = total > SWEEP_MAX_PLACES ? (start + take) % total : 0;
         const reports = [];
         for (const id of order) {
+          /**
+           * KEEP A PUBLISHED BRANCH CURRENT, not merely born.
+           *
+           * A settle publishes what the turn just wrote, which covers almost
+           * everything — but a branch also moves without a turn: the stale
+           * path folds base in before a merge, and an operator can commit in
+           * the agent's worktree by hand. Without this the remote ref would sit
+           * at whatever the last turn left and the durability claim would be
+           * quietly false for exactly the branches somebody is working on.
+           *
+           * ONLY where a target is already known. Nothing here composes a name,
+           * so an agent this process has never been told to publish is
+           * untouched — and the sha compare inside makes the resting cost of
+           * this loop one `rev-parse` per agent.
+           */
+          const known = agentPublished.get(id);
+          if (known?.ref) await publishAgentBranch(id, known.ref);
           const r = sessionWorktreeReport(id);
           if (r) reports.push(r);
         }
@@ -4486,17 +4711,41 @@ export function createWorkManager({
           else branchMeasured = false;
         }
         if (branchMeasured && !existsSync(wtDir) && !hasBranch) {
-          const on = typeof job.begunOn === 'string' && job.begunOn.trim()
-            ? job.begunOn.trim().slice(0, 64)
-            : null;
-          await postAgentTurn({
-            turnId,
-            outcome: 'nothing',
-            answer:
-              `This machine does not hold this agent's worktree or branch${on ? ` — its work is on ${on}` : ''}. ` +
-              'Stop the agent to re-plan it here.',
-          });
-          return;
+          /**
+           * …UNLESS THE WORK IS ON THE REMOTE (0.86.0).
+           *
+           * The guard's premise was "nothing pushes an agent's branch before
+           * approve", and a project that publishes has changed exactly that
+           * third of it: the COMMITS are on `origin` under `flowviant/`, so a
+           * box that holds neither the directory nor the branch can fetch them
+           * and continue the work instead of redoing it. The other two thirds
+           * are untouched — the conversation still does not move, which is why
+           * the kickoff re-prompts from the card either way.
+           *
+           * The refusal below is still the fallback, and it is the fallback for
+           * BOTH shapes of failure: a project that does not publish (no ref,
+           * sentence unchanged) and a fetch that could not land (sentence
+           * extended with git's own reason, because "this machine does not hold
+           * it" alone would hide that we tried and how it went).
+           */
+          const fetched = fetchPublishedBranch(place, job.publishedRef);
+          if (!fetched?.ok) {
+            const on = typeof job.begunOn === 'string' && job.begunOn.trim()
+              ? job.begunOn.trim().slice(0, 64)
+              : null;
+            await postAgentTurn({
+              turnId,
+              outcome: 'nothing',
+              answer:
+                `This machine does not hold this agent's worktree or branch${on ? ` — its work is on ${on}` : ''}. ` +
+                'Stop the agent to re-plan it here.' +
+                (fetched ? ` Its published branch could not be fetched (${fetched.why}).` : ''),
+            });
+            return;
+          }
+          // The branch is here and measured. `placeWtFor`'s attach fallback
+          // opens a worktree on it below — the same path a directory somebody
+          // cleaned up already takes, on commits this box now genuinely holds.
         }
       }
       const dir = placeWtFor(place);
@@ -4755,6 +5004,48 @@ export function createWorkManager({
       // worktree we are already standing in and still hold the lock on.
       if (reply?.review === true) await runCheck(agentId, wt);
     });
+    /**
+     * …AND THEN PUBLISH, IF THE PROJECT PUBLISHES.
+     *
+     * AFTER the settle and OUTSIDE the place lock, both deliberately. A push is
+     * a network call that can hang for its whole timeout, and it is worth
+     * exactly nothing compared with the turn's answer: holding the settle
+     * behind it would put a remote's bad day in front of the board, and holding
+     * the writer lock through it would put the same delay in front of the next
+     * turn.
+     *
+     * OUT HERE rather than beside any one settle, because `runAgentTurn` has
+     * many ways to end and every one of them leaves a branch worth publishing —
+     * including the refusals, where what is worth publishing is whatever an
+     * earlier turn already committed. The paths with nothing to push say so by
+     * having no local branch, which `publishAgentBranch` reads and skips.
+     *
+     * A REPORT ONLY WHEN SOMETHING CHANGED: an action that changes what the
+     * machine would measure must cause a new measurement, and one that changed
+     * nothing must not cost a write per turn restating it.
+     *
+     * …AND AN ABSENT TARGET IS AN INSTRUCTION TO FORGET. The sweep republishes
+     * from `agentPublished`, which is this PROCESS's memory — so without the
+     * else arm, an owner turning the switch off left every already-publishing
+     * agent still pushing every commit it made for the life of the daemon, and
+     * the settings copy promising "publishes nothing further" was false. A
+     * 0.86.0 daemon only ever sees the key dropped because the project stopped
+     * asking (`publishTargetForJob`), so forgetting is exactly what absence
+     * means here; an agent nobody asked about has no entry, and the delete is a
+     * no-op. It bounds the leak to the one sweep window between the switch and
+     * the next settle.
+     */
+    try {
+      if (!job.publishTo) {
+        agentPublished.delete(place);
+        agentRemoteAt.delete(place);
+      } else if (await publishAgentBranch(place, job.publishTo)) {
+        void reportSessionWorktree(place).catch(() => {});
+      }
+    } catch {
+      /* publishing is tail work — it may never fail a turn that is already
+         settled, whatever went wrong down there */
+    }
   };
 
   const lastAgentBeat = new Map(); // agentId -> last activity POST, ms
@@ -5158,8 +5449,28 @@ export function createWorkManager({
      * nothing anywhere saying what went wrong.
      */
     let reported = false;
+    /**
+     * THE PUBLISHED REF DIES WHEN THE WORK LANDS (0.86.0) — recorded here,
+     * retired in the tail below.
+     *
+     * A `flowviant/*` branch exists so the work survives the box that cut it.
+     * Once the commits are on base that job is done, and one ref per agent
+     * forever is a branch list nobody wants to read. The server sends the ref
+     * only when it heard about a real push, so this never deletes a name we
+     * merely composed — and `publishDeleteArgs` refuses anything outside the
+     * prefix, because `:refs/heads/<x>` is the most destructive argv in this
+     * file.
+     *
+     * ONLY ON SUCCESS. A failed merge keeps its branch — that is the whole
+     * point of the branch — and stopping or declining an agent deletes nothing
+     * anywhere: durability is what this feature is, and a ref whose work never
+     * landed is the case it exists for. It is recorded in `report` rather than
+     * at the three success sites so a fourth one cannot forget it.
+     */
+    let landedRef = null;
     const report = async (body) => {
       reported = true;
+      if (body?.ok === true) landedRef = job.publishedRef ?? null;
       await postAgentMerge(body);
     };
 
@@ -5273,8 +5584,42 @@ export function createWorkManager({
           });
           return;
         }
+        /**
+         * THE PULL REQUEST'S HEAD IS THE PUBLISHED REF, when there is one
+         * (0.86.0).
+         *
+         * Pushing `session/a-<uuid>` here and reviewing THAT would defeat the
+         * whole feature on exactly the projects it is most for: the owner asked
+         * for "control over what branch the agents are working on", and a PR
+         * mode project is one where people read branches in a host UI. Worse, it
+         * leaves TWO refs per agent — the uuid one nothing ever deletes, and the
+         * readable one the cleanup below retires — so the survivor is the opaque
+         * name this feature exists to replace.
+         *
+         * ONLY when the local branch really is this agent's own. If somebody
+         * checked something else out in the worktree, `session/<place>` is not
+         * what is being merged and pushing it under the published name would put
+         * work on that ref that nobody approved; the plain push of the checked
+         * out branch is the honest fallback.
+         */
+        const ownBranch = branch === `session/${place}`;
+        const head =
+          ownBranch && isPublishRef(job.publishedRef) ? job.publishedRef : branch;
         try {
-          git(['push', '-u', 'origin', branch], wt);
+          if (head === branch) {
+            git(['push', '-u', 'origin', branch], wt);
+          } else {
+            // The same lease discipline the publish lane keeps, and TIMED like
+            // every other network call on this path: `git()` has no timeout, and
+            // this one runs inside the place writer lock.
+            const seen = agentRemoteAt.get(place);
+            gitNet(
+              publishPushArgs(place, head, seen?.ref === head ? seen.sha : null),
+              120_000
+            );
+            agentPublished.set(place, { ref: head, sha: tip });
+            agentRemoteAt.set(place, { ref: head, sha: tip });
+          }
         } catch (e) {
           // SCRUBBED. Every other failure on this path relays `gh`'s own words,
           // but a push writes the REMOTE URL to stderr and a remote can carry a
@@ -5287,7 +5632,7 @@ export function createWorkManager({
         let prUrl = null;
         try {
           const j = JSON.parse(
-            execFileSync('gh', ['pr', 'view', branch, '--json', 'url,state,baseRefName'], {
+            execFileSync('gh', ['pr', 'view', head, '--json', 'url,state,baseRefName'], {
               cwd: repoRoot,
               stdio: ['ignore', 'pipe', 'pipe'],
               timeout: 30_000,
@@ -5303,7 +5648,7 @@ export function createWorkManager({
               await report({
                 agentId,
                 ok: false,
-                detail: `the open pull request for ${branch} targets ${j.baseRefName}, not ${prBase} — retarget or close it, then approve again`,
+                detail: `the open pull request for ${head} targets ${j.baseRefName}, not ${prBase} — retarget or close it, then approve again`,
               });
               return;
             }
@@ -5317,7 +5662,7 @@ export function createWorkManager({
             const out = execFileSync(
               'gh',
               // baseBranchName, not baseRef: gh 422s on a remote-tracking name.
-              ['pr', 'create', '--head', branch, '--base', prBase, '--fill'],
+              ['pr', 'create', '--head', head, '--base', prBase, '--fill'],
               { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000 }
             )
               .toString()
@@ -5329,7 +5674,7 @@ export function createWorkManager({
           }
         }
         try {
-          execFileSync('gh', ['pr', 'merge', branch, '--merge'], {
+          execFileSync('gh', ['pr', 'merge', head, '--merge'], {
             cwd: repoRoot,
             stdio: ['ignore', 'pipe', 'pipe'],
             timeout: 120_000,
@@ -5428,6 +5773,42 @@ export function createWorkManager({
           ok: false,
           detail: 'the merge did not complete — check the daemon log',
         }).catch(() => {});
+      }
+      /**
+       * …AND THE RETIREMENT IS TAIL WORK, OUTSIDE THE PLACE LOCK — the same
+       * placement the turn's publish argues for, for the same reason.
+       *
+       * `gitNet` is `execFileSync`: it blocks the whole event loop for up to its
+       * timeout, and inside `inPlace(place, true, …)` it would hold this
+       * agent's WRITER lock through a remote's bad day, with the merge already
+       * settled and nothing left that the delay serves. This block is PAST the
+       * lock: `inPlace` has returned (or thrown) before a `finally` runs.
+       *
+       * IN THE `finally` rather than after it, so a throw between the ok settle
+       * and the end of the locked block cannot strand the ref. `landedRef` is
+       * set only by a reported success, so there is nothing here to run on any
+       * other path — and a remote that refuses the delete only warns: the merge
+       * is the thing that matters, and a landed branch must not become a failed
+       * approval.
+       *
+       * The record goes with the ref. `agentPublished` is what the SWEEP
+       * republishes from, so leaving the entry behind would let the next sweep
+       * push the ref straight back — an orphan no later merge job can ever
+       * carry, and therefore one nothing can delete.
+       */
+      if (landedRef) {
+        agentPublished.delete(place);
+        agentRemoteAt.delete(place);
+        const args = publishDeleteArgs(landedRef);
+        if (args) {
+          try {
+            gitNet(args, 60_000);
+          } catch (e) {
+            warn(
+              `agent ${agentId}: the published branch ${landedRef} could not be deleted — ${publishErrorText(envScrub(e?.stderr?.toString?.() || e?.message || ''))}`
+            );
+          }
+        }
       }
     }
   };
