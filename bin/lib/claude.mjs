@@ -13,7 +13,7 @@
 
 import { spawn } from 'node:child_process';
 import { SAFE } from './config.mjs';
-import { runtimeById, humanizeClaudeTool } from './runtimes.mjs';
+import { runtimeById, humanizeClaudeTool, THINK_MARKER } from './runtimes.mjs';
 
 // Every prompt/kickoff constant lives in prompts.mjs and is re-exported here:
 // a dozen call sites import them from claude.mjs, and none of them care where
@@ -197,12 +197,39 @@ function handleStreamLine(line, { cwd, emit, onActivity, onToolEvent, appendText
   if (ev.type === 'assistant' && Array.isArray(ev.message?.content)) {
     for (const b of ev.message.content) {
       if (b.type === 'thinking' || b.type === 'redacted_thinking') {
-        // The `thinking` text is usually redacted (signature only), so emit a
-        // marker — enough to show Claude is actively reasoning, not hung.
-        push({ kind: 'think', label: b.thinking ? `thinking: ${oneLine(b.thinking)}` : 'thinking…' });
+        /**
+         * NO THINKING TEXT ARRIVES TODAY, AND THAT IS MEASURED (2026-09-16).
+         *
+         * This used to say the text is "usually redacted", which was a guess
+         * doing the work of a fact. The fact: across three real transcripts, 93
+         * thinking blocks, EVERY ONE of them carried an empty `thinking` — and
+         * a live probe with MAX_THINKING_TOKENS set and
+         * `--include-partial-messages` on returned an empty `thinking_delta`
+         * and a complete block of length zero (signature only). So the CLI
+         * emits the FACT that it reasoned and not a word of the reasoning, and
+         * "show the full thinking" cannot be conjured from this stream.
+         *
+         * THE BRANCH BELOW EXISTS ANYWAY, and deliberately. The shape is the
+         * whole point: when text is present it rides `full` UNCLIPPED, so the
+         * day a CLI release starts emitting it, the trace carries the thought
+         * whole with no daemon change and no version floor — the report's own
+         * presence is the capability. Until then every block takes the marker
+         * arm, and `trace.mjs` collapses a run of identical markers so the
+         * absence reads as one quiet step rather than forty.
+         */
+        push(
+          b.thinking
+            ? { kind: 'think', label: `thinking: ${oneLine(b.thinking)}`, full: b.thinking }
+            : { kind: 'think', label: THINK_MARKER }
+        );
       } else if (b.type === 'text' && b.text?.trim()) {
         if (!answerFromResult) appendText(b.text + '\n');
-        push({ kind: 'say', label: oneLine(b.text) });
+        // `label` for the console and the pulse — one collapsed 160-char line,
+        // byte-identical to what it has always printed. `full` for the trace:
+        // a `say` is the agent NARRATING, several sentences at a time, and the
+        // clip at 160 was landing mid-sentence on the one thing a person opens
+        // the page to read.
+        push({ kind: 'say', label: oneLine(b.text), full: b.text });
       } else if (b.type === 'tool_use') {
         push(humanizeToolUse(b.name, b.input || {}, cwd));
         // The STRUCTURED form of the same event, for the transcript's tool

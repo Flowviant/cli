@@ -4888,7 +4888,16 @@ export function createWorkManager({
             // seconds. Two channels, one stream, and the drop-sampler stays a
             // drop-sampler — buffering the pulse would make a stale line look
             // fresh, which is the one thing it exists to answer.
-            if (!doubledKinds || !doubledKinds.has(a.kind)) trace.prose(a.kind, line);
+            //
+            // …AND THE TRACE TAKES THE WHOLE LINE. `label` is a 160-char
+            // console readout; `full` is what the CLI actually said, when the
+            // parser had more than the label could hold (see runtimes.mjs).
+            // The fallback is not a degradation — it is what every activity
+            // without a fuller form carries, and what an entire pre-0.87.0
+            // daemon carried for all of them. The PULSE below is deliberately
+            // still `line`: it is one overwritten line on a board, and a
+            // paragraph there would be a paragraph nobody can read.
+            if (!doubledKinds || !doubledKinds.has(a.kind)) trace.prose(a.kind, a.full ?? line);
             const now = Date.now();
             if (now - (lastAgentBeat.get(agentId) ?? 0) < 2_000) return;
             lastAgentBeat.set(agentId, now);

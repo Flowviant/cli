@@ -82,6 +82,7 @@ import {
   probeSkillsOnce,
   recordSkills,
   RUNTIMES,
+  THINK_MARKER,
 } from './runtimes.mjs';
 import { createWorkManager } from './work.mjs';
 import { scanLocalSessions, ourConversationIds } from './localSessions.mjs';
@@ -1598,7 +1599,13 @@ export async function runFleetDaemon() {
             pagesSeen.add(a.path || a.label);
           }
           // Collapse runs of bare "thinking…" so the feed doesn't fill with it.
-          if (!(a.label === 'thinking…' && feed[feed.length - 1] === 'thinking…')) {
+          // Keyed on the SHARED constant (runtimes.mjs), not on the literal: the
+          // labels being compared here are the ones claude.mjs now builds from
+          // that constant, so a reworded marker would leave this comparison
+          // matching nothing and the 48-slot feed filling with the repeat — the
+          // exact noise this line exists to stop, and silent, because a collapse
+          // that stops collapsing fails no test.
+          if (!(a.label === THINK_MARKER && feed[feed.length - 1] === THINK_MARKER)) {
             feed.push(a.label);
             if (feed.length > 48) feed.shift();
           }

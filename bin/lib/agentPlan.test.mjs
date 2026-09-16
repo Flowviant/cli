@@ -11,6 +11,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { parseProposal } from './agentPlan.mjs';
+import { SYSTEM_PLAN } from './prompts.mjs';
 
 const plan = { agents: [{ tempId: 'a1', name: 'auth', taskIds: ['t1', 't2'] }] };
 
@@ -88,6 +89,81 @@ test('caps every string it carries', () => {
   );
   assert.equal(out.agents[0].name.length, 80);
   assert.equal(out.note.length, 1000);
+});
+
+// ── The split is for PARALLELISM, so there is no way to say "wait" ──────────
+
+/**
+ * A STRAY `waitsOn` IS DROPPED, AND THE PROPOSAL AROUND IT STANDS.
+ *
+ * The planner's schema used to carry it; the owner deleted the idea — "whats
+ * the point of dividing up the agents if one of the agents rely on waiting for
+ * one to finish? if thats the case have it be in the same agent" — and
+ * SYSTEM_PLAN no longer mentions the key. A model emitting one anyway is
+ * answering a schema it was not given (an older prompt cached in a resumed
+ * conversation, or invention), and reading it would create a silently-waiting
+ * agent through the exact door the prompt closed.
+ *
+ * DROPPED rather than REFUSED, on this file's own law: lenient packaging,
+ * strict shape. A stray key is packaging, and refusing the whole plan over one
+ * would throw away a turn the operator already paid for.
+ */
+test('drops a waitsOn the model was never asked for, and keeps the rest', () => {
+  const out = parseProposal(
+    JSON.stringify({
+      note: 'split by surface',
+      agents: [
+        { tempId: 'a1', name: 'auth', taskIds: ['t1'] },
+        { tempId: 'a2', name: 'billing', taskIds: ['t2'], waitsOn: ['a1'], pointsBudget: 8 },
+      ],
+    })
+  );
+  assert.equal(out.agents.length, 2);
+  assert.equal(out.note, 'split by surface');
+  for (const a of out.agents) assert.equal('waitsOn' in a, false);
+  // Everything beside it on the same agent survives — the key is dropped, the
+  // agent is not.
+  assert.equal(out.agents[1].name, 'billing');
+  assert.equal(out.agents[1].taskIds[0], 't2');
+  assert.equal(out.agents[1].pointsBudget, 8);
+});
+
+/**
+ * THE PROMPT DOES NOT OFFER THE WORD — an ABSENCE, with a positive anchor.
+ *
+ * A rule the model can still express a violation of is one it will sometimes
+ * express a violation of, so the vocabulary is gone rather than discouraged.
+ * The anchors are asserted FIRST and deliberately: an absence pin over a string
+ * that has moved, been renamed or gone empty passes forever while proving
+ * nothing, which is a failure this repo has shipped more than once.
+ *
+ * Scoped to SYSTEM_PLAN and nothing wider, because `waitsOn` is ALIVE
+ * elsewhere: SYSTEM_AGENT's `update_cards` uses it for card-level ordering, and
+ * the server still reads it off stored proposals from 0.86.0 daemons.
+ */
+test('SYSTEM_PLAN still states the answer schema, and never the word waitsOn', () => {
+  assert.ok(SYSTEM_PLAN.includes('```json'), 'the schema block is still fenced');
+  assert.ok(SYSTEM_PLAN.includes('"taskIds"'));
+  assert.ok(SYSTEM_PLAN.includes('"pointsBudget"'));
+  assert.ok(SYSTEM_PLAN.includes('"intoAgentId"'));
+  assert.ok(
+    SYSTEM_PLAN.includes('SEQUENTIAL WORK BELONGS IN ONE AGENT'),
+    'rule 1 is where the reasoning lives'
+  );
+  assert.ok(!SYSTEM_PLAN.includes('waitsOn'), 'a wait is a split done wrong');
+});
+
+/** `intoAgentId` sits directly beside it in the source and is a DIFFERENT
+ *  thing: adding cards to an agent that already exists, which the prompt still
+ *  asks for. Deleting the wrong arm is the plausible slip. */
+test('intoAgentId survives the removal of waitsOn', () => {
+  const out = parseProposal(
+    JSON.stringify({
+      agents: [{ tempId: 'a1', taskIds: ['t1'], waitsOn: ['a0'], intoAgentId: 'agent-9' }],
+    })
+  );
+  assert.equal(out.agents[0].intoAgentId, 'agent-9');
+  assert.equal('waitsOn' in out.agents[0], false);
 });
 
 // ── An agent's answer at the end of a turn ──────────────────────────────────

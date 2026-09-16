@@ -588,6 +588,35 @@ export const REGROUND_KICKOFF = ({ sha, title, files, vaultDir, predictedPages =
  * TOUCHED. Everything else — how long something will take, who should own it,
  * whether it is a good idea — is not a question a planner can answer from a
  * repository, and asking for it produces confident invention.
+ *
+ * ── THERE IS NO WAY TO SAY "THIS ONE WAITS" (2026-09-16) ──
+ *
+ * The answer schema used to carry `waitsOn`, a list of tempIds an agent had to
+ * see MERGE before it could start, and the owner deleted the idea outright:
+ *
+ *   "for the planning agent, whats the point of dividing up the agents if one
+ *    of the agents rely on waiting for one to finish? if thats the case have it
+ *    be in the same agent. the point of having it divide into various agent is
+ *    so that its capable of parallel and simultaneous work."
+ *
+ * That is not a preference about a field, it is what an agent IS. An agent is
+ * one CLI in one worktree working its cards IN ORDER — ordering is the thing it
+ * already does, for free, with no branch to merge in between. So a planner that
+ * splits a chain across two agents has bought nothing and paid twice: a second
+ * worktree, a second branch, a second review, and a second agent sitting idle
+ * until the first one lands. The ONLY thing a split buys is two CLIs typing at
+ * the same time, and work that waits cannot do that by definition.
+ *
+ * So the vocabulary is gone rather than discouraged. A rule the model can still
+ * express a violation of is a rule it will sometimes express a violation of;
+ * removing the key removes the move. Rule 1 below carries the reasoning in the
+ * planner's own terms, and `agentPlan.mjs` drops the key if a model on an older
+ * prompt sends it anyway.
+ *
+ * WHAT DID NOT CHANGE, on purpose: the SERVER still accepts `waitsOn` on the
+ * wire and still honours it on stored proposals, because 0.86.0 daemons are
+ * still running and agents created under the old prompt still exist. This is a
+ * change to what is PROPOSED, not to what can be read.
  */
 export const SYSTEM_PLAN = `You are the human's own Claude, planning a batch of work in their repository.
 
@@ -602,8 +631,13 @@ as a single reviewable branch.
 THE RULES THAT MATTER:
 
 1. SEQUENTIAL WORK BELONGS IN ONE AGENT. If B needs A's code to exist, put them
-   in the same agent, A first. Splitting a chain across agents means the second
-   one waits for the first to MERGE before it can even start.
+   in the same agent, A first — an agent works its cards in the order you give,
+   so ordering is free and costs no merge in between. THE ONLY REASON TO SPLIT
+   IS WORK THAT CAN RUN AT THE SAME TIME. There is no way to say that one agent
+   waits for another, and that is deliberate: an agent that has to wait is a
+   split done wrong. Splitting a chain buys a second worktree, a second branch
+   and a second review, and the second agent sits idle until the first one
+   merges — slower than one agent doing both in order.
 
 2. SPLIT ONLY WHAT CAN GENUINELY RUN AT THE SAME TIME. Two agents editing the
    same files land two branches that conflict, and somebody resolves it by hand.
@@ -641,7 +675,6 @@ after it. Wrap it in a \`\`\`json fence:
       "name": "auth",
       "taskIds": ["<card id>", "<card id>"],
       "pointsBudget": 8,
-      "waitsOn": [],
       "intoAgentId": null
     }
   ]
@@ -649,7 +682,7 @@ after it. Wrap it in a \`\`\`json fence:
 \`\`\`
 
 Every selected card id must appear EXACTLY ONCE across all agents. Use the ids
-exactly as given. "waitsOn" holds tempIds of agents that must MERGE first.`;
+exactly as given.`;
 
 /**
  * The planner's turn.

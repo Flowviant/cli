@@ -46,6 +46,41 @@ import { SAFE, MODEL, USER_AGENT } from './config.mjs';
 const oneLine = (s, n = 140) =>
   String(s ?? '').replace(/\s+/g, ' ').trim().slice(0, n);
 
+/**
+ * `label` IS THE READOUT; `full` IS THE RELAY (2026-09-16) — the convention
+ * every prose activity in this daemon follows, stated once here because three
+ * parsers produce one and three consumers read them.
+ *
+ * `label` is one collapsed, clamped line, because its first two consumers are a
+ * terminal console and a one-line pulse that is overwritten every two seconds,
+ * and neither can show a paragraph. The turn TRACE is a third consumer with the
+ * opposite need: it is scrollback, and clipping a sentence at 140 characters
+ * there is the product summarizing its own agent.
+ *
+ * So a prose activity may ALSO carry `full`: the text EXACTLY as the CLI
+ * emitted it, uncollapsed and unclipped. Nothing derives it and nothing but the
+ * trace reads it — `label` is untouched, so the console and the pulse are
+ * byte-identical to before. Absent means there was no fuller text than the
+ * label (a tool line, a bare thinking marker), and the trace falls back to the
+ * label — which is what every pre-0.87.0 daemon does for everything.
+ *
+ * THE MARKER BELOW IS THE label-ONLY CASE, and one definition with four
+ * readers: claude.mjs writes it, this file's codex parser falls back to it, and
+ * TWO collapses key on it — `trace.mjs` for the turn trace, `fleet.mjs` for the
+ * wiki sweep's feed. A collapse keyed on a string typed out four times would
+ * silently stop collapsing the first time somebody reworded one of them, and a
+ * collapse that stops collapsing fails no test — it just fills a feed.
+ *
+ * It exists at all because the CLIs do not hand over the thinking itself:
+ * measured 2026-09-16 across three real transcripts, 93 thinking blocks, every
+ * one of them empty (signature only), and a live probe with MAX_THINKING_TOKENS
+ * and `--include-partial-messages` returned an empty `thinking_delta` and a
+ * zero-length complete block. So the marker is the honest whole of what is
+ * known — "it is reasoning, not hung" — and the day text does arrive it rides
+ * `full` and this marker is simply not used.
+ */
+export const THINK_MARKER = 'thinking…';
+
 const shortPath = (p, cwd) => {
   const s = String(p ?? '');
   return cwd && s.startsWith(cwd) ? s.slice(cwd.length).replace(/^\//, '') : s;
@@ -239,10 +274,22 @@ export const CLAUDE_TOOL_PROSE_KINDS = new Set([
  */
 function humanizeCodexItem(item = {}, cwd = '') {
   switch (item.item_type ?? item.type) {
-    case 'agent_message':
-      return { kind: 'say', label: oneLine(item.text ?? item.message) };
-    case 'reasoning':
-      return { kind: 'think', label: oneLine(item.text) || 'thinking…' };
+    // `full` rides beside the label wherever the item carries more than the
+    // label can hold — see the `label`/`full` note above. Codex is the runtime
+    // that actually SENDS reasoning text today, so its `think` is the one place
+    // in this daemon where a real thought reaches the trace whole.
+    case 'agent_message': {
+      const text = String(item.text ?? item.message ?? '');
+      return { kind: 'say', label: oneLine(text), ...(text ? { full: text } : {}) };
+    }
+    case 'reasoning': {
+      const text = String(item.text ?? '');
+      return {
+        kind: 'think',
+        label: oneLine(text) || THINK_MARKER,
+        ...(text.trim() ? { full: text } : {}),
+      };
+    }
     case 'command_execution':
       return {
         kind: 'bash',
@@ -301,11 +348,28 @@ function parseCodexLine(line, cwd) {
           : '';
       return { activity, text };
     }
-    case 'turn.failed':
+    case 'turn.failed': {
+      // An error is prose too, and the sentence that explains a failed turn is
+      // routinely longer than a 140-char label — a stack-shaped message loses
+      // its cause exactly where somebody is reading to find it.
+      //
+      // THE LABEL KEEPS ITS OWN `??`, not `msg || …`, and the difference is one
+      // input: an EXPLICITLY EMPTY message. `??` lets `''` through as an empty
+      // label, which every consumer swallows (`if (!label)`); `||` would print
+      // "turn failed" and fire a pulse where this daemon printed nothing. That
+      // may well be the better readout, but it is a change to the console and
+      // the pulse, and `full` shipped on the promise that neither moved — so it
+      // is argued for on its own day, not smuggled in beside a relay field.
+      const msg = String(ev.error?.message ?? '');
       return {
-        activity: { kind: 'error', label: oneLine(ev.error?.message ?? 'turn failed') },
+        activity: {
+          kind: 'error',
+          label: oneLine(ev.error?.message ?? 'turn failed'),
+          ...(msg.trim() ? { full: msg } : {}),
+        },
         text: '',
       };
+    }
     // A bare `error` event — the shape an auth failure arrives in ("401
     // Unauthorized: Missing bearer…", observed against 0.147.0 with no
     // credentials). It used to fall through to `default` and be dropped, which
@@ -314,11 +378,19 @@ function parseCodexLine(line, cwd) {
     // gave up rather than that the CLI is not signed in. The message goes into
     // `text` so it reaches the operator's console AND the usage-limit
     // classifier, which reads exactly this stream.
-    case 'error':
+    case 'error': {
+      // Same split as the arm above: `??` for the label (untouched behaviour),
+      // `msg` for the relay field only.
+      const msg = String(ev.message ?? '');
       return {
-        activity: { kind: 'error', label: oneLine(ev.message ?? 'error') },
+        activity: {
+          kind: 'error',
+          label: oneLine(ev.message ?? 'error'),
+          ...(msg.trim() ? { full: msg } : {}),
+        },
         text: `${ev.message ?? ''}\n`,
       };
+    }
     default:
       return null; // turn.started / item.started / item.updated
   }
@@ -376,7 +448,14 @@ function parseAgyLine(line, cwd) {
     const ti = su.tool_info;
     if (!ti) return null;
     const err = ti.error?.message;
-    if (err) return { activity: { kind: 'error', label: oneLine(err) }, text: '' };
+    // Same rule as codex's error lines: the label is the console's, `full` is
+    // the trace's, and a tool error's message is exactly the kind of sentence a
+    // 140-char clamp cuts the cause out of.
+    if (err)
+      return {
+        activity: { kind: 'error', label: oneLine(err), full: String(err) },
+        text: '',
+      };
     // Each tool is reported twice — once ACTIVE, once DONE — so only the
     // terminal state emits, otherwise every action appears in the thread twice.
     if (su.state && su.state !== 'DONE') return null;
@@ -387,7 +466,9 @@ function parseAgyLine(line, cwd) {
     // The final answer is the ONLY sentinel-bearing text: agy has no incremental
     // assistant-message event, so a turn's whole verdict arrives here at once.
     return {
-      activity: r.error ? { kind: 'error', label: oneLine(r.error) } : null,
+      activity: r.error
+        ? { kind: 'error', label: oneLine(r.error), full: String(r.error) }
+        : null,
       text: `${r.response ?? ''}${r.error ? `\n${r.error}` : ''}\n`,
     };
   }

@@ -54,6 +54,8 @@
  * tail of a trace, never the settle behind it.
  */
 
+import { THINK_MARKER } from './runtimes.mjs';
+
 /** One batch every two seconds — the discipline the tab's narrator keeps, for
  *  the same reason: a turn emits hundreds of entries and nobody is reading them
  *  faster than that. */
@@ -64,9 +66,22 @@ export const TRACE_BATCH = 40;
  *  scrollback, and the newest steps are the ones somebody watching wants. The
  *  drop is not silent — see the seq rule above. */
 export const TRACE_BUFFER = 120;
-/** Longest prose entry. The server clamps to the same number; doing it here too
- *  means a pathological line never becomes the POST. */
-export const TRACE_PROSE_CAP = 300;
+/**
+ * Longest prose entry. The server clamps to the same number
+ * (`agentTrace.ts.TRACE_PROSE_CAP`); doing it here too means a pathological line
+ * never becomes the POST. The two must move together — daemon at or below the
+ * server's, or the server silently does the cutting and this file's caps stop
+ * describing what ships.
+ *
+ * 300 UNTIL 2026-09-16, when it was the thing clipping sentences. A trace entry
+ * used to be the humanized 160-char label the console prints, so a 300 cap could
+ * not bite; it now carries the FULL text of what the CLI said or thought, and at
+ * 300 a paragraph of narration was cut mid-sentence. The real bound is the
+ * TURN's (400 entries / 96KB server-side, oldest shed with the count said out
+ * loud) — a long thought spends budget older steps would have held, and an
+ * admitted shed beats a silent clip.
+ */
+export const TRACE_PROSE_CAP = 4_000;
 
 /**
  * ONE ATTEMPT AT ONE TURN, named.
@@ -93,6 +108,11 @@ export function makeTraceRelay({ agentId, turnId, post, scrub = (s) => s, run = 
    *  server's business: it rebases each run onto its own high-water mark. */
   const queue = [];
   let base = 0;
+  /** The last entry this relay ACCEPTED, kept across flushes and across a shed
+   *  buffer — `queue[queue.length - 1]` is not the same thing, because a flush
+   *  empties the queue and a batch boundary is not a change in the stream. Read
+   *  by the bare-marker collapse in `prose()` and nothing else. */
+  let lastEntry = null;
   let dirty = false;
   let timer = null;
   let stopped = false;
@@ -111,6 +131,7 @@ export function makeTraceRelay({ agentId, turnId, post, scrub = (s) => s, run = 
 
   const push = (entry) => {
     if (stopped || !entry) return;
+    lastEntry = entry;
     queue.push(entry);
     while (queue.length > TRACE_BUFFER) {
       queue.shift();
@@ -157,17 +178,59 @@ export function makeTraceRelay({ agentId, turnId, post, scrub = (s) => s, run = 
   };
 
   return {
-    /** A prose line from the stream. `kind` is the daemon's activity vocabulary
-     *  (runtimes.mjs); anything that is not thinking or the model speaking is a
-     *  `note` — the honest bucket for a codex error line or an agy tool name,
-     *  rather than a wire value invented per runtime. */
+    /**
+     * A prose line from the stream. `kind` is the daemon's activity vocabulary
+     * (runtimes.mjs); anything that is not thinking or the model speaking is a
+     * `note` — the honest bucket for a codex error line or an agy tool name,
+     * rather than a wire value invented per runtime.
+     *
+     * THE NEWLINES SURVIVE (2026-09-16). This used to be `\s+ → ' '`, which was
+     * right while an entry WAS a one-line label and wrong the moment the caller
+     * started handing over the whole of what the CLI said: a model writes in
+     * paragraphs and lists, and flattening them here is the relay deciding how
+     * the agent's own words should be shaped. So only HORIZONTAL runs collapse,
+     * and a wall of blank lines becomes one — that second rule is not cosmetic,
+     * it stops padding eating the cap that the real sentences need.
+     *
+     * The scrub still runs over the WHOLE text, before the cap: this is the
+     * CLI's own stdout, and a secret in a thought must not ride further than it
+     * did when a thought was 300 characters.
+     */
     prose(kind, text) {
       const t = scrub(String(text ?? ''))
-        .replace(/\s+/g, ' ')
+        // One line ending, whatever the CLI printed.
+        .replace(/\r\n?/g, '\n')
+        // Spaces and tabs collapse; `\n` is deliberately excluded from the class.
+        .replace(/[^\S\n]+/g, ' ')
+        // Three or more breaks in a row — two or more blank lines — become one.
+        .replace(/\n{3,}/g, '\n\n')
         .trim()
         .slice(0, TRACE_PROSE_CAP);
       if (!t) return;
-      push({ k: kind === 'think' ? 'think' : kind === 'say' ? 'say' : 'note', t });
+      const k = kind === 'think' ? 'think' : kind === 'say' ? 'say' : 'note';
+      /**
+       * A RUN OF BARE "thinking…" IS ONE STEP, not forty.
+       *
+       * Claude emits a thinking block per burst and (measured 2026-09-16, three
+       * real transcripts: 93 blocks, all of them empty) carries no text in any
+       * of them — so the trace filled with the identical marker repeated, which
+       * is noise standing exactly where the thought would have been. The wiki
+       * feed collapses the same run for the same reason (fleet.mjs: "Collapse
+       * runs of bare 'thinking…' so the feed doesn't fill with it").
+       *
+       * ONLY THE BARE MARKER, and that is the whole safety of it: a think WITH
+       * text is never equal to it, so no real thought is ever eaten — the day
+       * the CLI starts emitting thinking text, every one of those blocks lands
+       * whole beside the others.
+       *
+       * A collapsed marker is NOT a drop: it never becomes an entry, so it
+       * never takes a seq, exactly like the empty line above it. The "N earlier
+       * steps are not shown" count stays a count of steps that existed.
+       */
+      if (k === 'think' && t === THINK_MARKER && lastEntry?.k === 'think' && lastEntry.t === t) {
+        return;
+      }
+      push({ k, t });
     },
     /** One structured tool event, exactly as `toolEventOf` built it. A tool this
      *  builder does not know returns null there and nothing is pushed here — a

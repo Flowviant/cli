@@ -108,9 +108,27 @@ export function parseProposal(text) {
       ...(Number.isFinite(g.pointsBudget) && g.pointsBudget > 0
         ? { pointsBudget: Math.min(Math.round(g.pointsBudget), 100_000) }
         : {}),
-      ...(Array.isArray(g.waitsOn)
-        ? { waitsOn: g.waitsOn.filter((w) => typeof w === 'string' && w).slice(0, 20) }
-        : {}),
+      // NO `waitsOn`, AND ITS ABSENCE IS THE FEATURE (2026-09-16).
+      //
+      // The planner's schema used to carry it — tempIds of agents that had to
+      // MERGE first — and the owner deleted the idea: "whats the point of
+      // dividing up the agents if one of the agents rely on waiting for one to
+      // finish? if thats the case have it be in the same agent." An agent
+      // already works its cards in order, so a chain split across two agents
+      // buys a second worktree, a second branch and a second review and then
+      // idles one of them; the only thing a split buys is SIMULTANEOUS work.
+      // SYSTEM_PLAN no longer mentions the key at all.
+      //
+      // So a model that emits it anyway is answering a schema it was not given
+      // — an older prompt cached in a resumed conversation, or invention — and
+      // reading it would create a silently-waiting agent through the exact door
+      // the prompt just closed. DROPPED, not REFUSED: this file's own law is
+      // lenient packaging, strict shape, and a stray key is packaging. The
+      // proposal is otherwise good work the operator already paid for.
+      //
+      // The SERVER still accepts and honours `waitsOn` on the wire — 0.86.0
+      // daemons are still proposing it and existing agents still carry it. This
+      // is the end of PROPOSING one, not the end of reading one.
       ...(typeof g.intoAgentId === 'string' && g.intoAgentId
         ? { intoAgentId: g.intoAgentId.slice(0, 64) }
         : {}),
