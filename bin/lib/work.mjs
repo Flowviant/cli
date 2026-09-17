@@ -52,7 +52,8 @@ import { listenersIn, measureListeners, listenersSupported } from './listeners.m
 import { measureProcesses, liveGroups, processesSupported } from './processes.mjs';
 import { mutateRegistry, processAlive, readRegistry } from './procRegistry.mjs';
 import { createPlaceLock } from './placeLock.mjs';
-import { parseProposal, parseTurnResult } from './agentPlan.mjs';
+import { parseProposal, parsePrecheck, parseTurnResult } from './agentPlan.mjs';
+import { readStash, stashCard } from './agentCards.mjs';
 import { sweepMergedBranch } from './shipSweep.mjs';
 import { mergeOutward as shipMergeOutward } from './shipMerge.mjs';
 import { openTunnel } from './preview.mjs';
@@ -68,8 +69,11 @@ import {
   SYSTEM_PLAN,
   AGENT_PLAN_KICKOFF,
   SYSTEM_AGENT,
+  SYSTEM_PRECHECK,
   AGENT_TASK_KICKOFF,
+  AGENT_TASK_SPEC,
   AGENT_HUMAN_KICKOFF,
+  AGENT_PRECHECK_KICKOFF,
 } from './prompts.mjs';
 import {
   materializeInto,
@@ -84,6 +88,7 @@ import {
   pickRuntimeFor,
   recordSkills,
   toolEventOf,
+  removeProbeTranscript,
   CLAUDE_TOOL_PROSE_KINDS,
   RUNTIMES,
 } from './runtimes.mjs';
@@ -222,6 +227,7 @@ export function createWorkManager({
   const AGENT_TRACE_URL = FLEET_URL.replace(/\/agents\/?$/, '/agent-trace');
   const AGENT_PARKED_URL = FLEET_URL.replace(/\/agents\/?$/, '/agent-parked');
   const AGENT_CHECK_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/agent-check-done');
+  const AGENT_PRECHECK_URL = FLEET_URL.replace(/\/agents\/?$/, '/agent-precheck');
   const AGENT_MERGE_CLAIM_URL = FLEET_URL.replace(/\/agents\/?$/, '/agent-merge-claim');
   const AGENT_MERGE_DONE_URL = FLEET_URL.replace(/\/agents\/?$/, '/agent-merge-done');
   // What arrived on base, whichever road it took — observed after every beat
@@ -4811,6 +4817,34 @@ export function createWorkManager({
       const resume = rt === 'claude' && Boolean(ranMarker && existsSync(ranMarker));
 
       /**
+       * WRITE THE CARD DOWN BEFORE HANDING IT OVER — the material the AI
+       * pre-review reads at review entry (see agentCards.mjs).
+       *
+       * HERE rather than at review entry because here is the ONLY moment this
+       * machine holds the card at all: the server feeds an agent one card per
+       * prompt and keeps no copy on this disk, so by the time the queue empties
+       * card one exists locally as nothing but its own commit messages — which
+       * are a claim about the work, not the specification it was judged against.
+       *
+       * BEFORE the CLI runs rather than after, so a turn that crashes still
+       * leaves the spec behind: the card really was given to the agent, the
+       * commits it made are on the branch, and a reviewer is entitled to read
+       * what was asked for either way.
+       *
+       * ONE SPEC BUILDER (`AGENT_TASK_SPEC`) shared with the kickoff below, so
+       * what the reviewer reads is byte-identical to what the agent read.
+       * Failure is swallowed inside `stashCard`: a note about a turn may never
+       * cost the turn.
+       */
+      if (job.kind === 'task' && job.task) {
+        stashCard(
+          sessionMetaPath(wt, 'flowviant-agent-cards', agentId),
+          job.task.id,
+          AGENT_TASK_SPEC(job.task)
+        );
+      }
+
+      /**
        * THE WHOLE STREAM, not just its latest line — see trace.mjs.
        *
        * The pulse below is untouched and still sent: it carries staleness (how
@@ -5009,9 +5043,10 @@ export function createWorkManager({
         branch,
         worktree: wt,
       });
-      // The queue just emptied. Run the project's own check HERE, in the
-      // worktree we are already standing in and still hold the lock on.
-      if (reply?.review === true) await runCheck(agentId, wt);
+      // The queue just emptied. Run the project's own check and the AI
+      // pre-review HERE, in the worktree we are already standing in and still
+      // hold the lock on — see `runReviewEntry`.
+      if (reply?.review === true) await runReviewEntry(agentId, wt, job.agentName);
     });
     /**
      * …AND THEN PUBLISH, IF THE PROJECT PUBLISHES.
@@ -5102,8 +5137,8 @@ export function createWorkManager({
         // body — never the CLI, which would spend the operator's quota again
         // and write a second set of commits. The reply can still carry the one
         // instruction a settle can (`review: true`, the queue just emptied),
-        // so the project's check runs from here too, under the same writer
-        // lock the turn itself would have held.
+        // so the project's check and the AI pre-review run from here too, under
+        // the same writer lock the turn itself would have held.
         agentTurns.add(id);
         void (async () => {
           const reply = await postAgentTurn(held.body);
@@ -5111,7 +5146,7 @@ export function createWorkManager({
           const wt = typeof held.body.worktree === 'string' ? held.body.worktree : null;
           if (reply?.review === true && isSafePathSegment(place) && wt && existsSync(wt)) {
             await inPlace(place, place.startsWith('a-'), () =>
-              runCheck(String(job.agentId || ''), wt)
+              runReviewEntry(String(job.agentId || ''), wt, job.agentName)
             );
           }
         })()
@@ -5361,6 +5396,363 @@ export function createWorkManager({
     });
   };
 
+  // ── THE AI PRE-REVIEW ──────────────────────────────────────────────────────
+  //
+  // A FRESH Claude reads the branch before the human does. The owner asked for
+  // it in these words: "before having the user manually check, can we have the
+  // daemon … spawn an agent to review the work so basically we get an ai to look
+  // at the review before a human looks at it for a double check."
+  //
+  // IT IS NOT THE AGENT CHECKING ITSELF. `runTurn` is called with no `resume`,
+  // so there is no conversation to inherit: an agent that spent four turns
+  // arguing itself into a design defends that design, and asked whether its work
+  // meets the card it answers from the very context that produced the work. The
+  // reviewer stands IN the agent's worktree because it needs the code and the
+  // diff, under `readOnly` (CONSULT_PERM — Read, Grep, Glob and a few git reads)
+  // with NO MCP passed at all, so there is no control plane on this turn even if
+  // the repository it reads tries to steer it.
+  //
+  // IT LABELS AND NEVER BLOCKS — the check's own law, one function up. Approve,
+  // the per-card verdicts and the ship quiz do not know this exists. Every exit
+  // below POSTS NOTHING, and the server renders an absent precheck as nothing:
+  // a failed, timed-out, skipped or unparseable read leaves the human's review
+  // exactly as it was before this feature existed. Ignorance never withholds.
+  //
+  // NO VERSION FLOOR. This is a daemon→server report on a NEW endpoint, so an
+  // older daemon simply never posts, and an older SERVER 404s — which `postPre`
+  // treats as delivered-and-done for the agent-trace reason stated there.
+  //
+  // IT RIDES THE BEAT THE CHECK ALREADY OWNS (`runReviewEntry`), AFTER it: the
+  // check is a local command and this is a model call, so the cheap answer lands
+  // on the row first and a wedged reviewer cannot delay it.
+  /**
+   * FIVE MINUTES, and `runTurn` has no timer of its own.
+   *
+   * Half the planner's cap, because this turn is strictly smaller — it reads one
+   * branch's diff and answers, where a planner reads a repository to decide
+   * whether a batch of work collides. And it is HELD INSIDE THE PLACE WRITER
+   * LOCK by the beat it rides, so every minute here is a minute the agent's next
+   * turn (or its merge) is waiting: a generous cap on a label would be spending
+   * the work's time on a note about the work.
+   */
+  const PRECHECK_TIMEOUT_MS = 5 * 60_000;
+  /** Commit subjects handed to the reviewer. A bound on the prompt, not on the
+   *  branch — the reviewer reads the diff itself, and the log is context. */
+  const PRECHECK_LOG_LINES = 80;
+
+  /**
+   * ONE PRE-REVIEW, POSTED.
+   *
+   * Resolves TRUE for a permanent refusal as well as a success, and that is
+   * deliberate — the `postAgentTrace` rule, for the same reason: a server with
+   * no such route 404s this body and will 404 every retry of it, so re-sending
+   * would be a wedge wearing a retry's clothes. A NETWORK error resolves false
+   * and is retried ONCE, because unlike a trace batch this body cost a whole
+   * model call and losing it to a blip means the operator paid for a label
+   * nobody ever sees.
+   */
+  const postPre = async (body) => {
+    try {
+      const res = await fetch(AGENT_PRECHECK_URL, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${FLEET_TOKEN}`,
+          'User-Agent': USER_AGENT,
+          'Content-Type': 'application/json',
+        },
+        signal: AbortSignal.timeout(30_000),
+        body: JSON.stringify(body),
+      });
+      return (
+        res.ok ||
+        (res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429)
+      );
+    } catch {
+      return false; // a blip — worth one more attempt at a model call's answer
+    }
+  };
+
+  /**
+   * THE BRANCH'S OWN COMMITS, subject + trailers, and the card ids they name.
+   *
+   * MEASURED, never asserted — the same reason `commitsBetween` exists. The
+   * trailer ids are what let the prompt say "N earlier cards' specs are not on
+   * this box" honestly: the difference between the cards this branch claims and
+   * the specs this disk holds is a fact, and a box that adopted the agent
+   * mid-run is exactly the case where it is non-zero.
+   *
+   * IT CANNOT THROW. `baseRef()` is free text an owner typed and may name no
+   * ref at all; an unreadable range costs the reviewer its context, never the
+   * review-entry beat it is standing in.
+   */
+  const branchLog = (wt) => {
+    let out;
+    try {
+      out = git(['log', '--format=%s%n%b%n--', `${baseRef()}..HEAD`, '--not', baseRef()], wt);
+    } catch {
+      return { text: '', taskIds: [] };
+    }
+    if (typeof out !== 'string') return { text: '', taskIds: [] };
+    const taskIds = new Set();
+    for (const m of out.matchAll(/^\s*Flowviant-Task:\s*(\S+)\s*$/gm)) {
+      taskIds.add(m[1].slice(0, 64));
+    }
+    const text = out
+      .split('\n')
+      .filter((l) => l.trim())
+      .slice(0, PRECHECK_LOG_LINES)
+      .join('\n');
+    return { text, taskIds: [...taskIds] };
+  };
+
+  const runPrecheck = async (agentId, wt, agentName) => {
+    /**
+     * WHICH CLI READS. `pickRuntimeFor('consult')` — the same picker the scratch
+     * planner uses, and for the same reason: this prompt was written against
+     * Claude, and a machine with no read-only-capable runtime simply does not
+     * produce a precheck. Nothing is posted and nothing is said on the row.
+     */
+    const rt = pickRuntimeFor('consult');
+    if (!rt) return;
+    /**
+     * THE PRESSURE GUARD, at the spawn, exactly as every other unattended lane
+     * asks it. `churn` and never `interactive`: nobody is watching this, and a
+     * label is the first thing that should not be started on a box that is
+     * struggling. Deferring here does NOT queue anything — there is no job and
+     * no re-offer — so a precheck skipped under pressure is simply a precheck
+     * that did not happen, which is what absence already means.
+     */
+    const hold = admit('churn');
+    if (hold) {
+      note(`${c.cyan('pre-review')} ${c.dim(`— skipped: ${hold.reason}`)}`);
+      return;
+    }
+    const releaseSlot = admit.reserve();
+
+    // THE HEAD THE READING BELONGS TO, taken BEFORE the turn — the
+    // `checkFingerprint` shape, so a commit landing after this voids it rather
+    // than letting an old reading label a branch it never saw. Optional: an
+    // unreadable head costs the staleness comparison, not the precheck.
+    let headSha = null;
+    try {
+      headSha = (git(['rev-parse', 'HEAD'], wt) || '').trim() || null;
+    } catch {
+      headSha = null;
+    }
+
+    const stash = readStash(sessionMetaPath(wt, 'flowviant-agent-cards', agentId));
+    const log = branchLog(wt);
+    /** Cards the BRANCH names that this box has no spec for. Measured, not
+     *  guessed — see agentCards.mjs on why a stash is per-box. */
+    const held = new Set(stash.map((s) => s.taskId));
+    const missingSpecs = log.taskIds.filter((id) => !held.has(id)).length;
+
+    let out = '';
+    let child = null;
+    let timer = null;
+    /** The cap fired: the CLI was still running when this machine stopped it. */
+    let wedged = false;
+    /**
+     * THE CONVERSATION THIS READING SPEAKS UNDER — held for exactly one reason:
+     * to DELETE the transcript it leaves behind (review, 2026-09-17).
+     *
+     * This is the first thing in the daemon to run a second `claude -p` inside
+     * an AGENT's worktree, and the agent's own resume is `--continue`, which is
+     * CWD-KEYED — the invariant `runAgentTurn` states in words ("ONE AGENT IS
+     * ONE DIRECTORY, so the CLI's own cwd-keyed resume is exactly right here").
+     * Leaving this turn's `~/.claude/projects/<munged-cwd>/<id>.jsonl` in place
+     * makes the read-only stranger the newest conversation in that directory,
+     * so the agent's NEXT turn — a send-back's re-queued card, a merge-resolve,
+     * a human's typed answer — resumes "you are a SECOND reviewer… YOU ARE
+     * READ-ONLY" instead of its own four-turn context, under build permissions.
+     * That is the 0.69.0 Workbench cross-resume and codex's `resume --last`,
+     * arriving a third time by a third route.
+     *
+     * `removeProbeTranscript` is exported for precisely this and already serves
+     * the skills probe and the dev-command resolver.
+     */
+    let preSession = null;
+    try {
+      /**
+       * THE CAP RESOLVES THE WAIT ITSELF rather than waiting for `close` after
+       * the kill — the shape the project check and the planner both keep. A
+       * SIGKILLed process whose stdio a grandchild still holds can be slow to
+       * emit `close`, or never emit it, and this promise is inside the place's
+       * writer lock.
+       */
+      let stopWaiting = () => {};
+      const capped = new Promise((r) => {
+        stopWaiting = r;
+      });
+      const turn = runTurn({
+        prompt: AGENT_PRECHECK_KICKOFF({
+          agentName,
+          cards: stash.map((s) => s.prompt).join('\n---\n'),
+          missingSpecs,
+          commits: log.text,
+          diffCommand: `git diff ${baseRef()}...HEAD`,
+        }),
+        system: SYSTEM_PRECHECK,
+        // READ-ONLY, and no MCP: `mcpArgs` is omitted entirely rather than
+        // passed empty, so there is no control plane on this turn at all.
+        readOnly: true,
+        cwd: wt,
+        runtime: rt,
+        // NO `resume`, AND THAT IS THE FEATURE. A resumed turn would be the
+        // agent grading its own homework out of its own context; this is a
+        // stranger reading a diff.
+        streamJson: true,
+        answerFromResult: true,
+        label: c.cyan('[pre-review]'),
+        // The id the CLI reports at `system.init` — harvested off the stream
+        // this turn already parses, no probe and no extra spawn. Held only so
+        // the `finally` below can delete this turn's transcript; see
+        // `preSession`.
+        onInit: (i) => {
+          if (typeof i.sessionId === 'string' && i.sessionId.trim())
+            preSession = i.sessionId.trim();
+        },
+        onSpawn: (ch) => {
+          child = ch;
+          // No task id: a pre-review belongs to no card, and the machine
+          // snapshot's per-task rows must not invent one. It still COUNTS
+          // against the machine's ceiling — see liveTurnCount.
+          workChildren.set(ch, null);
+          releaseSlot();
+          // ARMED AT THE SPAWN, not at entry: time spent getting here is not a
+          // wedged CLI. The CHILD and never its group — a read-only turn starts
+          // no server, so there is nothing behind it worth signalling and
+          // everything to lose by signalling somebody else's.
+          timer = setTimeout(() => {
+            wedged = true;
+            try {
+              ch.kill('SIGKILL');
+            } catch {
+              /* already gone */
+            }
+            stopWaiting('');
+          }, PRECHECK_TIMEOUT_MS);
+          timer.unref?.();
+        },
+      });
+      out = await Promise.race([turn, capped]);
+    } catch {
+      return; // a label may never fail the beat it rides
+    } finally {
+      if (timer) clearTimeout(timer);
+      if (child) workChildren.delete(child);
+      releaseSlot();
+      /**
+       * DELETE THIS READING'S TRANSCRIPT, on EVERY exit — settled, wedged and
+       * killed, or thrown — because every one of them leaves the file behind
+       * and the agent's `--continue` reads the newest one in the directory.
+       *
+       * AFTER the kill and ON A DELAY, the skills probe's own shape: the
+       * transcript is the CHILD's file, so removing it while the child is still
+       * dying races a recreate. Unref'd — it must not hold the process open.
+       */
+      if (preSession) setTimeout(() => removeProbeTranscript(wt, preSession), 750).unref?.();
+    }
+
+    // A WEDGED READING POSTS NOTHING. There is no row to settle and nobody
+    // waiting on an answer, so the honest record is that no pre-review exists —
+    // the same silence a machine that never ran one leaves.
+    if (wedged) {
+      note(`${c.cyan('pre-review')} ${c.dim('— ran past five minutes and was stopped')}`);
+      return;
+    }
+
+    /**
+     * SCRUBBED ON THE WAY OUT, every string — AND SCRUBBED BEFORE IT IS CUT,
+     * which is the order that matters and the reason `envScrub` rides INTO the
+     * parser rather than being applied to what comes back out.
+     *
+     * This turn read the repository with `cat` and `git show` in a worktree
+     * holding the project's materialized dev secrets, and its answer is about to
+     * be stored and rendered to every member of the project. `scrub` replaces
+     * EXACT full values, so a note capped first and scrubbed second hands the
+     * scrub a credential already cut in half: it matches nothing and the
+     * surviving prefix ships. The check's output lane learned exactly that the
+     * expensive way, and this lane relearned it in review (2026-09-17) — see
+     * `parsePrecheck`, which now caps only what it has already redacted.
+     */
+    const result = parsePrecheck(out, envScrub);
+
+    /**
+     * A QUOTA LIMIT SKIPS THE PRE-REVIEW AND PARKS NOTHING — AND A LIMIT IS
+     * ONLY A LIMIT WHEN THE READING PRODUCED NOTHING.
+     *
+     * `limitLine` is a literal phrase match over the CLI's whole output, and
+     * under `answerFromResult` that output IS the reviewer's answer — so a
+     * pre-review OF rate-limiting code, or any triage that quotes the phrase,
+     * read as a quota failure and threw a perfectly good reading away. The
+     * agent-turn lane fixed this exact false positive once (`const limit = res
+     * ? null : limitLine(out)`); gating on "nothing parsed" is what makes the
+     * match mean what it says.
+     *
+     * And when it IS a limit, nothing parks. `postAgentParked` stops EVERY
+     * agent on the project, because the CLI login is shared — the right answer
+     * when the thing that hit the limit was somebody's actual work, the wrong
+     * one here: parking a whole fleet because a LABEL could not be written
+     * would let an optional readout take the product's primary lane down. The
+     * branch is still reviewable; it just has no note on it.
+     */
+    if (!result) {
+      if (limitLine(out)) {
+        note(`${c.cyan('pre-review')} ${c.dim('— skipped: the CLI reported a limit')}`);
+      }
+      // UNPARSEABLE POSTS NOTHING. A half-read triage is a plausible-looking
+      // paragraph nobody wrote, rendered on the surface where somebody decides
+      // whether a branch reaches main — see parsePrecheck.
+      return;
+    }
+
+    const body = {
+      agentId,
+      ...(headSha ? { headSha } : {}),
+      cards: result.cards.map((cd) => ({
+        taskId: cd.taskId,
+        verdict: cd.verdict,
+        ...(cd.note ? { note: cd.note } : {}),
+      })),
+      ...(result.overall ? { overall: result.overall } : {}),
+    };
+    // ONE RETRY, and only for a network error — see `postPre`. A permanent
+    // refusal is an older server, and asking it again changes nothing.
+    if (!(await postPre(body))) await postPre(body);
+  };
+
+  /**
+   * REVIEW ENTRY — everything this machine does the moment an agent's queue
+   * empties, in one place.
+   *
+   * It exists so the two readings cannot drift apart at the three call sites
+   * that own this beat (the settle reply, the held body's re-POST, and the
+   * stale-merge re-read after base is folded in). Each of those used to call
+   * `runCheck` directly; a second thing to run at the same moment is a second
+   * thing three call sites can forget.
+   *
+   * THE CHECK FIRST, ALWAYS. It is a local command whose answer the board wants
+   * on the row immediately; the pre-review is a model call that may take
+   * minutes. Ordering them the other way would put a label behind a label.
+   *
+   * NEITHER MAY THROW PAST THIS POINT. Both are optional readouts and both run
+   * INSIDE the place's writer lock on a path whose callers settle real work —
+   * `runAgentMerge` in particular reports a claimed merge after this returns.
+   */
+  const runReviewEntry = async (agentId, wt, agentName) => {
+    try {
+      await runCheck(agentId, wt);
+    } catch {
+      /* the row keeps its previous check answer, which is null the first time */
+    }
+    try {
+      await runPrecheck(agentId, wt, agentName);
+    } catch {
+      /* no pre-review is posted, and absence renders nothing */
+    }
+  };
+
   // ── THE MERGE ──────────────────────────────────────────────────────────────
   //
   // LEASED, because two `git merge --no-ff` and two pushes over one branch is
@@ -5514,9 +5906,12 @@ export function createWorkManager({
           });
           return;
         }
-        // The branch changed, so the previous check answered about a different
-        // tree. Re-run it before anything merges.
-        await runCheck(agentId, wt);
+        // The branch changed, so the previous check — and the previous
+        // pre-review — answered about a different tree. Re-read it before
+        // anything merges: a failed merge sends the agent BACK to review, which
+        // is a review-entry beat like any other, and a stale reading standing
+        // over a rebased branch is exactly what `precheckSha` exists to void.
+        await runReviewEntry(agentId, wt, job.agentName);
       }
       // `git()` THROWS on a non-zero exit, and `symbolic-ref` exits non-zero on
       // a detached HEAD — so the guard below was unreachable and the throw

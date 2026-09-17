@@ -220,3 +220,128 @@ test('finds the object after prose, and ignores a decoy brace', async () => {
   );
   assert.equal(out.outcome, 'delivered');
 });
+
+// ── THE AI PRE-REVIEW's ANSWER ────────────────────────────────────────────────
+//
+// The strict half bites harder here than anywhere else in this file: this text
+// is rendered on the surface where somebody decides whether a branch reaches
+// main, and a precheck that posts NOTHING costs a label nobody was promised.
+
+test('reads a triage, fence and all', async () => {
+  const { parsePrecheck } = await import('./agentPlan.mjs');
+  const out = parsePrecheck(
+    'Here you go:\n```json\n' +
+      JSON.stringify({
+        cards: [
+          { taskId: 'c1', verdict: 'ok', note: '' },
+          { taskId: 'c2', verdict: 'concerns', note: 'the migration drops a column nothing re-adds' },
+        ],
+        overall: 'read c2 first',
+      }) +
+      '\n```'
+  );
+  assert.equal(out.cards.length, 2);
+  assert.equal(out.cards[0].verdict, 'ok');
+  assert.equal(out.cards[0].note, undefined, 'an empty note is absent, never an empty string');
+  assert.match(out.cards[1].note, /drops a column/);
+  assert.equal(out.overall, 'read c2 first');
+});
+
+/**
+ * A MALFORMED ANSWER POSTS NOTHING. Every shape here is one a model reaches:
+ * the right punctuation with no content, a verdict word nobody listed, a card
+ * with no id. None of them may become a paragraph on the review deck.
+ */
+test('returns null for anything that is not a readable triage', async () => {
+  const { parsePrecheck } = await import('./agentPlan.mjs');
+  assert.equal(parsePrecheck(''), null);
+  assert.equal(parsePrecheck('The branch looks fine to me.'), null);
+  assert.equal(parsePrecheck('{"cards":'), null, 'truncated JSON is not a triage');
+  assert.equal(parsePrecheck(JSON.stringify({ overall: '' })), null, 'no cards key at all');
+  assert.equal(
+    parsePrecheck(JSON.stringify({ cards: [], overall: '   ' })),
+    null,
+    'right punctuation, no content'
+  );
+  assert.equal(
+    parsePrecheck(JSON.stringify({ cards: [{ taskId: 'c1', verdict: 'looks-good' }] })),
+    null,
+    'an unlisted verdict is DROPPED, never coerced to ok'
+  );
+  assert.equal(
+    parsePrecheck(JSON.stringify({ cards: [{ verdict: 'ok', note: 'x' }] })),
+    null,
+    'a note nobody can attach to a card is not a triage'
+  );
+});
+
+/**
+ * SCRUBBED BEFORE IT IS CUT, and this test is the behavioural half of the
+ * source pin in `work.test.mjs` (review, 2026-09-17).
+ *
+ * The lane shipped `envScrub(note).slice(0, 400)` over a note this parser had
+ * ALREADY cut to 400 — and `scrub` is an EXACT FULL-VALUE replace, so a secret
+ * straddling the cap arrived pre-severed, matched nothing, and its prefix was
+ * stored and rendered to every member of the project. The reviewer reads a
+ * worktree holding the project's materialized dev secrets, so a note quoting a
+ * `.env` line is the ordinary way to reach this. Both fields straddle their own
+ * cap here on purpose.
+ */
+test('a secret straddling the cap is redacted, not severed', async () => {
+  const { parsePrecheck } = await import('./agentPlan.mjs');
+  const SECRET = `sk-live-${'z'.repeat(40)}`;
+  const scrub = (s) => s.split(SECRET).join('[REDACTED:API_KEY]');
+  const out = parsePrecheck(
+    JSON.stringify({
+      // The secret starts 20 chars before the 400-cap and 20 before the 1200.
+      cards: [{ taskId: 'c1', verdict: 'concerns', note: `${'a'.repeat(380)}${SECRET} tail` }],
+      overall: `${'b'.repeat(1180)}${SECRET} tail`,
+    }),
+    scrub
+  );
+  for (const field of [out.cards[0].note, out.overall]) {
+    assert.ok(!field.includes('sk-live-'), 'not even the prefix survives');
+    assert.ok(field.includes('[REDACTED:API_KEY]'), 'the whole value matched and was replaced');
+  }
+  // …and the caps still hold: redacting first must not grow the row past what
+  // the server and the deck will take.
+  assert.ok(out.cards[0].note.length <= 400);
+  assert.ok(out.overall.length <= 1200);
+  // An un-scrubbed call is still a legal call — the default is identity, so a
+  // caller that forgets loses redaction rather than the whole reading.
+  assert.ok(parsePrecheck(JSON.stringify({ cards: [], overall: 'plain' })).overall === 'plain');
+});
+
+// An `overall` on its own IS an answer — the reviewer gets the paragraph even
+// when the model forgot to judge the cards one by one.
+test('keeps an overall with no readable cards', async () => {
+  const { parsePrecheck } = await import('./agentPlan.mjs');
+  const out = parsePrecheck(JSON.stringify({ cards: [{ verdict: 'nonsense' }], overall: 'careful' }));
+  assert.deepEqual(out, { cards: [], overall: 'careful' });
+});
+
+// ONE ENTRY PER CARD, first wins: a model that judged a card twice contradicted
+// itself, and two notes on one card face asks the reviewer to arbitrate.
+test('keeps the first verdict per card and caps what it keeps', async () => {
+  const { parsePrecheck } = await import('./agentPlan.mjs');
+  const out = parsePrecheck(
+    JSON.stringify({
+      cards: [
+        { taskId: 'c1', verdict: 'concerns', note: 'first' },
+        { taskId: 'c1', verdict: 'ok', note: 'second' },
+      ],
+      overall: 'x'.repeat(5000),
+    })
+  );
+  assert.equal(out.cards.length, 1);
+  assert.equal(out.cards[0].note, 'first');
+  assert.equal(out.overall.length, 1200);
+});
+
+test('caps a note at the length the prompt asked for', async () => {
+  const { parsePrecheck } = await import('./agentPlan.mjs');
+  const out = parsePrecheck(
+    JSON.stringify({ cards: [{ taskId: 'c1', verdict: 'concerns', note: 'y'.repeat(2000) }] })
+  );
+  assert.equal(out.cards[0].note.length, 400);
+});

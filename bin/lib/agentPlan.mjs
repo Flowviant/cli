@@ -1,5 +1,7 @@
 /**
- * READING A PLANNER'S ANSWER.
+ * READING A MODEL'S ANSWER, in the agent lane's three shapes: a planner's
+ * PROPOSAL, an agent's own TURN RESULT, and (2026-09-16) the AI pre-review's
+ * TRIAGE.
  *
  * The scratch agent behind a Deploy press is asked for one JSON object and
  * nothing else. This is what turns its final message into a proposal, and it is
@@ -31,38 +33,50 @@ const MAX_NAME = 80;
 const MAX_NOTE = 1000;
 
 /**
- * Find the object.
+ * Find the objects.
  *
  * A fenced block first, because that is what was asked for. Otherwise every `{`
  * in the text is tried as a start, and its BALANCED end is found by counting
- * braces while skipping string literals — the first candidate that parses into
- * something with an `agents` array wins.
+ * braces while skipping string literals — each caller then takes the first
+ * candidate whose SHAPE is the one it asked for.
  *
  * The obvious cheap version — first `{` to last `}` — is wrong in a way a test
  * caught: a planner that writes "I looked at {the auth module} first" before its
  * JSON produces a span starting at the wrong brace, and the whole plan is lost
  * to a sentence. Scanning candidates costs nothing at this size and cannot be
  * defeated by prose.
+ *
+ * ONE SCANNER FOR ALL THREE READERS in this file (2026-09-16). It was written
+ * twice — once here and once inline in `parseTurnResult` — and a third copy was
+ * about to be written for the precheck. A brace scanner that skips string
+ * literals is exactly the kind of thing where two copies quietly stop agreeing
+ * about escapes and nobody notices, because the disagreement only shows up on a
+ * card title with a quote in it.
  */
-function extract(raw) {
+function candidateObjects(raw) {
   const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/);
-  const candidates = [];
-  if (fenced) candidates.push(fenced[1]);
+  const bodies = [];
+  if (fenced) bodies.push(fenced[1]);
   for (let i = 0; i < raw.length; i++) {
     if (raw[i] !== '{') continue;
     const end = balanced(raw, i);
-    if (end > i) candidates.push(raw.slice(i, end + 1));
+    if (end > i) bodies.push(raw.slice(i, end + 1));
   }
-  for (const body of candidates) {
+  const out = [];
+  for (const body of bodies) {
     if (!body.trim()) continue;
     try {
       const v = JSON.parse(body);
-      if (v && typeof v === 'object' && Array.isArray(v.agents)) return v;
+      if (v && typeof v === 'object') out.push(v);
     } catch {
       /* the next candidate may be the object */
     }
   }
-  return null;
+  return out;
+}
+
+function extract(raw) {
+  return candidateObjects(raw).find((v) => Array.isArray(v.agents)) ?? null;
 }
 
 /** The index of the `}` that closes the `{` at `from`, or -1. Skips string
@@ -158,23 +172,7 @@ export function parseProposal(text) {
  * up here rather than being read as success.
  */
 export function parseTurnResult(text) {
-  const parsedRaw = String(text ?? '');
-  const fenced = parsedRaw.match(/```(?:json)?\s*([\s\S]*?)```/);
-  const candidates = [];
-  if (fenced) candidates.push(fenced[1]);
-  for (let i = 0; i < parsedRaw.length; i++) {
-    if (parsedRaw[i] !== '{') continue;
-    const end = balanced(parsedRaw, i);
-    if (end > i) candidates.push(parsedRaw.slice(i, end + 1));
-  }
-  for (const body of candidates) {
-    let v;
-    try {
-      v = JSON.parse(body);
-    } catch {
-      continue;
-    }
-    if (!v || typeof v !== 'object') continue;
+  for (const v of candidateObjects(String(text ?? ''))) {
     if (v.status === 'blocked') {
       const question = typeof v.question === 'string' ? v.question.trim() : '';
       // A "blocked" with no question is not an answer anybody can act on — it
@@ -202,4 +200,81 @@ export function parseTurnResult(text) {
     }
   }
   return null;
+}
+
+/** The precheck's own bounds — mirrored at the server boundary, which caps
+ *  again. A note is one sentence of triage and `overall` is one paragraph; the
+ *  numbers are the ones SYSTEM_PRECHECK asks for, stated here so a model that
+ *  ignores them cannot make the row bigger than the surface can render. */
+const MAX_PRECHECK_CARDS = 60;
+const MAX_PRECHECK_NOTE = 400;
+const MAX_PRECHECK_OVERALL = 1200;
+
+/**
+ * READING THE AI PRE-REVIEW's ANSWER (2026-09-16).
+ *
+ * Same law as its two neighbours — LENIENT ON PACKAGING, STRICT ON SHAPE — and
+ * here the strict half has a sharper consequence than usual: this text is about
+ * to be rendered on the surface where somebody decides whether a branch reaches
+ * main. A half-read answer is a plausible-looking triage nobody wrote.
+ *
+ * NULL IS THE SAFE ANSWER AND THE COMMON ONE. A precheck that came back
+ * unparseable posts NOTHING, and the absence renders nothing: the human's review
+ * is exactly what it was before this feature existed. That is the whole reason
+ * this may be strict where `parseProposal` cannot be — a lost proposal wastes a
+ * press somebody made, a lost precheck costs a label nobody was promised.
+ *
+ * ONE ENTRY PER CARD, and the FIRST one wins: a model that judges a card twice
+ * has contradicted itself, and rendering two notes on one card face would ask
+ * the reviewer to arbitrate between them. An unknown verdict word is dropped
+ * rather than coerced — `ok` is a claim ("I looked and found nothing"), and
+ * guessing it from a word nobody listed would be the parser making that claim.
+ *
+ * `scrub` RIDES IN, AND IT RUNS BEFORE EVERY CUT (review, 2026-09-17).
+ *
+ * The caller used to scrub afterwards — `envScrub(cd.note).slice(0, 400)` over
+ * a note this function had ALREADY cut to 400. `scrub` replaces EXACT full
+ * values, so a credential straddling the cut arrived here pre-severed, matched
+ * nothing, and its surviving prefix was stored and rendered to every member of
+ * the project. That is byte-for-byte the bug `runCheck`'s output lane records
+ * learning the expensive way, and the reviewer this parses reads a worktree
+ * holding the project's materialized dev secrets — a note quoting a `.env`
+ * line is the ordinary way to reach it. The fix is `toolEventOf`'s: the scrub
+ * rides INTO the builder and runs over the whole field, before the cap.
+ *
+ * DEFAULTED TO IDENTITY so the parser stays testable on its own, and so a
+ * caller that forgets loses redaction rather than the whole reading — but the
+ * ONE production caller passes `envScrub`, and `work.test.mjs` pins the order.
+ */
+export function parsePrecheck(text, scrub = (s) => s) {
+  const parsed = candidateObjects(String(text ?? '')).find((v) => Array.isArray(v.cards));
+  if (!parsed) return null;
+
+  const cards = [];
+  const seen = new Set();
+  for (const c of parsed.cards.slice(0, MAX_PRECHECK_CARDS)) {
+    if (!c || typeof c !== 'object') continue;
+    const taskId = typeof c.taskId === 'string' ? c.taskId.trim().slice(0, 64) : '';
+    if (!taskId || seen.has(taskId)) continue;
+    if (c.verdict !== 'ok' && c.verdict !== 'concerns') continue;
+    seen.add(taskId);
+    // SCRUB, THEN CUT — see the docblock. The whole field is in hand here, so an
+    // exact-value match still finds a secret that spans the cap.
+    const note =
+      typeof c.note === 'string' ? scrub(c.note.trim()).slice(0, MAX_PRECHECK_NOTE) : '';
+    cards.push({ taskId, verdict: c.verdict, ...(note ? { note } : {}) });
+  }
+  const overall =
+    typeof parsed.overall === 'string'
+      ? scrub(parsed.overall.trim()).slice(0, MAX_PRECHECK_OVERALL)
+      : '';
+  /**
+   * AN ANSWER THAT SAYS NOTHING IS NOT AN ANSWER. No readable card verdict and
+   * no overall means the model produced the right punctuation and no content —
+   * posting that would put an empty "Claude's pre-review" heading on the deck,
+   * which reads as a feature that ran and found the branch unremarkable. It did
+   * not run.
+   */
+  if (cards.length === 0 && !overall) return null;
+  return { cards, ...(overall ? { overall } : {}) };
 }

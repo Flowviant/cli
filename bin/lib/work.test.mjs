@@ -770,10 +770,21 @@ test('a landed merge retires the published ref; a failed one keeps it', async (t
 test('the publish is tail work: after the settle, and outside the place lock', () => {
   const turn = fnBody(workSource(), 'runAgentTurn');
   const lockAt = turn.indexOf('await inPlace(place, place.startsWith(\'a-\')');
-  const lastAt = turn.indexOf('if (reply?.review === true) await runCheck(agentId, wt);');
+  /**
+   * THE REVIEW-ENTRY BEAT — the project's check AND, since 0.88.0, the AI
+   * pre-review, both behind `runReviewEntry`. Re-anchored when the call was
+   * wrapped: a pin moves with the code it pins, and this one sliced on a string
+   * the file no longer held. BOTH anchors are asserted before they are compared,
+   * because `-1` makes every `>` below it silently true.
+   */
+  const lastAt = turn.indexOf(
+    'if (reply?.review === true) await runReviewEntry(agentId, wt, job.agentName);'
+  );
   const pubAt = turn.indexOf('await publishAgentBranch(place, job.publishTo)');
   assert.ok(lockAt > -1, 'the turn must still take its place lock');
-  assert.ok(lastAt > lockAt, 'the check runs inside the lock, as the last thing in it');
+  assert.ok(lastAt > -1, 'the review-entry beat must still be the last thing in the lock');
+  assert.ok(pubAt > -1, 'the publish must still exist');
+  assert.ok(lastAt > lockAt, 'the review-entry beat runs inside the lock, as the last thing in it');
   assert.ok(pubAt > lastAt, 'the publish must exist, after the lock block');
   /**
    * A push is a blocking network call that can hang for its whole timeout, and
@@ -1007,4 +1018,267 @@ test('an absent target makes the sweep forget the agent, not keep pushing it', a
     published,
     'a switched-off project must not keep pushing an agent it already published'
   );
+});
+
+// ── THE AI PRE-REVIEW ─────────────────────────────────────────────────────────
+//
+// A fresh Claude reads the branch before the human does. Everything under pin
+// here is a property whose failure is silent: a reviewer spawned on the wrong
+// beat spends the operator's quota on every settle; one that resumed the agent's
+// own conversation produces self-approval wearing a second reader's name; one
+// that posts an unparseable answer puts a paragraph nobody wrote on the surface
+// where a merge is decided.
+
+test('the reviewer runs ONLY on the review-entry beat, and only through one door', () => {
+  const src = workSource();
+  /**
+   * ONE CALL SITE, and it is inside `runReviewEntry`. The mutation this exists
+   * to catch is the obvious one — spawning the reviewer after EVERY settle
+   * rather than after the settles that emptied a queue — which on a busy board
+   * is a model call per card instead of one per branch.
+   */
+  assert.equal(
+    (src.match(/await runPrecheck\(/g) ?? []).length,
+    1,
+    'exactly one caller: the review-entry beat'
+  );
+  assert.equal(
+    (src.match(/await runCheck\(/g) ?? []).length,
+    1,
+    'the check goes through the same door, so the two cannot drift apart'
+  );
+  const entry = fnBody(src, 'runReviewEntry');
+  assert.ok(entry.includes('await runCheck(agentId, wt)'));
+  assert.ok(entry.includes('await runPrecheck(agentId, wt, agentName)'));
+  assert.ok(
+    entry.indexOf('runCheck(') < entry.indexOf('runPrecheck('),
+    'the cheap local command lands on the row before the model call'
+  );
+  // Neither may throw past the beat: `runAgentMerge` settles a CLAIMED merge
+  // after this returns, and an escape there leaves it unreported until its
+  // lease lapses.
+  assert.equal((entry.match(/catch\s*\{/g) ?? []).length, 2);
+
+  /**
+   * EVERY REVIEW-ENTRY BEAT, AND NOTHING ELSE. Three call sites: the settle
+   * reply, the held body's re-POST, and the stale-merge re-read after base is
+   * folded in. A fourth appearing here without a `review === true` guard (or the
+   * merge's own `job.stale` branch) is the mutation this counts.
+   */
+  // The definition is `const runReviewEntry = async (` and does not match; what
+  // this counts is CALLS.
+  const beats = src.match(/runReviewEntry\(/g) ?? [];
+  assert.equal(beats.length, 3, 'exactly three beats own review entry');
+  assert.ok(src.includes('if (reply?.review === true) await runReviewEntry(agentId, wt, job.agentName);'));
+  assert.ok(src.includes('runReviewEntry(String(job.agentId || \'\'), wt, job.agentName)'));
+  const merge = fnBody(src, 'runAgentMerge');
+  assert.ok(merge.includes('await runReviewEntry(agentId, wt, job.agentName);'));
+});
+
+test('the reviewer is a STRANGER: fresh conversation, read-only, no MCP', () => {
+  const pre = fnBody(workSource(), 'runPrecheck');
+  // The whole design in one absence. A resumed turn would be the agent grading
+  // its own homework out of the context that produced the work.
+  assert.ok(!/\bresume\b\s*[:,]/.test(pre), 'no resume — a second reader has no conversation');
+  assert.ok(pre.includes('readOnly: true'), 'CONSULT_PERM: no Write, no Edit, no mkdir, no rm');
+  assert.ok(!pre.includes('mcpArgs'), 'no control plane on this turn at all');
+  assert.ok(!pre.includes('mcpConfig'));
+  assert.ok(pre.includes('system: SYSTEM_PRECHECK'));
+  // IN the agent's worktree: it needs the code and the diff.
+  assert.ok(pre.includes('cwd: wt'));
+  assert.ok(pre.includes("pickRuntimeFor('consult')"));
+});
+
+test('the reviewer is bounded: admission, a cap under the check\'s, and a quota skip', () => {
+  const src = workSource();
+  const pre = fnBody(src, 'runPrecheck');
+  // The pressure guard every unattended lane asks. `churn`, never
+  // `interactive`: nobody is watching a label.
+  assert.ok(pre.includes("const hold = admit('churn');"));
+  assert.ok(pre.includes('admit.reserve()'));
+  assert.ok(/releaseSlot\(\)/.test(pre));
+
+  const m = src.match(/const PRECHECK_TIMEOUT_MS = (\d+) \* 60_000;/);
+  assert.ok(m, 'runTurn has no timer of its own — this turn must carry a cap');
+  const minutes = Number(m[1]);
+  const check = Number(src.match(/const CHECK_TIMEOUT_MS = (\d+) \* 60_000;/)[1]);
+  assert.ok(
+    minutes < check,
+    `a label must not outlast the check it rides behind (got ${minutes} vs ${check})`
+  );
+  assert.ok(pre.includes("ch.kill('SIGKILL')"), 'the child is killed — never its group');
+  assert.ok(!/kill\(-/.test(pre));
+  // A wedged reading posts NOTHING: there is no row to settle, and absence is
+  // what a machine that never ran one already leaves.
+  assert.ok(/if \(wedged\) \{[\s\S]{0,200}return;/.test(pre));
+
+  /**
+   * A QUOTA LIMIT SKIPS, AND NEVER PARKS. `postAgentParked` stops every agent on
+   * the project because the CLI login is shared — the right answer for real
+   * work, and catastrophic for an optional label.
+   */
+  assert.ok(pre.includes('if (limitLine(out))'));
+  assert.ok(!pre.includes('postAgentParked'), 'a label may never stall the fleet');
+
+  /**
+   * …AND A LIMIT IS ONLY A LIMIT WHEN NOTHING PARSED (review, 2026-09-17).
+   *
+   * `limitLine` matches a literal phrase over the CLI's WHOLE output, and under
+   * `answerFromResult` that output is the reviewer's own answer — so a triage of
+   * rate-limiting code read as a quota failure and threw a good reading away.
+   * The agent-turn lane fixed the identical false positive once; this pins the
+   * ORDER rather than the presence, because the broken version contained both
+   * lines.
+   */
+  assert.ok(
+    pre.indexOf('parsePrecheck(out') < pre.indexOf('limitLine(out)'),
+    'parse first: a pre-review that mentions a rate limit is not a rate limit'
+  );
+  assert.ok(
+    /if \(!result\) \{[\s\S]{0,400}limitLine\(out\)/.test(pre),
+    'the limit branch is reached only when the reading produced nothing'
+  );
+});
+
+test('a malformed answer posts nothing, and everything that does leave is scrubbed BEFORE it is cut', () => {
+  const src = workSource();
+  const pre = fnBody(src, 'runPrecheck');
+  assert.ok(pre.includes('parsePrecheck(out, envScrub)'), 'the scrub rides INTO the parser');
+  assert.ok(/if \(!result\) \{[\s\S]{0,400}return;/.test(pre), 'an unparseable triage is not a triage');
+
+  /**
+   * THE ORDER, NOT THE PRESENCE (review, 2026-09-17).
+   *
+   * This lane shipped `envScrub(cd.note).slice(0, 400)` over a note
+   * `parsePrecheck` had ALREADY cut to 400 — and `scrub` is an exact full-value
+   * replace, so a credential straddling that cut arrived pre-severed, matched
+   * nothing, and its prefix was rendered to every member of the project. That is
+   * byte-for-byte the bug `runCheck`'s output lane records learning the
+   * expensive way. The old pin asserted only that `envScrub(` appeared, which
+   * was true of the broken order; this asserts the cut comes after the scrub,
+   * inside the one function that holds the whole field.
+   */
+  // BOTH ANCHORS BEFORE THE SLICE — a pin that slices on a missing anchor
+  // asserts over nothing, which this repo has caught itself doing five times.
+  const planSrc = readFileSync(new URL('./agentPlan.mjs', import.meta.url), 'utf8');
+  const from = planSrc.indexOf('export function parsePrecheck(');
+  const to = planSrc.indexOf('\n}', from);
+  assert.ok(from > -1 && to > from, 'parsePrecheck must exist to be pinned');
+  const parse = planSrc.slice(from, to);
+  assert.ok(parse.includes('parsePrecheck(text, scrub'), 'the scrub is a parameter, not an afterthought');
+  for (const field of ['scrub(c.note.trim())', 'scrub(parsed.overall.trim())']) {
+    const at = parse.indexOf(field);
+    assert.ok(at > -1, `${field}: the whole field is redacted first`);
+    const cut = parse.indexOf('.slice(0, MAX_PRECHECK', at);
+    assert.ok(cut > at, `${field}: and only then capped`);
+  }
+  // …and nothing downstream re-cuts what the parser already sized, which is how
+  // a second cap silently reintroduces the same straddle.
+  assert.ok(!/envScrub\((?:cd\.note|result\.overall)\)/.test(pre));
+  assert.ok(!/cd\.note\.slice|result\.overall\.slice/.test(pre));
+
+  // The head the reading belongs to — the `checkFingerprint` shape, so a later
+  // commit voids it rather than letting an old reading label a new branch.
+  assert.ok(pre.includes("git(['rev-parse', 'HEAD'], wt)"));
+  assert.ok(pre.includes('...(headSha ? { headSha } : {})'));
+});
+
+/**
+ * THE READING DELETES ITS OWN TRANSCRIPT, and an absent call is invisible to
+ * every other test in this file (review, 2026-09-17).
+ *
+ * The agent resumes with `--continue`, which is CWD-KEYED, and this is the only
+ * thing in the daemon that runs a SECOND `claude -p` in an agent's worktree. Its
+ * leftover `~/.claude/projects/<munged-cwd>/<id>.jsonl` is the newest
+ * conversation there, so the agent's next turn — a send-back's re-queued card, a
+ * merge-resolve, a human's typed answer — resumes the read-only stranger's
+ * diff-triage under build permissions.
+ */
+test('the pre-review leaves no conversation behind for the agent to resume', () => {
+  const pre = fnBody(workSource(), 'runPrecheck');
+  assert.ok(pre.includes('onInit:'), 'the session id is harvested off the stream, not probed');
+  assert.ok(/preSession = i\.sessionId\.trim\(\)/.test(pre));
+  assert.ok(
+    pre.includes('removeProbeTranscript(wt, preSession)'),
+    'the same cleanup the skills probe and the dev-command resolver already use'
+  );
+  // In the `finally`, so a wedged, killed or thrown turn cleans up too — every
+  // one of them leaves the file behind.
+  const fin = pre.slice(pre.indexOf('} finally {'));
+  assert.ok(fin.includes('removeProbeTranscript(wt, preSession)'), 'on every exit, not just the happy one');
+});
+
+test('a permanent refusal is delivered-and-done; a blip is retried once', () => {
+  const src = workSource();
+  assert.ok(
+    src.includes("const AGENT_PRECHECK_URL = FLEET_URL.replace(/\\/agents\\/?$/, '/agent-precheck');")
+  );
+  const post = fnBody(src, 'postPre');
+  /**
+   * THE `postAgentTrace` SPLIT, for the same reason: a server with no such route
+   * 404s this body and will 404 every retry of it, so re-sending is a wedge
+   * wearing a retry's clothes. There is NO version floor here — an older daemon
+   * never posts, and an older server simply never learns the pre-review.
+   */
+  assert.ok(
+    post.includes(
+      'res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429'
+    )
+  );
+  assert.ok(/catch \{\s*return false;/.test(post), 'a network error stays retryable');
+  const pre = fnBody(src, 'runPrecheck');
+  assert.ok(
+    pre.includes('if (!(await postPre(body))) await postPre(body);'),
+    'ONE retry — the body cost a whole model call'
+  );
+});
+
+test('the card spec is stashed as the agent is given it, from ONE builder', () => {
+  const turn = fnBody(workSource(), 'runAgentTurn');
+  assert.ok(turn.includes("sessionMetaPath(wt, 'flowviant-agent-cards', agentId)"));
+  assert.ok(turn.includes('AGENT_TASK_SPEC(job.task)'));
+  // BEFORE the CLI runs, so a turn that crashes still leaves behind the spec
+  // its commits were made against.
+  const stashAt = turn.indexOf('stashCard(');
+  const runAt = turn.indexOf('out = await runTurn(');
+  assert.ok(stashAt > -1 && runAt > -1);
+  assert.ok(stashAt < runAt, 'the spec is written down before the card is handed over');
+  // …and the reviewer reads the same builder's output, so what it judges
+  // against is byte-identical to what the agent was given.
+  const pre = fnBody(workSource(), 'runPrecheck');
+  assert.ok(pre.includes("readStash(sessionMetaPath(wt, 'flowviant-agent-cards', agentId))"));
+});
+
+/**
+ * MISSING SPECS ARE MEASURED, NEVER INVENTED. A box that adopted this agent
+ * mid-run holds only the prompts IT typed; the count is the difference between
+ * the `Flowviant-Task:` trailers on the branch and the specs on this disk.
+ */
+test('a box that holds only half the specs says so, from the branch\'s own trailers', () => {
+  const src = workSource();
+  const log = fnBody(src, 'branchLog');
+  assert.ok(log.includes('Flowviant-Task:'), 'the ids come off the commits, not from a guess');
+  assert.ok(/catch \{[\s\S]{0,120}return \{ text: '', taskIds: \[\] \};/.test(log),
+    'an unreadable range costs the context, never the beat');
+  const pre = fnBody(src, 'runPrecheck');
+  assert.ok(pre.includes('const held = new Set(stash.map((s) => s.taskId));'));
+  assert.ok(pre.includes('log.taskIds.filter((id) => !held.has(id)).length'));
+  assert.ok(pre.includes('missingSpecs,'));
+});
+
+test('an ordinary settle runs no pre-review and posts nothing about one', async (t) => {
+  const m = manager(t);
+  const { calls } = stubFetch(t);
+  // The no-task refusal: a real settle on a path that never emptied a queue.
+  // The stub answers `{claimed:true}` and NO `review` flag, which is what an
+  // ordinary turn's reply looks like.
+  m.processAgentTurnJobs([{ id: 'at-9', agentId: 'ag-9', placeId: 'a-9', kind: 'task' }]);
+  await until(() => calls.some((c) => c.url.includes('agent-turn-done')));
+  await tick(120);
+  assert.equal(
+    calls.filter((c) => c.url.includes('agent-precheck')).length,
+    0,
+    'no pre-review without a review-entry beat'
+  );
+  assert.equal(calls.filter((c) => c.url.includes('agent-check-done')).length, 0);
 });

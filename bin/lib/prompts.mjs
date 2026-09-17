@@ -830,12 +830,24 @@ const safeName = (n) =>
     .trim()
     .slice(0, 60) || 'agent';
 
-const taskBlock = (task) =>
+/**
+ * A CARD'S SPEC, WRITTEN DOWN ONCE.
+ *
+ * EXPORTED (2026-09-16) because a second reader now needs the identical text:
+ * the AI pre-review is composed from the card specs the daemon STASHED as it
+ * typed each turn's prompt, and the whole claim of that surface is that the
+ * reviewer read what the agent read. Two builders for one thing is two
+ * renderings of a card that can drift — and the drift would be invisible,
+ * because nobody reads both prompts side by side.
+ */
+export const AGENT_TASK_SPEC = (task) =>
   `id: ${task?.id ?? ''}\n` +
   `title: ${task?.title ?? ''}\n` +
   (task?.brief ? `\nbrief:\n${task.brief}\n` : '') +
   (task?.criteria?.length ? `\ndone when:\n${task.criteria.map((c) => `- ${c}`).join('\n')}\n` : '') +
   (task?.anchors?.length ? `\nthis card owns:\n${task.anchors.map((a) => `- ${a}`).join('\n')}\n` : '');
+
+const taskBlock = AGENT_TASK_SPEC;
 
 /**
  * A PERSON SPOKE TO THE AGENT — usually the answer to its own question.
@@ -852,3 +864,126 @@ export const AGENT_HUMAN_KICKOFF = ({ agentName, message, askedByName, task, pos
   `${fence('WHAT THEY SAID', message)}\n\n` +
   (task ? `${fence('THE CARD YOU ARE ON', taskBlock(task))}\n\n` : '') +
   `Carry on, and end with the JSON object as usual.`;
+
+/**
+ * THE AI PRE-REVIEW — a FRESH Claude reads the branch before the human does
+ * (2026-09-16).
+ *
+ * The owner asked for it in these words: "before having the user manually check,
+ * can we have the daemon … spawn an agent to review the work so basically we get
+ * an ai to look at the review before a human looks at it for a double check."
+ *
+ * ── FRESH EYES, AND THAT IS THE ENTIRE DESIGN ──
+ *
+ * This is NOT the agent's own conversation asked to check itself. An agent that
+ * has spent four turns arguing itself into a design defends that design; asked
+ * whether its work meets the card, it answers from the same context that
+ * produced the work and finds it good. So the precheck is a NEW `claude -p` with
+ * no resumed conversation, standing in the agent's worktree because it needs the
+ * code and the diff, under the READ-ONLY profile the scratch planner and the
+ * capture chat already run behind, with no MCP at all. It reads; it cannot
+ * write; it has no control plane to reach even if the repository it is reading
+ * tries to steer it.
+ *
+ * ── IT LABELS AND NEVER BLOCKS ──
+ *
+ * The project's own check states this law and this obeys it identically:
+ * Approve, the verdicts and the ship quiz do not know this exists. A precheck
+ * that failed, timed out, or was never run posts NOTHING, and the absence
+ * renders nothing — ignorance never withholds a human's review, the same
+ * three-state rule every readout in this product keeps.
+ *
+ * ── AND IT IS ASKED FOR A TRIAGE, NOT A VERDICT ──
+ *
+ * The one thing a second reader can do that the first cannot is say WHERE TO
+ * LOOK FIRST. Asked to approve or reject, a model produces a confident judgment
+ * nobody asked it for and somebody will eventually treat as one. Asked what a
+ * reviewer should check first, it produces a list of places — which is useful
+ * whether it is right or wrong, because the human is about to look anyway.
+ */
+export const SYSTEM_PRECHECK = `You are a SECOND reviewer with fresh eyes, reading a branch an agent has just
+finished. You did not write this code and you were not in the conversation that
+produced it. That is the whole point of you.
+
+A PERSON REVIEWS THIS NEXT, and your job is to tell them what to look at first.
+You are not approving or rejecting anything: nothing you say gates the merge,
+nothing you say is shown to the agent, and nobody is waiting on a decision from
+you.
+
+YOU ARE READ-ONLY. You cannot write, edit or create files, and you have no tools
+beyond reading this repository. Do not try.
+
+HOW TO READ IT:
+
+1. READ THE DIFF. A commit message is a CLAIM about the work; the diff is the
+   work. Run the diff command you are given and read what actually changed
+   before you say anything about it.
+2. VERIFY EACH CARD AGAINST ITS OWN ACCEPTANCE CRITERIA. For every card you are
+   given, decide FROM THE DIFF whether what was asked for is actually there.
+   "ok" means you looked and found nothing a reviewer needs warning about.
+   "concerns" means there is something specific you would want them to check
+   first.
+3. BE SPECIFIC OR SAY NOTHING. "Looks reasonable" helps nobody. A concern names
+   a file, a function or a behaviour and says what about it worries you. If you
+   cannot point at something, the verdict is "ok".
+4. NEVER INVENT. If a card's spec was not given to you, judge it from the diff
+   and the commits and SAY in your note what you could not check it against.
+   Never assume a file exists, a test passes, or a criterion was met because a
+   commit message says so.
+5. YOU ARE NOT A STYLE GUIDE. Correctness, missing pieces, things the criteria
+   asked for that the diff does not show, changes that reach further than the
+   card did. Not formatting, not naming preferences, not the rewrite you would
+   have preferred.
+
+END YOUR TURN WITH ONE JSON OBJECT AND NOTHING AFTER IT, in a \`\`\`json fence:
+
+\`\`\`json
+{
+  "cards": [
+    { "taskId": "<card id, exactly as given>", "verdict": "ok", "note": "" },
+    { "taskId": "<card id, exactly as given>", "verdict": "concerns", "note": "what a reviewer should look at first, and why" }
+  ],
+  "overall": "what you would tell the reviewer before they start reading"
+}
+\`\`\`
+
+One entry per card, AT MOST ONE note each, and use the card ids exactly as
+given. A note is at most 400 characters and "overall" at most 1200: you are
+writing the first paragraph of somebody's review, not the review.`;
+
+/**
+ * The precheck's turn.
+ *
+ * THE CARDS AND THE COMMITS ARE FENCED. A card's title, brief and criteria are
+ * written by whoever files cards in this project; a commit subject is written by
+ * a model that has just been editing files. Both are untrusted content this turn
+ * reads, and the instruction that matters — "read the diff and triage it" — is
+ * ours and sits outside the fence.
+ *
+ * `missingSpecs` IS MEASURED, NOT GUESSED. A box that adopted this agent
+ * mid-run (the machine moved, or an older turn ran elsewhere) holds only the
+ * prompts IT typed, so the stash can be short of what the branch carries. The
+ * count is the difference between the `Flowviant-Task:` trailers on the branch
+ * and the specs on this disk — so the reviewer is told what it could not read
+ * rather than being handed a silent gap, and never told a card exists that
+ * nothing measured.
+ */
+export const AGENT_PRECHECK_KICKOFF = ({
+  agentName,
+  cards,
+  missingSpecs = 0,
+  commits,
+  diffCommand,
+}) =>
+  `The agent "${safeName(agentName)}" has finished its queue. A person is about to ` +
+  `review this branch; you are reading it first.\n\n` +
+  `${fence('THE CARDS IT WAS GIVEN', cards || '(none of this branch’s card specs are on this machine)')}\n\n` +
+  (missingSpecs > 0
+    ? `${missingSpecs} earlier card${missingSpecs === 1 ? "'s spec is" : "s' specs are"} ` +
+      `not on this box — review ${missingSpecs === 1 ? 'it' : 'them'} from the diff and the ` +
+      `commits below, and say in your note what you could not check them against.\n\n`
+    : '') +
+  `${fence('THE COMMITS ON THIS BRANCH', commits || '(none)')}\n\n` +
+  `Read the diff yourself before you judge any of it:\n\n` +
+  `    ${diffCommand}\n\n` +
+  `Then answer with the JSON object and nothing else.`;
