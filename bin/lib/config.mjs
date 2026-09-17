@@ -118,6 +118,16 @@ export const MACHINE = machineLimits();
  * tests want, and this process is the only party that can see the cores, the
  * RAM and the fan.
  *
+ * …AND SINCE 2026-09-17 THE APP MAY NAME A NUMBER TOO, which narrows that
+ * sentence rather than reversing it. What stays true is that the DERIVATION
+ * belongs here and that the enforcement is local: a ceiling that only exists as
+ * a request is not one. What changed is that a person may now say "run two at
+ * once" without going to the box, because the owner's answer to being stuck at
+ * one was "it shouldnt be a variable on the npx to make it friendly for non
+ * tech users. why cant it be on the web interface?". The precedence — env, then
+ * the app's dial, then this derivation — lives in `pickMaxTurns`
+ * (admission.mjs), and this value is what that falls back to.
+ *
  * Sent to the server on every roster poll so it can pace what it offers UNDER
  * this ceiling, and ENFORCED LOCALLY BESIDES — a ceiling that only exists as a
  * request is not one, and the roster can always offer more than this.
@@ -142,23 +152,56 @@ export const MACHINE = machineLimits();
  *
  * MEMORY is the bound, not cores. Cores oversubscribe gracefully (everything
  * gets slower); memory does not (something dies, and not necessarily the
- * offender). A task is a Claude session plus a dev server plus whatever the
- * test runner spawns — call it 2GB, keep 2GB back for the operating system,
- * and let cores cap it only when they are the scarcer thing.
+ * offender).
  *
- * This used to be `min(4, cores/2)` — half the cores because "the user is
- * working on this machine too", and a hard 4 because a personal Claude plan
- * ran out before the CPU did. Both were laptop assumptions. The machine is now
- * a box the project leaves running, so it reserves one core rather than half of
- * them, and the ceiling is what the hardware can hold rather than a guess about
- * somebody's plan.
+ * BOTH HALVES WERE RETUNED 2026-09-17, after the owner's box computed ONE and
+ * he met it as "theres nothing telling me that i could only have one agent on
+ * the board". The old numbers were `floor((memGB − 2) / 2)` and `cores − 1`,
+ * and each was a guess this file had stopped examining:
+ *
+ *  · 2GB PER TURN assumed every turn drags a dev server and a test runner
+ *    behind it. Most do not — an agent turn is a CLI that reads, edits and
+ *    commits, and it is API-bound for nearly all of its life. 1GB per turn with
+ *    the same 2GB held back for the operating system is the honest sizing, and
+ *    the PRESSURE guard (resources.mjs) is what catches the turn that really
+ *    does hold gigabytes: it measures at the moment of spawning, which is a
+ *    thing a static divisor cannot do.
+ *  · `cores − 1` is the laptop assumption this comment already claims to have
+ *    retired, reborn one line down. The paragraph above says cores
+ *    OVERSUBSCRIBE GRACEFULLY and memory is what does not — so cores must not
+ *    be the half that binds first. On a 2-core VM `cores − 1` was 1, and that
+ *    single subtraction is the whole reason the owner's machine serialized
+ *    every agent. `cores * 2` lets the scheduler do what it is for, and memory
+ *    stays the bound that actually refuses.
+ *
+ * `min(32, …)` and the env override are untouched: the hard 32 is a runaway
+ * bound on a box, not a product decision, and an operator who typed a number at
+ * the machine gets exactly that number.
  */
+export function deriveMaxConcurrent(memBytes, cores) {
+  const byMem = Math.floor(memBytes / 2 ** 30 - 2);
+  const byCpu = Number(cores) * 2;
+  return Math.max(1, Math.min(32, byMem, byCpu));
+}
+
+/**
+ * WAS THE ENV VAR THE SOURCE? — the one fact the precedence rule cannot
+ * reconstruct afterwards.
+ *
+ * `FLOWVIANT_MAX_CONCURRENT=4` and a box that happens to derive 4 produce the
+ * identical number, and they are not the same statement: one is an operator's
+ * last word and must outrank the app's dial, the other is a default the app may
+ * override. See `pickMaxTurns` in admission.mjs for what is done with it.
+ */
+export const MAX_CONCURRENT_FROM_ENV = (() => {
+  const asked = Number(process.env.FLOWVIANT_MAX_CONCURRENT);
+  return Number.isFinite(asked) && asked >= 1;
+})();
+
 export const MAX_CONCURRENT = (() => {
   const asked = Number(process.env.FLOWVIANT_MAX_CONCURRENT);
   if (Number.isFinite(asked) && asked >= 1) return Math.min(Math.floor(asked), 32);
-  const byMem = Math.floor((MACHINE.memBytes / 2 ** 30 - 2) / 2);
-  const byCpu = MACHINE.cores - 1;
-  return Math.max(1, Math.min(32, byMem, byCpu));
+  return deriveMaxConcurrent(MACHINE.memBytes, MACHINE.cores);
 })();
 export const IDLE_SECONDS = Number(process.env.IDLE_SECONDS || 30);
 // Live mode: after this long idle-parked on a blocker, tear the session down to

@@ -85,6 +85,7 @@ import {
   THINK_MARKER,
 } from './runtimes.mjs';
 import { createWorkManager } from './work.mjs';
+import { effectiveMaxTurns, setServerMaxTurns } from './admission.mjs';
 import { scanLocalSessions, ourConversationIds } from './localSessions.mjs';
 import { repoState } from './repoState.mjs';
 import { claudeAuthContext } from './claudeAuth.mjs';
@@ -259,6 +260,34 @@ async function fetchRoster(
   try {
     if (churnHold !== undefined) {
       url.searchParams.set('pr', churnHold ? String(churnHold.reason).slice(0, 160) : '-');
+      /**
+       * …AND THE BOUND THE REFUSAL IS ABOUT (2026-09-17, `mt`).
+       *
+       * THIS AMENDS THE PARAGRAPH DIRECTLY ABOVE, which says the relayed
+       * sentence "names ACTIVITY … never the ceiling, never headroom". That
+       * rule was written to stop a capacity meter, and it succeeded so
+       * completely that a machine which could only ever run ONE turn had no way
+       * to say so — the owner, verbatim: "we should have ui indicating this on
+       * the board view and a ui indicating or showing the agent as waiting or
+       * queued as a result of that resource constraint. thats why i was
+       * immediately confused. theres nothing telling me that i could only have
+       * one agent on the board."
+       *
+       * So the ceiling crosses the wire, and the narrow shape that survives is
+       * the same carve-out the sentence beside it already lives under: it is
+       * shown in SETTINGS (beside the dial that sets it — a control with no
+       * readout is not a control) and on the BOARD only while a real agent is
+       * actually being deferred. Never a resting chip, and never headroom:
+       * nothing anywhere subtracts this from the live count to advertise room.
+       *
+       * It rides the `pr` gate deliberately — this is the bound that admission
+       * measured against, so a poll with no admission to ask has no effective
+       * ceiling to report either, and absence keeps meaning "an older daemon".
+       * `capacity` above is the DERIVED number and predates the dial; it is a
+       * dispatch-era fossil the server ignores, and the two are not the same
+       * fact.
+       */
+      url.searchParams.set('mt', String(effectiveMaxTurns()));
     }
   } catch {
     /* a readout — the poll must never fail on one */
@@ -1933,6 +1962,20 @@ export async function runFleetDaemon() {
       }
     }
     if (roster.mcpUrl) mcpUrl = roster.mcpUrl;
+    /**
+     * HOW MANY TURNS THE APP SAYS THIS MACHINE MAY RUN (2026-09-17).
+     *
+     * Set on EVERY poll, including the ones that carry no key — absence is how
+     * "Auto" is spelled and how an older server looks, and both mean the
+     * derivation stands. Leaving a previous value in place on an absent key
+     * would make turning the dial back to Auto unspellable, which is the
+     * learn-only bug `listSessionPlaces` already paid for once.
+     *
+     * HERE, ABOVE EVERY LANE, so a number that arrived on this poll binds the
+     * spawns this same reconcile is about to decide. The `mt` the NEXT poll
+     * reports is therefore the value that was actually in force.
+     */
+    setServerMaxTurns(roster.maxTurns);
     if (roster.project?.id) wikiProjectId = roster.project.id; // keys the vault dir
     if (roster.leaseTtlSeconds) leaseTtlSeconds = roster.leaseTtlSeconds;
     // A COMMANDED STOP OUTRANKS AN UPDATE, and that ordering is the whole reason

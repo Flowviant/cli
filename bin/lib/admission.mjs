@@ -23,7 +23,16 @@
  * ── WHAT THIS IS NOT ──
  *
  * It is not a capacity meter: nothing is published ahead of the decision, and
- * the only time anyone hears about it is the moment it actually fires. It does
+ * the only time anyone hears about it is the moment it actually fires.
+ *
+ * NARROWED 2026-09-17, knowingly. The effective ceiling now rides the poll as
+ * `mt` and is shown in two places, and neither is a meter: project SETTINGS,
+ * beside the control that sets it — a dial has to say what it is currently
+ * worth or it is a control with no readout — and on the board ONLY while a real
+ * agent is being deferred, which is the "at the thing that is waiting, in the
+ * moment" carve-out this product already grants. What stays forbidden is the
+ * resting global chip and any statement of HEADROOM: "room for N more" is still
+ * dead, and the refusal below still names ACTIVITY and never the bound. It does
  * not kill anything — no signal is sent on Flowviant's initiative, ever. It
  * does not park an agent: a park needs a human gesture to lift, and pressure
  * clears on its own, so a deferral is simply a spawn that did not happen this
@@ -70,12 +79,98 @@
  * idempotent so doing both is the normal case rather than a bug.
  */
 
-import { MAX_CONCURRENT } from './config.mjs';
+import { MAX_CONCURRENT, MAX_CONCURRENT_FROM_ENV } from './config.mjs';
 import { pressureVerdict } from './resources.mjs';
+
+/**
+ * ── THE CEILING HAS THREE POSSIBLE AUTHORS (2026-09-17) ──
+ *
+ * The owner's box derived ONE, so every parallel agent serialized here with
+ * nothing but a per-agent pulse line to explain it: "thats why i was
+ * immediately confused. theres nothing telling me that i could only have one
+ * agent on the board." His fix was to move the dial into the product — "it
+ * shouldnt be a variable on the npx to make it friendly for non tech users. why
+ * cant it be on the web interface?" — so the roster reply may now carry
+ * `maxTurns`.
+ *
+ * THE ORDER IS ENV > SERVER > DERIVED, and the middle one is the new arrival:
+ *
+ *  · ENV WINS because an operator who typed `FLOWVIANT_MAX_CONCURRENT=2` at the
+ *    box is stating their last word about their own machine, and a control they
+ *    cannot see must not silently overrule it. This is the same posture the
+ *    daemon keeps everywhere else it is handed an instruction: the app decides
+ *    the product, the box decides the box.
+ *  · THE SERVER'S DIAL beats the derivation because the app is where every
+ *    decision in this product is made, and the derivation is a GUESS about
+ *    hardware — a good one, but one a person looking at their own machine is
+ *    entitled to overrule without opening a terminal.
+ *  · THE DERIVATION is the resting state, and it is what a project that has
+ *    never touched the dial gets. `null` — not 0, not NaN — is what "nobody
+ *    said" looks like, so the fallback is reached by ABSENCE rather than by a
+ *    sentinel number that could be mistaken for a bound.
+ *
+ * Pure, and exported, so the order can be proved without a server, a poll or a
+ * box of any particular size.
+ */
+export function pickMaxTurns({ env = null, server = null, derived = 1 } = {}) {
+  const clamp = (n) => {
+    const v = Number(n);
+    if (!Number.isFinite(v) || v < 1) return null;
+    return Math.min(Math.floor(v), 32);
+  };
+  return clamp(env) ?? clamp(server) ?? clamp(derived) ?? 1;
+}
+
+/**
+ * THE LAST NUMBER THE SERVER NAMED, or null.
+ *
+ * A module holder rather than a value threaded through `createWorkManager`,
+ * because the reader and the writer are two files apart and one poll apart: the
+ * POLL learns it (fleet.mjs) and every ADMISSION reads it, including the ones
+ * work.mjs takes in lanes fleet.mjs never sees. The alternative — passing it
+ * down — would mean the number that bound a spawn was whatever was current when
+ * the manager was CONSTRUCTED, which is exactly the frozen-at-startup bug
+ * `getBaseRef` and `getLeaseTtl` are getters to avoid.
+ */
+let serverMaxTurns = null;
+
+/**
+ * Record what the roster said. ANYTHING THAT IS NOT A USABLE NUMBER CLEARS IT,
+ * and both directions of that matter:
+ *
+ *  · a MALFORMED value must not become a ceiling — `Number('')` is 0 and a
+ *    ceiling of 0 refuses every spawn forever, which is a machine that has
+ *    silently stopped working;
+ *  · an ABSENT value is how "Auto" is spelled on the wire (the server simply
+ *    does not send the key), and how an older SERVER looks. Both mean the
+ *    derivation stands, so absence has to clear a value set by an earlier poll
+ *    rather than leaving the last dial standing forever — otherwise turning the
+ *    dial back to Auto would be unspellable.
+ */
+export function setServerMaxTurns(raw) {
+  const v = Number(raw);
+  serverMaxTurns = Number.isFinite(v) && v >= 1 ? Math.min(Math.floor(v), 32) : null;
+  return serverMaxTurns;
+}
+
+/** THE NUMBER IN FORCE RIGHT NOW — read per admission, and reported to the app
+ *  on the poll as `mt`, because it is the bound the refusal is about. */
+export function effectiveMaxTurns() {
+  return pickMaxTurns({
+    env: MAX_CONCURRENT_FROM_ENV ? MAX_CONCURRENT : null,
+    server: serverMaxTurns,
+    derived: MAX_CONCURRENT,
+  });
+}
 
 export function createAdmission({
   liveTurnCount,
-  maxConcurrent = MAX_CONCURRENT,
+  /** A NUMBER OR A FUNCTION. The function form is the live one: the ceiling can
+   *  move between two polls now, so a value captured when the manager was built
+   *  would be the dial as it stood at daemon start for the rest of the process.
+   *  A number is still accepted, and every test here passes one — the whole
+   *  point of injecting it. */
+  maxConcurrent = effectiveMaxTurns,
   verdict = pressureVerdict,
 } = {}) {
   /** Slots taken by a decision whose process does not exist yet. A Set of
@@ -88,7 +183,18 @@ export function createAdmission({
   function admit(level) {
     const counted = Number(liveTurnCount?.() ?? 0);
     const live = (Number.isFinite(counted) ? counted : 0) + holding.size;
-    if (live >= maxConcurrent)
+    /**
+     * READ PER ADMISSION, and falling back to the DERIVED number rather than to
+     * nothing. A ceiling that comes out NaN is not a permissive ceiling, it is
+     * NO ceiling — `live >= NaN` is false every time — which is precisely the
+     * unguarded spawn loop that froze somebody's computer. The local derivation
+     * is the one value in this process that cannot be garbage.
+     */
+    const asked =
+      typeof maxConcurrent === 'function' ? Number(maxConcurrent()) : Number(maxConcurrent);
+    const ceiling =
+      Number.isFinite(asked) && asked >= 1 ? Math.min(Math.floor(asked), 32) : MAX_CONCURRENT;
+    if (live >= ceiling)
       return {
         reason: `the machine is already running ${live} CLI turn${live === 1 ? '' : 's'}`,
       };
