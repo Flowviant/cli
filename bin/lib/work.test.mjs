@@ -1282,3 +1282,70 @@ test('an ordinary settle runs no pre-review and posts nothing about one', async 
   );
   assert.equal(calls.filter((c) => c.url.includes('agent-check-done')).length, 0);
 });
+
+/**
+ * WHAT A TURN SPENT REACHES THE SERVER ON EVERY SETTLE A CLI ACTUALLY RAN
+ * (2026-09-19), and on none of the ones it did not.
+ *
+ * This is a source pin because the behaviour it guards lives past a real
+ * `claude -p`: the fake wire above reaches the agent lane only through the
+ * refusals, which are exactly the settles that must carry NO usage. So the
+ * runtime tests here prove the absence and this proves the presence.
+ *
+ * THE THREE THAT CARRY IT are the three that follow the turn: the limit park,
+ * the no-result backstop and the main settle. A turn that hit a limit or
+ * produced nothing parseable still spent real tokens, and a counter that only
+ * charged the happy path would under-report precisely the runs somebody opens
+ * the number to understand.
+ *
+ * THE ONES THAT MUST NOT are the pre-spawn refusals (a traversal place, a
+ * missing card, the begun-guard) and the teardown sweep — nothing ran there.
+ * `usage` is null on every one of them by construction, which is what makes the
+ * spread its own guard; the pin is on the spread being spelled that way, since
+ * an unconditional `usage` key would post `null` and read as a measured zero.
+ */
+test('every settle that follows a CLI carries what it spent, and no other does', () => {
+  const src = workSource();
+  const turn = fnBody(src, 'runAgentTurn');
+  assert.ok(turn.includes('let usage = null;'), 'held across the turn, for every settle below');
+  assert.ok(
+    /onUsage: \(u\) => \{\s*usage = u;\s*\},/.test(turn),
+    'SET, never accumulated — one turn is one result event, and the adding-up is the server\'s'
+  );
+  const spread = '...(usage ? { usage } : {}),';
+  assert.equal(
+    turn.split(spread).length - 1,
+    3,
+    'the limit park, the no-result backstop and the main settle — those three and no more'
+  );
+  // The teardown sweep re-POSTs stored bodies and settles the rest as
+  // `nothing`; nothing ran in it, so it may not invent a spend.
+  const sweep = fnBody(src, 'settleAgentTurns');
+  assert.ok(!sweep.includes('usage'), 'a turn nobody ran charges nothing');
+
+  // …AND THE PRE-REVIEW, which charges the AGENT and never a card link: a
+  // reading belongs to no card, which is why the link totals can never sum to
+  // the container's.
+  const pre = fnBody(src, 'runPrecheck');
+  assert.ok(pre.includes('let usage = null;'));
+  assert.ok(/onUsage: \(u\) => \{\s*usage = u;\s*\},/.test(pre));
+  assert.ok(pre.includes(spread), 'on the /fleet/agent-precheck body');
+});
+
+/**
+ * A REFUSED TURN POSTS NO SPEND — the other half of the pin above, at runtime.
+ * The begun-guard settles before anything is cut, so its body is the shape of
+ * every pre-spawn refusal: an outcome, a sentence, and no claim about tokens.
+ */
+test('a settle that refused before spawning claims no tokens', async (t) => {
+  const { m } = managerIn(t);
+  const { calls } = stubFetch(t);
+  m.processAgentTurnJobs([
+    { id: 'at-u1', agentId: 'ag-u1', placeId: 'a-ag-u1', kind: 'task', task: { id: 'c', title: 'T' }, begun: true },
+  ]);
+  await until(() => calls.some((c) => c.url.includes('agent-turn-done')));
+  const settle = calls.find((c) => c.url.includes('agent-turn-done'));
+  assert.equal(settle.body.outcome, 'nothing');
+  assert.equal('usage' in settle.body, false, 'absent, never a zeroed object');
+  await until(() => !m.workBusy());
+});

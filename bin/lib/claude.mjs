@@ -168,6 +168,43 @@ export const humanizeToolUse = humanizeClaudeTool;
 // Collapse whitespace + clip so a narration/thinking snippet is one tidy feed line.
 const oneLine = (s, n = 160) => String(s).replace(/\s+/g, ' ').trim().slice(0, n);
 
+/**
+ * WHAT THIS TURN COST, IN THE CLI'S OWN NUMBERS (2026-09-19).
+ *
+ * The `result` event carries a `usage` object — `input_tokens`,
+ * `output_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens` —
+ * and this reads exactly those four and nothing else. A RELAY: nothing here
+ * derives, estimates or prices anything.
+ *
+ * DELIBERATELY NOT `total_cost_usd`, which rides the same event. It is a
+ * notional list price that a subscription operator did not pay, so relaying it
+ * as "cost" would be the product asserting a figure nobody was charged — the
+ * refusal the board's fix pass already made once against the mock's "1.4
+ * spent". Tokens are measured; dollars are not.
+ *
+ * COERCED AND FLOORED, never trusted: a non-number, a NaN, an Infinity or a
+ * negative reads as 0, because these are summed into a counter that only ever
+ * goes up and one bad field must not poison the other three.
+ *
+ * Returns null when there is no usage object at all — the three-state rule
+ * every readout here keeps: a turn that reported nothing charges nothing, and
+ * that is not the same as a turn that reported zeros.
+ */
+export function usageFromResult(ev) {
+  const u = ev?.usage;
+  if (!u || typeof u !== 'object') return null;
+  const n = (v) => {
+    const x = Number(v);
+    return Number.isFinite(x) && x > 0 ? Math.floor(x) : 0;
+  };
+  return {
+    input: n(u.input_tokens),
+    output: n(u.output_tokens),
+    cacheCreate: n(u.cache_creation_input_tokens),
+    cacheRead: n(u.cache_read_input_tokens),
+  };
+}
+
 // Parse ONE line of `--output-format stream-json` NDJSON into feed activities.
 // Surfaces the WHOLE turn — thinking, narration, AND every tool — so neither the
 // daemon console nor the app cover goes dark while Claude reasons (Opus thinks in
@@ -180,7 +217,15 @@ const oneLine = (s, n = 160) => String(s).replace(/\s+/g, ' ').trim().slice(0, n
 // every intermediate text block still NARRATES, but only the final `result`
 // event contributes text — otherwise the same sentences arrive twice, once as
 // they stream and once in the result, and the tab posts the duplicate.
-function handleStreamLine(line, { cwd, emit, onActivity, onToolEvent, appendText, answerFromResult, onInit }) {
+//
+// EXPORTED FOR ITS TEST ONLY (2026-09-19), and the reason is worth stating: the
+// `onUsage` threading through this function, `runTurn`'s options and `onLine`
+// was four edits and NOT ONE of them was reachable from either suite — delete
+// any one and both stay green, while the only symptom in production is a
+// container that reports no spend, which is indistinguishable from an older
+// daemon by design. A callback that is silent when it breaks has to be called
+// directly by something.
+export function handleStreamLine(line, { cwd, emit, onActivity, onToolEvent, appendText, answerFromResult, onInit, onUsage }) {
   let ev;
   try {
     ev = JSON.parse(line);
@@ -262,6 +307,18 @@ function handleStreamLine(line, { cwd, emit, onActivity, onToolEvent, appendText
       });
     }
   } else if (ev.type === 'result') {
+    /**
+     * WHAT THE TURN SPENT, BEFORE ANYTHING ELSE IN THIS BRANCH.
+     *
+     * FIRED ON A FAILED RESULT TOO, and that ordering is the point: a turn that
+     * hit a limit, ran out of permission or aborted still sent the requests it
+     * sent, and a spend readout that quietly skipped every unhappy turn would
+     * under-report exactly the runs somebody is looking at the number to
+     * understand. `usageFromResult` returns null when the event carries no
+     * usage at all, and a caller that passes no `onUsage` sees no change.
+     */
+    const usage = usageFromResult(ev);
+    if (usage) onUsage?.(usage);
     // The final assistant text (carries WIKI_DONE / REGROUND_DONE).
     if (typeof ev.result === 'string') appendText(ev.result + '\n');
     else if (ev.is_error || ev.subtype) {
@@ -294,7 +351,7 @@ function handleStreamLine(line, { cwd, emit, onActivity, onToolEvent, appendText
 // returned string for sentinel detection, and each activity is handed to
 // `onActivity` so the caller can forward progress. Build-agent turns leave it
 // off and keep the raw text passthrough + line sentinels.
-export function runTurn({ prompt, resume, system, cwd, mcpConfig, mcpArgs, mcpEnv, runtime = 'claude', label, onSpawn, streamJson, answerFromResult, onActivity, onToolEvent, onInit, onThreadId, wikiPerm, readOnly, planPerm, vaultDir, resultSchemaArgs, model, effort, adoptResumeId, resumeThreadId, resumeConversationId }) {
+export function runTurn({ prompt, resume, system, cwd, mcpConfig, mcpArgs, mcpEnv, runtime = 'claude', label, onSpawn, streamJson, answerFromResult, onActivity, onToolEvent, onInit, onUsage, onThreadId, wikiPerm, readOnly, planPerm, vaultDir, resultSchemaArgs, model, effort, adoptResumeId, resumeThreadId, resumeConversationId }) {
   return new Promise((resolve) => {
     const rt = runtimeById(runtime);
     if (!rt.args) {
@@ -425,7 +482,7 @@ export function runTurn({ prompt, resume, system, cwd, mcpConfig, mcpArgs, mcpEn
       /** One line of the child's stdout, in whichever dialect it speaks. */
       const onLine = (line) => {
         if (!rt.parse)
-          return handleStreamLine(line, { cwd, emit, onActivity, onToolEvent, appendText, answerFromResult, onInit });
+          return handleStreamLine(line, { cwd, emit, onActivity, onToolEvent, appendText, answerFromResult, onInit, onUsage });
         const ev = rt.parse(line, cwd);
         if (!ev) return;
         // The conversation id, when the runtime announces one (codex's

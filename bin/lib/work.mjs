@@ -4885,6 +4885,21 @@ export function createWorkManager({
 
       let out = '';
       let child = null;
+      /**
+       * WHAT THIS TURN SPENT, AS THE CLI COUNTED IT (2026-09-19).
+       *
+       * Held across the whole turn so every settle below can carry it — a turn
+       * that hit a limit, produced no parseable outcome or delivered properly
+       * all spent real tokens, and a readout that only charged the happy path
+       * would under-report the runs somebody opens the number to understand.
+       *
+       * The three settles it is spread into are the ones that follow a CLI
+       * actually running. The pre-spawn refusals above (a bad place, a missing
+       * card, the begun-guard) and the teardown sweep below deliberately do NOT
+       * take it: nothing ran there, and `usage` stays null anyway, which is
+       * what makes `...(usage ? … : {})` the whole guard.
+       */
+      let usage = null;
       try {
         out = await runTurn({
           prompt:
@@ -4943,6 +4958,13 @@ export function createWorkManager({
           // toolEventOf). A tool it does not know pushes nothing.
           onToolEvent: (name, input) => {
             trace.tool(toolEventOf(name, input, wt, envScrub));
+          },
+          // The CLI's own per-turn token counts, off the `result` event. One
+          // result per turn, so this is a set and not an accumulate — the
+          // adding-up happens SERVER-side, behind the settle's idempotent win,
+          // because a retried settle must not charge the same turn twice.
+          onUsage: (u) => {
+            usage = u;
           },
           onSpawn: (ch) => {
             child = ch;
@@ -5015,7 +5037,14 @@ export function createWorkManager({
         // limit means all of them have. The turn itself is reported as
         // `nothing` — it did not deliver and it did not ask.
         await postAgentParked(limit);
-        await postAgentTurn({ turnId, outcome: 'nothing', answer: limit, branch, worktree: wt });
+        await postAgentTurn({
+          turnId,
+          outcome: 'nothing',
+          answer: limit,
+          ...(usage ? { usage } : {}),
+          branch,
+          worktree: wt,
+        });
         return;
       }
 
@@ -5029,6 +5058,7 @@ export function createWorkManager({
             ? envScrub(out).slice(-1500)
             : 'the turn produced no output on the machine — its CLI may be signed out',
           ...(commits.length ? { commits } : {}),
+          ...(usage ? { usage } : {}),
           branch,
           worktree: wt,
         });
@@ -5040,6 +5070,7 @@ export function createWorkManager({
         answer: envScrub(res.answer ?? '').slice(0, 8000),
         ...(commits.length ? { commits } : {}),
         ...(res.raised?.length ? { raised: res.raised } : {}),
+        ...(usage ? { usage } : {}),
         branch,
         worktree: wt,
       });
@@ -5450,6 +5481,17 @@ export function createWorkManager({
    * and is retried ONCE, because unlike a trace batch this body cost a whole
    * model call and losing it to a blip means the operator paid for a label
    * nobody ever sees.
+   *
+   * THE RETRY IS NOT A GUARANTEE THAT THE FIRST ATTEMPT FAILED, and since the
+   * body started carrying `usage` (0.90.0) that matters. The `catch` below
+   * takes the 30-second `AbortSignal` with everything else, so a server that
+   * was merely SLOW — and committed — receives this identical body twice. The
+   * store was always idempotent; the token counts riding it were not, and a
+   * timed-out-but-committed post added them twice. The SERVER closes that: its
+   * write refuses a body whose text already sits on the row, so a re-send
+   * stores the same reading and charges nothing for it. Nothing here needs to
+   * change, and nothing here may start assuming a thrown fetch means the
+   * server never saw this.
    */
   const postPre = async (body) => {
     try {
@@ -5553,6 +5595,21 @@ export function createWorkManager({
     /** The cap fired: the CLI was still running when this machine stopped it. */
     let wedged = false;
     /**
+     * WHAT THE READING SPENT — the agent-turn lane's own relay, on the one
+     * other lane that charges an AGENT (2026-09-19).
+     *
+     * It rides the agent and never a card link: a pre-review belongs to no card
+     * (the same reason `workChildren` gets a null task id below), so the four
+     * counters it adds to are the container's alone. That is also why an
+     * agent's links can never sum to its total, and the schema says so.
+     *
+     * A WEDGED OR UNPARSEABLE READING POSTS NOTHING AT ALL, so it charges
+     * nothing either — which under-reports a turn that really did spend. That
+     * is the honest direction: there is no row to put it on, and inventing a
+     * settle to carry a number would be a post whose only content is a bill.
+     */
+    let usage = null;
+    /**
      * THE CONVERSATION THIS READING SPEAKS UNDER — held for exactly one reason:
      * to DELETE the transcript it leaves behind (review, 2026-09-17).
      *
@@ -5611,6 +5668,11 @@ export function createWorkManager({
         onInit: (i) => {
           if (typeof i.sessionId === 'string' && i.sessionId.trim())
             preSession = i.sessionId.trim();
+        },
+        // The CLI's own count for this reading. Set, never accumulated: one
+        // turn is one `result` event, and the adding-up is the server's.
+        onUsage: (u) => {
+          usage = u;
         },
         onSpawn: (ch) => {
           child = ch;
@@ -5710,6 +5772,7 @@ export function createWorkManager({
     const body = {
       agentId,
       ...(headSha ? { headSha } : {}),
+      ...(usage ? { usage } : {}),
       cards: result.cards.map((cd) => ({
         taskId: cd.taskId,
         verdict: cd.verdict,
