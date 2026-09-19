@@ -264,6 +264,24 @@ export const MACHINE_HOST = (() => {
   }
 })();
 
+/**
+ * WHEN THIS PROCESS STARTED (0.91.0), measured ONCE at import.
+ *
+ * It rides the poll as `st` beside `pid`, and together they are what somebody
+ * who has lost track of their daemons actually needs: the owner, verbatim, "im
+ * not sure if i have any duplicate or redundant daemons running". A pid alone
+ * cannot tell one long-lived daemon from a process that has restarted nine
+ * times since you last looked; a start time can.
+ *
+ * Derived from `process.uptime()` rather than stamped at import for its own
+ * sake, so it stays true across a lazy import and reads as the process's own
+ * age rather than this module's. Computed once, deliberately: a value that
+ * drifts by a millisecond every poll would rewrite the column for ever.
+ */
+export const PROCESS_STARTED_AT = new Date(
+  Date.now() - Math.max(0, process.uptime() * 1000)
+).toISOString();
+
 // The ONE credential. `tokens` (FLOWVIANT_TOKEN / FLOWVIANT_TOKENS / --token /
 // --tokens) stood beside it and carried WORKER tokens into the pre-daemon loop;
 // that principal owns zero tools since dispatch was deleted, and the kind can no

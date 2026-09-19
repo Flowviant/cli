@@ -25,6 +25,7 @@ import {
   SAFE,
   DAEMON_INSTANCE,
   MACHINE_HOST,
+  PROCESS_STARTED_AT,
   POLL_SECONDS,
   MAX_CONCURRENT,
   IDLE_SECONDS,
@@ -93,6 +94,64 @@ import { claudeAuthContext } from './claudeAuth.mjs';
 /** Said once per process — see the catch around `envQueryParams` below. */
 let warnedEnvIdentity = false;
 
+/**
+ * HAS THIS PROCESS ALREADY ASKED FOR THE MACHINE? (0.91.0)
+ *
+ * The owner's ruling on two boxes running one project: "it should kill the
+ * first one and take over". So a daemon asks on the FIRST poll of its life and
+ * never again, and this pair is the whole of that "never again".
+ *
+ * ONE ASK PER PROCESS IS THE SAFETY, NOT A POLITENESS. A param that kept asking
+ * would be two boxes trading a machine back and forth every ten seconds. Asked
+ * once, the story ends at the first exchange, because the box that loses
+ * SETTLES ITS TURNS AND EXITS rather than restarting — and a process that has
+ * exited sends no more first polls.
+ *
+ * THAT LAST SENTENCE IS TRUE OF THE PROCESS AND NOT OF THE UNIT, which is why
+ * the server stopped relying on it (2026-09-19). Under `Restart=always`, pm2 or
+ * docker, exit 0 is a relaunch and the relaunch's first poll is a genuine one.
+ * `takeMachineHolderNow` refuses a take by the box it just displaced for the
+ * length of the displaced window, so the ping-pong is bounded on the side that
+ * can see both boxes. This module still keeps its half of the bargain.
+ *
+ * SPENT ON A DELIVERED POLL, NOT ON AN ATTEMPTED ONE, which is why this is two
+ * functions instead of one consuming read. A daemon that starts while the wire
+ * is down retries every ten seconds; spending the ask on the failed attempt
+ * would mean the box you walked over to and started never takes the machine,
+ * and nothing anywhere would say why.
+ *
+ * IT IS NOT THE DELETED FLAG COMING BACK. There is still nothing to type: the
+ * terminal surface is `npx flowviant` and `npx flowviant login`, and what
+ * claims here is starting the daemon, which is already one of those two.
+ *
+ * Exported so both properties can be proved without a server, a credential or a
+ * second box — they are the contract, and nothing else in the file states them.
+ */
+/**
+ * AND A RESTART IS NOT A PERSON (2026-09-19, the review).
+ *
+ * `update.mjs` re-execs the daemon with `FLOWVIANT_REEXEC='1'` after an
+ * UNATTENDED auto-update, which is on by default. Born `false`, the new process
+ * would then spend a fresh ask and TAKE THE PROJECT'S MACHINE — so a standby
+ * sitting quietly on somebody's second computer would seize the machine off the
+ * live holder in the middle of the night, settling its running turns as moved,
+ * because npm published a patch. Nobody was at either keyboard, and nothing on
+ * any surface would say why.
+ *
+ * The ask belongs to the GESTURE, not to the process: what claims a machine is
+ * a person typing `npx flowviant`, and a re-exec is the same start continuing.
+ * So a re-executed daemon is born with the ask already spent and behaves
+ * exactly as it did before the update — it keeps the machine if it had it (arm
+ * (a) stamps it), and stands by if it did not.
+ */
+let machineAskSpent = process.env.FLOWVIANT_REEXEC === '1';
+export function machineAskPending() {
+  return !machineAskSpent;
+}
+export function spendMachineAsk() {
+  machineAskSpent = true;
+}
+
 async function fetchRoster(
   haveIds,
   livePreviewSessionIds = [],
@@ -101,7 +160,12 @@ async function fetchRoster(
    *  every unattended lane asks — see the `pr` param below for why it is the
    *  admission and not the pressure reading alone. Undefined where the caller
    *  has no admission to offer, which reads exactly like an older daemon. */
-  churnHold = undefined
+  churnHold = undefined,
+  /** The checkout this daemon serves, for the `cp` report below. Passed in
+   *  rather than re-derived: `repoRootOrDie` is resolved once at startup and
+   *  running git on every poll to re-learn a constant would be a syscall for
+   *  a readout. */
+  repoRoot = null
 ) {
   const url = new URL(FLEET_URL);
   if (haveIds.length) url.searchParams.set('have', haveIds.join(','));
@@ -132,9 +196,51 @@ async function fetchRoster(
   // Absent when the host has no readable name — an older daemon looks the same,
   // and both mean "nobody said", which is what the nameless fallback renders.
   if (MACHINE_HOST) url.searchParams.set('mh', MACHINE_HOST);
-  // NOTHING HERE ASKS FOR THE MACHINE. A poll reports what this box IS; moving
-  // the project's machine onto it is a gesture a person makes in the app, and
-  // the daemon learns the outcome on its next poll like every other holder fact.
+  /**
+   * WHICH CHECKOUT, WHICH PROCESS, AND SINCE WHEN (0.91.0) — the three facts
+   * that turn "a box polled" into a row somebody can act on.
+   *
+   * The owner could not answer a plain question about his own machines: "im not
+   * sure if i have any duplicate or redundant daemons running". The hostname
+   * alone cannot answer it either, because ONE box legitimately runs several
+   * daemons — "i can have 1 daemon in one directory, 1 in another as a
+   * differentiator of projects" — so `cp` is what makes two rows on one box
+   * legible, and `pid` + `st` are what let somebody standing at that box find
+   * the process and tell a long-lived daemon from one that has restarted nine
+   * times since they last looked.
+   *
+   * DAEMON→SERVER REPORTS, so no floor: an older daemon sends none of these and
+   * the server stores null, which reads as "it did not say" rather than as a
+   * box with no checkout. Bounded here as well as at the boundary — a query
+   * string is not a log, and this one is rendered into a terminal.
+   */
+  if (repoRoot) url.searchParams.set('cp', String(repoRoot).slice(0, 256));
+  url.searchParams.set('pid', String(process.pid));
+  url.searchParams.set('st', PROCESS_STARTED_AT);
+  /**
+   * THE FIRST POLL OF THIS PROCESS ASKS FOR THE MACHINE (`claim`, 0.91.0).
+   *
+   * The owner, on two boxes running one project: "it should kill the first one
+   * and take over." Starting the daemon on the computer in front of you IS the
+   * gesture — there is no flag, no env var and no third command, so the ruling
+   * that deleted the old machine-moving flag ("i dont intend to run or do
+   * anything in the terminal besides npx flowviant or npx flowviant login")
+   * stands untouched.
+   *
+   * SENT ONCE PER PROCESS, and that is the safety rather than a politeness: see
+   * `askForMachineOnce`. The server takes holdership there and then, the box it
+   * displaces learns through the existing named-and-windowed `displaced` signal
+   * and exits 0, and nothing restarts to ask again.
+   *
+   * AN OLDER SERVER IGNORES IT and the old standby behaviour stands, which is
+   * why this needs no floor of its own — the server applies one (it will not
+   * take a machine from a box too old to be told it lost it).
+   */
+  if (machineAskPending()) url.searchParams.set('claim', '1');
+  // A poll reports what this box IS. Moving the project's machine onto it, when
+  // this process has already spent its one ask above, is a gesture a person
+  // makes in the app — and the daemon learns that outcome on its next poll like
+  // every other holder fact.
   // Which shares this machine is still serving. It rides the poll rather than
   // taking an endpoint of its own: one beat, no floor, and the stale window is
   // the reconcile interval instead of minutes — which matters, because a share
@@ -305,6 +411,12 @@ async function fetchRoster(
     throw e;
   }
   if (!res.ok) throw new Error(`fleet poll failed (${res.status})`);
+  // THE ASK IS SPENT HERE AND NOWHERE ELSE — on a poll the server actually
+  // answered. Spending it where the param is SET would lose the claim of a
+  // daemon that started while the wire was down: it would retry, silently
+  // without `claim`, and the box somebody walked over to and started would
+  // never take the machine.
+  spendMachineAsk();
   const body = await res.json();
   // Validate the shape here so a malformed 200 (deploy hiccup, error envelope)
   // throws a NORMAL retryable error inside the loop's try/catch, instead of a
@@ -600,6 +712,34 @@ export function createHolderWatch({ say = () => {} } = {}) {
         return 'absent';
       }
       if (holder.mine === true) {
+        /**
+         * WE TOOK IT, AND THE SERVER SAID SO (0.91.0).
+         *
+         * Sent on the one poll that moved holdership and never again, so this
+         * is news by construction — no key to remember, no window to judge.
+         * RELAYED AND NEVER DERIVED: the box we displaced is named because the
+         * server named it, and an unnamed one gets the nameless fallback the
+         * rest of this file uses rather than a guess. The turns clause DROPS
+         * WHOLE when the count is absent — "0 turns were running" is a
+         * measurement nobody took, printed at the one moment somebody is
+         * deciding whether they have just interrupted their own work.
+         */
+        const took = holder.took;
+        if (took && typeof took === 'object' && !Array.isArray(took)) {
+          standbyKey = null;
+          const from =
+            typeof took.from === 'string' && took.from.trim()
+              ? took.from.trim().slice(0, 64)
+              : 'another machine';
+          const turns = Number.isInteger(took.turns) && took.turns > 0 ? took.turns : null;
+          say(
+            `took this project's machine from ${from}` +
+              (turns
+                ? ` — ${turns} turn${turns === 1 ? '' : 's'} ${turns === 1 ? 'was' : 'were'} running there and ${turns === 1 ? 'was' : 'were'} settled as moved.`
+                : '.')
+          );
+          return 'mine';
+        }
         if (standbyKey !== null) {
           standbyKey = null;
           say('this machine now serves the project.');
@@ -631,10 +771,28 @@ export function createHolderWatch({ say = () => {} } = {}) {
         // rather than a zero — because "heard 0s ago" is a measurement nobody
         // took, printed at the one moment the person is deciding whether to
         // wait.
+        //
+        // THE PROMISE IS GONE (0.91.0), and its absence is the honest half.
+        // This sentence used to end "It moves here automatically once that
+        // machine has been quiet 10 minutes", which was true while starting a
+        // daemon did nothing but wait. Since 0.91.0 a process START asks for
+        // the machine on its first poll — the owner's ruling, "it should kill
+        // the first one and take over" — so reaching this branch at all means
+        // the ask was REFUSED or never spent. Four ways: an older server that
+        // does not honour it; a daemon this server will not hand a machine to;
+        // an UNATTENDED RE-EXEC, which is born with the ask spent because a
+        // restart is not a person; and — the one worth naming — a box this
+        // credential DISPLACED inside the last ten minutes, which the server
+        // refuses so that two supervised daemons cannot trade a machine back
+        // and forth forever (see `takeMachineHolderNow`). In that last case the
+        // right next move is a decision, not a wait, which is exactly what this
+        // sentence already points at. Restating the staleness clock instead
+        // would promise a handover on the one path where it is least likely to
+        // be what happens. So the line relays the fact and points at the door,
+        // which is the same door it always pointed at.
         say(
           `This project's machine is ${name ?? 'another machine'}${ago ? ` (heard ${ago} ago)` : ''}. ` +
-            'It moves here automatically once that machine has been quiet 10 minutes ' +
-            "— or move it now from the app's project settings."
+            "This one is standing by — move it here from the app's project settings."
         );
       }
       return 'standby';
@@ -1926,7 +2084,8 @@ export async function runFleetDaemon() {
         buildHave(),
         livePreviewIds(),
         heldSessionIds(),
-        admit('churn')
+        admit('churn'),
+        repoRoot
       );
     } catch (e) {
       if (e.auth) {
@@ -1960,6 +2119,35 @@ export async function runFleetDaemon() {
         // for a --fleet/env token (nothing stored to annotate).
         setStoredProjectName(roster.project.id, roster.project.name);
       }
+      /**
+       * WHAT ELSE IS SERVING THIS PROJECT — said ONCE, right after the first
+       * poll lands, and never again (0.91.0).
+       *
+       * The owner could not answer a plain question about his own setup: "im
+       * not sure if i have any duplicate or redundant daemons running". This is
+       * the half of the answer that belongs in the terminal you just typed
+       * into, because that is where you are standing when the question occurs
+       * to you — the app's Home is where the whole account's answer lives.
+       *
+       * A RELAY, and it withholds nothing on failure: an older server has no
+       * boxes route and 404s, which prints NOTHING rather than a complaint
+       * about a feature nobody asked for. Fire-and-forget and never awaited on
+       * the poll path — a listing must never delay a roster tick.
+       */
+      void (async () => {
+        try {
+          const { boxesUrlFrom, fetchBoxesFor, otherBoxesLine } = await import('./machines.mjs');
+          const res = await fetchBoxesFor(
+            { fleetToken: FLEET_TOKEN },
+            { url: boxesUrlFrom(FLEET_URL), envpub: myPubB64() ?? undefined }
+          );
+          if (!res.boxes) return;
+          const line = otherBoxesLine(res.boxes, res.me);
+          if (line) note(line);
+        } catch {
+          /* a readout — it must never disturb the daemon that produced it */
+        }
+      })();
     }
     if (roster.mcpUrl) mcpUrl = roster.mcpUrl;
     /**

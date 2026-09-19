@@ -106,11 +106,27 @@ test('a standby says its sentence once per DISTINCT holder, and never per poll',
     assert.equal(w.observe({ mine: false, name: 'mac-mini', heardAgo: 34_000 }), 'standby');
   }
   assert.equal(said.length, 1);
+  /**
+   * THE SENTENCE MAKES NO PROMISE ANY MORE (0.91.0), and the absence is pinned
+   * because it is the whole point of the rewording.
+   *
+   * It used to end "It moves here automatically once that machine has been
+   * quiet 10 minutes", which was true while starting a daemon did nothing but
+   * wait. Since 0.91.0 a process START asks for the machine on its first poll
+   * — the owner's "it should kill the first one and take over" — so REACHING
+   * this branch at all means that ask was refused (an older server, or a daemon
+   * this server will not hand a machine to). Reciting the staleness clock there
+   * would promise a handover on the one path where it is least likely to be
+   * what happens.
+   */
   assert.equal(
     said[0],
-    "This project's machine is mac-mini (heard 34s ago). It moves here automatically " +
-      "once that machine has been quiet 10 minutes — or move it now from the app's " +
-      'project settings.'
+    "This project's machine is mac-mini (heard 34s ago). This one is standing by " +
+      "— move it here from the app's project settings."
+  );
+  assert.ok(
+    !/automatically|10 minutes/.test(said[0]),
+    'a standby that was already refused a claim is promised nothing'
   );
   // A DIFFERENT box is news; the same one again is not.
   w.observe({ mine: false, name: 'studio', heardAgo: 60_000 });
@@ -127,9 +143,8 @@ test('an unnamed holder gets the nameless fallback and still announces once', ()
   assert.equal(said.length, 1);
   assert.equal(
     said[0],
-    "This project's machine is another machine. It moves here automatically " +
-      "once that machine has been quiet 10 minutes — or move it now from the app's " +
-      'project settings.'
+    "This project's machine is another machine. This one is standing by " +
+      "— move it here from the app's project settings."
   );
   assert.ok(!said[0].includes('heard'), 'an unmeasured duration drops the clause whole');
 });
@@ -299,7 +314,7 @@ test('the standby never exits, and standing by gates nothing but copy', () => {
   assert.equal(src.split("holderState = 'absent'").length - 1, 1);
 });
 
-test('NOTHING in the terminal asks for the machine — the gesture is the app\'s', () => {
+test('NOTHING a person TYPES asks for the machine — there is still no flag', () => {
   /**
    * THE OWNER'S RULING, verbatim: "i dont intend to run or do anything in the
    * terminal besides npx flowviant or npx flowviant login." So a daemon flag
@@ -308,6 +323,21 @@ test('NOTHING in the terminal asks for the machine — the gesture is the app\'s
    * the server performs it (it is the only party that can see both boxes), and
    * every daemon learns the outcome on its next poll, exactly like every other
    * holder fact.
+   *
+   * ── AMENDED 2026-09-19 (0.91.0), AND NARROWLY ──
+   *
+   * A daemon now DOES ask, once, on the first poll of its process (`claim=1`),
+   * on the owner's later ruling about two boxes running one project: "it should
+   * kill the first one and take over". That does not weaken the rule above, it
+   * satisfies it: what claims is STARTING THE DAEMON, which is already one of
+   * the two commands the terminal surface consists of. There is still nothing
+   * to type, nothing to learn and nothing to get wrong.
+   *
+   * So the ban keeps its exact shape — no FLAG, no env var, no third thing a
+   * person types — and the patterns below are unchanged. What is pinned beside
+   * it now is that the ask is spelled `claim` and is spent ONCE (see the tests
+   * above it), because a param that kept asking would be two boxes trading a
+   * machine back and forth every ten seconds.
    *
    * PINNED AS AN ABSENCE, because an absence passes every test ever written
    * against it: the only thing that stops a flag like this being re-added is

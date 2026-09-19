@@ -146,6 +146,31 @@ export function myPubB64() {
   return keypair ? sodium.to_base64(keypair.publicKey, B64()) : null;
 }
 
+/**
+ * THIS BOX'S PUBLIC KEY, READ AND NEVER WRITTEN (2026-09-19, the review).
+ *
+ * `flowviant machines` is a VIEW-ONLY command — that narrowness is the whole
+ * reason a third terminal command was allowed to exist at all — and it was
+ * calling `ensureKeypair`, which on a box with no keypair CREATES ONE: a
+ * filesystem write, 0600, minting this machine's durable identity, from a
+ * command whose entire job is to print a list. Listing must not enrol.
+ *
+ * It reads the stored file and nothing else. No sodium, no parse of the private
+ * half, no creation. NULL for every failure — absent, unreadable, malformed —
+ * and null simply means no row gets the "← this box" mark, which is honest: a
+ * box that has never run a daemon has never polled, so it is not in the listing
+ * to be marked. Claiming a row is you on a guess would be worse than the mark
+ * being absent.
+ */
+export function readStoredPubB64() {
+  try {
+    const stored = JSON.parse(readFileSync(KEYPAIR_PATH, 'utf8'));
+    return typeof stored?.pub === 'string' && stored.pub ? stored.pub : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Query params the roster poll carries: identity, materialized version, and
  *  the target files we REFUSED to write.
  *

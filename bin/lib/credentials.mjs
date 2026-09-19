@@ -136,6 +136,42 @@ export function projectLabel(e) {
   return e?.name ?? (e?.projectId ? `project ${e.projectId.slice(0, 8)}…` : 'an unnamed project');
 }
 
+/**
+ * THE SAME LABEL, DISAMBIGUATED — for a list where two rows can read alike
+ * (2026-09-19).
+ *
+ * Two projects genuinely named the same thing is not a hypothetical: production
+ * held two called "BRIF AI", both bound to the same checkout on one box, so
+ * `npx flowviant` there offered two IDENTICAL picker rows and the only way to
+ * choose between them was to guess. A picker whose options cannot be told apart
+ * is not a picker.
+ *
+ * THE SUFFIX IS ONLY ON THE COLLIDING ROWS. An id on every row would be noise
+ * on the ordinary case — one project per repo, nothing ambiguous — and noise is
+ * what makes the one row that matters unfindable. The DATE rides beside the id
+ * because it is the fact a person can actually match against their own memory
+ * ("I set that one up last month"), where two random-looking hex prefixes are
+ * two things to compare character by character.
+ *
+ * `flowviant machines` deliberately does the OPPOSITE and prints the id on
+ * every row: there you are reconciling a whole box's worth of credentials, and
+ * a suffix you have to notice before you know it matters has already made you
+ * do the work the listing exists to do for you.
+ */
+export function projectRowLabel(e, entries) {
+  const label = projectLabel(e);
+  const collides =
+    Array.isArray(entries) &&
+    entries.filter((x) => x !== e && projectLabel(x) === label).length > 0;
+  if (!collides) return label;
+  const d = e?.savedAt ? new Date(e.savedAt) : null;
+  const when =
+    d && !Number.isNaN(d.getTime())
+      ? `, connected ${d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`
+      : '';
+  return `${label} (id ${String(e?.projectId ?? '').slice(0, 8)}…${when})`;
+}
+
 /** Collapse a name or slug for loose comparison: "My Project", "my-project"
  *  and "myproject" all become "myproject". */
 function normalizeName(s) {
@@ -211,6 +247,48 @@ export function selectStoredProject(projectId, { bindRepoRoot } = {}) {
     f.projectId = projectId;
     f.mcpUrl = e.mcpUrl ?? null;
   });
+}
+
+/**
+ * FORGET A STORED CREDENTIAL — `flowviant machines --forget <id>` (2026-09-19).
+ *
+ * The one write this otherwise view-only command can make, and it edits THIS
+ * BOX'S credential file and nothing else: no server is called, no daemon is
+ * stopped, no project is deleted. It exists because a credential whose project
+ * was disconnected or deleted in the app 401s forever from here, and until now
+ * the only way to clear one was to hand-edit JSON under `~/.flowviant`.
+ *
+ * IT CLEARS THE LEGACY MIRROR TOO when the mirror names the entry being
+ * removed. Leaving it would resurrect the row on the next read —
+ * `listStoredProjects` surfaces the top-level trio as an entry whenever no map
+ * row carries its token — so the forget would silently not have happened, which
+ * is the worst outcome available here.
+ *
+ * MATCHES BY FULL ID OR A PREFIX OF AT LEAST SIX, the same rule
+ * `matchStoredProject` keeps, and AMBIGUITY IS A REFUSAL rather than a coin
+ * flip: this deletes a credential, and the case that produced the whole command
+ * is two projects that look alike.
+ */
+export function forgetStoredProject(ref) {
+  const q = String(ref ?? '').trim();
+  if (!q) return { error: 'empty --forget value' };
+  const hits = listStoredProjects().filter(
+    (e) => e.projectId === q || (q.length >= 6 && e.projectId.startsWith(q))
+  );
+  if (hits.length === 0) return { error: `no stored project matches "${q}"` };
+  if (hits.length > 1) {
+    return { error: `"${q}" matches ${hits.length} stored projects — use the full project id` };
+  }
+  const gone = hits[0];
+  mutate((f) => {
+    delete f.projects[gone.projectId];
+    if (f.projectId === gone.projectId) {
+      delete f.projectId;
+      delete f.fleetToken;
+      delete f.mcpUrl;
+    }
+  });
+  return { entry: gone };
 }
 
 export function bindStoredRepo(projectId, repoRoot) {

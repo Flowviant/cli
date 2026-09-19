@@ -40,7 +40,10 @@
  * bare `npx flowviant` serves the project BOUND to the repo it is started in.
  * Ambiguity is a picker on a TTY and a worded refusal headless — never a
  * guess. `flowviant projects` lists what is stored; `--project <name|id>`
- * picks without a prompt.
+ * picks without a prompt. `flowviant machines` (0.91.0) asks the server which
+ * BOXES have polled each of those credentials — the view-only answer to "am I
+ * running duplicate or redundant daemons?", which the store alone cannot give
+ * because a daemon on another computer is invisible from here.
  *
  * Env:
  *   FLOWVIANT_FLEET     the machine credential (or use `flowviant login`).
@@ -195,8 +198,18 @@ if (process.argv[2] === 'projects') {
     process.exit(0);
   }
   for (const e of entries) {
+    // THE DATE RIDES THE ID, always — this listing exists for the moment
+    // somebody is asking "why did it say skadooble?", and "which of these two
+    // did I set up last month" is the same question one step on. Absent when
+    // nothing recorded one (a credential stored before the field existed);
+    // nothing is invented.
+    const savedOn = e.savedAt ? new Date(e.savedAt) : null;
+    const connected =
+      savedOn && !Number.isNaN(savedOn.getTime())
+        ? `, connected ${savedOn.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`
+        : '';
     console.log(
-      `  ${projectLabel(e)}  (${e.projectId.slice(0, 8)}…)` +
+      `  ${projectLabel(e)}  (${e.projectId.slice(0, 8)}…${connected})` +
         `${e.repoRoot ? `\n      repo · ${e.repoRoot}` : '\n      repo · not bound yet — first start or login in its repo binds it'}` +
         `${e.active ? '\n      what a pre-0.55.0 flowviant on this box would serve (the legacy mirror)' : ''}`
     );
@@ -205,6 +218,96 @@ if (process.argv[2] === 'projects') {
     '\n  `npx flowviant` picks by the repo it is started in; `--project <name|id>` overrides;\n' +
       '  `flowviant login` in a new repo connects another project.'
   );
+  process.exit(0);
+}
+
+// ── `flowviant machines` — every project connected on THIS box, and every box
+//    that has polled each of them.
+//
+// A THIRD COMMAND, and the owner's ruling it amends is his own: the terminal
+// surface is `npx flowviant` and `npx flowviant login`, full stop — which is
+// what deleted the old terminal flag for moving a machine — and he asked for
+// this one directly ("the CLI gets a command to list connections"). So it is
+// amended in the narrowest form that ruling allows: VIEW-ONLY. It starts
+// nothing, stops nothing, moves nothing, takes no lock and reaches no daemon.
+// The only state it can change is this box's credential file, and only behind
+// an explicit `--forget`.
+//
+// The question is the owner's, verbatim: "is there a way to view ALL the
+// connected flowviants? because im not sure if i have any duplicate or
+// redundant daemons running". It needs the NETWORK, unlike `projects` next
+// door, because the boxes are the server's answer — this box cannot see a
+// daemon running on somebody else's computer, and guessing would be worse than
+// asking.
+//
+// ONE CALL PER STORED CREDENTIAL, because the CLI has NO PERSON IDENTITY: every
+// request it can make is `Bearer <machine token>`, so "all my machines" has to
+// be assembled from the credentials this box holds. That is also the limit the
+// footer states out loud — the app's Home is where the whole account's answer
+// lives.
+//
+// EXIT 0 whatever it finds, including nothing: the listing is the answer the
+// asker came for, and a non-zero code over "you have no projects connected"
+// would make this command unusable in anything that checks one.
+if (process.argv[2] === 'machines') {
+  const creds = await import('./lib/credentials.mjs');
+  const forgetAt = process.argv.indexOf('--forget');
+  if (forgetAt >= 0) {
+    // THE ONE WRITE. Named explicitly, matched by full id or a ≥6 prefix, and
+    // AMBIGUITY REFUSES rather than guessing — this deletes a credential, and
+    // two projects that look alike is the case that produced the command.
+    const res = creds.forgetStoredProject(process.argv[forgetAt + 1]);
+    if (res.error) {
+      console.error(`error: ${res.error}`);
+      process.exit(1);
+    }
+    console.log(
+      `forgot ${creds.projectLabel(res.entry)} (${res.entry.projectId.slice(0, 8)}…) on this box.\n` +
+        '  Nothing was stopped or deleted anywhere else — `flowviant login` connects it again.'
+    );
+    process.exit(0);
+  }
+
+  const entries = creds.listStoredProjects();
+  if (entries.length === 0) {
+    console.log('no projects connected on this machine yet — run `flowviant login` inside a repo.');
+    process.exit(0);
+  }
+  const { boxesUrlFrom, fetchBoxesFor, renderMachines, MACHINES_FOOTER } = await import(
+    './lib/machines.mjs'
+  );
+  const { FLEET_URL } = await import('./lib/config.mjs');
+  // OUR OWN BOX ID, so the listing can mark "← this box".
+  //
+  // READ, NEVER CREATED. This called `ensureKeypair()` until 2026-09-19, which
+  // MINTS a keypair when there is no file — a 0600 write establishing this
+  // machine's durable identity, performed by a command whose entire job is to
+  // print a list. A view-only command is what let a third terminal command
+  // exist at all, and enrolling a box as a side effect of looking at one is not
+  // that. `readStoredPubB64` reads or answers null.
+  //
+  // NULL COSTS ONLY THE MARK, and that is the honest outcome: a box that has
+  // never run a daemon has never polled, so it is not in this listing to be
+  // marked in the first place.
+  let me;
+  try {
+    const env = await import('./lib/env.mjs');
+    me = env.readStoredPubB64() ?? undefined;
+  } catch {
+    /* unreadable keypair — nothing is marked, and nothing is claimed */
+  }
+  const url = boxesUrlFrom(FLEET_URL);
+  const results = {};
+  // SEQUENTIAL, not a fan-out: this is a handful of credentials on somebody's
+  // laptop, and a parallel burst against the API buys nothing a person waiting
+  // two seconds can perceive.
+  for (const e of entries) {
+    results[e.projectId] = await fetchBoxesFor(e, { url, envpub: me });
+  }
+  console.log('');
+  for (const line of renderMachines(entries, results)) console.log(line);
+  console.log('');
+  for (const line of MACHINES_FOOTER) console.log(line);
   process.exit(0);
 }
 
@@ -268,11 +371,16 @@ async function reexecAfterLogin() {
   process.exit(await new Promise((resolve) => child.on('exit', (code) => resolve(code ?? 0))));
 }
 
-function listLines(entries, { projectLabel }) {
+// TWO ROWS THAT READ ALIKE ARE NOT A CHOICE. `projectRowLabel` adds the id and
+// the connected date to the COLLIDING rows only — production held two projects
+// both called "BRIF AI", both bound to the same checkout, so this picker
+// offered two identical lines and the only way to answer was to guess. See
+// credentials.mjs for why the suffix is not on every row.
+function listLines(entries, { projectRowLabel }) {
   return entries
     .map(
       (e, i) =>
-        `  ${i + 1}. ${projectLabel(e)}` +
+        `  ${i + 1}. ${projectRowLabel(e, entries)}` +
         (e.repoRoot ? `  — connected for ${e.repoRoot}` : '  — not tied to a repo yet')
     )
     .join('\n');
@@ -321,7 +429,8 @@ if (!FLEET_TOKEN) {
     let chosen = null; // 0-based into [...choices, login]
     if (menuSupported()) {
       const rowLabel = (e) =>
-        creds.projectLabel(e) + (e.repoRoot ? `  — connected for ${e.repoRoot}` : '  — not tied to a repo yet');
+        creds.projectRowLabel(e, choices) +
+        (e.repoRoot ? `  — connected for ${e.repoRoot}` : '  — not tied to a repo yet');
       const options = [...choices.map(rowLabel), loginLabel];
       // Say WHY the cursor starts where it does — "intuitive" made visible.
       if (likely >= 0) options[likely] += '   ← looks like this repo';
