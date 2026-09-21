@@ -5,15 +5,22 @@
  * server stores is ciphertext it cannot open.
  *
  * Duties per roster tick (handleRosterEnv):
- *  - register this machine's pubkey (once) → an admin approves in Settings.
+ *  - register this machine's pubkey (once) → that IS the enrolment (server
+ *    2026-09-20): the box already holds this project's machine credential,
+ *    which a person handed it by typing a device code into the app, so there is
+ *    nothing left for anybody to approve. Nobody clicks; nothing is printed
+ *    except one quiet line.
  *  - bootstrap the project keypair when none exists (first machine): generate
- *    it + a standing RECOVERY keypair wrapped under a one-time passphrase
- *    printed exactly once — rotations re-seal to the same recovery pub, so
- *    that passphrase survives forever.
+ *    it + a standing RECOVERY keypair wrapped under a one-time passphrase —
+ *    rotations re-seal to the same recovery pub, so that passphrase survives
+ *    forever. Bootstrap itself is SILENT since 2026-09-20: the passphrase is
+ *    parked in this box's keypair file and printed the first time this box
+ *    materializes a secret, which is the first moment it is about anything
+ *    (`stashRecoveryCode`).
  *  - sync: on a bundle version change, unwrap the priv, open every sealed
  *    value, cache (encrypted under a key derived from our own priv), and
  *    rematerialize env files into the agent worktrees.
- *  - execute wrap jobs (admin approved a new machine → seal the priv to it).
+ *  - execute wrap jobs (another box registered → seal the priv to it).
  *  - execute rotations (a machine was revoked → new keypair, re-seal all
  *    values, re-wrap every enrolled machine, re-seal recovery).
  *
@@ -66,33 +73,18 @@ export async function sodiumReady() {
   await sodium.ready;
 }
 
-/** 6-emoji key fingerprint — algorithm MUST match the web's pubkeyEmoji
- *  (EnvironmentSettings.tsx) so the human can compare terminal ↔ approve card. */
-// MUST stay byte-identical to the web's pubkeyEmoji (EnvironmentSettings.tsx) —
-// the human compares the two strings. 32 glyphs × 8 positions, effective ~40
-// bits. Two FNV-1a rolling hashes over the whole key + a murmur3 finalizer per
-// glyph (a plain additive sum collapsed the space to ~10 bits — grindable).
-const FP_EMOJI = ['🦊','🐙','🦕','🐝','🦉','🐬','🦁','🐸','🦄','🐢','🦋','🐺','🦜','🐳','🦔','🐌','🦩','🐿️','🦥','🐨','🦦','🐇','🦡','🦂','🦨','🐜','🦢','🐋','🦭','🐞','🦚','🐊'];
-export function pubkeyEmoji(pubkeyB64) {
-  let h1 = 0x811c9dc5 >>> 0;
-  let h2 = 0xc2b2ae35 >>> 0;
-  for (let i = 0; i < pubkeyB64.length; i++) {
-    const ch = pubkeyB64.charCodeAt(i);
-    h1 = Math.imul(h1 ^ ch, 0x01000193) >>> 0;
-    h2 = Math.imul(h2 ^ ch, 0x85ebca6b) >>> 0;
-  }
-  let out = '';
-  for (let i = 0; i < 8; i++) {
-    let x = (((i < 4 ? h1 : h2) + i * 0x9e3779b1) >>> 0);
-    x ^= x >>> 16;
-    x = Math.imul(x, 0x7feb352d) >>> 0;
-    x ^= x >>> 15;
-    x = Math.imul(x, 0x846ca68b) >>> 0;
-    x ^= x >>> 16;
-    out += FP_EMOJI[x & 31];
-  }
-  return out;
-}
+/*
+ * `pubkeyEmoji` IS DELETED (2026-09-20), and so is its byte-identical twin in
+ * the web app.
+ *
+ * It existed for exactly one gesture: the terminal printed eight glyphs, the
+ * browser's approve card printed the same eight, and a human compared them
+ * before pressing Approve. Registering IS enrolling now — the device code that
+ * gave this box the project's machine credential was the decision — so there is
+ * no approve card, no comparison, and nobody to make it. A fingerprint kept
+ * byte-identical across two repos for nobody to look at is worse than none:
+ * it reads like a live MITM defence and defends nothing.
+ */
 
 /** This machine's persistent keypair (created on first use, 0600). */
 export async function ensureKeypair() {
@@ -169,6 +161,120 @@ export function readStoredPubB64() {
   } catch {
     return null;
   }
+}
+
+/**
+ * ── THE RECOVERY CODE WAITS UNTIL THERE IS SOMETHING TO RECOVER (2026-09-20) ──
+ *
+ * `bootstrapProject` used to end with the loudest artefact this product owns:
+ * a blank line, RECOVERY CODE in bold, a passphrase in yellow, and "the only
+ * way back into the secrets". That fired on the FIRST DAEMON OF EVERY PROJECT
+ * — a keypair is bootstrapped whether or not a single secret exists — so the
+ * overwhelming majority of the people who saw it were being handed a code for
+ * an empty vault, in custody vocabulary they had not asked for, having run
+ * `npx flowviant` to connect a machine. That is the same complaint the approve
+ * gate died of, printed instead of clicked, and leaving it in would have
+ * contradicted the change it shipped beside.
+ *
+ * So bootstrap is SILENT (one quiet line that the keypair exists) and the code
+ * is kept HERE, in this box's own keypair file, until the first time this box
+ * materializes a secret — the moment the person actually has something to
+ * protect, and the first moment the sentence is true.
+ *
+ * THE FILE IS THE RIGHT PLACE AND COSTS NOTHING. It already holds the private
+ * key the passphrase would recover — anybody who can read one can read the
+ * other — so storing it there adds no exposure that was not already the whole
+ * security model of this machine. It is 0600 and stays 0600.
+ *
+ * EXTENDING THE SHAPE IS SAFE. `ensureKeypair` reads `pub` and `priv` and
+ * ignores every other key, and it only WRITES the file when there is none, so
+ * an older daemon reading a file with a `recovery` field behaves identically
+ * and cannot clobber it.
+ *
+ * THE ONE ACCEPTED COST, stated: a box that bootstraps and never materializes
+ * anything never prints the code. That is the point — there is nothing to
+ * recover — and the code is not lost, it is on this disk beside the key.
+ */
+function readKeypairFile() {
+  try {
+    return JSON.parse(readFileSync(KEYPAIR_PATH, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+/** 0600 on every write, not just at creation: `writeFileSync`'s `mode` applies
+ *  only when the file is created, which is the same trap `materializeInto`
+ *  documents. Returns whether it landed — the caller has to know, because the
+ *  thing being written is unrecoverable if it does not. */
+function writeKeypairFile(stored) {
+  try {
+    writeFileSync(KEYPAIR_PATH, JSON.stringify(stored), { mode: 0o600 });
+    try {
+      chmodSync(KEYPAIR_PATH, 0o600);
+    } catch {
+      /* a filesystem without modes is not a reason to refuse */
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Park the bootstrap passphrase beside the key it recovers. False means it did
+ *  NOT land, and the caller's answer to that is to print it immediately —
+ *  losing a recovery code silently is the one outcome worse than printing it
+ *  early. */
+export function stashRecoveryCode(code, projectId) {
+  const stored = readKeypairFile();
+  if (!stored?.priv) return false;
+  stored.recovery = { code, projectId: projectId ?? null, shown: false };
+  return writeKeypairFile(stored);
+}
+
+/** Once per process at most, and once per box for real. */
+let recoveryUnprinted = true;
+
+function printRecoveryBlock(code) {
+  console.log('');
+  ok(`${c.cyan('env')} — this machine now holds this project's secrets.`);
+  console.log(`  ${c.bold('RECOVERY CODE')} ${c.dim('(shown ONCE — save it in a password manager):')}`);
+  console.log(`  ${c.bold(c.yellow(code))}`);
+  note('  If every enrolled machine is ever lost, this code is the only way back into the secrets.');
+  console.log('');
+}
+
+/**
+ * Print the parked code the first time this box writes a secret to disk, then
+ * mark it shown so it never prints again.
+ *
+ * The mark is written to the FILE, not just to the module flag, because "once"
+ * has to survive a restart. If that write fails the flag still stops this
+ * process from repeating itself and a later process prints again — noisy in
+ * the safe direction, which is the only direction available when the thing at
+ * stake is the only way back into somebody's secrets.
+ *
+ * The parked `projectId` is checked because the keypair file is per BOX while
+ * the code is per PROJECT: a daemon serves one project, so a mismatch means
+ * this code belongs to a different one and printing it here would attribute it
+ * to the wrong vault. An older stash carries no id and prints regardless.
+ */
+function printRecoveryCodeOnce() {
+  if (!recoveryUnprinted) return;
+  const stored = readKeypairFile();
+  const rec = stored?.recovery;
+  if (!rec?.code || rec.shown) {
+    recoveryUnprinted = false;
+    return;
+  }
+  if (rec.projectId && cachedProjectId && rec.projectId !== cachedProjectId) {
+    recoveryUnprinted = false; // one project per daemon — this will not change
+    return;
+  }
+  recoveryUnprinted = false;
+  printRecoveryBlock(rec.code);
+  stored.recovery = { ...rec, shown: true };
+  writeKeypairFile(stored);
 }
 
 /** Query params the roster poll carries: identity, materialized version, and
@@ -623,6 +729,13 @@ export function materializeInto(wt) {
   if (anyProblem) cleanWorktrees.delete(wt);
   else cleanWorktrees.add(wt);
   everMaterialized = true;
+
+  // THE FIRST SECRET THIS BOX EVER WROTE TO DISK is the moment the recovery
+  // code stops being a warning about nothing — see `printRecoveryCodeOnce`.
+  // Gated on `written`, not on reaching this line: a pass that refused every
+  // file for a git reason materialized nothing, and the sentence would be
+  // false. Nothing is printed on any later pass.
+  if (written.length > 0) printRecoveryCodeOnce();
 }
 
 
@@ -664,8 +777,9 @@ export async function handleRosterEnv(env, { projectId } = {}) {
     // wedge registration until restart.
     if (env.status === 'none' && !registeredOnce) {
       const label = hostname() || 'daemon';
+      let registered = null;
       try {
-        await post('register', { pubkey: myPubB64(), label });
+        registered = await post('register', { pubkey: myPubB64(), label });
       } catch (e) {
         // A 429 = the project is at its machine cap; retrying every poll would
         // just hammer it. Stop for this session (a restart re-tries).
@@ -677,12 +791,45 @@ export async function handleRosterEnv(env, { projectId } = {}) {
         throw e; // transient — retry next poll (registeredOnce still false)
       }
       registeredOnce = true;
-      const fp = pubkeyEmoji(myPubB64());
-      info(`${c.cyan('env')}    · this machine requested env access as ${c.bold(label)}`);
-      note(`  fingerprint ${fp} — an admin approves it in Settings → Environment (compare the emoji).`);
+      /*
+       * ONE LINE, AND IT RELAYS WHAT THE SERVER ANSWERED.
+       *
+       * It used to print a key fingerprint and say "an admin approves it in
+       * Settings → Environment (compare the emoji)" — an instruction for a
+       * button that no longer exists, about a comparison nobody was making, on
+       * top of a credential this box was already trusted with. What replaced it
+       * asserted the opposite and just as blindly: "enrolled … secrets sync to
+       * this box automatically", printed whatever the response said. A fresh
+       * registration comes back `approved`, not `enrolled` — the key is not
+       * here yet and arrives only once some box that holds it polls — so the
+       * line was claiming a state this box was one or more ticks away from, and
+       * on an OLDER server (which still answers `pending`) it was claiming one
+       * the box would never reach at all.
+       *
+       * So the status is read off the response and each state says its own
+       * true sentence, and an answer we do not recognise — or no body at all —
+       * says only the part we measured: the registration went out.
+       */
+      const registeredAs = `${c.cyan('env')}    · registered as ${c.bold(label)}`;
+      if (registered?.status === 'enrolled') {
+        info(`${c.cyan('env')}    · enrolled as ${c.bold(label)} — secrets sync to this box automatically`);
+      } else if (registered?.status === 'approved') {
+        info(`${registeredAs} — secrets sync here as soon as a machine holding the key is online`);
+      } else if (registered?.status === 'pending') {
+        // An older server, which still has the approve gate. Say what IT is
+        // waiting on rather than what we are: this daemon cannot clear it.
+        info(`${registeredAs} — this server is waiting on an approval in Settings`);
+      } else {
+        info(registeredAs);
+      }
       return { changed: false };
     }
-    if (env.status === 'pending') return { changed: false }; // waiting on the admin
+    // A HARMLESS WAIT, and the server no longer produces this: registering IS
+    // enrolling since 2026-09-20, and a row left `pending` by the old gate is
+    // promoted on the register above. Kept because an OLDER server still
+    // answers `pending`, and a daemon must not treat an unrecognised state as a
+    // reason to act.
+    if (env.status === 'pending') return { changed: false };
     if (env.status === 'revoked') return { changed: false };
 
     // 2. Bootstrap: no project keypair exists — this machine creates it.
@@ -701,7 +848,9 @@ export async function handleRosterEnv(env, { projectId } = {}) {
     projectPriv = openSealed(bundle.wrappedPriv, keypair.publicKey, keypair.privateKey);
     const projectPub = sodium.from_base64(bundle.projectPub, B64());
 
-    // Execute approved enrollments: seal the priv to each new machine. The
+    // Execute pending enrollments: seal the priv to each newly registered
+    // machine. Registering is what puts a box on this list now — there is no
+    // approval step between the two. The
     // wrap's epoch rides along — the server rejects (stale) if a rotation moved
     // it since we fetched, so nobody enrolls with a dead key.
     if (bundle.pendingWraps.length) {
@@ -711,7 +860,7 @@ export async function handleRosterEnv(env, { projectId } = {}) {
       }));
       const res = await post('wraps', { pubkey: myPubB64(), keyEpoch: bundle.keyEpoch, wraps });
       if (res?.stale) note(`${c.cyan('env')} ${c.dim('— wraps raced a rotation; retrying next poll')}`);
-      else ok(`${c.cyan('env')} ${c.dim(`— delivered the key to ${wraps.length} newly approved machine${wraps.length === 1 ? '' : 's'}`)}`);
+      else ok(`${c.cyan('env')} ${c.dim(`— delivered the key to ${wraps.length} newly registered machine${wraps.length === 1 ? '' : 's'}`)}`);
     }
 
     // Decrypt the values we have — carrying each key's VERSION so a rotation can
@@ -777,9 +926,15 @@ export async function handleRosterEnv(env, { projectId } = {}) {
   }
 }
 
-/** First machine creates the project keypair + the standing recovery target.
- *  The recovery passphrase prints ONCE — rotations re-seal to the same
- *  recovery pub, so this passphrase works forever. */
+/**
+ * First machine creates the project keypair + the standing recovery target.
+ *
+ * THIS IS SILENT (2026-09-20). Rotations re-seal to the same recovery pub, so
+ * the passphrase minted here works forever — which is exactly why it does not
+ * have to be shouted at somebody who has no secrets yet. It is parked in this
+ * box's keypair file and printed the first time this box materializes a
+ * secret; `stashRecoveryCode`'s docblock carries the whole argument.
+ */
 async function bootstrapProject() {
   const project = sodium.crypto_box_keypair();
   const recovery = sodium.crypto_box_keypair();
@@ -816,10 +971,14 @@ async function bootstrapProject() {
     recoverySealed: seal(project.privateKey, sodium.to_base64(recovery.publicKey, B64())),
   });
 
-  console.log('');
-  ok(`${c.cyan('env')} — this machine created the project's env keypair.`);
-  console.log(`  ${c.bold('RECOVERY CODE')} ${c.dim('(shown ONCE — save it in a password manager):')}`);
-  console.log(`  ${c.bold(c.yellow(passphrase))}`);
-  note('  If every enrolled machine is ever lost, this code is the only way back into the secrets.');
-  console.log('');
+  // ONE QUIET LINE. The code goes into the keypair file and waits for the
+  // first secret. A stash that did NOT land is the one case that prints now:
+  // the passphrase exists only in this closure, and losing the only way back
+  // into a project's secrets to keep the terminal tidy is not a trade.
+  if (stashRecoveryCode(passphrase, cachedProjectId)) {
+    ok(`${c.cyan('env')} ${c.dim('— created this project\'s env keypair')}`);
+  } else {
+    warn('env: could not save the recovery code to this machine — here it is, once:');
+    printRecoveryBlock(passphrase);
+  }
 }

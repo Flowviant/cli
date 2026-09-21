@@ -130,7 +130,7 @@ export async function runEnvCommand(args) {
     // that file in every worktree.
     const targetFile = argAfter(args, '--file') ?? file.replace(/^\.\//, '');
     const bundle = await fetchBundle();
-    if (bundle.status !== 'enrolled') die('this machine is not enrolled — approve it in Settings → Environment first.');
+    if (bundle.status !== 'enrolled') die('this machine is not enrolled yet — leave `flowviant` running in this project; enrolment happens on its own within a poll or two.');
     if (!bundle.projectPub) die('no project env keypair yet — start the daemon once to bootstrap it.');
     const existing = new Map(bundle.keys.map((k) => [k.name, k]));
     let added = 0;
@@ -159,7 +159,7 @@ export async function runEnvCommand(args) {
     const name = args[1];
     if (!name || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) die('usage: flowviant env set <KEY> [--file <targetFile>]');
     const bundle = await fetchBundle();
-    if (bundle.status !== 'enrolled') die('this machine is not enrolled — approve it in Settings → Environment first.');
+    if (bundle.status !== 'enrolled') die('this machine is not enrolled yet — leave `flowviant` running in this project; enrolment happens on its own within a poll or two.');
     if (!bundle.projectPub) die('no project env keypair yet — start the daemon once to bootstrap it.');
     const prior = bundle.keys.find((k) => k.name === name);
     const targetFile = argAfter(args, '--file') ?? prior?.targetFile ?? '.env';
@@ -179,7 +179,7 @@ export async function runEnvCommand(args) {
 
   if (cmd === 'show') {
     const bundle = await fetchBundle();
-    if (bundle.status !== 'enrolled') die('this machine is not enrolled — approve it in Settings → Environment first.');
+    if (bundle.status !== 'enrolled') die('this machine is not enrolled yet — leave `flowviant` running in this project; enrolment happens on its own within a poll or two.');
     if (!bundle.wrappedPriv) die('no key material for this machine yet.');
     const kp = await ensureKeypair();
     const priv = sodium.crypto_box_seal_open(
