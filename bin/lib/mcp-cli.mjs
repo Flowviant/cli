@@ -6,14 +6,15 @@
  * per-session `work` tokens the daemon mints for Workbench tabs. That
  * separation is the point, not bookkeeping: a session's agent reads untrusted
  * repo and issue text all day, so giving THAT principal tools that write to
- * your workspace would mean a hostile string in a README could file work as
- * you. The cli credential sees only the management tools and can never work or
- * ship a card; a session token can never reach create_task.
+ * your project would mean a hostile string in a README could file work as you.
+ * The cli credential sees only the management tools and can never work or ship
+ * a card; a session token can never reach create_task.
  *
- * There is deliberately no invite capability on it. Invites grant access to a
- * paid workspace and are guarded by a human browser session — they are sent
- * from the workspace card's gear menu in the app, and never from a CLI
- * credential sitting on a shared machine.
+ * There is deliberately no invite capability on it. An invite grants access to
+ * a PROJECT — which is access to its machine and everything that machine can
+ * reach — and is guarded by a human browser session plus admin access on that
+ * project. Links are made in the project's own settings, under People, and
+ * never from a CLI credential sitting on a shared machine.
  */
 
 import { FLEET_TOKEN, USER_AGENT, MCP_URL, FLEET_URL } from './config.mjs';
