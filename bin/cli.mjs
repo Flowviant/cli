@@ -350,15 +350,14 @@ if (process.argv[2] === 'env') {
 const { canPrompt, askWithTimeout, selectMenu, menuSupported } = await import('./lib/tty.mjs');
 const interactive = canPrompt() && process.env.FLOWVIANT_REEXEC !== '1';
 
-/** How long the one-time binding confirm waits before serving unbound. A person
- *  who just typed `flowviant` answers in seconds; anything longer is a restart
- *  nobody is watching, and the machine must not sit dark for it. */
-const CONFIRM_TIMEOUT_MS = 20_000;
-
-/** The picker's own budget. Longer than the confirm: this one asks you to READ
- *  a list before answering, and its fallback costs you a start rather than
- *  costing you a binding. */
-const PICK_TIMEOUT_MS = 60_000;
+/** NO ANSWER TIME LIMIT on the start path (2026-09-20, the owner: "why is
+ *  there an answer time limit, remove that"). The confirm below carried 20s
+ *  and the picker 60s, each arguing that a restart nobody is watching must
+ *  not sit dark on a prompt — but `interactive` already excludes exactly that
+ *  case (no foreground terminal, or a self-update re-exec, and nothing is
+ *  asked). What was left was a person reading a list being told "no answer
+ *  in 60s — nothing started". A prompt a person can see waits for the
+ *  person; tty.mjs's header carries the argument. */
 const externalToken = process.argv.includes('--fleet') || Boolean(process.env.FLOWVIANT_FLEET);
 
 /** Re-exec a plain `flowviant` after an inline login — the login command's own
@@ -437,15 +436,7 @@ if (!FLEET_TOKEN) {
       const res = await selectMenu({
         options,
         defaultIndex: likely >= 0 ? likely : 0,
-        timeoutMs: PICK_TIMEOUT_MS,
       });
-      if (res.timedOut) {
-        console.error(
-          `\nno answer in ${Math.round(PICK_TIMEOUT_MS / 1000)}s — nothing started. ` +
-            `Name one with \`--project <name|id>\`, or run \`flowviant\` here in the foreground and pick.`
-        );
-        process.exit(1);
-      }
       if (res.cancelled) {
         console.error('nothing chosen — nothing started.');
         process.exit(1);
@@ -460,12 +451,13 @@ if (!FLEET_TOKEN) {
       console.log(`  ${choices.length + 1}. ${loginLabel}`);
       const hint = likely >= 0 ? ` (enter for ${creds.projectLabel(choices[likely])})` : '';
       const raw = await askWithTimeout(
-        `Which project should this daemon serve? [1-${choices.length + 1}]${hint} `,
-        PICK_TIMEOUT_MS
+        `Which project should this daemon serve? [1-${choices.length + 1}]${hint} `
       );
       if (raw === null) {
+        // The read itself failed — stdin closed, or the terminal went away
+        // mid-question. Not a timeout: there is none.
         console.error(
-          `\nno answer in ${Math.round(PICK_TIMEOUT_MS / 1000)}s — nothing started. ` +
+          `\ncould not read an answer — nothing started. ` +
             `Name one with \`--project <name|id>\`, or run \`flowviant\` here in the foreground and pick.`
         );
         process.exit(1);
@@ -519,7 +511,10 @@ if (!FLEET_TOKEN) {
   // stop here with the machine serving nothing. A guard that only works once
   // everyone already has it is not a guard.
   //
-  // ON TIMEOUT WE SERVE, AND WE DO NOT BIND. Those are two decisions:
+  // IF THE READ FAILS WE SERVE, AND WE DO NOT BIND. (This used to say "on
+  // timeout"; there is no timeout since 2026-09-20 — a person at the prompt
+  // is waited for. `null` now means stdin closed under the question.) Those
+  // are two decisions:
   //  · SERVE, because it is what every version before 0.55.0 did with this
   //    exact store, so the silent path is the status quo rather than a new
   //    risk — and a daemon that answers is strictly better than one that does
@@ -531,13 +526,12 @@ if (!FLEET_TOKEN) {
   const creds = await import('./lib/credentials.mjs');
   const label = creds.projectLabel(CREDENTIAL.entry);
   const answered = await askWithTimeout(
-    `This machine's one connected project is ${label}. Serve this repo (${CREDENTIAL.repoRoot}) as ${label}? [Y/n] `,
-    CONFIRM_TIMEOUT_MS
+    `This machine's one connected project is ${label}. Serve this repo (${CREDENTIAL.repoRoot}) as ${label}? [Y/n] `
   );
-  const raw = answered === null ? null : answered.toLowerCase(); // null = nobody answered
+  const raw = answered === null ? null : answered.toLowerCase(); // null = the read failed
   if (raw === null) {
     console.log(
-      `\n  no answer in ${Math.round(CONFIRM_TIMEOUT_MS / 1000)}s — serving ${label} for this run ` +
+      `\n  could not read an answer — serving ${label} for this run ` +
         `without tying it to this repo. Run \`flowviant\` here and answer to make it stick.`
     );
   } else if (raw === '' || raw === 'y' || raw === 'yes') {

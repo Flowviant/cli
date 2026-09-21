@@ -19,13 +19,29 @@
  *
  *  2. `askWithTimeout()` — while asking, install no-op SIGTTIN/SIGTTOU handlers.
  *     A handler (even an empty one) replaces the default STOP, so a misjudged
- *     foreground check degrades to a read that fails or hangs — and a hang is
- *     something the timer can now actually interrupt, because the process is
- *     still running.
+ *     foreground check degrades to a read that fails rather than a process
+ *     that is frozen.
  *
  * The detection is best-effort by design and FAILS TOWARDS ASKING: an unknown
  * platform returns true, because refusing to prompt a human who IS there is a
- * worse failure than a prompt that times out on its own.
+ * worse failure than a prompt that waits.
+ *
+ * A PROMPT A PERSON IS LOOKING AT WAITS FOR THE PERSON (2026-09-20). Both
+ * helpers used to carry a mandatory timer — 20s on the binding confirm, 60s
+ * on the project picker — on the argument that "anything longer is a restart
+ * nobody is watching, and the machine must not sit dark for it". That
+ * argument was already answered one layer up: the start path never asks at
+ * all unless `canPrompt()` says a foreground terminal is attached AND the
+ * process is not a self-update re-exec, so the unattended restart the timer
+ * was defending against cannot reach a prompt. What the timer actually did
+ * was refuse a person who went to read the list, make a coffee, or answer a
+ * message — "no answer in 60s — nothing started" — on the one path where
+ * nothing has been started yet and waiting costs nothing. The owner's ruling,
+ * verbatim: "why is there an answer time limit, remove that." So `timeoutMs`
+ * is OPTIONAL now and the start path passes none; a caller that has a real
+ * reason to bound a wait (the install prompt, where silence is "no") may
+ * still pass one. The signal handlers stay — they were never about the timer,
+ * they are what keeps a backgrounded job from freezing.
  */
 
 import { readFileSync } from 'node:fs';
@@ -80,11 +96,21 @@ export function canPrompt() {
   return Boolean(process.stdin.isTTY && process.stdout.isTTY) && inForeground();
 }
 
+/** A timer only when a caller asked for one. `clearTimeout(null)` is a no-op,
+ *  so the finally blocks need no branch. Non-finite or non-positive means
+ *  "wait for the person". */
+export function boundedTimer(timeoutMs, fire) {
+  return Number.isFinite(timeoutMs) && timeoutMs > 0 ? setTimeout(fire, timeoutMs) : null;
+}
+
 /**
- * Ask, and come back no matter what. Resolves the trimmed answer, or `null`
- * when nobody answered within `timeoutMs` — the caller decides what silence
- * means, because it is not the same answer everywhere (the binding confirm
- * serves unbound; the project picker refuses, exactly as it does headless).
+ * Ask, and come back with an answer or a refusal. Resolves the trimmed
+ * answer, or `null` when the read failed (stdin closed under us, the terminal
+ * went away) or — only when a caller passed a finite `timeoutMs` — when nobody
+ * answered in time. With no `timeoutMs` it waits for the person; see the
+ * header. The caller decides what `null` means, because it is not the same
+ * answer everywhere (the binding confirm serves unbound; the project picker
+ * refuses, exactly as it does headless).
  */
 export async function askWithTimeout(query, timeoutMs) {
   const noop = () => {};
@@ -97,7 +123,7 @@ export async function askWithTimeout(query, timeoutMs) {
     output: process.stdout,
   });
   const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), timeoutMs);
+  const timer = boundedTimer(timeoutMs, () => ac.abort());
   try {
     return (await rl.question(query, { signal: ac.signal })).trim();
   } catch {
@@ -153,15 +179,15 @@ const MENU_FOOTER = '↑/↓ move · enter select · 1–9 jump · esc cancel';
  * An arrow-navigable picker for the start path. Resolves one of:
  *   { index }        the row taken
  *   { cancelled }    Esc/q/Ctrl-C
- *   { timedOut }     nobody drove it within timeoutMs
+ *   { timedOut }     a caller passed `timeoutMs` and nobody drove it in time
+ *                    (the start path passes none — see the header)
  *   { unsupported }  no raw mode — the caller uses the numeric prompt instead
  *
- * Held to this file's one law — no start-path prompt may hang the daemon — the
- * same way `askWithTimeout` is: it keeps the timeout, installs the
- * SIGTTIN/SIGTTOU no-ops that keep that timer alive, restores the terminal in
- * every exit, and refuses (returns `unsupported`) rather than half-drawing when
- * raw mode is not really there. The caller still gates on `canPrompt()` before
- * ever reaching here.
+ * Held to this file's one law — no start-path prompt may STOP the daemon — the
+ * same way `askWithTimeout` is: it installs the SIGTTIN/SIGTTOU no-ops,
+ * restores the terminal in every exit, and refuses (returns `unsupported`)
+ * rather than half-drawing when raw mode is not really there. The caller still
+ * gates on `canPrompt()` before ever reaching here.
  */
 export async function selectMenu({ options, defaultIndex = 0, timeoutMs }) {
   if (!menuSupported()) return { unsupported: true };
@@ -220,7 +246,7 @@ export async function selectMenu({ options, defaultIndex = 0, timeoutMs }) {
     };
     process.on('SIGTTIN', noop);
     process.on('SIGTTOU', noop);
-    const timer = setTimeout(() => finish({ timedOut: true }), timeoutMs);
+    const timer = boundedTimer(timeoutMs, () => finish({ timedOut: true }));
     try {
       stdin.setRawMode(true);
     } catch {

@@ -59,3 +59,38 @@ test('an unhandled key is ignored', () => {
   assert.equal(menuKey('\t', at(1)), null);
   assert.equal(menuKey('0', at(1)), null); // 0 is not a 1-based shortcut
 });
+
+// ---------------------------------------------------------------------------
+// NO ANSWER TIME LIMIT ON THE START PATH (2026-09-20, the owner: "why is there
+// an answer time limit, remove that"). The timer is a caller's option now, and
+// the start path passes none. Pinned at both ends: the helper arms nothing
+// without a finite positive budget, and cli.mjs hands neither prompt one.
+// ---------------------------------------------------------------------------
+
+test('boundedTimer arms nothing unless a caller passed a real budget', async () => {
+  const { boundedTimer } = await import('./tty.mjs');
+  for (const none of [undefined, null, 0, -1, NaN, Infinity, 'soon']) {
+    assert.equal(boundedTimer(none, () => {}), null, `no timer for ${String(none)}`);
+  }
+  const t = boundedTimer(50, () => {});
+  assert.ok(t !== null, 'a finite positive budget arms a timer');
+  clearTimeout(t);
+});
+
+test('the picker and the binding confirm pass NO timeout', async () => {
+  const { readFileSync } = await import('node:fs');
+  const cli = readFileSync(new URL('../cli.mjs', import.meta.url), 'utf8');
+  // The constants that carried the budgets are gone outright, not zeroed.
+  assert.ok(!cli.includes('PICK_TIMEOUT_MS'), 'PICK_TIMEOUT_MS is deleted');
+  assert.ok(!cli.includes('CONFIRM_TIMEOUT_MS'), 'CONFIRM_TIMEOUT_MS is deleted');
+  assert.ok(!cli.includes('no answer in'), 'no start-path sentence blames a clock');
+  // Every start-path ask is a one-argument call; every menu carries no timeoutMs.
+  const asks = cli.match(/askWithTimeout\(\s*`[^`]*`\s*(,[^)]*)?\)/gs) ?? [];
+  assert.equal(asks.length, 2, 'the picker fallback and the binding confirm');
+  for (const call of asks) assert.ok(!/,\s*\w/.test(call.slice(call.indexOf('`', 1) + 1)), `no budget: ${call.slice(0, 60)}`);
+  assert.ok(!cli.includes('timeoutMs:'), 'selectMenu is called without a budget');
+  // …and the install prompt, which is NOT on the start path, keeps its own
+  // bounded "silence is no" — the option still exists for a reason.
+  const install = readFileSync(new URL('./install.mjs', import.meta.url), 'utf8');
+  assert.ok(/askWithTimeout\([\s\S]*?30_000/.test(install), 'promptYesNo keeps its bound');
+});
