@@ -293,8 +293,36 @@ export const PROCESS_STARTED_AT = new Date(
 export let FLEET_TOKEN =
   argFlag('--fleet') || process.env.FLOWVIANT_FLEET || CREDENTIAL.entry?.fleetToken || '';
 
+/**
+ * WHICH PROJECT THIS DAEMON SERVES, or null when nothing on this box names one.
+ *
+ * ADDED 2026-09-21 for one consumer: it SALTS the env report's value
+ * fingerprints (`env.mjs`), so an eight-character hash over `production` or
+ * `3000` stops being a dictionary lookup anybody with the stored report can
+ * perform. The whole comparison is between the boxes of ONE project, so a
+ * per-project salt costs the feature nothing.
+ *
+ * NULL IS A REAL ANSWER AND IS NOT PAPERED OVER. A credential handed in through
+ * `FLOWVIANT_FLEET` or `--fleet` names no project until the roster does, and the
+ * consumer's rule is that a box which cannot name its project reports NO env
+ * files rather than fingerprints salted with something else — incomparable
+ * hashes would render as a confident "these boxes differ" beside a box holding
+ * the identical value. Ignorance renders nothing.
+ *
+ * `let`, for the same reason `FLEET_TOKEN` is: when cli.mjs answers an
+ * ambiguous store with a picker, `adoptStoredCredential` is what settles both,
+ * and ES named imports are LIVE bindings so every importer sees the answer.
+ * A frozen copy read at import would salt a picked project's report with null
+ * and report nothing at all, for the whole life of the process.
+ */
+export let PROJECT_ID = CREDENTIAL.entry?.projectId ?? null;
+
 /** cli.mjs's picker chose. Must run BEFORE runFleetDaemon — nothing here
  *  re-authenticates a connection already made. */
 export function adoptStoredCredential(entry) {
   if (entry?.fleetToken) FLEET_TOKEN = entry.fleetToken;
+  // The project id travels WITH the token, always. They are one answer, and a
+  // picker that updated only the credential left the fingerprint salt null on
+  // exactly the boxes that had to be asked which project they serve.
+  if (entry?.projectId) PROJECT_ID = entry.projectId;
 }

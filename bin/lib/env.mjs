@@ -1,73 +1,224 @@
 /**
- * Team env sync — the daemon is the CRYPTO ANCHOR. This machine holds a
- * persistent X25519 keypair (~/.flowviant/env-keypair.json, 0600); the
- * project's private key reaches it only sealed to that pubkey. Everything the
- * server stores is ciphertext it cannot open.
+ * THREE THINGS THIS BOX KNOWS ABOUT ITSELF — and nothing it holds for anybody.
  *
- * Duties per roster tick (handleRosterEnv):
- *  - register this machine's pubkey (once) → that IS the enrolment (server
- *    2026-09-20): the box already holds this project's machine credential,
- *    which a person handed it by typing a device code into the app, so there is
- *    nothing left for anybody to approve. Nobody clicks; nothing is printed
- *    except one quiet line.
- *  - bootstrap the project keypair when none exists (first machine): generate
- *    it + a standing RECOVERY keypair wrapped under a one-time passphrase —
- *    rotations re-seal to the same recovery pub, so that passphrase survives
- *    forever. Bootstrap itself is SILENT since 2026-09-20: the passphrase is
- *    parked in this box's keypair file and printed the first time this box
- *    materializes a secret, which is the first moment it is about anything
- *    (`stashRecoveryCode`).
- *  - sync: on a bundle version change, unwrap the priv, open every sealed
- *    value, cache (encrypted under a key derived from our own priv), and
- *    rematerialize env files into the agent worktrees.
- *  - execute wrap jobs (another box registered → seal the priv to it).
- *  - execute rotations (a machine was revoked → new keypair, re-seal all
- *    values, re-wrap every enrolled machine, re-seal recovery).
+ *  1. THE BOX KEYPAIR. A persistent X25519 keypair at
+ *     `~/.flowviant/env-keypair.json` (0600). Its public half rides EVERY roster
+ *     poll as `envpub`, and that is what tells two computers apart when the
+ *     server decides which of them is this project's machine (holdership,
+ *     2026-09-14) and which rows belong to which box in the registry
+ *     (`machine_box`, 0.91.0). It is an identity LABEL for arbitration, never
+ *     an authorization: nothing is GRANTED by it — the credential grants, the
+ *     pubkey only disambiguates boxes.
+ *  2. THE UPLINK SCRUBBER. `scrub()` redacts secret values out of every piece
+ *     of text this daemon posts — turn streams, tool events, the trace,
+ *     process command lines, wiki progress, deploy logs. It is fed from TWO
+ *     places (2026-09-21, the review): the checkout's `.env*` files, and the
+ *     PRESENT values of `childEnv`'s `DEPLOY_KEEP` names out of this process's
+ *     own environment, which is where an operator's `CLOUDFLARE_API_TOKEN`
+ *     actually lives and which the deploy lane hands to a command whose stdout
+ *     it then streams to the server. It redacts on SHAPE, never on meaning: a
+ *     value that looks like an ordinary word is left alone, because a relay
+ *     that swaps the CLI's own words for `[REDACTED:NODE_ENV]` has stopped
+ *     being a relay.
+ *  3. THE ENV COMPARISON SCAN. `scanEnvFiles()` reads the checkout's own
+ *     `.env*` files and reports variable NAMES plus a short VALUE FINGERPRINT
+ *     SALTED WITH THE PROJECT ID, so the app can answer "why does it work on
+ *     that box and not this one?" without an eight-character hash over
+ *     `production` becoming a dictionary lookup. THE VALUE NEVER LEAVES THE
+ *     BOX, and neither does anything from (2) — a report is a statement about
+ *     the CHECKOUT'S FILES, and this process's environment is not one.
  *
- * Materialization writes per-targetFile KEY=value files into a worktree and
- * registers each path in the worktree's git info/exclude — untracked AND
- * unstageable, so an agent can never commit them. The WIKI worktree never
- * gets env (the cartographer doesn't need secrets).
+ * ── THE VAULT IS DELETED (2026-09-21) ──
  *
- * scrub() redacts every known plaintext value from daemon-posted uplinks
- * (turn streams, wiki progress, vault sync). Agent-MCP-direct payloads
- * (evidence, progress, complete) never pass through the daemon — those are
- * covered by the prompt contract, not here.
+ * This module used to be the CRYPTO ANCHOR of an end-to-end-encrypted team
+ * secrets vault: the project's private key reached this box sealed to the
+ * keypair above, the daemon opened every value, cached them encrypted on disk,
+ * MATERIALIZED `.env` files into every session worktree, executed wrap jobs for
+ * newly registered boxes, executed rotations when a machine was revoked, and
+ * minted a one-time RECOVERY PASSPHRASE parked beside the private key. About
+ * 700 lines, a `libsodium-wrappers-sumo` Argon2 dependency, four `/fleet/env/*`
+ * endpoints, a `flowviant env` subcommand, and five server tables.
+ *
+ * The owner, asked directly whether he wanted it:
+ *
+ *     "no i dont want it. unless its needed where i want to show the env of
+ *      each of the machines (for comparison)."
+ *
+ * and on the recovery passphrase the whole custody ceremony existed to protect:
+ *
+ *     "no, its fine to repaste from providers."
+ *
+ * So the vault goes whole and the ONE readout inside it that was genuinely
+ * wanted — seeing what each machine's environment looks like — is rebuilt as
+ * the scan below, which holds no secrets and therefore needs no custody, no
+ * recovery code, no rotation and no wrap jobs. Gone with it: `handleRosterEnv`,
+ * `bootstrapProject`, `fetchBundle`, `loadCachedEnv`, the encrypted
+ * `~/.flowviant/env-cache`, `materializeInto` / `hasMaterialized`,
+ * `deployCreds` / `appSecretsFor`, `stashRecoveryCode` /
+ * `printRecoveryCodeOnce`, `removeStaleEnvFile`, `isSafeTarget`, and the
+ * `envv` / `envskip` poll params the materializer reported through.
+ *
+ * WHAT DID NOT GO, AND MUST NOT: the keypair file, its path, and its 2026-09-14
+ * correctness rule (only ENOENT mints; every other read failure RETHROWS).
+ * Rotating this box's identity would make the same physical machine arrive at
+ * the roster as a stranger — a new row in the registry, and a standby of
+ * itself for the whole holder-claim window.
+ *
+ * `excludeInWorktree` moved to `git.mjs`: it is a generic `git info/exclude`
+ * helper that only ever lived here because the materializer was its first
+ * caller.
  */
 
-import {
-  readFileSync,
-  writeFileSync,
-  mkdirSync,
-  existsSync,
-  appendFileSync,
-  chmodSync,
-  lstatSync,
-  rmSync,
-} from 'node:fs';
-import { execFileSync } from 'node:child_process';
-import { homedir, hostname } from 'node:os';
-import { join, dirname, resolve } from 'node:path';
-// The SUMO build: the standard `libsodium-wrappers` omits Argon2 (crypto_pwhash),
-// which bootstrapProject() needs to derive the recovery-code key — without it
-// crypto_pwhash_SALTBYTES is undefined and bootstrap throws every poll.
+import { readdirSync, readFileSync, writeFileSync, mkdirSync, lstatSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { homedir } from 'node:os';
+import { join, dirname } from 'node:path';
+// STILL SUMO, and deliberately not narrowed to the standard build in the same
+// pass that deleted the vault. `crypto_box_keypair` exists in both, but the
+// sumo package is what is installed, what every other daemon on npm resolves,
+// and swapping the dependency is a separate change with its own install-time
+// failure modes. Nothing here needs Argon2 any more; nothing here forbids the
+// narrowing either.
 import sodium from 'libsodium-wrappers-sumo';
-import { FLEET_URL, FLEET_TOKEN, USER_AGENT } from './config.mjs';
-import { c, info, note, ok, warn } from './ui.mjs';
+// THE PROJECT ID, as a live binding. It salts every fingerprint (see
+// `fingerprint`), and it is a `let` in config.mjs because cli.mjs's ambiguity
+// picker chooses a project AFTER import — reading a frozen copy here would salt
+// a picked project's report with `null` and report nothing at all.
+import { PROJECT_ID } from './config.mjs';
+// THE DEPLOY LANE'S OWN ALLOWLIST, borrowed for REDACTION ONLY. Deriving the
+// scrub list from the set a deploy command is actually handed is what stops the
+// two drifting; `processEnvSecrets`'s docblock carries the whole argument,
+// including why none of it ever reaches the wire.
+import { processEnvSecrets } from './childEnv.mjs';
 
 const B64 = () => sodium.base64_variants.ORIGINAL;
 const KEYPAIR_PATH = join(homedir(), '.flowviant', 'env-keypair.json');
-const CACHE_DIR = join(homedir(), '.flowviant', 'env-cache');
-const SCRUB_MIN_LENGTH = 6; // mirrors shared ENV_SCRUB_MIN_LENGTH
-const envUrl = (tail) => FLEET_URL.replace(/\/agents\/?$/, `/env/${tail}`);
 
-// ── Module state (one project per daemon, same as the vault) ───────────────
+// ── What `scrub` will redact ───────────────────────────────────────────────
+//
+// THE PREDICATE LIVES ABOVE THE LIST ON PURPOSE (2026-09-21): the list is
+// FILTERED THROUGH IT ONCE, when a scan rebuilds it, rather than tested per
+// call. `scrub` runs on every posted line of every turn stream, tool event and
+// deploy log, and it does a whole-string `split`/`join` per value — so a value
+// that will never match must not survive into the loop at all. Pre-filtering
+// also makes the list smaller than it was before this pass on a typical
+// checkout, because half of a real `.env` is ordinary configuration.
+
+/**
+ * THE LENGTH FLOOR. A value of one or two characters — `1`, `ab`, `on` — occurs
+ * in ordinary prose constantly, so redacting one replaces half of every stream
+ * this daemon posts with `[REDACTED:NAME]` and the trace stops being readable
+ * at all. Six is the point below which a value is far likelier to be a flag
+ * than a secret, and nothing this short is worth making the product illegible
+ * for.
+ *
+ * (It used to carry the comment "mirrors shared ENV_SCRUB_MIN_LENGTH". That
+ * constant does not exist anywhere in the monorepo any more — it went with the
+ * vault's server half on 2026-09-21 — and a cross-reference to a deleted
+ * identifier reads as "do not change this, the other end depends on it", which
+ * is a claim about a coupling nobody can check. The floor's own argument is
+ * above and it stands on its own.)
+ */
+const SCRUB_MIN_LENGTH = 6;
+
+/**
+ * A VALUE THAT LOOKS LIKE AN ORDINARY WORD IS NOT REDACTED (2026-09-21, the
+ * review) — and this is a correctness fix, not a tuning knob.
+ *
+ * `scrub` now reads the CHECKOUT'S `.env*` files, and a real `.env` is full of
+ * configuration that is not secret at all: `NODE_ENV=development`,
+ * `HOST=localhost`, `APP_NAME=flowviant`, `LOG_LEVEL=verbose`,
+ * `AWS_REGION=us-east-1`. With those in the list, every occurrence of the word
+ * "development" in the CLI's own narration came back as
+ * `[REDACTED:NODE_ENV]` — so a turn trace, which exists to relay what the CLI
+ * said, was relaying something else. A relay does not swap the words it
+ * carries. That is a worse failure than under-redaction, because it is silent,
+ * universal, and destroys the readout the trace was built for.
+ *
+ * TWO SHAPE TESTS, applied per value, both cheap and both about SHAPE rather
+ * than meaning (nothing here classifies, guesses, or asks a model):
+ *
+ *  · A PLAIN IDENTIFIER — starts with a letter, runs at most sixteen
+ *    characters, and is made only of letters, digits and `.` `/` `-`. That is
+ *    what a word, a hostname, a short version string and an enum value all look
+ *    like. `_` is deliberately NOT in the set: an underscore is rare in prose
+ *    and common in key material (`sk-live_…`), so its presence is the cheapest
+ *    honest signal that a string was minted rather than written.
+ *  · A SHORT VALUE WITH LITTLE VARIETY — under twelve characters and drawing on
+ *    fewer than three of {lower, upper, digit, symbol}. A real credential short
+ *    enough to be under twelve characters is mixed; `us-east-1` and `verbose`
+ *    are not.
+ *
+ * THE ACCEPTED COST, STATED RATHER THAN HIDDEN: a genuinely secret value that
+ * is short and lowercase — `hunter2secret`, a thirteen-character all-letters
+ * password — is NOT redacted. Under-redaction is chosen here over making the
+ * product illegible, because the alternative is a trace nobody can read and a
+ * product that silently rewrites its own CLI's output. An operator whose secret
+ * is a dictionary word has a problem this function cannot fix. Anything with a
+ * symbol, a case mix, twelve-plus characters, or an underscore — which is every
+ * token, key, URL, JWT and hex digest anybody actually pastes into a `.env` —
+ * is redacted.
+ */
+const SCRUB_PLAIN_RE = /^[A-Za-z][A-Za-z0-9._/-]{0,15}$/;
+function characterClasses(value) {
+  let n = 0;
+  if (/[a-z]/.test(value)) n += 1;
+  if (/[A-Z]/.test(value)) n += 1;
+  if (/[0-9]/.test(value)) n += 1;
+  if (/[^A-Za-z0-9]/.test(value)) n += 1;
+  return n;
+}
+function worthRedacting(value) {
+  if (typeof value !== 'string' || value.length < SCRUB_MIN_LENGTH) return false;
+  if (SCRUB_PLAIN_RE.test(value)) return false;
+  if (value.length < 12 && characterClasses(value) < 3) return false;
+  return true;
+}
+
+// ── Module state ───────────────────────────────────────────────────────────
 let keypair = null; // { publicKey: Uint8Array, privateKey: Uint8Array }
-let registeredOnce = false;
-let projectPriv = null; // Uint8Array — unwrapped project private key
-let bundleVersion = -1; // last materialized bundle version (-1 = never)
-let values = []; // [{ name, targetFile, value }]
-let cachedProjectId = null;
+
+/**
+ * WHAT `scrub` REDACTS — `[{ name, value }]`, refilled by every env scan.
+ *
+ * THIS ARRAY CHANGED HANDS (2026-09-21), and the change is an IMPROVEMENT
+ * rather than a salvage. It used to hold the vault's decrypted bundle: only
+ * the values Flowviant itself had delivered to this box. With the vault gone
+ * that array would be permanently empty and `scrub` would become a silent
+ * no-op in roughly ten call sites — the worst possible way for a redactor to
+ * stop working, because every one of those sites keeps calling it and nothing
+ * looks different until a secret is already in the server's database.
+ *
+ * So it is filled from the CHECKOUT'S OWN `.env*` FILES, which are the box's
+ * REAL secrets: the ones the operator pasted in from their providers, the ones
+ * a dev server actually loads, and the ones a CLI turn is overwhelmingly
+ * likeliest to echo into a log. The vault could only ever redact what it had
+ * delivered; this redacts what is there.
+ *
+ * ── TWO SOURCES, KEPT IN TWO VARIABLES (2026-09-21, the review) ──
+ *
+ * `values` is what `scrub` reads and is rebuilt on every scan as
+ * `processEnvSecrets()` ++ `fileValues`. The split exists because the two halves
+ * have opposite failure modes. The CHECKOUT half can come back empty for two
+ * different reasons — the operator deleted `.env`, or this pass could not read
+ * the directory — so an empty read must NOT replace it (see `scanEnvForScrub`).
+ * The PROCESS half cannot blink: `process.env` is in memory and reading it is
+ * infallible, so it is replaced unconditionally, and folding it into one array
+ * with the file half would make a single unreadable-directory blip drop the
+ * operator's deploy credential out of the redactor too.
+ *
+ * SEEDED AT IMPORT, deliberately. `scrub` is reachable from the deploy lane and
+ * from a turn before the first scan has run, and the process half needs no
+ * checkout, no credential and no I/O to be correct — so there is no moment at
+ * which this module knows a deploy token and is not hiding it.
+ *
+ * AND IT IS ALREADY FILTERED. Every entry in `values` has passed
+ * `worthRedacting` — see that predicate's block above — so `scrub` itself makes
+ * no decisions and simply replaces. `fileValues` keeps the UNFILTERED read,
+ * because the filter is about redaction and the read is about what is on disk.
+ */
+let fileValues = [];
+let values = processEnvSecrets().filter((v) => worthRedacting(v.value));
 
 export async function sodiumReady() {
   await sodium.ready;
@@ -79,11 +230,11 @@ export async function sodiumReady() {
  *
  * It existed for exactly one gesture: the terminal printed eight glyphs, the
  * browser's approve card printed the same eight, and a human compared them
- * before pressing Approve. Registering IS enrolling now — the device code that
- * gave this box the project's machine credential was the decision — so there is
- * no approve card, no comparison, and nobody to make it. A fingerprint kept
- * byte-identical across two repos for nobody to look at is worse than none:
- * it reads like a live MITM defence and defends nothing.
+ * before pressing Approve. Registering became enrolling, and then the whole
+ * enrolment went with the vault — so there is no approve card, no comparison,
+ * and nobody to make it. A fingerprint kept byte-identical across two repos
+ * for nobody to look at is worse than none: it reads like a live MITM defence
+ * and defends nothing.
  */
 
 /** This machine's persistent keypair (created on first use, 0600). */
@@ -98,12 +249,17 @@ export async function ensureKeypair() {
      * ONLY "THERE IS NO FILE" IS A FIRST RUN, and the bare catch that used to
      * stand here said every failure was one.
      *
-     * This keypair is the box's DURABLE IDENTITY — it is what the project's
-     * private key is sealed to, and since 2026-09-14 it is also what tells two
-     * computers apart when the server decides which of them is this project's
-     * machine. Regenerating it on a truncated file or an unreadable one
-     * OVERWRITES that identity: the wraps stop opening, and the box arrives at
-     * the roster as a stranger and stands itself down as a standby of itself.
+     * This keypair is the box's DURABLE IDENTITY — since 2026-09-14 it is what
+     * tells two computers apart when the server decides which of them is this
+     * project's machine, and since 0.91.0 it is the key of this box's row in
+     * the machine registry. Regenerating it on a truncated file or an
+     * unreadable one OVERWRITES that identity: the box arrives at the roster as
+     * a stranger and stands itself down as a standby of itself.
+     *
+     * (It was ALSO what the project's secret vault was sealed to, until the
+     * vault was deleted 2026-09-21. That was the loudest consequence and it is
+     * gone; the identity consequence is the one that survives, and it is on its
+     * own sufficient.)
      *
      * A file we cannot read is not a file we may replace. Rethrown, the caller
      * that can survive it does: `envQueryParams` is wrapped, so the poll simply
@@ -164,821 +320,408 @@ export function readStoredPubB64() {
 }
 
 /**
- * ── THE RECOVERY CODE WAITS UNTIL THERE IS SOMETHING TO RECOVER (2026-09-20) ──
+ * THE IDENTITY PARAMS THE ROSTER POLL CARRIES — one key, and it is the box.
  *
- * `bootstrapProject` used to end with the loudest artefact this product owns:
- * a blank line, RECOVERY CODE in bold, a passphrase in yellow, and "the only
- * way back into the secrets". That fired on the FIRST DAEMON OF EVERY PROJECT
- * — a keypair is bootstrapped whether or not a single secret exists — so the
- * overwhelming majority of the people who saw it were being handed a code for
- * an empty vault, in custody vocabulary they had not asked for, having run
- * `npx flowviant` to connect a machine. That is the same complaint the approve
- * gate died of, printed instead of clicked, and leaving it in would have
- * contradicted the change it shipped beside.
+ * It used to carry two more: `envv` (the materialized bundle version, which fed
+ * the Settings "env vN" chip) and `envskip` (the target files the materializer
+ * REFUSED to write, with the empty string as a real "measured, refused nothing"
+ * report). Both were facts about the vault and both died with it; the server
+ * stopped reading them in the same change.
  *
- * So bootstrap is SILENT (one quiet line that the keypair exists) and the code
- * is kept HERE, in this box's own keypair file, until the first time this box
- * materializes a secret — the moment the person actually has something to
- * protect, and the first moment the sentence is true.
+ * WHAT DID NOT CHANGE IS `envpub`: the same base64 of the same public key out
+ * of the same file. Holdership arbitration, the displaced signal and the box
+ * registry all key on it, so a box that upgrades to this release must be the
+ * SAME box to the server it was before — no new row, no re-claim, no standby
+ * of itself. That continuity is the point of this function still existing at
+ * all.
  *
- * THE FILE IS THE RIGHT PLACE AND COSTS NOTHING. It already holds the private
- * key the passphrase would recover — anybody who can read one can read the
- * other — so storing it there adds no exposure that was not already the whole
- * security model of this machine. It is 0600 and stays 0600.
- *
- * EXTENDING THE SHAPE IS SAFE. `ensureKeypair` reads `pub` and `priv` and
- * ignores every other key, and it only WRITES the file when there is none, so
- * an older daemon reading a file with a `recovery` field behaves identically
- * and cannot clobber it.
- *
- * THE ONE ACCEPTED COST, stated: a box that bootstraps and never materializes
- * anything never prints the code. That is the point — there is nothing to
- * recover — and the code is not lost, it is on this disk beside the key.
+ * Absence keeps its reserved meaning: a poll with no `envpub` is EXEMPT from
+ * arbitration rather than treated as an unknown box.
  */
-function readKeypairFile() {
-  try {
-    return JSON.parse(readFileSync(KEYPAIR_PATH, 'utf8'));
-  } catch {
-    return null;
-  }
-}
-
-/** 0600 on every write, not just at creation: `writeFileSync`'s `mode` applies
- *  only when the file is created, which is the same trap `materializeInto`
- *  documents. Returns whether it landed — the caller has to know, because the
- *  thing being written is unrecoverable if it does not. */
-function writeKeypairFile(stored) {
-  try {
-    writeFileSync(KEYPAIR_PATH, JSON.stringify(stored), { mode: 0o600 });
-    try {
-      chmodSync(KEYPAIR_PATH, 0o600);
-    } catch {
-      /* a filesystem without modes is not a reason to refuse */
-    }
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/** Park the bootstrap passphrase beside the key it recovers. False means it did
- *  NOT land, and the caller's answer to that is to print it immediately —
- *  losing a recovery code silently is the one outcome worse than printing it
- *  early. */
-export function stashRecoveryCode(code, projectId) {
-  const stored = readKeypairFile();
-  if (!stored?.priv) return false;
-  stored.recovery = { code, projectId: projectId ?? null, shown: false };
-  return writeKeypairFile(stored);
-}
-
-/** Once per process at most, and once per box for real. */
-let recoveryUnprinted = true;
-
-function printRecoveryBlock(code) {
-  console.log('');
-  ok(`${c.cyan('env')} — this machine now holds this project's secrets.`);
-  console.log(`  ${c.bold('RECOVERY CODE')} ${c.dim('(shown ONCE — save it in a password manager):')}`);
-  console.log(`  ${c.bold(c.yellow(code))}`);
-  note('  If every enrolled machine is ever lost, this code is the only way back into the secrets.');
-  console.log('');
-}
-
-/**
- * Print the parked code the first time this box writes a secret to disk, then
- * mark it shown so it never prints again.
- *
- * The mark is written to the FILE, not just to the module flag, because "once"
- * has to survive a restart. If that write fails the flag still stops this
- * process from repeating itself and a later process prints again — noisy in
- * the safe direction, which is the only direction available when the thing at
- * stake is the only way back into somebody's secrets.
- *
- * The parked `projectId` is checked because the keypair file is per BOX while
- * the code is per PROJECT: a daemon serves one project, so a mismatch means
- * this code belongs to a different one and printing it here would attribute it
- * to the wrong vault. An older stash carries no id and prints regardless.
- */
-function printRecoveryCodeOnce() {
-  if (!recoveryUnprinted) return;
-  const stored = readKeypairFile();
-  const rec = stored?.recovery;
-  if (!rec?.code || rec.shown) {
-    recoveryUnprinted = false;
-    return;
-  }
-  if (rec.projectId && cachedProjectId && rec.projectId !== cachedProjectId) {
-    recoveryUnprinted = false; // one project per daemon — this will not change
-    return;
-  }
-  recoveryUnprinted = false;
-  printRecoveryBlock(rec.code);
-  stored.recovery = { ...rec, shown: true };
-  writeKeypairFile(stored);
-}
-
-/** Query params the roster poll carries: identity, materialized version, and
- *  the target files we REFUSED to write.
- *
- *  `envv` alone was a half-truth and the surface built on it said the wrong
- *  thing out loud: it is set the moment the bundle DECRYPTS, independent of
- *  whether a single byte reached a worktree, so a project whose `.env` is
- *  tracked in git got the green "on the current env" chip while every session
- *  ran on whatever stale placeholder git had checked out. The daemon knew —
- *  it warned, to a console nobody reads. `envskip` is that warning routed
- *  somewhere a human is actually looking.
- *
- *  A daemon→server REPORT, so it needs no version floor: an older daemon
- *  simply sends no `envskip` key, which reads as "nothing to report" — and
- *  that is honest, because an older daemon genuinely is not measuring it.
- *  Bounded hard: a query string is not a log. */
 export async function envQueryParams() {
   await ensureKeypair();
-  const params = { envpub: myPubB64() };
-  if (bundleVersion >= 0) params.envv = String(bundleVersion);
-  // THE EMPTY STRING IS A REPORT, and it is the only thing that can ever CLEAR
-  // the surface's warning. Gating this on truthiness (which is what it did
-  // first) meant a person who followed the on-screen remedy exactly — gitignore
-  // the file, restart — sent no `envskip` at all, the server left the column
-  // alone by design, and the amber line stayed up forever telling them to fix
-  // something already fixed. Absence must keep meaning IGNORANCE, so the gate
-  // is "has a pass actually run", never "is there something to say".
-  // (fleet.mjs's query loop had to stop filtering on truthiness too — one
-  // check here is useless while a second one downstream drops the same value.)
-  if (everMaterialized) {
-    const files = [...new Set([...skippedByWorktree.values()].flat())].sort();
-    // Each path is percent-encoded BEFORE the join, because `isSafeEnvTargetFile`
-    // permits a comma in a filename and the server splits on one — unencoded,
-    // `a,b.env` would arrive as two files that do not exist. Truncation is by
-    // WHOLE ELEMENTS against a byte budget; a mid-path cut names a file nobody
-    // has, which is worse than naming fewer.
-    const parts = [];
-    let budget = 400;
-    for (const f of files) {
-      if (parts.length >= 10) break;
-      const enc = encodeURIComponent(f);
-      if (enc.length + 1 > budget) break;
-      parts.push(enc);
-      budget -= enc.length + 1;
-    }
-    params.envskip = parts.join(',');
-  }
-  return params;
+  return { envpub: myPubB64() };
 }
 
-// ── HTTP helpers ───────────────────────────────────────────────────────────
-async function post(tail, body) {
-  const res = await fetch(envUrl(tail), {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${FLEET_TOKEN}`,
-      'User-Agent': USER_AGENT,
-      'Content-Type': 'application/json',
-    },
-    signal: AbortSignal.timeout(30_000),
-    body: JSON.stringify(body),
-  });
-  const json = await res.json().catch(() => ({}));
-  if (!res.ok || json?.success === false) {
-    throw new Error(`env ${tail} failed (${res.status}${json?.error ? `: ${json.error}` : ''})`);
-  }
-  return json?.data;
-}
-
-export async function fetchBundle() {
-  const res = await fetch(`${envUrl('bundle')}?pubkey=${encodeURIComponent(myPubB64())}`, {
-    headers: { Authorization: `Bearer ${FLEET_TOKEN}`, 'User-Agent': USER_AGENT },
-    signal: AbortSignal.timeout(30_000),
-  });
-  const json = await res.json().catch(() => ({}));
-  if (!res.ok || !json?.data) throw new Error(`env bundle fetch failed (${res.status})`);
-  return json.data;
-}
-
-// ── Crypto ─────────────────────────────────────────────────────────────────
-const seal = (bytes, pubB64) => sodium.to_base64(sodium.crypto_box_seal(bytes, sodium.from_base64(pubB64, B64())), B64());
-const openSealed = (b64, pub, priv) => sodium.crypto_box_seal_open(sodium.from_base64(b64, B64()), pub, priv);
-
-/** Cache the decrypted bundle at rest, encrypted under a key derived from our
- *  own priv — the worktrees hold the same plaintext anyway; this just keeps
- *  the cache from being a SECOND, tidier copy. */
-function cacheKey() {
-  return sodium.crypto_generichash(sodium.crypto_secretbox_KEYBYTES, keypair.privateKey);
-}
-function writeCache(projectId, payload) {
-  try {
-    mkdirSync(CACHE_DIR, { recursive: true });
-    const nonce = sodium.randombytes_buf(sodium.crypto_secretbox_NONCEBYTES);
-    const box = sodium.crypto_secretbox_easy(sodium.from_string(JSON.stringify(payload)), nonce, cacheKey());
-    writeFileSync(
-      join(CACHE_DIR, `${projectId}.json`),
-      JSON.stringify({ nonce: sodium.to_base64(nonce, B64()), box: sodium.to_base64(box, B64()) }),
-      { mode: 0o600 }
-    );
-  } catch {
-    /* cache is best-effort */
-  }
-}
-function readCache(projectId) {
-  try {
-    const { nonce, box } = JSON.parse(readFileSync(join(CACHE_DIR, `${projectId}.json`), 'utf8'));
-    const plain = sodium.crypto_secretbox_open_easy(
-      sodium.from_base64(box, B64()),
-      sodium.from_base64(nonce, B64()),
-      cacheKey()
-    );
-    return JSON.parse(sodium.to_string(plain));
-  } catch {
-    return null;
-  }
-}
-
-/** Offline start: materialize from the encrypted cache before the first poll.
- *  Also seeds knownTargetFiles so stale-file cleanup survives a restart. */
-export async function loadCachedEnv(projectId) {
-  await ensureKeypair();
-  const cached = readCache(projectId);
-  if (!cached) return false;
-  values = cached.values ?? [];
-  bundleVersion = cached.bundleVersion ?? -1;
-  // Filtered even though we wrote the cache: this set feeds removeStaleEnvFile,
-  // and a cache file predates whatever rules the running daemon enforces.
-  knownTargetFiles = new Set((cached.knownFiles ?? values.map((v) => v.targetFile)).filter(isSafeTarget));
-  cachedProjectId = projectId;
-  return values.length > 0;
-}
-
-// ── Materialization ────────────────────────────────────────────────────────
+// ── The env comparison scan ────────────────────────────────────────────────
 
 /**
- * Add the materialized paths to the exclude file git ACTUALLY READS.
+ * THE BOUNDS, as local literals.
  *
- * This used to resolve the worktree's own gitdir (`.git/worktrees/<name>`) and
- * write `info/exclude` there, on the belief that it "applies to that worktree
- * only and never touches the user's repo". Git does not read that file: it
- * resolves `info/exclude` against $GIT_COMMON_DIR — the main `.git` — so in
- * every linked worktree the daemon creates, the exclusion did nothing at all.
- * The plaintext secret files stayed visible to `git add -A` — the first thing
- * an agent runs before committing and pushing the branch it is working on.
+ * They mirror the server's own report schema (`packages/shared` — the env
+ * report's zod parse), and they are DUPLICATED here on purpose rather than
+ * imported: this package ships to npm on its own and has no path to the
+ * monorepo's shared types. The daemon holds its own line for the same reason
+ * every other boundary in this file does — a report that the server will
+ * reject is a report nobody sees, and clamping here is what makes the
+ * difference visible as a smaller list rather than a 400.
  *
- * `--git-common-dir` is asked of git rather than derived, because that is the
- * one answer that cannot drift from what git itself will consult. The file is
- * local to the clone and never committed.
+ * ── THE REPORT'S CAPS ARE NOT THE SCRUBBER'S, AND THAT ASYMMETRY IS
+ *    DELIBERATE (2026-09-21, the review) ──
  *
- * This is a CONVENIENCE, not the guarantee. The guarantee is the check-ignore
- * verification in materializeInto, which refuses to write a secret that git can
- * still see.
+ * `MAX_ENV_FILES` / `MAX_ENV_VARS` bound what goes ON THE WIRE, because a
+ * comparison screen is a thing a person reads and a 4000-row list answers
+ * nothing. `MAX_SCRUB_VALUES` bounds what this box KNOWS TO HIDE, and it is an
+ * order of magnitude larger because redaction has no wire cost, no render cost
+ * and no reader. A secret dropped for being the 201st variable in the checkout
+ * is a secret in the server's database — the report's economy must never be
+ * allowed to decide that. The scrub list is still bounded, because an
+ * unbounded `split`/`join` loop over a stream is a real cost; 2000 is a number
+ * no honest checkout reaches.
+ *
+ * `MAX_SCAN_FILES` is the read bound that makes `filesTotal`/`varsTotal`
+ * affordable: every `.env*` name in the root is COUNTED, and the first 64 are
+ * actually read, so the totals are honest about a directory somebody has let
+ * grow without this scan walking an unbounded list of files on the poll's beat.
  */
-export function excludeInWorktree(wt, relPaths) {
-  try {
-    let gitdir;
-    try {
-      gitdir = resolve(
-        wt,
-        execFileSync('git', ['rev-parse', '--git-common-dir'], {
-          cwd: wt,
-          encoding: 'utf8',
-          stdio: ['ignore', 'pipe', 'ignore'],
-        }).trim()
-      );
-    } catch {
-      return; // not a repo — materializeInto's check-ignore gate will refuse anyway
-    }
-    const excludePath = join(gitdir, 'info', 'exclude');
-    mkdirSync(dirname(excludePath), { recursive: true });
-    let existing = '';
-    try {
-      existing = readFileSync(excludePath, 'utf8');
-    } catch {
-      /* fresh */
-    }
-    const missing = relPaths.filter((p) => !existing.split('\n').includes(`/${p}`));
-    if (missing.length) {
-      appendFileSync(excludePath, `${existing.endsWith('\n') || !existing ? '' : '\n'}${missing.map((p) => `/${p}`).join('\n')}\n`);
-    }
-  } catch {
-    /* best-effort — the agent prompt still forbids committing secrets */
-  }
-}
+const MAX_ENV_FILES = 8;
+const MAX_ENV_VARS = 200; // TOTAL across every file, not per file — REPORT only
+const MAX_ENV_NAME_CHARS = 64;
+const MAX_ENV_FILE_BYTES = 256 * 1024;
+const MAX_SCAN_FILES = 64;
+const MAX_SCRUB_VALUES = 2000;
+const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
-/** MUST match the server's isSafeEnvTargetFile (env.schema.ts) — the server
- *  validates at intake, but this file also refills paths from the on-disk
- *  cache and hands them to rmSync, so the daemon holds its own line rather
- *  than trusting either source. `.git` is refused at ANY depth and
- *  case-insensitively (git treats `.GIT` the same on case-insensitive
- *  filesystems): a target of `.git/hooks/pre-commit` would turn a
- *  materialized value into code git runs on the operator's next commit —
- *  check-ignore alone must not be the only thing standing there. The control
- *  range subsumes the old bare `\0` check and keeps a newline out of a PATH,
- *  where nothing downstream expects one. */
-const isSafeTarget = (p) =>
-  typeof p === 'string' &&
-  p.length > 0 &&
-  p.length <= 200 &&
-  !p.includes('\\') &&
-  // eslint-disable-next-line no-control-regex
-  !/[\x00-\x1f\x7f]/.test(p) &&
-  !p.startsWith('/') &&
-  p.split('/').every((s) => s.length > 0 && s !== '.' && s !== '..' && s.toLowerCase() !== '.git');
+/** `.env`, `.env.local`, `.env.production` … and never a template. A file whose
+ *  name ends `.example` / `.sample` / `.template` is somebody's DOCUMENTATION
+ *  of the shape, committed on purpose, and its "values" are placeholders — so
+ *  it would fingerprint `your-key-here` on every box and report them as
+ *  agreeing, which is the exact opposite of what a comparison is for. */
+const isEnvFileName = (name) =>
+  (name === '.env' || name.startsWith('.env.')) &&
+  !/\.(example|sample|template)$/i.test(name);
 
-/** Is this path TRACKED in the repo? info/exclude only hides UNTRACKED files —
- *  materializing secrets into a tracked file would make them stageable and
- *  committable. We refuse those paths entirely. */
-function isTrackedInGit(wt, relPath) {
-  try {
-    execFileSync('git', ['ls-files', '--error-unmatch', '--', relPath], {
-      cwd: wt,
-      stdio: 'ignore',
-    });
-    return true;
-  } catch {
-    return false;
+/**
+ * ONE LINE OF DOTENV. Blank lines and `#` comments are skipped, an optional
+ * `export ` prefix is allowed, the line is split on the FIRST `=` (a value may
+ * contain any number of them), key and value are trimmed, and ONE matching pair
+ * of surrounding quotes is stripped. A line with no `=` is skipped rather than
+ * guessed at; `null` means "this is not a variable".
+ *
+ * ── WHAT "PARSED THE WAY EVERY DOTENV PARSER DOES" USED TO GLOSS OVER, AND
+ *    WHAT THE REAL RULES ARE (2026-09-21, the review) ──
+ *
+ * 1. AN INLINE COMMENT IS NOT PART OF THE VALUE. `PORT=3000 # dev server`
+ *    loads as `3000` everywhere, and this parser kept ` # dev server`. Two
+ *    consequences, both wrong in the direction that matters: the FINGERPRINT
+ *    then depended on somebody's comment, so two boxes running the identical
+ *    port disagreed on the one screen whose whole job is to say whether they
+ *    agree; and the scrub list held a value that never occurs in any log, so
+ *    the real one was not redacted. Inside a QUOTED value a `#` is literal
+ *    (`PASS="a#b"` is `a#b`), and the quoted branch below never looks for one.
+ *
+ *    DELIBERATELY NARROWER THAN dotenv v16 ON ONE POINT, and it is stated
+ *    rather than hidden: dotenv's unquoted value group is `[^#\r\n]+`, so
+ *    `PASS=a#b` loads as `a`. Here a `#` only begins a comment when it is at
+ *    the start or preceded by WHITESPACE. An unquoted password containing `#`
+ *    is an ordinary thing for an operator to paste, and cutting it would
+ *    produce exactly the two failures above — a fingerprint of a value nobody
+ *    holds, and a redaction that misses the secret. Keeping too much is the
+ *    safe direction for both halves of this module; inventing a shorter value
+ *    is not.
+ *
+ * 2. A QUOTED VALUE MAY NOT END ON THIS LINE, and that was a BLOCKER. An RSA
+ *    private key pasted into `.env` as
+ *
+ *        KEY="-----BEGIN RSA PRIVATE KEY-----
+ *        MIIEpAIBAAKCAQEA...
+ *        -----END RSA PRIVATE KEY-----"
+ *
+ *    was parsed a line at a time, so the variable's "value" was the header
+ *    line. Every RSA key on every box then fingerprinted to the same eight
+ *    characters, which made the comparison screen state that two DIFFERENT
+ *    private keys agree — a readout whose only job is to answer "do these
+ *    boxes match" answering it backwards. Worse, `scrub` was handed the header
+ *    instead of the key, so the actual key body was NOT redacted out of turn
+ *    traces or deploy logs.
+ *
+ *    The fix is the file's own rule applied honestly: a value we cannot read
+ *    correctly is reported as NOTHING, never as a wrong fingerprint — the same
+ *    call an over-long name gets ("a cut name is a DIFFERENT VARIABLE"). So an
+ *    unterminated quote returns `{ name, unterminated }` and the caller DROPS
+ *    the variable from both halves and consumes forward to the closing quote,
+ *    so the key's own body lines are never mistaken for variables of their own.
+ *    That forward skip is not cosmetic: base64 carries `=` padding and a body
+ *    line can perfectly well contain `A=B`, which this parser would otherwise
+ *    read as a variable whose value is a slice of somebody's private key.
+ *
+ *    THE COST IS NAMED: a legitimately multi-line value is invisible to the
+ *    comparison AND unredacted. Reading it properly means a stateful parser
+ *    that also has to decide what `\n` escaping means per dialect, and getting
+ *    that subtly wrong reproduces exactly the bug above. Silence is the honest
+ *    answer until somebody asks for the feature.
+ */
+function parseEnvLine(raw) {
+  const line = raw.trim();
+  if (!line || line.startsWith('#')) return null;
+  const eq = line.indexOf('=');
+  if (eq <= 0) return null;
+  const name = line.slice(0, eq).trim().replace(/^export\s+/, '');
+  const rest = line.slice(eq + 1).trim();
+  const quote = rest[0];
+  if (quote === '"' || quote === "'") {
+    const close = rest.indexOf(quote, 1);
+    // No closing quote ON THIS LINE. We know the name and we do not know the
+    // value; saying so is the whole contract.
+    if (close < 0) return { name, unterminated: quote };
+    // Anything after the closing quote is a comment or stray text, and a `#`
+    // INSIDE the quotes is part of the value.
+    return { name, value: rest.slice(1, close) };
   }
+  const hash = rest.search(/(?:^|\s)#/);
+  return { name, value: hash < 0 ? rest : rest.slice(0, hash).trimEnd() };
 }
 
 /**
- * Will git hide this path? Asked of git, never inferred.
+ * WHERE A MULTI-LINE QUOTED VALUE ENDS — the index of the line holding its
+ * closing quote, or the end of the file if there is none.
  *
- * This is the gate that makes writing a secret safe, and it is asked AFTER the
- * exclude file is updated so it reflects the state the agent will actually run
- * under. It fails CLOSED: any error — not a repo, git missing, a weird
- * pathspec — reads as "not ignored", so the secret is not written. A wrong
- * "yes" here puts plaintext on a remote branch; a wrong "no" costs a warning.
+ * Deliberately the cheap shape: the first line containing that quote character
+ * closes it. An escaped quote inside the body would end it early, which cuts
+ * the skip short and lets a few body lines be looked at again — and those lines
+ * are dropped anyway, because `ENV_NAME_RE` refuses every name a base64 or PEM
+ * body can produce. Under-skipping degrades to the old behaviour on a line or
+ * two; over-skipping would silently eat real variables after the key, which is
+ * the failure worth avoiding.
+ *
+ * An unterminated quote that runs to EOF consumes the rest of the file, which
+ * is what a shell and a dotenv loader both effectively do with one.
  */
-function isIgnoredInGit(wt, relPath) {
-  try {
-    execFileSync('git', ['check-ignore', '-q', '--', relPath], {
-      cwd: wt,
-      stdio: 'ignore',
-    });
-    return true; // exit 0 = ignored
-  } catch {
-    return false;
-  }
+function closingQuoteLine(lines, start, quote) {
+  for (let i = start + 1; i < lines.length; i++) if (lines[i].includes(quote)) return i;
+  return lines.length;
 }
 
-// Per-worktree: the target files we last materialized THIS SESSION.
-const lastFilesByWorktree = new Map();
-
-/** Target files refused for a GIT reason, PER WORKTREE — reported to the
- *  server on the next poll. Per-worktree because the refusal is: both
- *  predicates (`isTrackedInGit`, `isIgnoredInGit`) run with `cwd: wt`, so
- *  ".env is refused" is a fact about ONE tree. A process-global set mixed two
- *  trees' answers together and, worse, could only ever grow.
+/**
+ * A VALUE FINGERPRINT — sha256 over `<projectId>\n<value>`, first 8 hex
+ * characters.
  *
- *  Names only — a path is not a secret, and the whole point is that a human
- *  can act on it ("gitignore apps/api/.dev.vars"). Only the two GIT causes go
- *  in here: they have a remedy the reader can carry out, and the surface names
- *  that remedy. A transient write failure is a warn, not a standing claim. */
-const skippedByWorktree = new Map();
-
-/** Worktrees whose most recent pass wrote everything it was asked to.
- *  `hasMaterialized` is built on THIS rather than on "a pass ran", so a pass
- *  that refused something RETRIES on the next turn — which is what lets
- *  `echo .env >> .gitignore` actually take effect without waiting for an
- *  unrelated bundle change. A pass with nothing to write counts as clean. */
-const cleanWorktrees = new Set();
-
-/** True once any materialization pass has completed. Distinguishes "we refused
- *  nothing" from "we have not looked", which is the whole contract of the
- *  `envskip` report — see envQueryParams. */
-let everMaterialized = false;
-
-/** Has this process completed a CLEAN materialization pass for this worktree?
- *  The creation-only rule (work.mjs) needs a second condition or a directory
- *  that existed before the bundle did is never revisited. */
-export function hasMaterialized(wt) {
-  return cleanWorktrees.has(wt);
-}
-// Project-global union of every target file we've ever materialized — PERSISTED
-// in the cache and seeded on load, so a file whose key was deleted while the
-// daemon was down still gets its stale plaintext copy cleaned on the next
-// materialize (lastFilesByWorktree alone is empty after a restart, and
-// `git clean -fd` never removes an info/exclude'd file).
-let knownTargetFiles = new Set();
-
-const MATERIALIZE_HEADER = '# Materialized by flowviant env sync';
-
-/** Render KEY=value with values that contain newlines/= safely quoted so one
- *  value can't fabricate another key line. */
-function renderEnvFile(list) {
-  const lines = list.map((v) => {
-    const needsQuote = /[\n\r"'`$\\ ]/.test(v.value) || v.value === '';
-    if (!needsQuote) return `${v.name}=${v.value}`;
-    const esc = v.value.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n').replace(/\r/g, '');
-    return `${v.name}="${esc}"`;
-  });
-  return `${MATERIALIZE_HEADER} — DO NOT COMMIT.\n${lines.join('\n')}\n`;
-}
-
-/** Delete a materialized file from a worktree, but ONLY if it's ours (carries
- *  our header) and not git-tracked — never touch a file we didn't write.
+ * THE VALUE NEVER LEAVES THE BOX. The whole question the owner asked is
+ * comparative — "show the env of each of the machines (for comparison)" — and
+ * a comparison needs only to know whether two boxes hold the SAME thing, which
+ * a fingerprint answers and a value answers no better. Sending the value would
+ * rebuild, on a plainer wire, the exact custody problem the vault was deleted
+ * to be rid of.
  *
- *  `rel` gets the SAME gate the write path has: it arrives via
- *  knownTargetFiles, which is refilled from the server bundle and from the
- *  on-disk cache, and this function joins it to a worktree and calls rmSync.
- *  The isTrackedInGit check cannot stand in for validation — `ls-files` on a
- *  path outside the worktree THROWS, the catch reads as "not tracked", and
- *  the deletion proceeds. A delete primitive validates its own input. */
-function removeStaleEnvFile(wt, rel) {
-  if (!isSafeTarget(rel)) return;
-  if (isTrackedInGit(wt, rel)) return;
-  const abs = join(wt, rel);
+ * ── IT IS SALTED PER PROJECT (2026-09-21, the review), BECAUSE AN UNSALTED
+ *    TRUNCATED HASH OVER A LOW-ENTROPY VALUE IS A DICTIONARY ORACLE ──
+ *
+ * The first cut hashed the value alone. Half of a real `.env` is drawn from a
+ * vocabulary of a few hundred strings — `true`, `false`, `3000`, `8080`,
+ * `development`, `production`, `postgres`, `localhost`, `info` — so anybody who
+ * could read a stored report could recover those values with one precomputed
+ * table, and the eight characters that were chosen to be uninformative became
+ * a lookup key instead. Salting with the project id makes the table worthless
+ * without knowing which project it is for, and makes it per-project even then.
+ *
+ * IT COSTS THE FEATURE NOTHING, and that is what makes the trade obvious: the
+ * screen compares the BOXES OF ONE PROJECT. Two projects agreeing on a value is
+ * not a question anybody has asked, is not rendered anywhere, and is stated
+ * here as NOT A FEATURE so that a later "why don't these match" has an answer
+ * in the file rather than a bug report.
+ *
+ * Eight hex characters is 32 bits — a birthday collision at a few tens of
+ * thousands of distinct values, which no single project's env is — and it stays
+ * deliberately SHORT so nobody mistakes it for a commitment to the value.
+ */
+const fingerprint = (salt, value) =>
+  createHash('sha256').update(`${salt}\n${value}`, 'utf8').digest('hex').slice(0, 8);
+
+/**
+ * READ THE CHECKOUT'S `.env*` FILES AND REPORT WHAT IS IN THEM BY NAME.
+ *
+ * Returns
+ * `{ files: [{ file, vars: [{ name, fp }] }], filesTotal, varsTotal, values }`
+ * — `files` + the two totals are the REPORT (names and fingerprints, safe to
+ * send) and `values` is what stays here and feeds `scrub`. The two are
+ * separated at the type level rather than by a filter at the call site, because
+ * the one mistake that would matter here is a value riding the report, and a
+ * caller that has to remember to strip something will eventually not.
+ *
+ * ── THE TOTALS RIDE BESIDE THE CAPPED LISTS (2026-09-21, the review) ──
+ *
+ * `filesTotal` and `varsTotal` are the numbers BEFORE the report's caps, so the
+ * app can say "N more not shown" instead of letting a list silently cut at
+ * eight files read as the whole directory. That is the rule `repoState` already
+ * keeps for branches and worktrees, and the rule the listeners panel learned
+ * the hard way when `wrangler dev` opened nine sockets into a cap of eight: a
+ * list cut without saying so answers "how much is in here" with a lie.
+ *
+ * ── THE SALT IS AN ARGUMENT, AND AN ABSENT ONE REPORTS NOTHING ──
+ *
+ * `salt` is the project id (see `fingerprint`). It is passed in rather than
+ * read from config here so this function stays pure and provable from a temp
+ * directory; `scanEnvForScrub` is the impure wrapper that defaults it.
+ *
+ * A box that cannot name its project — a credential handed in through
+ * `FLOWVIANT_FLEET` with nothing in the store — reports NO FILES AT ALL rather
+ * than fingerprints salted with something else. Incomparable fingerprints would
+ * render as a confident `differs` beside a box that holds the identical value,
+ * which is the readout asserting the opposite of the truth. Ignorance renders
+ * nothing, the three-state rule this daemon keeps everywhere. THE SCRUB HALF IS
+ * UNAFFECTED: `values` is filled whatever the salt is, because hiding a secret
+ * needs no project id and a box with no report is not a box with no secrets.
+ *
+ * ── THE CHECKOUT ROOT ONLY, AND THAT BOUND IS DELIBERATE ──
+ *
+ * Not worktrees (a session's directory is a branch of this one, and reporting N
+ * near-identical copies answers a question nobody asked), not subdirectories,
+ * and not "every `.env*` git knows about". A monorepo genuinely does keep
+ * `apps/api/.dev.vars` and friends, and this scan will not see them — that is
+ * an accepted, stated limit rather than an oversight. Walking a tree to find
+ * secret files is how a scan ends up reading `node_modules/**` on somebody's
+ * laptop, and the root is where the overwhelming majority of the "it works on
+ * my machine" difference actually lives. Widening it is a decision with an
+ * argument, not a tweak.
+ *
+ * ── A SYMLINK IS NOT A FILE (2026-09-21, the review) ──
+ *
+ * `statSync` FOLLOWS a link, so `.env.link -> /proc/self/environ` was stat'd
+ * and size-capped at its TARGET and then read: the scan would have reported the
+ * daemon's own process environment — the machine credential among it — as this
+ * checkout's variables, and `-> /etc/shadow` or a link onto a multi-gigabyte
+ * file elsewhere are the same gesture. `lstatSync` + `isFile()` refuses every
+ * one of them without needing to reason about where any of them point. The
+ * argument is one line: this scan reads THE CHECKOUT, and a link is an
+ * instruction to read somewhere else. A checkout whose `.env` is genuinely a
+ * symlink into a secrets directory reports nothing, which is the same silence
+ * every other unreadable thing here produces.
+ *
+ * ── IT NEVER THROWS ──
+ *
+ * This runs on the poll's own beat. A per-file error contributes nothing and is
+ * swallowed; an unreadable directory yields an empty report. Ignorance renders
+ * nothing — a box that could not look reports no files, and the app's answer to
+ * that is silence rather than "this machine has no env".
+ */
+export function scanEnvFiles(repoRoot, salt) {
+  const out = { files: [], filesTotal: 0, varsTotal: 0, values: [] };
+  if (!repoRoot || typeof repoRoot !== 'string') return out;
+  let names;
   try {
-    if (existsSync(abs) && readFileSync(abs, 'utf8').startsWith(MATERIALIZE_HEADER)) {
-      rmSync(abs, { force: true });
-    }
+    names = readdirSync(repoRoot).filter(isEnvFileName).sort();
   } catch {
-    /* best-effort */
+    return out; // unreadable checkout — say nothing rather than say "none"
   }
-}
-
-/** Deploy-scope credentials (e.g. CLOUDFLARE_API_TOKEN) as a NAME→value map —
- *  injected into the deploy command's process env, NEVER written to a file. */
-export function deployCreds() {
-  const out = {};
-  for (const v of values) if (v.scope === 'deploy' && v.value) out[v.name] = v.value;
-  return out;
-}
-
-/** app-scope secrets for one environment as a NAME→value map — for pushing to
- *  the provider's secret store on a prod deploy (`wrangler secret put`). */
-export function appSecretsFor(env) {
-  const out = {};
-  for (const v of values) if (v.scope === 'app' && v.env === env && v.value) out[v.name] = v.value;
-  return out;
-}
-
-/** Write the decrypted env into ONE worktree. Never call on the wiki worktree.
- *  v1 materializes the 'dev' app env (agent test runs + local preview); prod
- *  app secrets go to the provider at deploy, deploy creds are injected only. */
-export function materializeInto(wt) {
-  if (!wt || !existsSync(wt)) return;
-  // NEVER SYNCED IS NOT "NO SECRETS", and conflating them cost a whole session.
-  // `values` is empty both before the first bundle lands and for a project that
-  // genuinely has none; `bundleVersion < 0` is the one that means IGNORANCE.
-  // Writing nothing here and RECORDING it as materialized let a worktree
-  // created on the first poll after a restart — before handleRosterEnv had
-  // warmed the cache — sit secret-less for its entire life, because nothing
-  // re-materializes a directory that is neither fresh nor covered by a bundle
-  // CHANGE. Returning without recording is what makes the next turn retry.
-  if (bundleVersion < 0) return;
-  const byFile = new Map();
-  for (const v of values) {
-    if (v.scope !== 'app' || v.env !== 'dev') continue; // only local dev secrets hit a worktree file
-    if (!isSafeTarget(v.targetFile)) continue;
-    const list = byFile.get(v.targetFile) ?? [];
-    list.push(v);
-    byFile.set(v.targetFile, list);
-  }
-
-  // Exclude BEFORE writing, not after. The old order wrote plaintext first and
-  // tried to hide it afterwards, so every failure mode — and the exclude file
-  // being the wrong one, which it was — left a readable secret sitting where
-  // the next `git add -A` in that tree would stage it for a push.
-  excludeInWorktree(wt, [...byFile.keys()]);
-
-  const written = [];
-  /** Refused for a GIT reason this pass — reported, and remediable. */
-  const refusedForGit = [];
-  /** Anything that did not get written, git reasons and write failures alike.
-   *  Blocks the clean mark so the next turn tries again. */
-  let anyProblem = false;
-  for (const [file, list] of byFile) {
-    if (isTrackedInGit(wt, file)) {
-      warn(`env: "${file}" is tracked in git — refusing to write secrets there (gitignore it). Its keys are NOT materialized.`);
-      refusedForGit.push(file);
-      anyProblem = true;
-      continue;
-    }
-    // The load-bearing check. A materialized secret sits in a worktree where an
-    // agent runs `git add -A` and pushes as a matter of course, so "git cannot
-    // see this file" is a precondition for writing it, not a nicety.
-    if (!isIgnoredInGit(wt, file)) {
-      warn(`env: "${file}" is not gitignored — refusing to write secrets there. Add it to .gitignore. Its keys are NOT materialized.`);
-      refusedForGit.push(file);
-      anyProblem = true;
-      continue;
-    }
+  out.filesTotal = names.length;
+  const canReport = typeof salt === 'string' && salt.length > 0;
+  let budget = MAX_ENV_VARS;
+  for (const name of names.slice(0, MAX_SCAN_FILES)) {
     try {
-      const abs = join(wt, file);
-      // A SYMLINK AT THE TARGET IS NOT A TARGET. `writeFileSync` follows one,
-      // so a link committed into the repo (or dropped by an agent) at the
-      // materialization path would write the project's decrypted secrets
-      // wherever it points — outside the worktree, and outside everything the
-      // check-ignore gate can reason about. `lstat`, not `stat`, and refuse.
-      // Cheap, and the whole exposure is one call away otherwise.
-      try {
-        if (lstatSync(abs).isSymbolicLink()) {
-          warn(`env: "${file}" is a symlink — refusing to write secrets through it.`);
-          anyProblem = true;
+      const abs = join(repoRoot, name);
+      // The cap is checked against the LSTAT before the read, so a stray binary
+      // named `.env.bin` — or a log somebody redirected into `.env.out` — is
+      // never slurped into memory at all. A directory called `.env.d` is not a
+      // file and contributes nothing, and neither is a SYMLINK: see above.
+      const st = lstatSync(abs);
+      if (!st.isFile() || st.size > MAX_ENV_FILE_BYTES) continue;
+      // A MAP, because LAST WRITE WINS inside one file — which is how a dotenv
+      // loader resolves a repeated key, so the fingerprint reported is the one
+      // actually in force. It also makes the totals honest: a file that sets
+      // the same key forty times counts once, not forty times.
+      const byName = new Map();
+      const lines = readFileSync(abs, 'utf8').split('\n');
+      for (let i = 0; i < lines.length; i++) {
+        const parsed = parseEnvLine(lines[i]);
+        if (!parsed) continue;
+        // A VALUE WE CANNOT READ IS REPORTED AS NOTHING. The variable is
+        // dropped from BOTH halves and the scan steps over its continuation
+        // lines, so a PEM body can never be read as variables of its own.
+        if (parsed.unterminated) {
+          i = closingQuoteLine(lines, i, parsed.unterminated);
           continue;
         }
-      } catch {
-        /* does not exist yet — the ordinary case */
+        // A NAME THAT FAILS EITHER TEST IS DROPPED, NEVER TRUNCATED: a cut name
+        // is a DIFFERENT VARIABLE, and a comparison screen rendering two boxes'
+        // truncated names as the same row is worse than rendering neither.
+        if (parsed.name.length > MAX_ENV_NAME_CHARS) continue;
+        if (!ENV_NAME_RE.test(parsed.name)) continue;
+        if (!byName.has(parsed.name) && byName.size >= MAX_SCRUB_VALUES) continue;
+        byName.set(parsed.name, parsed.value);
       }
-      mkdirSync(dirname(abs), { recursive: true });
-      const body = renderEnvFile(list);
-      // Skip an identical rewrite — otherwise every bundle bump touches the
-      // file mtime and hot-restarts a running preview dev-server mid-review.
-      let prior = null;
-      try {
-        prior = readFileSync(abs, 'utf8');
-      } catch {
-        /* new file */
+      out.varsTotal += byName.size;
+      // Decided BEFORE this file spends any budget, so `budget` reaching zero
+      // inside a file still lets that file's own entry carry what it got.
+      const reporting = canReport && budget > 0 && out.files.length < MAX_ENV_FILES;
+      const vars = [];
+      for (const [n, value] of byName) {
+        // THE SCRUB LIST IS NOT BOUNDED BY THE REPORT'S CAPS — see the bounds
+        // block above. A secret dropped for being the 201st is a secret in the
+        // server's database.
+        if (out.values.length < MAX_SCRUB_VALUES) out.values.push({ name: n, value });
+        if (reporting && budget > 0) {
+          vars.push({ name: n, fp: fingerprint(salt, value) });
+          budget -= 1;
+        }
       }
-      if (prior !== body) writeFileSync(abs, body, { mode: 0o600 });
-      // `mode` on writeFileSync applies at CREATION only — an overwrite of a
-      // file that already existed keeps whatever mode it had, so a 0644 stub
-      // committed by a teammate (or left by an older daemon) would hold
-      // plaintext secrets world-readable on a shared box. chmod every time.
-      try {
-        chmodSync(abs, 0o600);
-      } catch {
-        /* best-effort: a filesystem without modes is not a reason to refuse */
-      }
-      written.push(file);
-    } catch (e) {
-      // NOT reported as a refusal: the surface's line names a git cause and a
-      // git remedy, and a full disk is neither. It still blocks the clean mark,
-      // so the next turn retries.
-      warn(`env: could not write ${file} into worktree: ${e.message}`);
-      anyProblem = true;
+      if (reporting) out.files.push({ file: name, vars });
+    } catch {
+      /* an unreadable file contributes nothing — never a thrown poll */
     }
   }
-
-  // Remove any file we ever materialized (this session OR a prior one, via the
-  // persisted knownTargetFiles) that has no keys now — a deleted secret's
-  // plaintext file must not linger, even across a daemon restart.
-  const writtenSet = new Set(written);
-  const candidates = new Set([...(lastFilesByWorktree.get(wt) ?? []), ...knownTargetFiles]);
-  for (const stale of candidates) {
-    if (!writtenSet.has(stale)) removeStaleEnvFile(wt, stale);
-  }
-  for (const f of written) knownTargetFiles.add(f);
-  lastFilesByWorktree.set(wt, written);
-
-  // THE PASS'S VERDICT, recorded whole and REPLACING the previous one — this is
-  // what lets a refusal clear. `refusedForGit` is recomputed from scratch every
-  // pass, so a file that gets gitignored simply is not in the next one, and the
-  // union reported on the poll shrinks. `anyProblem` (which also covers a write
-  // failure) is what decides whether this worktree gets retried on the next
-  // turn; a clean pass is remembered so we stop touching a live directory.
-  if (refusedForGit.length > 0) skippedByWorktree.set(wt, refusedForGit);
-  else skippedByWorktree.delete(wt);
-  if (anyProblem) cleanWorktrees.delete(wt);
-  else cleanWorktrees.add(wt);
-  everMaterialized = true;
-
-  // THE FIRST SECRET THIS BOX EVER WROTE TO DISK is the moment the recovery
-  // code stops being a warning about nothing — see `printRecoveryCodeOnce`.
-  // Gated on `written`, not on reaching this line: a pass that refused every
-  // file for a git reason materialized nothing, and the sentence would be
-  // false. Nothing is printed on any later pass.
-  if (written.length > 0) printRecoveryCodeOnce();
+  return out;
 }
 
+/**
+ * Run a scan and hand its values to the scrubber. Returns the REPORT half —
+ * `{ files, filesTotal, varsTotal }`, the body `/fleet/env-report` posts.
+ *
+ * Separated from `scanEnvFiles` so the scan itself stays pure and testable: the
+ * only impure things about this whole lane are one module-level assignment and
+ * one read of `process.env`, and both live here where they can be read in four
+ * lines.
+ *
+ * THE SCRUBBER IS FED WHETHER OR NOT THE REPORT IS SENT. The report is deduped
+ * against its own hash and posted at most once per change; redaction has no
+ * such economy and must reflect the newest read every time, because a secret
+ * added to `.env` five minutes ago is exactly the one a turn is about to echo.
+ *
+ * THE PROCESS ENVIRONMENT'S INFRA CREDENTIALS ARE MERGED IN HERE, and here is
+ * the point: this is the one function every caller already goes through, so the
+ * two lists cannot drift and nobody has to remember. They are derived from
+ * `childEnv`'s own `DEPLOY_KEEP`, which is the set a deploy command is actually
+ * handed — see `processEnvSecrets` for why they are redacted and never
+ * reported. They are re-read on every scan rather than frozen at import,
+ * because that costs nothing and an environment read once is a list that can
+ * only be wrong.
+ *
+ * AN EMPTY READ DOES NOT CLEAR WHAT WE ALREADY KNOW, and this is the one place
+ * the two halves deliberately disagree. A scan that comes back with nothing is
+ * two different facts wearing one shape — the operator deleted `.env`, or this
+ * pass could not read the directory (EACCES, a mid-sweep rename, a network
+ * mount that blinked) — and `scanEnvFiles` swallows per-file errors by design
+ * so the poll cannot throw. Replacing the list on an empty read means a blip
+ * silently turns the redactor OFF, which is the exact failure mode the whole
+ * repoint above exists to avoid, and it is invisible until a secret is already
+ * in the server's database. Hence the separate `fileValues`: the process half
+ * is refreshed unconditionally (process.env does not blink) while the file half
+ * is only ever replaced by a read that found something.
+ *
+ * So an empty read leaves the previous list standing. The cost is
+ * OVER-redaction — a value the operator has since removed or rotated keeps
+ * being replaced with `[REDACTED:NAME]` for the life of this process — and
+ * over-redacting is the safe direction, the same one every three-state readout
+ * in this daemon takes. The REPORT half is unaffected: it returns the real
+ * (empty) read, so the app is told what was actually measured.
+ */
+export function scanEnvForScrub(repoRoot, salt = PROJECT_ID) {
+  const scanned = scanEnvFiles(repoRoot, salt);
+  if (scanned.values.length) fileValues = scanned.values;
+  // FILTERED ONCE, HERE — see the predicate's own block above: `scrub` is a hot
+  // path and a value that can never match must not survive into its loop.
+  values = [...processEnvSecrets(), ...fileValues].filter((v) => worthRedacting(v.value));
+  return { files: scanned.files, filesTotal: scanned.filesTotal, varsTotal: scanned.varsTotal };
+}
 
 // ── Uplink scrubbing ───────────────────────────────────────────────────────
 
-/** Redact every known secret value from daemon-posted text. Values shorter
- *  than the floor ("1", "true") would redact half the stream — skipped. */
+/** Redact every known secret value from daemon-posted text. The list has
+ *  already been through `worthRedacting`, so this makes no decisions: an
+ *  ordinary word, a short flag and anything under the length floor are simply
+ *  not in it. */
 export function scrub(text) {
   if (typeof text !== 'string' || !text || !values.length) return text;
   let out = text;
-  for (const v of values) {
-    if (typeof v.value === 'string' && v.value.length >= SCRUB_MIN_LENGTH) {
-      out = out.split(v.value).join(`[REDACTED:${v.name}]`);
-    }
-  }
+  for (const v of values) out = out.split(v.value).join(`[REDACTED:${v.name}]`);
   return out;
-}
-
-// ── Roster tick ────────────────────────────────────────────────────────────
-
-let busy = false; // one env operation at a time — ticks are cheap to skip
-
-/**
- * React to the roster's env block. Returns { changed } — true when the bundle
- * was (re)materialized so the caller refreshes its worktrees.
- */
-export async function handleRosterEnv(env, { projectId } = {}) {
-  if (!env || busy) return { changed: false };
-  busy = true;
-  try {
-    await ensureKeypair();
-    if (projectId) cachedProjectId = projectId;
-    // First tick after a restart: warm from the encrypted cache so worktrees
-    // can materialize even if the bundle fetch below fails transiently.
-    if (bundleVersion < 0 && cachedProjectId) await loadCachedEnv(cachedProjectId);
-
-    // 1. Introduce this machine (idempotent server-side). registeredOnce is set
-    // only AFTER the POST lands — a transient failure must retry next poll, not
-    // wedge registration until restart.
-    if (env.status === 'none' && !registeredOnce) {
-      const label = hostname() || 'daemon';
-      let registered = null;
-      try {
-        registered = await post('register', { pubkey: myPubB64(), label });
-      } catch (e) {
-        // A 429 = the project is at its machine cap; retrying every poll would
-        // just hammer it. Stop for this session (a restart re-tries).
-        if (/\(429/.test(e.message)) {
-          registeredOnce = true;
-          warn('env: this project is at its machine limit — env access not requested. Ask an admin to remove an old machine.');
-          return { changed: false };
-        }
-        throw e; // transient — retry next poll (registeredOnce still false)
-      }
-      registeredOnce = true;
-      /*
-       * ONE LINE, AND IT RELAYS WHAT THE SERVER ANSWERED.
-       *
-       * It used to print a key fingerprint and say "an admin approves it in
-       * Settings → Environment (compare the emoji)" — an instruction for a
-       * button that no longer exists, about a comparison nobody was making, on
-       * top of a credential this box was already trusted with. What replaced it
-       * asserted the opposite and just as blindly: "enrolled … secrets sync to
-       * this box automatically", printed whatever the response said. A fresh
-       * registration comes back `approved`, not `enrolled` — the key is not
-       * here yet and arrives only once some box that holds it polls — so the
-       * line was claiming a state this box was one or more ticks away from, and
-       * on an OLDER server (which still answers `pending`) it was claiming one
-       * the box would never reach at all.
-       *
-       * So the status is read off the response and each state says its own
-       * true sentence, and an answer we do not recognise — or no body at all —
-       * says only the part we measured: the registration went out.
-       */
-      const registeredAs = `${c.cyan('env')}    · registered as ${c.bold(label)}`;
-      if (registered?.status === 'enrolled') {
-        info(`${c.cyan('env')}    · enrolled as ${c.bold(label)} — secrets sync to this box automatically`);
-      } else if (registered?.status === 'approved') {
-        info(`${registeredAs} — secrets sync here as soon as a machine holding the key is online`);
-      } else if (registered?.status === 'pending') {
-        // An older server, which still has the approve gate. Say what IT is
-        // waiting on rather than what we are: this daemon cannot clear it.
-        info(`${registeredAs} — this server is waiting on an approval in Settings`);
-      } else {
-        info(registeredAs);
-      }
-      return { changed: false };
-    }
-    // A HARMLESS WAIT, and the server no longer produces this: registering IS
-    // enrolling since 2026-09-20, and a row left `pending` by the old gate is
-    // promoted on the register above. Kept because an OLDER server still
-    // answers `pending`, and a daemon must not treat an unrecognised state as a
-    // reason to act.
-    if (env.status === 'pending') return { changed: false };
-    if (env.status === 'revoked') return { changed: false };
-
-    // 2. Bootstrap: no project keypair exists — this machine creates it.
-    if (env.bootstrapNeeded && (env.status === 'approved' || env.status === 'enrolled' || env.status === 'none')) {
-      if (env.status === 'none') return { changed: false }; // register first, next tick
-      await bootstrapProject();
-      return { changed: false }; // next tick syncs as enrolled
-    }
-    if (env.status !== 'enrolled') return { changed: false };
-
-    // 3. Wrap jobs + rotation + sync — all need the bundle.
-    const needSync = env.bundleVersion !== bundleVersion;
-    if (!needSync && !env.pendingWraps && !env.rotationPending) return { changed: false };
-    const bundle = await fetchBundle();
-    if (!bundle.wrappedPriv || !bundle.projectPub) return { changed: false };
-    projectPriv = openSealed(bundle.wrappedPriv, keypair.publicKey, keypair.privateKey);
-    const projectPub = sodium.from_base64(bundle.projectPub, B64());
-
-    // Execute pending enrollments: seal the priv to each newly registered
-    // machine. Registering is what puts a box on this list now — there is no
-    // approval step between the two. The
-    // wrap's epoch rides along — the server rejects (stale) if a rotation moved
-    // it since we fetched, so nobody enrolls with a dead key.
-    if (bundle.pendingWraps.length) {
-      const wraps = bundle.pendingWraps.map((p) => ({
-        daemonId: p.daemonId,
-        wrappedPriv: seal(projectPriv, p.pubkey),
-      }));
-      const res = await post('wraps', { pubkey: myPubB64(), keyEpoch: bundle.keyEpoch, wraps });
-      if (res?.stale) note(`${c.cyan('env')} ${c.dim('— wraps raced a rotation; retrying next poll')}`);
-      else ok(`${c.cyan('env')} ${c.dim(`— delivered the key to ${wraps.length} newly registered machine${wraps.length === 1 ? '' : 's'}`)}`);
-    }
-
-    // Decrypt the values we have — carrying each key's VERSION so a rotation can
-    // prove it re-sealed the current value (not one a concurrent write moved).
-    const opened = [];
-    let allOpened = true;
-    for (const k of bundle.keys) {
-      try {
-        const plain = openSealed(k.ciphertext, projectPub, projectPriv);
-        opened.push({ name: k.name, env: k.env, scope: k.scope ?? 'app', targetFile: k.targetFile, value: sodium.to_string(plain), version: k.version });
-      } catch {
-        allOpened = false;
-        warn(`env: could not open ${k.name} (epoch ${k.keyEpoch}) — skipping; a rotation should heal it`);
-      }
-    }
-
-    // Execute a pending rotation: new keypair, full coverage, all wraps. If we
-    // couldn't open every value, DON'T attempt — a partial rotate would fail
-    // the server's coverage check; let another enrolled daemon (which can open
-    // them) do it. Server serializes concurrent executors via a claim lock.
-    if (bundle.rotationPending) {
-      if (!allOpened) {
-        warn(`env: skipping rotation — this machine can't open every value; another daemon will rotate`);
-        return { changed: false };
-      }
-      const next = sodium.crypto_box_keypair();
-      const nextPubB64 = sodium.to_base64(next.publicKey, B64());
-      const res = await post('rotate', {
-        pubkey: myPubB64(),
-        fromEpoch: bundle.keyEpoch,
-        projectPub: nextPubB64,
-        values: opened.map((v) => ({ name: v.name, env: v.env, ciphertext: seal(sodium.from_string(v.value), nextPubB64), version: v.version })),
-        wraps: bundle.enrolledDaemons.map((d) => ({ daemonId: d.daemonId, wrappedPriv: seal(next.privateKey, d.pubkey) })),
-        ...(bundle.recoveryPub ? { recoverySealed: seal(next.privateKey, bundle.recoveryPub) } : {}),
-      }).catch((e) => {
-        // epoch_stale / value_moved / coverage → a concurrent change; the next
-        // poll re-fetches and retries. Not fatal.
-        note(`${c.cyan('env')} ${c.dim(`— rotation deferred (${e.message}); retrying next poll`)}`);
-        return null;
-      });
-      if (res) ok(`${c.cyan('env')} ${c.dim('— project key rotated (a machine was revoked); next poll syncs the new epoch')}`);
-      return { changed: false }; // resync on the next tick at the new version
-    }
-
-    if (needSync) {
-      values = opened;
-      bundleVersion = bundle.bundleVersion;
-      // Fold the current target files into the persisted known set so stale
-      // cleanup survives a restart (a key deleted while down still gets swept).
-      // Filtered at the fill, not just at the delete: this set is persisted,
-      // so an unsafe path admitted here would outlive the bundle that sent it.
-      for (const v of values) if (isSafeTarget(v.targetFile)) knownTargetFiles.add(v.targetFile);
-      if (cachedProjectId) writeCache(cachedProjectId, { values, bundleVersion, knownFiles: [...knownTargetFiles] });
-      ok(`${c.cyan('env')} ${c.dim(`— synced ${values.length} secret${values.length === 1 ? '' : 's'} (env v${bundleVersion})`)}`);
-      return { changed: true };
-    }
-    return { changed: false };
-  } catch (e) {
-    warn(`env sync: ${e.message} — will retry next poll`);
-    return { changed: false };
-  } finally {
-    busy = false;
-  }
-}
-
-/**
- * First machine creates the project keypair + the standing recovery target.
- *
- * THIS IS SILENT (2026-09-20). Rotations re-seal to the same recovery pub, so
- * the passphrase minted here works forever — which is exactly why it does not
- * have to be shouted at somebody who has no secrets yet. It is parked in this
- * box's keypair file and printed the first time this box materializes a
- * secret; `stashRecoveryCode`'s docblock carries the whole argument.
- */
-async function bootstrapProject() {
-  const project = sodium.crypto_box_keypair();
-  const recovery = sodium.crypto_box_keypair();
-  // Human-typable passphrase: 6 groups of 4 from an unambiguous alphabet.
-  const ALPHA = 'abcdefghjkmnpqrstuvwxyz23456789';
-  const raw = sodium.randombytes_buf(24);
-  const passphrase = Array.from(raw, (b, i) => ALPHA[b % ALPHA.length] + ((i + 1) % 4 === 0 && i < 23 ? '-' : '')).join('');
-  const salt = sodium.randombytes_buf(sodium.crypto_pwhash_SALTBYTES);
-  const kdfKey = sodium.crypto_pwhash(
-    sodium.crypto_secretbox_KEYBYTES,
-    passphrase,
-    salt,
-    sodium.crypto_pwhash_OPSLIMIT_MODERATE,
-    sodium.crypto_pwhash_MEMLIMIT_MODERATE,
-    sodium.crypto_pwhash_ALG_DEFAULT
-  );
-  const nonce = sodium.randombytes_buf(sodium.crypto_secretbox_NONCEBYTES);
-  const recoverySecret = JSON.stringify({
-    pub: sodium.to_base64(recovery.publicKey, B64()),
-    priv: sodium.to_base64(recovery.privateKey, B64()),
-  });
-  const recoveryBlob = [
-    sodium.to_base64(salt, B64()),
-    sodium.to_base64(nonce, B64()),
-    sodium.to_base64(sodium.crypto_secretbox_easy(sodium.from_string(recoverySecret), nonce, kdfKey), B64()),
-  ].join(':');
-
-  await post('bootstrap', {
-    pubkey: myPubB64(),
-    projectPub: sodium.to_base64(project.publicKey, B64()),
-    selfWrap: seal(project.privateKey, myPubB64()),
-    recoveryPub: sodium.to_base64(recovery.publicKey, B64()),
-    recoveryBlob,
-    recoverySealed: seal(project.privateKey, sodium.to_base64(recovery.publicKey, B64())),
-  });
-
-  // ONE QUIET LINE. The code goes into the keypair file and waits for the
-  // first secret. A stash that did NOT land is the one case that prints now:
-  // the passphrase exists only in this closure, and losing the only way back
-  // into a project's secrets to keep the terminal tidy is not a trade.
-  if (stashRecoveryCode(passphrase, cachedProjectId)) {
-    ok(`${c.cyan('env')} ${c.dim('— created this project\'s env keypair')}`);
-  } else {
-    warn('env: could not save the recovery code to this machine — here it is, once:');
-    printRecoveryBlock(passphrase);
-  }
 }

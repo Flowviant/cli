@@ -1,6 +1,8 @@
 /** Git worktree helpers (fleet & static-fleet modes). */
 
 import { execFileSync } from 'node:child_process';
+import { appendFileSync, mkdirSync, readFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 
 export function git(args, cwd) {
   return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
@@ -154,3 +156,64 @@ export function resetWorktree(wt, baseRef) {
   }
 }
 
+
+/**
+ * Add paths to the exclude file git ACTUALLY READS, for one worktree.
+ *
+ * MOVED HERE 2026-09-21, from env.mjs. It lived in the secrets vault because
+ * the vault is what first needed it — materialized `.env` files had to be
+ * untracked AND unstageable — but it is a plain `git info/exclude` helper with
+ * no crypto, no bundle and no opinion about secrets, and the vault is deleted.
+ * Its one surviving caller is `work.mjs`, which hides a tab's `.flowviant/`
+ * upload directory with it.
+ *
+ * WHY IT IS NOT `.git/worktrees/<name>/info/exclude`: it used to resolve the
+ * worktree's own gitdir and write there, on the belief that the file "applies
+ * to that worktree only and never touches the user's repo". Git does not read
+ * that file — it resolves `info/exclude` against $GIT_COMMON_DIR, the main
+ * `.git` — so in every linked worktree the daemon creates, the exclusion did
+ * nothing at all, and the paths it was meant to hide stayed visible to
+ * `git add -A`.
+ *
+ * `--git-common-dir` is ASKED OF GIT rather than derived, because that is the
+ * one answer that cannot drift from what git itself will consult. The file is
+ * local to the clone and never committed. Idempotent: a path already listed is
+ * not appended again, so calling this per fetch costs one read.
+ *
+ * Best-effort throughout. It is a CONVENIENCE and never a guarantee — nothing
+ * downstream may treat "we called this" as proof git cannot see a path.
+ */
+export function excludeInWorktree(wt, relPaths) {
+  try {
+    let gitdir;
+    try {
+      gitdir = resolve(
+        wt,
+        execFileSync('git', ['rev-parse', '--git-common-dir'], {
+          cwd: wt,
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'ignore'],
+        }).trim()
+      );
+    } catch {
+      return; // not a repo — there is no exclude file to write
+    }
+    const excludePath = join(gitdir, 'info', 'exclude');
+    mkdirSync(dirname(excludePath), { recursive: true });
+    let existing = '';
+    try {
+      existing = readFileSync(excludePath, 'utf8');
+    } catch {
+      /* fresh */
+    }
+    const missing = relPaths.filter((p) => !existing.split('\n').includes(`/${p}`));
+    if (missing.length) {
+      appendFileSync(
+        excludePath,
+        `${existing.endsWith('\n') || !existing ? '' : '\n'}${missing.map((p) => `/${p}`).join('\n')}\n`
+      );
+    }
+  } catch {
+    /* best-effort */
+  }
+}

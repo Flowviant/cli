@@ -155,7 +155,7 @@ test('the poll reports the checkout, the pid and the process start', () => {
 test('a stale box is LISTED with "last heard", never hidden', () => {
   const now = Date.now();
   const line = renderBox(
-    box({ fresh: false, role: 'idle', boxName: 'wayleempc', lastHeardAt: new Date(now - 3 * 86_400_000).toISOString() }),
+    box({ fresh: false, role: 'inactive', boxName: 'wayleempc', lastHeardAt: new Date(now - 3 * 86_400_000).toISOString() }),
     {},
     now
   );
@@ -185,12 +185,63 @@ test('“← this box” marks only the caller, and “behind” names the publi
   assert.ok(!/behind/.test(renderBox(box({ behind: true }), { latest: null })));
 });
 
-test('the role word is the SERVER’S, and an unknown one passes through', () => {
+/**
+ * THE ROLE WORD IS PRINTED AS THE SERVER SENT IT — no mapping, no default.
+ *
+ * It had ONE special case until 2026-09-21: `'standing-by'` was respelled as
+ * `standing by`, because a hyphenated enum value is an identifier and a
+ * terminal should not print one. The owner replaced the word itself — asked
+ * whether a box should keep saying "standing by", he answered *"no, it can [be]
+ * inactive instead"* — so the server sends `serving` and `inactive`, both
+ * already words, and the case had nothing left to translate.
+ *
+ * IT IS NOT KEPT "IN CASE". A mapping table inside a relay is a place for the
+ * two ends to disagree, and a stale entry would have this command print one
+ * word while the app printed another about the same box — the exact confusion
+ * this listing exists to end. Pinned as an ABSENCE, because an absence passes
+ * every render test ever written against it.
+ */
+test('the role word is the SERVER’S, printed, with no table in between', () => {
   assert.match(renderBox(box({ role: 'serving' })), /serving/);
-  assert.match(renderBox(box({ role: 'standing-by' })), /standing by/);
-  assert.match(renderBox(box({ role: 'idle' })), /idle/);
+  assert.match(renderBox(box({ role: 'inactive' })), /inactive/);
   // A relay does not second-guess a word it has not heard of.
   assert.match(renderBox(box({ role: 'quarantined' })), /quarantined/);
+  // THE DEAD SPELLING IS NOT TRANSLATED ANY MORE. A server still sending the
+  // old enum gets it printed raw, which is visibly wrong rather than quietly
+  // papered over — and nothing in the module may re-introduce the mapping.
+  assert.match(renderBox(box({ role: 'standing-by' })), /standing-by/);
+  const code = readFileSync(new URL('./machines.mjs', import.meta.url), 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .split('\n')
+    .filter((l) => !/^\s*(\/\/|\*)/.test(l))
+    .join('\n');
+  // THE CANARY: the function is really being read. A pin over a file it failed
+  // to read passes every doesNotMatch ever written against it.
+  assert.match(code, /function roleWord\(role\)/, 'reading the real relay');
+  assert.doesNotMatch(code, /'standing by'/, 'no respelling survives');
+  assert.doesNotMatch(code, /'standing-by'/, 'and nothing matches the dead enum');
+  // …nor a DEFAULT. `?? 'idle'` was a CLAIM — "the server told us this box is
+  // doing nothing" — about an answer the server did not give.
+  assert.doesNotMatch(code, /\?\? 'idle'/, 'an absent role is not defaulted');
+});
+
+/** An unreported role DROPS ITS CELL rather than printing a blank column or a
+ *  guess. Every other cell states its own absence because a reader needs to
+ *  know nobody measured one; a role is different — the row already carries the
+ *  mark, the version and the last-heard. */
+test('an absent role says nothing at all, at both doors', () => {
+  const line = renderBox(box({ role: null }));
+  assert.match(line, /vm-whuang-1/);
+  assert.ok(!/idle/.test(line), 'nothing is invented');
+  assert.ok(!/ {4,}/.test(line.trim()), 'and no empty column is left behind');
+
+  const now = Date.now();
+  const other = otherBoxesLine(
+    [box({ boxId: 'B2', boxName: 'wayleempc', role: null, lastHeardAt: new Date(now - 12_000).toISOString() })],
+    'B1',
+    now
+  );
+  assert.equal(other, 'other machines on this project: wayleempc (heard 12s ago)');
 });
 
 test('an unreported checkout or version says so — never blank, never guessed', () => {
@@ -265,10 +316,10 @@ test('the startup line excludes the calling box and says nothing when alone', ()
   assert.equal(otherBoxesLine([], me), null);
   assert.equal(otherBoxesLine(null, me), null);
   const line = otherBoxesLine(
-    [box({ boxId: me }), box({ boxId: 'X', boxName: 'wayleempc', role: 'idle', fresh: false, lastHeardAt: new Date(Date.now() - 3 * 86_400_000).toISOString() })],
+    [box({ boxId: me }), box({ boxId: 'X', boxName: 'wayleempc', role: 'inactive', fresh: false, lastHeardAt: new Date(Date.now() - 3 * 86_400_000).toISOString() })],
     me
   );
-  assert.match(line, /^other machines on this project: wayleempc \(idle · last heard 3d ago\)$/);
+  assert.match(line, /^other machines on this project: wayleempc \(inactive · last heard 3d ago\)$/);
 });
 
 // ── the helpers ─────────────────────────────────────────────────────────────
@@ -415,7 +466,7 @@ test('a box heard moments ago never reads "just now ago", at either door', async
   assert.match(renderBox(justNow, {}, now), /heard just now(?! ago)/);
   assert.doesNotMatch(renderBox(justNow, {}, now), /just now ago/);
 
-  const other = box({ boxId: 'B2', boxName: 'wayleempc', role: 'idle' });
+  const other = box({ boxId: 'B2', boxName: 'wayleempc', role: 'inactive' });
   const line = otherBoxesLine([{ ...other, lastHeardAt: new Date(now - 400).toISOString() }], 'B1', now);
   assert.match(line, /heard just now\)$/);
   assert.doesNotMatch(line, /just now ago/);

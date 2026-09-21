@@ -60,7 +60,8 @@
  * instance, login, mcp-cli; fleet (the roster loop) and work (session turns);
  * claude + runtimes + prompts + stream (spawning a CLI and reading its events);
  * git + worktreeDiff + patch; localSessions, listeners, preview + authproxy;
- * env + env-cli + vault, resources, deploy, shot.
+ * env (the box keypair, the uplink scrubber, the env-comparison scan) + vault
+ * (the knowledge wiki, not secrets), resources, deploy, shot.
  */
 import { FLEET_TOKEN, CREDENTIAL, adoptStoredCredential } from './lib/config.mjs';
 import { runFleetDaemon } from './lib/fleet.mjs';
@@ -311,9 +312,14 @@ if (process.argv[2] === 'machines') {
   process.exit(0);
 }
 
-// `flowviant env <import|set|show>` — the CLI half of team env sync. Values
-// are sealed to the project pubkey ON THIS MACHINE (same write-only crypto as
-// the browser); `show` decrypts locally — it only works on an ENROLLED machine.
+// `flowviant env <import|set|show>` IS DELETED (2026-09-21), with the
+// end-to-end-encrypted secrets vault it was the terminal half of. The owner:
+// "no i dont want it. unless its needed where i want to show the env of each
+// of the machines (for comparison)." So the terminal surface is back to the
+// three commands it is allowed: `npx flowviant`, `npx flowviant login`, and
+// the view-only `npx flowviant machines`. The comparison readout that ruling
+// carves out is a daemon REPORT, not a command — see `scanEnvFiles` in env.mjs.
+//
 // `flowviant mcp` — connect YOUR Claude to Flowviant so you can file work from
 // the terminal. Mints a `cli` credential: a separate principal from the
 // per-session tokens, with only the management tools and no way to work or ship
@@ -321,12 +327,6 @@ if (process.argv[2] === 'machines') {
 if (process.argv[2] === 'mcp') {
   const { runMcpCommand } = await import('./lib/mcp-cli.mjs');
   await runMcpCommand(process.argv.slice(3));
-  process.exit(0);
-}
-
-if (process.argv[2] === 'env') {
-  const { runEnvCommand } = await import('./lib/env-cli.mjs');
-  await runEnvCommand(process.argv.slice(3));
   process.exit(0);
 }
 

@@ -23,11 +23,13 @@
  *
  * ── IT IS A RELAY ──
  *
- * The role words (`serving`, `standing by`, `idle`) are the SERVER'S, computed
- * in one place so this command, project settings and the account's Home block
- * cannot disagree about what a box is doing. Nothing here re-derives a state, and
- * a project the server could not answer for says so rather than rendering as
- * empty.
+ * The role words are the SERVER'S — `serving` and `inactive` today — computed in
+ * one place so this command, project settings and the account's Home block
+ * cannot disagree about what a box is doing. They are PRINTED AS SENT: there is
+ * no mapping table here and no default word, because either is this command
+ * having an opinion about a state it did not measure. Nothing here re-derives a
+ * state, and a project the server could not answer for says so rather than
+ * rendering as empty.
  *
  * ── RENDERING IS PURE, FETCHING IS NOT ──
  *
@@ -113,11 +115,29 @@ export function connectedOn(iso) {
   return new Date(t).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
 }
 
-/** The server's own role word, spelled for a terminal. Unknown values pass
- *  through untouched: this is a relay, and a role this build has never heard of
- *  is still the server's answer. */
+/**
+ * THE SERVER'S OWN ROLE WORD, PRINTED. A pure relay and nothing else.
+ *
+ * It carried one special case until 2026-09-21: `'standing-by'` was respelled
+ * as `standing by`, because the server sent a hyphenated enum value and a
+ * terminal should not print an identifier. The owner replaced that word —
+ * asked whether a box should keep saying "standing by", he answered *"no, it
+ * can [be] inactive instead"* — so the server sends `serving` and `inactive`,
+ * both of which are already words, and the special case had nothing left to
+ * translate.
+ *
+ * IT IS NOT KEPT "IN CASE": a mapping table in a relay is a place for the two
+ * ends to disagree, and a stale entry would print one thing while the app
+ * printed another about the same box — which is precisely the confusion this
+ * command exists to end. A role this build has never heard of passes through
+ * untouched for the same reason.
+ *
+ * An ABSENT role prints nothing rather than a guess. It used to default to
+ * `idle`, which is a CLAIM — "the server told us this box is doing nothing" —
+ * about an answer the server did not give.
+ */
 function roleWord(role) {
-  return role === 'standing-by' ? 'standing by' : String(role ?? 'idle');
+  return typeof role === 'string' && role.trim() ? role.trim() : '';
 }
 
 /** One box, as a line under its project. The MARK is the only derived thing on
@@ -129,13 +149,18 @@ export function renderBox(box, { me = null, latest = null } = {}, now = Date.now
   // "LAST heard" is the staleness mark, and the row is never hidden for it —
   // the owner's answer to "what about a box that stopped" was exactly this.
   const heard = heardPhrase(box, now);
+  // An unreported role DROPS ITS CELL. Every other cell on this row states its
+  // own absence ("(checkout not reported)") because a reader who cannot see a
+  // path needs to know nobody measured one; a role is different — the row is
+  // already carrying the mark, the version and the last-heard, and a
+  // placeholder there would be four words of nothing in the widest column.
   const cells = [
     `${mark} ${name}`,
     roleWord(box.role),
     box.checkoutPath || '(checkout not reported)',
     box.daemonVersion ? `v${box.daemonVersion}` : 'version not reported',
     heard,
-  ];
+  ].filter(Boolean);
   let line = `    ${cells.join('   ')}`;
   if (me && box.boxId === me) line += '   ← this box';
   // Said only when the server said it, and it names the version that is
@@ -262,9 +287,10 @@ export async function fetchBoxesFor(entry, { url, envpub, fetchImpl = fetch } = 
 export function otherBoxesLine(boxes, me, now = Date.now()) {
   const others = (Array.isArray(boxes) ? boxes : []).filter((b) => b && b.boxId !== me);
   if (others.length === 0) return null;
-  const parts = others.slice(0, 6).map(
-    (b) => `${b.boxName || 'an unnamed machine'} (${roleWord(b.role)} · ${heardPhrase(b, now)})`
-  );
+  const parts = others.slice(0, 6).map((b) => {
+    const role = roleWord(b.role);
+    return `${b.boxName || 'an unnamed machine'} (${role ? `${role} · ` : ''}${heardPhrase(b, now)})`;
+  });
   const more = others.length - parts.length;
   return `other machines on this project: ${parts.join(', ')}${more > 0 ? `, and ${more} more` : ''}`;
 }

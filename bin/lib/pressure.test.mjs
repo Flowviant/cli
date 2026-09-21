@@ -451,10 +451,16 @@ test('a merge is NOT gated — it ends work and frees the box', () => {
 });
 
 test('the machine snapshot is built from the LIVE children, not the dead workers map', () => {
+  // The CLOSING anchor is code, not prose. It used to be the comment line
+  // "Deploy: a deploy-authorized daemon", and that comment was rewritten when
+  // the deploy gate moved off the deleted vault's roster block onto
+  // `roster.deployAllowed` — so a pin over a behaviour nobody touched went red
+  // over a sentence. A slice anchored on a comment is a slice anchored on
+  // whatever somebody rephrases next.
   const region = between(
     fleetSrc,
     'machineSnapshot({',
-    'Deploy: a deploy-authorized daemon',
+    'if (roster.deployAllowed) {',
     'machineSnapshot call'
   );
   assert.ok(region.includes('liveTurns()'));

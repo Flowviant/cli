@@ -39,7 +39,14 @@ import {
   MACHINE_HOST,
   MODEL,
 } from './config.mjs';
-import { git, gitRaw, splitNul, baseBranchName, isSafePathSegment } from './git.mjs';
+import {
+  git,
+  gitRaw,
+  splitNul,
+  baseBranchName,
+  isSafePathSegment,
+  excludeInWorktree,
+} from './git.mjs';
 import {
   isPublishRef,
   publishPushArgs,
@@ -75,13 +82,7 @@ import {
   AGENT_HUMAN_KICKOFF,
   AGENT_PRECHECK_KICKOFF,
 } from './prompts.mjs';
-import {
-  materializeInto,
-  hasMaterialized,
-  excludeInWorktree,
-  myPubB64,
-  scrub as envScrub,
-} from './env.mjs';
+import { myPubB64, scrub as envScrub } from './env.mjs';
 import {
   detectRuntimes,
   canRun,
@@ -2070,8 +2071,9 @@ export function createWorkManager({
     // an untracked `.flowviant/` makes the whole worktree dirty, which refuses
     // every ship, exempts the tree from closed-tab retirement forever, and
     // shows the human's own uploads in the rail as session changes. Same
-    // mechanism as the materialized env files — the exclude file git actually
-    // reads (env.mjs), which already skips lines it has written before, so
+    // mechanism the materialized env files used until the vault was deleted —
+    // the exclude file git actually reads (git.mjs, where the helper moved when
+    // env.mjs shrank), which already skips lines it has written before, so
     // calling it per fetch is idempotent.
     excludeInWorktree(wt, ['.flowviant/']);
     const written = [];
@@ -2253,39 +2255,28 @@ export function createWorkManager({
           }
         }
       }
-      // Synced env into the fresh worktree, exactly like a task checkout gets
-      // (worktreeFor): a tab builds and runs dev servers here, and without the
-      // bundle every session build was missing its .env while dispatched runs
-      // got theirs. Only on creation — a live directory's env belongs to the
-      // session, same as a resumed task tree. Ship's dirty-check is safe by
-      // construction: materializeInto writes ONLY gitignored paths (it refuses
-      // otherwise), and ignored files never appear in `git status --porcelain`.
-      // Best-effort, like everywhere else — the session still builds; paths
-      // that need secrets may 500.
-      try {
-        materializeInto(wt);
-      } catch {
-        /* best-effort */
-      }
-    } else if (!hasMaterialized(wt)) {
-      // CREATION-ONLY NEEDED A SECOND CONDITION. The rule above is right about
-      // a LIVE directory — its env belongs to the session and re-writing it
-      // mid-flight is not ours to do — but "created" and "ever given a bundle"
-      // are different events, and the gap between them is a whole daemon
-      // restart: `handleRosterEnv` (which warms the encrypted cache) runs
-      // AFTER `processWorkTurns` on the same poll, so a worktree made on the
-      // first turn after a restart was materialized against an EMPTY bundle
-      // and, being neither fresh nor covered by a bundle CHANGE, never
-      // revisited. `materializeInto` now declines to record a pass it made in
-      // ignorance (bundleVersion < 0), so this branch is what retries it —
-      // once, on the next turn, and never again after it succeeds. Idempotent
-      // by construction: identical bodies are not rewritten, so nothing
-      // hot-restarts a dev server the driver is watching.
-      try {
-        materializeInto(wt);
-      } catch {
-        /* best-effort */
-      }
+      // NOTHING IS MATERIALIZED INTO A FRESH WORKTREE ANY MORE (2026-09-21),
+      // and nothing replaced it.
+      //
+      // Two blocks stood here: one that wrote the decrypted vault bundle into a
+      // newly-created worktree, and a second that retried on the next turn for
+      // the restart window where the bundle had not warmed yet. The vault is
+      // deleted — the owner: "no i dont want it" — so Flowviant holds no secret
+      // for this project and has nothing to write.
+      //
+      // WHAT THE SOURCE OF A WORKTREE'S ENV IS NOW: the repo's own `.env`
+      // files, wherever the repo puts them. A worktree branches from the
+      // checkout, and a gitignored `.env` is by definition not in a fresh one —
+      // which is the ordinary behaviour of `git worktree add`, the same thing a
+      // person gets typing it themselves, and the operator's problem to solve
+      // the way they already solve it (a symlink, a `direnv`, a copy in a
+      // setup script). This product no longer claims otherwise, and the claim
+      // is what was worth deleting: a promise that every session tab comes up
+      // with the team's secrets is only kept while a vault exists to keep it.
+      //
+      // The CLI child still inherits the daemon's own environment exactly as it
+      // always did (claude.mjs spawns with `{...process.env}`), so anything
+      // exported in the shell the daemon was started from is present here.
     }
     return { wt, fresh };
   };

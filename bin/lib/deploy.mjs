@@ -1,13 +1,65 @@
 /**
  * Cloudflare DevOps — the daemon runs the user's own `wrangler`. Broker-not-
- * host: no cloud credential ever reaches Flowviant. A deploy-authorized daemon
- * claims deploy jobs off the roster, runs build → push prod secrets → deploy →
+ * host: no cloud credential ever reaches Flowviant. A daemon on a project with
+ * deploy allowed claims deploy jobs off the roster, runs build → deploy →
  * verify, and reports the outcome. It also reports its parsed
  * .flowviant/deploy.json so the app can list targets, and (basic) observes
  * out-of-band deployments.
  *
- * Every log line that leaves the machine passes through the env scrubber —
- * wrangler output routinely echoes secrets.
+ * ── THE MACHINE'S OWN ENVIRONMENT IS THE SOURCE OF A DEPLOY'S SECRETS
+ *    (2026-09-21), BECAUSE FLOWVIANT NO LONGER HOLDS ANY ──
+ *
+ * This lane used to get both halves of its secrets from the end-to-end
+ * encrypted vault: `deployCreds()` put the deploy-scope credentials in the
+ * command's environment, and `appSecretsFor('prod')` fed `wrangler secret put`
+ * on stdin so a prod deploy pushed the project's app secrets to the provider's
+ * own store. The vault is DELETED — the owner: "no i dont want it. unless its
+ * needed where i want to show the env of each of the machines (for
+ * comparison)", and on the recovery passphrase that protected it, "no, its fine
+ * to repaste from providers".
+ *
+ * So both halves are gone, and what replaces them is the operator:
+ *
+ *  - the deploy COMMAND runs with the infra credentials that are in this
+ *    daemon's own environment, passed through `childEnv`'s opt-in `deploy: true`
+ *    allowlist. If `wrangler` authenticates when the operator runs it in that
+ *    shell, it authenticates here.
+ *  - the `pushSecrets` step is DELETED outright rather than reimplemented
+ *    against `process.env`. It existed to move values Flowviant was custodian
+ *    of; with no custody there is nothing here that the operator does not
+ *    already have in front of them, and `wrangler secret put` is a command they
+ *    can run. Flowviant automating a push of secrets it does not hold, from an
+ *    environment it does not own, into a provider store it cannot read back, is
+ *    the shape of a feature that fails silently and invisibly. `target
+ *    .pushSecrets` is still PARSED and reported (a dormant key is the standing
+ *    call) — it simply drives nothing.
+ *
+ * ── WHAT A DEPLOY LOG IS ACTUALLY SCRUBBED AGAINST, corrected 2026-09-21 by
+ *    the review that caught this paragraph asserting a guarantee it had lost ──
+ *
+ * Every log line that leaves the machine still passes through `scrub`. What
+ * this paragraph claimed for a few hours was that being fed from the checkout's
+ * `.env*` files was "strictly more of what a deploy log can contain than the
+ * vault ever delivered", and for THIS lane that was exactly backwards. The
+ * vault's deploy-scope half WAS `CLOUDFLARE_API_TOKEN` and friends, so those
+ * were redacted; an operator's own token lives in the shell they started the
+ * daemon in — which is the entire reason `childEnv`'s `deploy: true` widening
+ * exists — and almost never in a checkout file. So the one lane that hands a
+ * credential to a command and then streams that command's stdout to the server
+ * was the one lane no longer redacting it.
+ *
+ * It is fed from BOTH now, and the join is made in `scanEnvForScrub` rather
+ * than here so no call site has to remember: the checkout's `.env*` files, plus
+ * the PRESENT values of `childEnv`'s own `DEPLOY_KEEP` names out of
+ * `process.env` (see `processEnvSecrets`, which also explains why `CF_API_TOKEN`
+ * is redacted although it is never passed, and why none of this reaches the
+ * `/fleet/env-report` wire — that report is a statement about the checkout's
+ * files, and this box's shell is not one). Deriving the redaction list from the
+ * admission list is what stops the two drifting the next time a name is added.
+ *
+ * The honest residue, stated: a credential that is neither in `DEPLOY_KEEP` nor
+ * in a checkout `.env*` — one a `build` script fetches for itself, say — is not
+ * redacted, because this daemon has never seen it.
  */
 
 
@@ -15,7 +67,7 @@ import { spawn } from 'node:child_process';
 import { join } from 'node:path';
 import { FLEET_URL, FLEET_TOKEN, USER_AGENT, DAEMON_INSTANCE } from './config.mjs';
 import { c, note, ok, warn } from './ui.mjs';
-import { deployCreds, appSecretsFor, scrub, myPubB64 } from './env.mjs';
+import { scrub, myPubB64 } from './env.mjs';
 import { childEnv } from './childEnv.mjs';
 import { git } from './git.mjs';
 
@@ -131,7 +183,7 @@ export async function reportDeployConfig(repoRoot, baseRef) {
 /** Run a shell command ASYNC (never blocks the daemon's event loop — the
  *  reconcile poll + the deploy heartbeat must keep firing during a long
  *  deploy). Captures combined + scrubbed output; resolves {ok,out,code}. */
-function run(command, { cwd, env, input }) {
+function run(command, { cwd, env }) {
   return new Promise((resolve) => {
     const child = spawn(command, { cwd, env, shell: true, stdio: ['pipe', 'pipe', 'pipe'] });
     let buf = '';
@@ -148,21 +200,17 @@ function run(command, { cwd, env, input }) {
         /* already gone */
       }
     }, 30 * 60_000);
-    // A broken pipe (child exits before draining stdin — e.g. a fast-failing
-    // `wrangler secret put`) surfaces as an ASYNC 'error' on the stdin stream,
-    // which the try/catch below can't catch. Without a listener it's an uncaught
-    // exception that kills the whole daemon. Swallow it.
+    // A broken pipe (a child that exits before its stdin is closed) surfaces as
+    // an ASYNC 'error' on the stdin stream, which the try/catch around this
+    // cannot catch. Without a listener it is an uncaught exception that kills
+    // the whole daemon. Swallow it.
+    //
+    // The `input` parameter this used to take went with the prod-secret push —
+    // it existed so a value could reach `wrangler secret put` on stdin rather
+    // than argv, and there is no value left to send. Closing stdin immediately
+    // is now the only case.
     child.stdin.on('error', () => {});
-    if (input != null) {
-      try {
-        child.stdin.write(input);
-        child.stdin.end();
-      } catch {
-        /* stdin closed */
-      }
-    } else {
-      child.stdin.end();
-    }
+    child.stdin.end();
     child.on('close', (code) => {
       clearTimeout(timer);
       resolve({ ok: code === 0, code: code ?? -1, out: scrub(buf) });
@@ -198,9 +246,9 @@ const claiming = new Set(); // in-flight guard (single-flight per daemon process
  * A deploy is IRREVERSIBLE and the report is not: a transient 5xx, a DNS blip
  * or the 30s timeout meant the outcome never landed, the heartbeat stopped,
  * and three minutes later the server requeued the job and this same daemon ran
- * `wrangler rollback` — or a full prod deploy with every pushSecret re-pushed —
- * a SECOND time, leaving production two versions behind the intended one with
- * nothing recording that it happened twice.
+ * `wrangler rollback` — or a full prod deploy — a SECOND time, leaving
+ * production two versions behind the intended one with nothing recording that
+ * it happened twice.
  *
  * So the process remembers. Not a substitute for the report (see the retry
  * below, which is the real fix); a floor under it, for the case where the
@@ -212,8 +260,8 @@ const ran = new Set();
 
 /**
  * Process queued deploy jobs from the roster. `ctx` = { repoRoot, baseRef,
- * myPubB64 }. Each job: claim → build → push prod secrets → deploy → verify →
- * report. Runs concurrently but one-per-jobId.
+ * myPubB64 }. Each job: claim → build → deploy → verify → report. Runs
+ * concurrently but one-per-jobId.
  */
 export function processDeployJobs(jobs, ctx) {
   if (!Array.isArray(jobs) || !jobs.length) return;
@@ -315,7 +363,13 @@ async function runDeploy(job, target, ctx) {
   // command — and of `target.build`, which is a string the REPO controls —
   // under a comment asserting the opposite. A denylist is a claim about a set
   // you cannot see; this is built from {} instead.
-  const env = childEnv({ cwd: ctx.repoRoot, extra: deployCreds() }); // infra creds; never a file
+  //
+  // `deploy: true` is the OPT-IN SECOND GROUP (childEnv.mjs): a named set of
+  // infra credential variables kept out of this daemon's own environment, and
+  // nothing else. It replaced `extra: deployCreds()` when the vault was deleted
+  // — the credentials are the OPERATOR's now, in the shell they started the
+  // daemon in, rather than values Flowviant decrypted onto the box.
+  const env = childEnv({ cwd: ctx.repoRoot, deploy: true }); // infra creds; never a file
   const logs = [];
   // Rollback is a single wrangler command; deploy is build → secrets → deploy.
   if (job.kind === 'rollback') {
@@ -331,24 +385,17 @@ async function runDeploy(job, target, ctx) {
     if (!b.ok) return { ok: false, message: `build failed:\n${logs.slice(-6).join('\n')}`, logs };
   }
 
-  // Push prod app secrets to the provider's secret store (never written local).
-  // `name` is always a validated vault key (alnum/underscore) or skipped, and
-  // the VALUE goes only via stdin — never argv (no prod plaintext in ps).
-  if (job.env === 'prod' && Array.isArray(target.pushSecrets) && target.pushSecrets.length) {
-    const secrets = appSecretsFor('prod');
-    for (const name of target.pushSecrets) {
-      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) || !(name in secrets)) {
-        warn(`deploy: pushSecret "${name}" invalid or not in the vault at prod scope — skipping`);
-        continue;
-      }
-      const putCmd = target.commands?.['secretPut']
-        ? target.commands['secretPut'].replace('{name}', name)
-        : `npx wrangler secret put ${name} --env production`;
-      const s = await run(putCmd, { cwd: ctx.repoRoot, env, input: secrets[name] });
-      if (!s.ok) return { ok: false, message: `pushing secret ${name} failed`, logs };
-    }
-  }
-
+  // THE PROD-SECRET PUSH IS DELETED (2026-09-21). What stood here read
+  // `appSecretsFor('prod')` out of the vault and piped each value into
+  // `wrangler secret put` on stdin — never argv, so no prod plaintext in `ps`.
+  // That care was right and it is moot: the vault is gone, Flowviant holds no
+  // app secret for anybody, and there is nothing left to push. It is not
+  // reimplemented against `process.env`, because a deploy that quietly pushes
+  // whatever happens to be exported in the daemon's shell into a provider's
+  // secret store is a worse feature than no feature — the operator can see and
+  // run `wrangler secret put`, and they are the only one who can tell which
+  // values belong there. `target.pushSecrets` stays parsed and reported, which
+  // is what every retired key in this product does.
   const cmd = target.commands?.[job.env] || target.command;
   const d = await run(cmd, { cwd: ctx.repoRoot, env });
   logs.push(...tailLines(d.out));
@@ -379,7 +426,7 @@ async function runDeploy(job, target, ctx) {
  * heartbeat, and the server — which requeues a running job after three minutes
  * without one — handed the SAME job back to the SAME daemon, which ran it
  * again. For a rollback that is production two versions behind the intended
- * one; for a prod deploy it is every pushSecret pushed twice. Nothing recorded
+ * one; for a prod deploy it is the whole deploy run twice. Nothing recorded
  * that it had happened at all.
  *
  * The heartbeat keeps running throughout (the caller's `finally` is what stops

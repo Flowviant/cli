@@ -15,7 +15,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { childEnv, DROPPED_SAMPLE } from './childEnv.mjs';
+import { childEnv, DROPPED_SAMPLE, DEPLOY_KEEP_NAMES, processEnvSecrets } from './childEnv.mjs';
 
 test('the machine credential is absent — the exact bug this replaces', () => {
   process.env.FLOWVIANT_FLEET = 'fleet-secret-value';
@@ -83,11 +83,61 @@ test('NODE_ENV and PORT are never asserted', () => {
 test('cwd becomes PWD, and extra is layered last', () => {
   const env = childEnv({ cwd: '/w/session/abc', extra: { CLOUDFLARE_API_TOKEN: 'given' } });
   assert.equal(env.PWD, '/w/session/abc');
-  // `extra` is the CALLER's own material — deploy credentials it fetched and
-  // decrypted. It is never repo-supplied: the deleted preview feature let a
-  // branch file contribute an env map layered last, which is how a branch got
-  // to set PATH.
+  // `extra` is the CALLER's own material. It is never repo-supplied: the
+  // deleted preview feature let a branch file contribute an env map layered
+  // last, which is how a branch got to set PATH.
   assert.equal(env.CLOUDFLARE_API_TOKEN, 'given');
+});
+
+/**
+ * THE DEPLOY OPT-IN IS A SECOND ALLOWLIST, NOT A DOOR OUT OF THE FIRST
+ * (2026-09-21).
+ *
+ * Deploy used to get its credentials from the secrets vault —
+ * `extra: deployCreds()`, values Flowviant had decrypted onto this box. The
+ * vault is deleted (the owner: "no i dont want it"), so the source is the
+ * OPERATOR's own environment, and this file's whole premise is that a spawned
+ * command is built from `{}`. Hence the widening.
+ *
+ * What it must never become is `{...process.env}` for deploys. A deploy target's
+ * `build` is a REPO-CONTROLLED string, so the kept set IS the blast radius, and
+ * the rot argument for an allowlist does not weaken because the caller is a
+ * deploy.
+ */
+test('deploy: true keeps the named infra credentials — and only those', () => {
+  for (const k of DEPLOY_KEEP_NAMES) process.env[k] = `value-of-${k}`;
+  process.env.SOME_OTHER_VENDOR_TOKEN = 'must-not-survive';
+  process.env.FLOWVIANT_FLEET = 'fleet-secret-value';
+  try {
+    const env = childEnv({ cwd: '/w', deploy: true });
+    for (const k of DEPLOY_KEEP_NAMES) {
+      assert.equal(env[k], `value-of-${k}`, `${k} must reach the deploy command`);
+    }
+    // A name nobody put on the list is still absent — the point of a KEEP list.
+    assert.equal(env.SOME_OTHER_VENDOR_TOKEN, undefined);
+    // AND THE MACHINE CREDENTIAL IS STILL ABSENT AT THE OPT-IN. It is the one
+    // secret whose leak costs the project itself, and `target.build` is a
+    // string the repo controls.
+    assert.equal(env.FLOWVIANT_FLEET, undefined);
+    assert.ok(!Object.keys(env).some((k) => k.startsWith('FLOWVIANT_')));
+    assert.ok(!Object.values(env).includes('fleet-secret-value'));
+  } finally {
+    for (const k of DEPLOY_KEEP_NAMES) delete process.env[k];
+    delete process.env.SOME_OTHER_VENDOR_TOKEN;
+    delete process.env.FLOWVIANT_FLEET;
+  }
+});
+
+test('and WITHOUT the opt-in those same names are dropped', () => {
+  for (const k of DEPLOY_KEEP_NAMES) process.env[k] = 'sensitive';
+  try {
+    const env = childEnv({ cwd: '/w' });
+    for (const k of DEPLOY_KEEP_NAMES) {
+      assert.equal(env[k], undefined, `${k} must not leak into an ordinary child`);
+    }
+  } finally {
+    for (const k of DEPLOY_KEEP_NAMES) delete process.env[k];
+  }
 });
 
 test('the deploy path actually calls it — a helper nobody uses fixes nothing', async () => {
@@ -104,8 +154,110 @@ test('the deploy path actually calls it — a helper nobody uses fixes nothing',
     .join('\n');
   const i = src.indexOf('async function runDeploy');
   assert.ok(i > -1);
-  const fn = src.slice(i, src.indexOf('\nasync function', i + 10));
+  const end = src.indexOf('\nasync function', i + 10);
+  // BOTH ANCHORS BEFORE THE SLICE. An `indexOf` that returns −1 slices to the
+  // end of the file (or, the other way round, to nothing) and the assertions
+  // below then pass over the wrong text — the inert-pin class this repo has
+  // caught repeatedly.
+  assert.ok(end > i, 'the end anchor must exist too');
+  const fn = src.slice(i, end);
   assert.ok(fn.includes('childEnv('), 'runDeploy must build its env through childEnv');
+  // …through the OPT-IN, since the vault that used to supply `extra` is gone.
+  assert.ok(fn.includes('deploy: true'), 'and it must ask for the infra-credential group');
   // The old shape must not come back.
   assert.ok(!/\{\s*\.\.\.process\.env\s*,\s*\.\.\.deployCreds\(\)/.test(src));
+  // Nor the vault readers it was built on. `deployCreds` and `appSecretsFor`
+  // are DELETED from env.mjs, and deploy.mjs's obituary NAMES both — which is
+  // the most useful prose in the file and also an exact match for what this
+  // bans. So the ban is on `src`, which is already comment-stripped above, and
+  // the canary is that the obituary is still there in the raw text.
+  assert.match(raw, /appSecretsFor\('prod'\)/, 'the obituary still explains what left');
+  assert.ok(!/\bdeployCreds\(/.test(src), 'nothing reads deploy credentials out of a vault');
+  assert.ok(!/\bappSecretsFor\(/.test(src), 'nothing pushes vault secrets any more');
+});
+
+/**
+ * THE REDACTION LIST IS DERIVED FROM THE ADMISSION LIST (2026-09-21, the
+ * review) — which is what stops the two drifting.
+ *
+ * Until the vault was deleted, `scrub()` was fed the decrypted bundle, and its
+ * deploy-scope half WAS `CLOUDFLARE_API_TOKEN` and friends — so `wrangler`
+ * output was redacted on its way to the server. The replacement scrubber reads
+ * the CHECKOUT'S `.env*` files, and an operator's deploy credential lives in
+ * the shell they started the daemon in, which is the entire reason
+ * `DEPLOY_KEEP` exists. So the one lane that hands a secret to a command and
+ * then streams that command's stdout to the server had stopped redacting it,
+ * under a `deploy.mjs` docblock still asserting the opposite.
+ *
+ * It is DERIVED rather than listed a second time, because a hand-kept copy
+ * rots the moment somebody adds a name here and forgets the other file. That
+ * is the same argument this module makes for an allowlist over a denylist,
+ * applied one level up.
+ */
+test('processEnvSecrets covers every DEPLOY_KEEP name that is actually set', () => {
+  for (const k of DEPLOY_KEEP_NAMES) process.env[k] = `value-of-${k}`;
+  process.env.SOME_OTHER_VENDOR_TOKEN = 'not-ours-to-hide';
+  process.env.FLOWVIANT_FLEET = 'fleet-secret-value';
+  try {
+    const found = processEnvSecrets();
+    const byName = new Map(found.map((v) => [v.name, v.value]));
+    for (const k of DEPLOY_KEEP_NAMES) {
+      assert.equal(byName.get(k), `value-of-${k}`, `${k} must be redactable`);
+    }
+    // A name nobody put on either list is not this daemon's secret to hide.
+    assert.ok(!byName.has('SOME_OTHER_VENDOR_TOKEN'));
+    // The machine credential is not in it either. It is never passed to a
+    // child, so there is no deploy log that can contain it, and listing it
+    // here would suggest otherwise.
+    assert.ok(!byName.has('FLOWVIANT_FLEET'));
+    assert.ok(!found.some((v) => v.value === 'fleet-secret-value'));
+  } finally {
+    for (const k of DEPLOY_KEEP_NAMES) delete process.env[k];
+    delete process.env.SOME_OTHER_VENDOR_TOKEN;
+    delete process.env.FLOWVIANT_FLEET;
+  }
+});
+
+/**
+ * TWO NAMES ARE REDACTED THAT ARE NEVER PASSED, and the asymmetry is the point.
+ *
+ * `CF_API_TOKEN` and `CF_ACCOUNT_ID` are wrangler's older spellings — it still
+ * reads them — so a box may hold the token under that name while the deploy
+ * command is handed nothing. Redacting a value we do not pass costs nothing and
+ * covers the operator still on the old spelling; PASSING one would widen the
+ * blast radius of a repo-controlled `build` string, which is what this module
+ * exists to bound. Redaction and admission are different questions, and this is
+ * the one place they are allowed to differ.
+ */
+test('the old wrangler spellings are redactable but never admitted', () => {
+  process.env.CF_API_TOKEN = 'cf-old-spelling-token';
+  process.env.CF_ACCOUNT_ID = 'cf-old-spelling-account';
+  try {
+    const byName = new Map(processEnvSecrets().map((v) => [v.name, v.value]));
+    assert.equal(byName.get('CF_API_TOKEN'), 'cf-old-spelling-token');
+    assert.equal(byName.get('CF_ACCOUNT_ID'), 'cf-old-spelling-account');
+    // …and the deploy child still does not get them, at any opt-in.
+    const env = childEnv({ cwd: '/w', deploy: true });
+    assert.equal(env.CF_API_TOKEN, undefined);
+    assert.equal(env.CF_ACCOUNT_ID, undefined);
+  } finally {
+    delete process.env.CF_API_TOKEN;
+    delete process.env.CF_ACCOUNT_ID;
+  }
+});
+
+/** AN ABSENT NAME IS ABSENT, never an empty string: a `''` in the scrub list
+ *  would make `String.split('')` explode every posted line into characters. */
+test('only names that are actually set appear, and never as empty strings', () => {
+  for (const k of DEPLOY_KEEP_NAMES) delete process.env[k];
+  delete process.env.CF_API_TOKEN;
+  delete process.env.CF_ACCOUNT_ID;
+  process.env.VERCEL_TOKEN = '';
+  try {
+    const found = processEnvSecrets();
+    assert.ok(!found.some((v) => v.name === 'VERCEL_TOKEN'), 'an empty value is not a secret');
+    assert.ok(found.every((v) => typeof v.value === 'string' && v.value.length > 0));
+  } finally {
+    delete process.env.VERCEL_TOKEN;
+  }
 });

@@ -66,14 +66,8 @@ import { acquireInstanceLock } from './instance.mjs';
 import { preflight } from './preflight.mjs';
 import { connectStream } from './stream.mjs';
 import { ensureVault, syncVault } from './vault.mjs';
-import {
-  envQueryParams,
-  handleRosterEnv,
-  loadCachedEnv,
-  materializeInto,
-  myPubB64,
-  scrub as envScrub,
-} from './env.mjs';
+import { envQueryParams, myPubB64, scanEnvForScrub, scrub as envScrub } from './env.mjs';
+import { sweepVaultArtefactsOnce } from './vaultArtefacts.mjs';
 import { processDeployJobs, reportDeployConfig } from './deploy.mjs';
 import { machineSnapshot } from './resources.mjs';
 import {
@@ -287,15 +281,20 @@ async function fetchRoster(
   } catch {
     /* best-effort — the poll must never fail on a readout */
   }
-  // Env-sync identity + materialized version (the Settings "env vN" chip).
+  // THIS BOX'S IDENTITY — `envpub`, and since 2026-09-21 nothing else.
   //
-  // `!= null`, NOT truthiness. `envskip` uses the EMPTY STRING as a real
-  // report — "measured, refused nothing" — and it is the only value that can
-  // clear the surface's warning. A `if (v)` here silently dropped it, so
-  // fixing the filter in envQueryParams alone would have changed nothing.
-  // This is the same trap the skills relay eight lines up documents and
-  // sidesteps by calling `url.searchParams.set` directly; the general fix is
-  // better than a second special case.
+  // It carried two more params while the secrets vault existed: `envv` (the
+  // materialized bundle version) and `envskip` (the target files the
+  // materializer refused to write, where the EMPTY STRING was a real report and
+  // a truthiness filter here silently dropped it). Both died with the vault and
+  // the server no longer reads either, so the loop's `!= null` has nothing left
+  // to defend — it stays anyway, because it is the correct general shape for
+  // forwarding a param map and re-deriving that lesson is how it was lost the
+  // first time.
+  //
+  // `envpub` ITSELF IS UNCHANGED: same key, same base64, same keypair file. A
+  // box upgrading into this release must stay the SAME box to holdership
+  // arbitration and to the machine registry.
   try {
     for (const [k, v] of Object.entries(await envQueryParams())) {
       if (v != null) url.searchParams.set(k, v);
@@ -606,6 +605,143 @@ async function maybeReportRepoState({ repoRoot, baseRef }) {
 }
 
 /**
+ * WHAT IS IN THIS BOX'S ENVIRONMENT, BY NAME (2026-09-21) — the one readout the
+ * deleted secrets vault was genuinely wanted for.
+ *
+ * The owner, on the vault: *"no i dont want it. unless its needed where i want
+ * to show the env of each of the machines (for comparison)."* So the custody
+ * went and the comparison stayed, rebuilt as a plain report: for each `.env*`
+ * file in the CHECKOUT ROOT, the variable NAMES and an 8-hex VALUE FINGERPRINT.
+ * **The value never leaves the box.** Two machines holding the same fingerprint
+ * for `DATABASE_URL` agree; two different fingerprints is the whole answer to
+ * "why does it work over there", and neither requires Flowviant to hold a
+ * secret, seal a key, or own a recovery code.
+ *
+ * ONE POST PER BOX PER CHANGE. The report is hashed and compared against the
+ * last one the server ACCEPTED, so a box whose env is stable posts exactly once
+ * per daemon and then never again — the same economy `maybeReportRepoState`
+ * keeps next door, and for the same reason: an env file is not PRESENCE, so
+ * re-posting an unchanged list would be a write per machine per minute to say
+ * nothing.
+ *
+ * A PERMANENT 4xx IS TREATED AS DELIVERED, which is the `/fleet/agent-trace`
+ * precedent stated there: an older SERVER 404s every batch, and a daemon that
+ * held them would keep re-posting a body nobody will ever read. Which statuses
+ * count as permanent is `envReportIsPermanent`, and it is a SHORT list for the
+ * reason stated there; everything else forgets the dedup so the next beat tries
+ * again.
+ *
+ * THE TOTALS RIDE BESIDE THE CAPPED LIST (2026-09-21, the review). The report
+ * is bounded at eight files and two hundred variables, and a list silently cut
+ * at a cap reads as the whole directory — so `filesTotal` and `varsTotal` (the
+ * numbers BEFORE the caps) go on the wire beside it and the app can say "N more
+ * not shown". Same rule `repoState` already keeps for branches and worktrees.
+ * Both are optional on the server, so an older server parsing only `files` is
+ * unaffected and needs no floor.
+ *
+ * NO VERSION FLOOR, and none is possible to need: it is a daemon→server report
+ * on a NEW endpoint, so an older server answers 404 once and is never asked
+ * again, and an older daemon simply never posts. The report's presence IS the
+ * capability.
+ *
+ * IT ALSO FEEDS THE SCRUBBER, on every scan and whether or not anything is
+ * posted (`scanEnvForScrub`). That is the half that must not be skipped: with
+ * the vault gone these files are what `scrub()` redacts out of turn streams,
+ * tool events, traces and deploy logs, and the dedup above is about the WIRE,
+ * never about what this box knows to hide.
+ */
+/**
+ * WHICH REFUSAL IS FINAL — pure, exported, and deliberately a SHORT list
+ * (2026-09-21, the review).
+ *
+ * The first cut treated EVERY 4xx as permanent, which quietly turned one bad
+ * minute into a dead lane for the life of the process. A 429 is a rate limit
+ * and says "later", not "never". A 401 or 403 during a credential blip — a
+ * rotation, a clock skew, a roster the box is momentarily not the holder of —
+ * is transient by construction. A 408 is a timeout wearing a 4xx. Every one of
+ * those stopped env reporting until somebody restarted the daemon, with NO
+ * sign anywhere that it had stopped: the report is deduped and silent by
+ * design, so "posted once and never again" is indistinguishable from "working
+ * normally on a box whose env has not changed". A lane that can die invisibly
+ * must not die for a reason that will pass.
+ *
+ * So permanent means exactly three things, and each of them is a fact about
+ * the REQUEST rather than about the moment: 404, the route does not exist (an
+ * older server — the `/fleet/agent-trace` precedent this lane is built on);
+ * 400 and 422, the server will never accept this shape. Retrying any of those
+ * forever is the daemon arguing with a decision already made.
+ *
+ * Pure and exported so the decision can be proved without a credential, a
+ * server or a poll — the same shape `shouldStop` and `createHolderWatch` keep
+ * below.
+ */
+export function envReportIsPermanent(status) {
+  return status === 400 || status === 404 || status === 422;
+}
+
+const ENV_REPORT_URL = FLEET_URL.replace(/\/agents\/?$/, '/env-report');
+const ENV_REPORT_SCAN_MS = 60_000;
+let envReportUnsupported = false; // the server refused permanently — quiet until restart
+let envReportScanAt = 0;
+let envReportSent = null; // the last report the server ACCEPTED, stringified
+/**
+ * Returns a one-word VERDICT — 'throttled' | 'scan-failed' | 'quiet' |
+ * 'deduped' | 'accepted' | 'retry' | 'stopped'. The daemon ignores it (the
+ * caller is a bare `void`); it exists so the lane's decisions can be driven
+ * against a real HTTP server in a test rather than pinned as source text. A
+ * readout whose only proof is that its source LOOKS right is the inert-pin
+ * class this repo has caught five times.
+ */
+export async function maybeReportEnv(repoRoot) {
+  if (Date.now() - envReportScanAt < ENV_REPORT_SCAN_MS) return 'throttled';
+  envReportScanAt = Date.now();
+  let report;
+  try {
+    // The SCAN happens even when the POST cannot — see the docblock: the
+    // scrubber has no dedup and must reflect the newest read every time.
+    report = scanEnvForScrub(repoRoot);
+  } catch {
+    return 'scan-failed'; // a readout must never throw into the poll loop
+  }
+  if (envReportUnsupported) return 'quiet';
+  const payload = JSON.stringify({
+    pubkey: myPubB64(),
+    files: report.files,
+    filesTotal: report.filesTotal,
+    varsTotal: report.varsTotal,
+  });
+  if (payload === envReportSent) return 'deduped';
+  try {
+    const res = await fetch(ENV_REPORT_URL, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${FLEET_TOKEN}`,
+        'User-Agent': USER_AGENT,
+        'Content-Type': 'application/json',
+      },
+      signal: AbortSignal.timeout(15_000),
+      body: payload,
+    });
+    // Only a refusal that cannot change stops the lane — see
+    // `envReportIsPermanent`. A 429 or a 401 during a credential blip is a
+    // "later", and treating it as a "never" killed env reporting for the life
+    // of the process with nothing anywhere saying so.
+    if (envReportIsPermanent(res.status)) {
+      envReportUnsupported = true;
+      return 'stopped';
+    }
+    // Only an ACCEPTED report counts, the rule `maybeReportRepoState` keeps:
+    // anything else forgets it so the next pass retries rather than
+    // dedup-suppressing a report nobody received.
+    envReportSent = res.ok ? payload : null;
+    return res.ok ? 'accepted' : 'retry';
+  } catch {
+    envReportSent = null;
+    return 'retry';
+  }
+}
+
+/**
  * A STOP COMMANDED BY FLOWVIANT, read off the roster poll.
  *
  * The daemon is a PULL client — the /fleet/stream socket is a one-way wake
@@ -686,12 +822,20 @@ export function agoLabel(ms) {
  *   · ABSENT        -> this server does not arbitrate machines. Behave exactly
  *                      as every daemon before 0.84.0 did — zero new paths.
  *   · mine: true    -> we are the machine. Announce it only if we have been
- *                      standing by, so an ordinary daemon prints nothing new.
- *   · mine: false   -> STAND BY. Keep polling quietly; the restricted roster
+ *                      inactive, so an ordinary daemon prints nothing new.
+ *   · mine: false   -> GO INACTIVE. Keep polling quietly; the restricted roster
  *                      serves us nothing, the auto-handover makes this box the
  *                      machine when the holder dies, and the app is where a
- *                      person moves it sooner. Never exit: a standby that quits
- *                      is a box somebody has to go and restart by hand.
+ *                      person moves it sooner. Never exit: an inactive box that
+ *                      quits is one somebody has to go and restart by hand.
+ *
+ * THE WORD A PERSON READS IS `inactive` (2026-09-21) — the owner replaced
+ * "standing by" outright: *"no, it can [be] inactive instead"*. The server's
+ * role enum says `inactive`, `flowviant machines` prints it, and so do the two
+ * sentences below. The STATE NAME returned here is still `'standby'`, and that
+ * is deliberate: it names the server's arbitration arm, it is what every gate
+ * in this file branches on, and renaming an identifier to match a copy change
+ * is how a rename becomes a behaviour change nobody reviewed.
  *
  * Printed ONCE PER DISTINCT HOLDER rather than per poll — a true sentence
  * restated every ten seconds is a scrolling console nobody reads, and the fact
@@ -790,9 +934,23 @@ export function createHolderWatch({ say = () => {} } = {}) {
         // would promise a handover on the one path where it is least likely to
         // be what happens. So the line relays the fact and points at the door,
         // which is the same door it always pointed at.
+        //
+        // THE WORD IS `inactive` (2026-09-21). It was "standing by" until the
+        // owner replaced it — asked whether a box should keep saying that, he
+        // answered *"no, it can [be] inactive instead"* — and the server's role
+        // enum moved in the same pass (`serving` / `inactive`, which is why
+        // `machines.mjs` no longer respells anything). A terminal saying one
+        // word about this box while the app says another about the same box is
+        // the confusion these readouts exist to end, so the two ends say the
+        // same thing.
+        //
+        // THE POINTER SURVIVES THE REWORD. The sentence still ends at the app's
+        // project settings rather than at "another machine is serving this
+        // project", which the line's first half has already said — restating it
+        // would spend the only clause the person can act on repeating a fact.
         say(
           `This project's machine is ${name ?? 'another machine'}${ago ? ` (heard ${ago} ago)` : ''}. ` +
-            "This one is standing by — move it here from the app's project settings."
+            "This one is inactive — move it here from the app's project settings."
         );
       }
       return 'standby';
@@ -806,6 +964,25 @@ export function createHolderWatch({ say = () => {} } = {}) {
 export function displacedTurnSentence(by) {
   const name = typeof by === 'string' && by.trim() ? by.trim().slice(0, 64) : 'another machine';
   return `The project's machine moved to ${name} while this turn was running.`;
+}
+
+/**
+ * …AND THE SENTENCE FOR THE OTHER WAY A BOX STOPS BEING THIS PROJECT'S
+ * MACHINE (2026-09-21): it was REMOVED in the app.
+ *
+ * Kept apart from the displaced one rather than generalised into "the machine
+ * is no longer this box", because the two are different facts and the person
+ * reading a stuck turn needs the one that happened. A move names where the work
+ * went and implies somebody will pick it up there; a removal names nothing,
+ * because there is nowhere for it to have gone. Guessing between them — or
+ * blurring them into one sentence that is true of both — is the product
+ * inventing a state.
+ *
+ * It takes NO name: there is no box that took over. The PROJECT is named on the
+ * console line instead, where it answers "removed from what".
+ */
+export function removedTurnSentence() {
+  return 'This machine was removed from the project in the app while this turn was running.';
 }
 
 /**
@@ -833,6 +1010,8 @@ export function displacedTurnSentence(by) {
  */
 export async function standDownDisplaced({
   by,
+  kind = 'moved',
+  project,
   settleAgentTurns,
   flushReports,
   teardown,
@@ -850,16 +1029,38 @@ export async function standDownDisplaced({
       }),
     ]);
   const name = typeof by === 'string' && by.trim() ? by.trim().slice(0, 64) : null;
+  /**
+   * TWO KINDS, ONE CHOREOGRAPHY (2026-09-21).
+   *
+   * `moved` is the original: another box took the machine, and it is the
+   * DEFAULT so the displaced call site reads exactly as it always did.
+   * `removed` is the project saying this box is not its machine at all any
+   * more — somebody pressed a button in the app — and the only thing that
+   * differs is the WORDS. Everything below this point is the same, and it must
+   * be: settle the turns first, flush the reports, tear down the detached
+   * children, keep the worktrees, exit 0.
+   *
+   * The sentences are picked HERE rather than passed in, so the two cannot
+   * drift and neither call site can invent a third.
+   */
+  const removed = kind === 'removed';
+  const projectName =
+    typeof project === 'string' && project.trim() ? project.trim().slice(0, 64) : 'this project';
   log.warn(
-    name
-      ? `this project's machine moved to ${name} — standing down.`
-      : "this project's machine moved to another box — standing down."
+    removed
+      ? `removed from ${projectName} in the app — stopping.`
+      : name
+        ? `this project's machine moved to ${name} — standing down.`
+        : "this project's machine moved to another box — standing down."
   );
   // FIRST, and awaited: an unsettled turn is the one thing here that no later
   // poll from anybody can fix — this process holds the only copy of the fact
   // that it was running.
   try {
-    await bounded(settleAgentTurns(displacedTurnSentence(by)), 10);
+    await bounded(
+      settleAgentTurns(removed ? removedTurnSentence() : displacedTurnSentence(by)),
+      10
+    );
   } catch {
     /* an unsettled turn expires server-side with words of its own */
   }
@@ -979,36 +1180,26 @@ export async function runFleetDaemon() {
 
   await preflight({ needGit: true });
 
-  // WARM THE ENV CACHE BEFORE THE FIRST POLL, not on the first roster tick.
-  // `handleRosterEnv` loads it, and `handleRosterEnv` runs AFTER
-  // `processWorkTurns` in the reconcile below — so on the first poll after a
-  // restart a brand-new session worktree was materialized against an EMPTY
-  // bundle, and then never revisited (creation-only, and `needSync` is false
-  // when the cache holds the version the server is already on). The turn ran
-  // with no secrets and nothing said so.
+  // FEED THE SCRUBBER BEFORE ANYTHING CAN POST, not on the first roster tick.
   //
-  // This is only possible since 0.55.0: the credential store knows which
-  // project this checkout is, so the cache — which is keyed by projectId — can
-  // be found before the server has named anything. A `--fleet`/env token names
-  // no project until the roster does, so it keeps the old lazy path.
-  // Best-effort throughout: a cache miss is the ordinary first-run state.
+  // What stood here warmed the VAULT's encrypted cache off the stored
+  // credential's projectId, so a worktree created on the first poll after a
+  // restart was not materialized against an empty bundle. The vault is deleted;
+  // the ordering lesson survives and applies to the one thing that replaced it.
+  // `scrub()` redacts the checkout's own `.env*` values out of everything this
+  // daemon posts, and a redactor that has not read yet redacts nothing — so the
+  // first read happens here, before the first poll, rather than on the 60s beat
+  // that keeps it current. A daemon that starts, immediately answers a turn and
+  // posts its stream must already know what to hide.
   //
-  // GATED ON THE STORE ACTUALLY BEING THE SOURCE. `--fleet` / `FLOWVIANT_FLEET`
-  // OVERRIDE the stored credential (config.mjs), but `CREDENTIAL` is resolved
-  // from the store regardless — so reading its projectId here would decrypt and
-  // materialize project A's cached secrets while this daemon is serving project
-  // B's token. That is the wrong project's plaintext in a worktree, which is
-  // the exact failure the repo binding exists to prevent, arriving by a
-  // different door. An external token names no project until the roster does,
-  // so it keeps the lazy path and loses nothing but one poll.
-  const externalToken =
-    process.argv.includes('--fleet') || Boolean(process.env.FLOWVIANT_FLEET);
-  if (!externalToken && CREDENTIAL?.entry?.projectId) {
-    try {
-      await loadCachedEnv(CREDENTIAL.entry.projectId);
-    } catch {
-      /* no cache, no keypair yet, unreadable home — the roster tick retries */
-    }
+  // Best-effort and unconditional: it reads files in a directory this process
+  // is already standing in, needs no credential and names no project, so the
+  // whole `--fleet`-overrides-the-store hazard the old warm had to reason
+  // about does not exist here.
+  try {
+    scanEnvForScrub(repoRoot);
+  } catch {
+    /* an unreadable checkout redacts nothing — the 60s beat retries */
   }
 
   // Kill any preview dev-server/tunnel groups a previously-crashed daemon left
@@ -1020,6 +1211,17 @@ export async function runFleetDaemon() {
   const repoKey = `${basename(repoRoot)}-${createHash('sha256').update(repoRoot).digest('hex').slice(0, 8)}`;
   const baseDir = join(homedir(), '.flowviant', 'worktrees', repoKey);
   mkdirSync(baseDir, { recursive: true });
+
+  // WHAT THE DELETED VAULT LEFT ON THIS DISK — once, here, because this is the
+  // first point at which both directories it wrote into are known. Deleting the
+  // code that writes a file does not delete the file: the encrypted
+  // `~/.flowviant/env-cache` and the PLAINTEXT `.env` files `materializeInto`
+  // put in every worktree survive the upgrade on every box that ever ran a
+  // daemon before this release. Only files carrying the vault's own header are
+  // removed — see vaultArtefacts.mjs for why "no marker, no delete" is
+  // absolute, and for the stated bound on the walk. Never throws, and silent
+  // unless it actually removed something.
+  sweepVaultArtefactsOnce({ roots: [repoRoot, baseDir], log: (m) => info(m) });
 
   // ONE CHECKOUT PER TASK, named after the task. Worktrees used to be
   // `agent-<agentId>` — a long-lived tree per lane, reset to base between
@@ -2230,6 +2432,45 @@ export async function runFleetDaemon() {
       return;
     }
     /**
+     * REMOVED FROM THE PROJECT IN THE APP — the second way this box stops being
+     * this project's machine, and it goes through the same door for the same
+     * reason (2026-09-21).
+     *
+     * IMMEDIATELY AFTER THE DISPLACEMENT, AND BEFORE THE VERSION SIGNAL, which
+     * is the ordering the stop and the displacement above both document:
+     * `handleVersionSignal` can RE-EXEC this process, and a box that was just
+     * removed coming back up wearing a newer version is the one outcome nobody
+     * asked for. The two removal-shaped signals sit together so a reader cannot
+     * find one without the other.
+     *
+     * THE KEY'S PRESENCE IS THE COMMAND, exactly as it is for a stop and a
+     * displacement: the server sends it only when it names THIS box and only
+     * inside its own window, so there is no TTL to re-evaluate here and no way
+     * for a relaunch to obey a removal aimed at somebody else.
+     *
+     * The choreography is identical — settle every in-flight turn, flush the
+     * queued reports, tear down the detached children, keep the worktrees,
+     * exit 0 — and only the sentences differ. Exit 0 for the reason every
+     * terminal path here states: this was ASKED FOR, so under
+     * `Restart=on-failure` a nonzero code would relaunch the daemon straight
+     * into being removed again.
+     */
+    if (roster.standDown && typeof roster.standDown === 'object' && !Array.isArray(roster.standDown)) {
+      await standDownDisplaced({
+        kind: 'removed',
+        // The project's NAME rather than the box that took over, because no box
+        // took over. Falls back to "this project" inside — an unnamed project
+        // says so rather than being guessed at.
+        project: roster.standDown.project ?? roster.project?.name,
+        settleAgentTurns,
+        flushReports: flushWorkReports,
+        teardown,
+        exit: (code) => process.exit(code),
+        log: { warn, note },
+      });
+      return;
+    }
+    /**
      * WHOSE MACHINE THIS IS. Absent = a server that does not arbitrate, and then
      * this is a no-op and the daemon behaves exactly as 0.83.0 did.
      *
@@ -2394,9 +2635,14 @@ export async function runFleetDaemon() {
     // there session turns, ships or unsettled reports in flight?
     if (!workBusy() && Date.now() - idleBeatAt > 60_000) {
       idleBeatAt = Date.now();
+      // `inactive`, the owner's own word for this state since 2026-09-21 — the
+      // same word the app's machines list and `flowviant machines` print for
+      // this box. The internal state is still called `standby` because it names
+      // the SERVER'S arbitration arm rather than anything a person reads; what
+      // a person reads is this sentence.
       info(
         holderState === 'standby'
-          ? 'standing by — another machine holds this project.'
+          ? 'inactive — another machine is serving this project.'
           : 'machine online — nothing running right now.'
       );
     }
@@ -2414,25 +2660,10 @@ export async function runFleetDaemon() {
     }
     void drainWiki();
 
-    // Env sync tick: register/bootstrap/wrap/rotate/sync as the roster block
-    // dictates (self-guarded — one operation at a time, errors retry next
-    // poll). A fresh bundle rematerializes every SESSION worktree this daemon
-    // holds — read off the sessions directory, the same fact retirement acts
-    // on; the wiki worktree NEVER gets env (the cartographer doesn't need
-    // secrets). This used to iterate the dispatch-era `workers` map, which
-    // nothing has ever `.set()`, so a rotation reached no worktree at all.
-    // Safe mid-turn by construction: materializeInto refuses to write anything
-    // git does not ignore, so it cannot dirty a tree and block a ship.
-    void handleRosterEnv(roster.env, { projectId: roster.project?.id }).then(({ changed }) => {
-      if (!changed) return;
-      for (const id of heldSessionIds()) {
-        try {
-          materializeInto(join(baseDir, 'sessions', id));
-        } catch {
-          /* best-effort */
-        }
-      }
-    });
+    // WHAT IS IN THIS BOX'S ENV, by name, on its own 60s beat. Never awaited,
+    // throttled and deduped inside, and silent forever on an older server.
+    // This is what replaced the vault's sync tick — see `maybeReportEnv`.
+    void maybeReportEnv(repoRoot);
 
     // Tell the app what this machine is doing with itself. Every reconcile,
     // best-effort, and never awaited — telemetry that can delay a dispatch is
@@ -2464,10 +2695,21 @@ export async function runFleetDaemon() {
       })
     );
 
-    // Deploy: a deploy-authorized daemon reports its .flowviant/deploy.json and
-    // runs queued deploy jobs (the server only sends deployJobs to authorized
-    // machines). Config report is cheap + dedup'd; jobs are single-flight.
-    if (roster.env?.deployAuthorized) {
+    // Deploy: a daemon on a project with deploy ALLOWED reports its
+    // .flowviant/deploy.json and runs queued deploy jobs (the server only sends
+    // deployJobs to such projects). Config report is cheap + dedup'd; jobs are
+    // single-flight.
+    //
+    // `roster.deployAllowed`, a top-level boolean the server sends only when
+    // TRUE — it used to be `roster.env.deployAuthorized`, read off the vault's
+    // own roster block. The fact never belonged there: since migration 0096 the
+    // answer comes from the PROJECT row (`projects.deploy_allowed`, owner-only,
+    // off by default), not from a per-device column on an enrolled daemon —
+    // "every device on a project shares one credential, so a boundary between
+    // them is not a boundary". The vault's block is gone; the switch is not, and
+    // this is where it now arrives. Absence reads as NOT allowed, which is the
+    // withholding direction and the right one for an irreversible act.
+    if (roster.deployAllowed) {
       // The BASE branch's copy, not the working tree's — see readDeployConfig.
       // Reporting the working tree would advertise targets the runner will not
       // find, which is the same lie in the other direction.

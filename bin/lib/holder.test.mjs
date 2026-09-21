@@ -30,6 +30,7 @@ import {
   agoLabel,
   createHolderWatch,
   displacedTurnSentence,
+  removedTurnSentence,
   standDownDisplaced,
 } from './fleet.mjs';
 import { MACHINE_HOST } from './config.mjs';
@@ -121,13 +122,23 @@ test('a standby says its sentence once per DISTINCT holder, and never per poll',
    */
   assert.equal(
     said[0],
-    "This project's machine is mac-mini (heard 34s ago). This one is standing by " +
+    "This project's machine is mac-mini (heard 34s ago). This one is inactive " +
       "— move it here from the app's project settings."
   );
   assert.ok(
     !/automatically|10 minutes/.test(said[0]),
     'a standby that was already refused a claim is promised nothing'
   );
+  /**
+   * AND THE WORD IS `inactive` (2026-09-21). The owner replaced "standing by"
+   * outright — asked whether a box should keep saying it, he answered *"no, it
+   * can [be] inactive instead"* — and the server's role enum moved in the same
+   * pass, which is why `machines.mjs` no longer respells anything. A terminal
+   * saying one word about this box while the app says another about the same
+   * box is the confusion these readouts exist to end, so the dead spelling is
+   * pinned as an ABSENCE: it passes every render test ever written against it.
+   */
+  assert.ok(!/standing by/.test(said[0]), 'the retired word must not come back');
   // A DIFFERENT box is news; the same one again is not.
   w.observe({ mine: false, name: 'studio', heardAgo: 60_000 });
   assert.equal(said.length, 2);
@@ -143,7 +154,7 @@ test('an unnamed holder gets the nameless fallback and still announces once', ()
   assert.equal(said.length, 1);
   assert.equal(
     said[0],
-    "This project's machine is another machine. This one is standing by " +
+    "This project's machine is another machine. This one is inactive " +
       "— move it here from the app's project settings."
   );
   assert.ok(!said[0].includes('heard'), 'an unmeasured duration drops the clause whole');
@@ -228,20 +239,120 @@ test('the stand-down runs to the end even when the wire is dead', async () => {
   );
 });
 
+/**
+ * THE SECOND WAY A BOX STOPS BEING THIS PROJECT'S MACHINE: IT WAS REMOVED IN
+ * THE APP (2026-09-21).
+ *
+ * One choreography, two sets of words. Everything a displaced box does —
+ * settle the turns it is holding, flush the queued reports, tear down the
+ * detached children, keep the worktrees, exit ZERO — is exactly what a removed
+ * box must do, because the reasons are identical: this process holds the only
+ * copy of the fact that those turns were running, a queued report is a
+ * COMPLETED turn whose side effects already happened, and a detached preview
+ * tunnel outlives this process by design.
+ *
+ * So the kind picks the SENTENCES and nothing else, and both are pinned here —
+ * a `kind` that silently fell through to the moved copy would tell somebody
+ * their machine went to a box that does not exist.
+ *
+ * `moved` is the DEFAULT, so the displaced call site is unchanged in meaning
+ * and the two tests above still describe the code they were written for.
+ */
+test('a removed box runs the same stand-down, says the removal, and exits 0', async () => {
+  const order = [];
+  const warned = [];
+  let code = 'never';
+  let sentence = null;
+  await standDownDisplaced({
+    kind: 'removed',
+    project: 'BRIF AI',
+    settleAgentTurns: async (s) => {
+      sentence = s;
+      order.push('settle');
+    },
+    flushReports: async () => order.push('flush'),
+    teardown: () => order.push('teardown'),
+    exit: (c) => {
+      order.push('exit');
+      code = c;
+    },
+    log: { warn: (m) => warned.push(m), note: () => {} },
+  });
+  assert.deepEqual(order, ['settle', 'flush', 'teardown', 'exit']);
+  assert.equal(code, 0, 'exit 0 — this was asked for, so Restart=on-failure must not relaunch it');
+  assert.equal(warned[0], 'removed from BRIF AI in the app — stopping.');
+  assert.equal(
+    sentence,
+    'This machine was removed from the project in the app while this turn was running.'
+  );
+  // IT NAMES NO BOX. A move can say where the work went; a removal cannot,
+  // because nowhere is where it went — and borrowing the move's sentence would
+  // point somebody at a machine that was never involved.
+  assert.ok(!sentence.includes('moved to'));
+});
+
+test('an unnamed project says "this project" rather than guessing at one', async () => {
+  const warned = [];
+  await standDownDisplaced({
+    kind: 'removed',
+    project: '   ',
+    settleAgentTurns: async () => {},
+    flushReports: async () => {},
+    teardown: () => {},
+    exit: () => {},
+    log: { warn: (m) => warned.push(m), note: () => {} },
+  });
+  assert.equal(warned[0], 'removed from this project in the app — stopping.');
+  // The sentence a turn is settled with carries no name at all, so there is
+  // nothing for an absent project to leave half-written.
+  assert.equal(
+    removedTurnSentence(),
+    'This machine was removed from the project in the app while this turn was running.'
+  );
+});
+
+test('kind defaults to moved, so the displaced call site is unchanged', async () => {
+  const warned = [];
+  let sentence = null;
+  await standDownDisplaced({
+    by: 'mac-mini',
+    settleAgentTurns: async (s) => {
+      sentence = s;
+    },
+    flushReports: async () => {},
+    teardown: () => {},
+    exit: () => {},
+    log: { warn: (m) => warned.push(m), note: () => {} },
+  });
+  assert.equal(warned[0], "this project's machine moved to mac-mini — standing down.");
+  assert.equal(sentence, displacedTurnSentence('mac-mini'));
+  // And an unrecognised kind is MOVED too rather than a third silent state.
+  assert.notEqual(removedTurnSentence(), displacedTurnSentence('mac-mini'));
+});
+
 // ── where it sits in the loop ────────────────────────────────────────────────
 
 test('the displacement is read before the version signal, and after the commanded stop', () => {
   const src = fleetSource();
   const stopAt = src.indexOf('const stopSignal = shouldStop(roster.daemon);');
   const displacedAt = src.indexOf('if (roster.displaced &&');
+  const removedAt = src.indexOf('if (roster.standDown &&');
   const updateAt = src.indexOf('const updating = handleVersionSignal({');
-  assert.ok(stopAt > -1 && displacedAt > -1 && updateAt > -1, 'all three anchors must exist');
+  assert.ok(
+    stopAt > -1 && displacedAt > -1 && removedAt > -1 && updateAt > -1,
+    'all four anchors must exist'
+  );
   // A stop was ASKED FOR by a person and outranks everything. A displacement
   // outranks the UPDATE for the reason the stop does: handleVersionSignal can
   // re-exec this process, and a box that has just been displaced coming back up
   // wearing a newer version is the one outcome nobody asked for.
   assert.ok(stopAt < displacedAt, 'a commanded stop outranks a displacement');
-  assert.ok(displacedAt < updateAt, 'standing down outranks re-execing into a new version');
+  // THE REMOVAL SITS WITH THE DISPLACEMENT, and for the same reason: it is the
+  // other way a box stops being this project's machine, and a box that was just
+  // removed coming back up wearing a newer version is the same bad outcome.
+  // Adjacent so a reader cannot find one without the other.
+  assert.ok(displacedAt < removedAt, 'the two removal-shaped signals sit together');
+  assert.ok(removedAt < updateAt, 'standing down outranks re-execing into a new version');
 });
 
 test('holdership is read in exactly one place, and gates nothing else in the loop', () => {
