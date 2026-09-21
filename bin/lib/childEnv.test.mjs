@@ -261,3 +261,24 @@ test('only names that are actually set appear, and never as empty strings', () =
     delete process.env.VERCEL_TOKEN;
   }
 });
+
+test('the renamed credential variable is stripped from children like the old one (2026-09-21)', async () => {
+  const { childEnv } = await import('./childEnv.mjs');
+  process.env.FLOWVIANT_MACHINE_TOKEN = 'machine-secret-value';
+  try {
+    const env = childEnv();
+    assert.equal(env.FLOWVIANT_MACHINE_TOKEN, undefined);
+  } finally {
+    delete process.env.FLOWVIANT_MACHINE_TOKEN;
+  }
+});
+
+test('config reads FLOWVIANT_MACHINE_TOKEN first and keeps FLOWVIANT_FLEET as the fallback', async () => {
+  const { readFileSync } = await import('node:fs');
+  const src = readFileSync(new URL('./config.mjs', import.meta.url), 'utf8');
+  const a = src.indexOf('export let FLEET_TOKEN =');
+  const b = src.indexOf("CREDENTIAL.entry?.fleetToken", a);
+  assert.ok(a >= 0 && b > a, 'both anchors present');
+  const slice = src.slice(a, b);
+  assert.ok(slice.indexOf('FLOWVIANT_MACHINE_TOKEN') < slice.indexOf('FLOWVIANT_FLEET'), 'new name wins, old name still read');
+});

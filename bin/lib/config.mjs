@@ -290,8 +290,20 @@ export const PROCESS_STARTED_AT = new Date(
 // ambiguous store with a picker, adoptStoredCredential updates every importer
 // before the daemon touches the network. Everything before that point (the
 // resolution, the flags) is settled synchronously at import, as it always was.
+// THE VARIABLE IS NAMED FOR WHAT IT IS (2026-09-21): `FLOWVIANT_MACHINE_TOKEN`.
+// The owner met `FLOWVIANT_FLEET=… npx flowviant` in the app's headless
+// credential panel and asked "what is flowviant fleet?" — a fair question,
+// because a FLEET was a pool of worker lanes deleted 2026-08-19 and the word
+// now names nothing a person can see. `FLOWVIANT_FLEET` stays as the fallback
+// forever: a CI runner somewhere may have it in its secrets, and a rename that
+// silently stops a headless box from authenticating is the substitution class
+// this codebase floors everything against.
 export let FLEET_TOKEN =
-  argFlag('--fleet') || process.env.FLOWVIANT_FLEET || CREDENTIAL.entry?.fleetToken || '';
+  argFlag('--fleet') ||
+  process.env.FLOWVIANT_MACHINE_TOKEN ||
+  process.env.FLOWVIANT_FLEET ||
+  CREDENTIAL.entry?.fleetToken ||
+  '';
 
 /**
  * WHICH PROJECT THIS DAEMON SERVES, or null when nothing on this box names one.

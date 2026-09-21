@@ -38,7 +38,7 @@ It shows a short code. Open your project's **Workbench** in Flowviant and enter 
 Prefer an explicit token? Create a machine credential in the app and pass it directly:
 
 ```bash
-FLOWVIANT_FLEET=fva_… npx flowviant@latest
+FLOWVIANT_MACHINE_TOKEN=fva_… npx flowviant@latest   # FLOWVIANT_FLEET still works
 ```
 
 Launch with `@latest` so each start pulls the newest published version — a bare `npx flowviant` can reuse a stale cache. A running daemon also keeps itself current: from **0.58.0** it restarts itself through `npx flowviant@latest` when a new version ships, so npx launches stay up to date the same way a global install does. (Before 0.58.0 that was only true of a global install — under npx the daemon printed a notice and stayed put, which is how machines ended up sitting several releases back.) It only ever restarts when no turn is running. `FLOWVIANT_NO_UPDATE=1` makes it nag-only; `flowviant update` updates now.
@@ -65,7 +65,7 @@ The daemon never executes anything the repository declares. An earlier version r
 
 | Env | What runs |
 | --- | --- |
-| _(stored login)_ or `FLOWVIANT_FLEET` | **the daemon** — the project's machine, serving its sessions |
+| _(stored login)_ or `FLOWVIANT_MACHINE_TOKEN` (`FLOWVIANT_FLEET` still read) | **the daemon** — the project's machine, serving its sessions |
 | `FLOWVIANT_SAFE=1` | restrict the toolset instead of running unattended |
 
 ## Not freezing the box

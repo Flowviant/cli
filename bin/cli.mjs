@@ -5,7 +5,7 @@
  *
  * ONE mode, one credential:
  *
- *   FLOWVIANT_FLEET=fva_…   npx flowviant@latest  # the machine daemon
+ *   FLOWVIANT_MACHINE_TOKEN=fva_…   npx flowviant@latest  # the machine daemon, headless
  *
  * `FLOWVIANT_TOKEN` (one worker, current checkout) and `FLOWVIANT_TOKENS` (a
  * comma list, one worktree each) stood beside it until 2026-08-19. Both ran the
@@ -46,7 +46,8 @@
  * because a daemon on another computer is invisible from here.
  *
  * Env:
- *   FLOWVIANT_FLEET     the machine credential (or use `flowviant login`).
+ *   FLOWVIANT_MACHINE_TOKEN  the machine credential (or use `flowviant login`);
+ *                        `FLOWVIANT_FLEET` is the old name and still works.
  *   FLOWVIANT_API_URL   default https://api.flowviant.com/api
  *   FLOWVIANT_MCP_URL   default <API_URL>/mcp
  *   FLOWVIANT_FLEET_URL default <API_URL>/fleet/agents
@@ -358,7 +359,10 @@ const interactive = canPrompt() && process.env.FLOWVIANT_REEXEC !== '1';
  *  asked). What was left was a person reading a list being told "no answer
  *  in 60s — nothing started". A prompt a person can see waits for the
  *  person; tty.mjs's header carries the argument. */
-const externalToken = process.argv.includes('--fleet') || Boolean(process.env.FLOWVIANT_FLEET);
+const externalToken =
+  process.argv.includes('--fleet') ||
+  Boolean(process.env.FLOWVIANT_MACHINE_TOKEN) ||
+  Boolean(process.env.FLOWVIANT_FLEET);
 
 /** Re-exec a plain `flowviant` after an inline login — the login command's own
  *  pattern: config.mjs read the store at IMPORT time, before the credential

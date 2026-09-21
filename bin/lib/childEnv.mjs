@@ -160,6 +160,7 @@ export function childEnv({ cwd, extra, deploy = false } = {}) {
  *  purpose: the default is what almost every caller gets, and the sample is
  *  about the default. */
 export const DROPPED_SAMPLE = [
+  'FLOWVIANT_MACHINE_TOKEN',
   'FLOWVIANT_FLEET',
   'FLOWVIANT_FLEET_URL',
   'FLOWVIANT_API_URL',
