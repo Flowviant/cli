@@ -212,6 +212,129 @@ test('returns null for anything that did not declare an outcome', async () => {
   assert.equal(parseTurnResult(JSON.stringify({ summary: 'did it' })), null);
 });
 
+/**
+ * THE AGENT'S RUNNING ACCOUNT OF THE BRANCH (2026-09-22, 0.93.0) — the key that
+ * must be OMITTED rather than emptied.
+ *
+ * The owner: "we should add a brief summary of what the agent has done overall
+ * at the top that updates." `progress` rides the settle body straight into a
+ * stored column, and the whole contract between the two halves is that an
+ * ABSENT key means "keep the last account that was true" — so a turn that did
+ * not write one must produce no key at all. An empty string would be
+ * indistinguishable, at the server, from an agent saying this branch now
+ * amounts to nothing, and it would blank the top of somebody's run because a
+ * model dropped a field.
+ *
+ * ON BOTH SHAPES, because a turn that stopped to ask has still done work.
+ */
+test('carries the running account, on a delivery and on a question alike', async () => {
+  const { parseTurnResult } = await import('./agentPlan.mjs');
+  const delivered = parseTurnResult(
+    JSON.stringify({
+      status: 'delivered',
+      summary: 'wired the route',
+      progress: '  Added the column and the route. Wired the head to read it.  ',
+    })
+  );
+  assert.equal(delivered.outcome, 'delivered');
+  // TRIMMED, so leading whitespace cannot survive into a paragraph rendered at
+  // the top of a page.
+  assert.equal(delivered.progress, 'Added the column and the route. Wired the head to read it.');
+  // …and the per-card summary is untouched beside it. They answer different
+  // questions — this card, versus the branch — and a reader of either must
+  // never be handed the other.
+  assert.equal(delivered.answer, 'wired the route');
+
+  const blocked = parseTurnResult(
+    JSON.stringify({
+      status: 'blocked',
+      question: 'which auth?',
+      progress: 'Read the two auth paths and changed nothing yet.',
+    })
+  );
+  assert.equal(blocked.outcome, 'question');
+  assert.equal(blocked.progress, 'Read the two auth paths and changed nothing yet.');
+});
+
+test('omits the key entirely when the turn wrote no account', async () => {
+  const { parseTurnResult } = await import('./agentPlan.mjs');
+  // AN OLDER PROMPT, a resumed conversation that never saw the key, or a model
+  // that simply dropped it. Each must leave the stored account standing.
+  const absent = parseTurnResult(JSON.stringify({ status: 'delivered', summary: 's' }));
+  assert.equal('progress' in absent, false);
+  // WHITESPACE IS NOT AN ACCOUNT, and neither is a non-string. `in` rather than
+  // a truthiness check, because `{ progress: '' }` would spread onto the settle
+  // body and reach the column.
+  for (const bad of ['', '   ', 42, null, { text: 'x' }, ['x']]) {
+    const out = parseTurnResult(JSON.stringify({ status: 'delivered', summary: 's', progress: bad }));
+    assert.equal('progress' in out, false, `progress must not survive ${JSON.stringify(bad)}`);
+  }
+  const q = parseTurnResult(JSON.stringify({ status: 'blocked', question: 'which?' }));
+  assert.equal('progress' in q, false);
+});
+
+/**
+ * THE PROMPT HAS TO ASK FOR IT ON BOTH SHAPES, or the parser above reads a key
+ * nothing was ever told to write.
+ *
+ * This is the half that is invisible when it breaks: drop `progress` out of the
+ * blocked example and every delivered turn still carries an account, so the
+ * feature looks like it works — and the one run where somebody most wants to
+ * know what has been done, the stalled one waiting on an answer, is the one
+ * that silently has nothing at the top of it.
+ */
+test('the work contract asks for the account on the delivered AND the blocked shape', async () => {
+  const { SYSTEM_AGENT } = await import('./prompts.mjs');
+  const shapes = SYSTEM_AGENT.split('```json')
+    .slice(1)
+    .map((b) => b.slice(0, b.indexOf('```')))
+    // The prose above the examples says "in a ```json fence:", which splits
+    // like an opener and holds no object. The shapes are the ones that do.
+    .filter((b) => b.trimStart().startsWith('{'));
+  assert.equal(shapes.length, 2, 'the contract draws exactly two shapes');
+  for (const shape of shapes) {
+    assert.ok(shape.includes('"progress"'), `every shape must ask for it: ${shape}`);
+  }
+  // Positive anchor on the pair, so a rename of one status cannot leave this
+  // asserting twice over the survivor.
+  assert.ok(shapes.some((b) => b.includes('"delivered"')));
+  assert.ok(shapes.some((b) => b.includes('"blocked"')));
+  // …and it must say what the account IS, or a model writes the card summary
+  // twice. The two things it has to state: it is cumulative across the branch,
+  // and it REPLACES rather than appends.
+  assert.match(SYSTEM_AGENT, /REPLACES the previous one whole/);
+  assert.match(SYSTEM_AGENT, /SO FAR/);
+});
+
+/**
+ * BOUNDED HERE, BUT ABOVE THE WIRE'S CUT — and the gap is the whole point
+ * (corrected 2026-09-22, in review).
+ *
+ * This parser used to slice to the wire's own 1000, which INVERTED the order
+ * `work.mjs` states it keeps: `envScrub` replaces EXACT values, so a paragraph
+ * cut at 1000 before the scrub ever sees it hands the scrub a credential cut in
+ * half — it matches nothing and the surviving prefix ships. The cap a reader
+ * SEES belongs after the scrub; what belongs here is the absurdity bound
+ * `summary` beside it already takes, so a model that answered with its whole
+ * transcript still cannot reach the caller unbounded.
+ *
+ * Both numbers are asserted, because a bound equal to the wire's cut is exactly
+ * the bug this replaced and reads identically on the happy path.
+ */
+test('bounds the account for absurdity, and leaves the display cap to the scrub', async () => {
+  const { parseTurnResult } = await import('./agentPlan.mjs');
+  const out = parseTurnResult(
+    JSON.stringify({ status: 'delivered', summary: 's', progress: 'x'.repeat(40_000) })
+  );
+  assert.equal(out.progress.length, 8000);
+  // A paragraph a person might actually get is untouched here — the cut that
+  // shortens it happens on the far side of `envScrub`, in `work.mjs`.
+  const long = parseTurnResult(
+    JSON.stringify({ status: 'delivered', summary: 's', progress: 'y'.repeat(4000) })
+  );
+  assert.equal(long.progress.length, 4000);
+});
+
 // A delivery buried after prose still counts — the turn ran and was paid for.
 test('finds the object after prose, and ignores a decoy brace', async () => {
   const { parseTurnResult } = await import('./agentPlan.mjs');

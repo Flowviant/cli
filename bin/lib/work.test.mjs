@@ -266,6 +266,62 @@ test('a wedged planning CLI is stopped inside the server\'s expiry, and the pres
   assert.ok(/ran past fifteen minutes on this machine/.test(plan));
 });
 
+/**
+ * THE AGENT'S RUNNING ACCOUNT RIDES THE ONE SETTLE THAT FOLLOWS A PARSED RESULT
+ * (2026-09-22, 0.93.0).
+ *
+ * WHY THIS IS A SOURCE PIN AND NOT A ROUND TRIP, stated because a source pin is
+ * the weaker instrument and this file already prefers the real wire everywhere
+ * it can reach it: the body under test is built only AFTER a CLI has run and
+ * produced a parseable final object, and this suite deliberately never spawns
+ * one — every agent-turn case here reaches the wire through `runtime: 'nope'`,
+ * which `canRun` refuses precisely so the tests do not depend on which CLIs
+ * happen to be installed on the box running them. Stubbing a `claude` onto PATH
+ * to reach this one line would make every case in this file hostage to that
+ * stub. The DECISION the pin covers — carried when present, key ABSENT when not
+ * — is exercised for real against `parseTurnResult` in `agentPlan.test.mjs`;
+ * what is left here is the wiring, which is exactly what a source pin can say.
+ *
+ * THREE CLAIMS, and each one fails silently if it goes:
+ *  · SPREAD, NOT ASSIGNED. `progress: res.progress` would put `undefined` on
+ *    the body — which `JSON.stringify` drops, so it would happen to work today
+ *    and would break the moment anything normalises the body. The contract is
+ *    that an absent key means KEEP, and a spread is what guarantees absence.
+ *  · SCRUBBED BEFORE IT IS CUT. `envScrub` replaces EXACT values, so a
+ *    paragraph sliced first hands the scrub a credential already cut in half:
+ *    it matches nothing and the surviving prefix ships. The check-output lane
+ *    learned this the expensive way and the pre-review relearned it in review.
+ *  · THE TWO `nothing` SETTLES CARRY NONE. They follow a turn that declared no
+ *    outcome at all — a signed-out CLI, a crash, a quota — so there is no
+ *    account to relay, and sending one would be the machine speaking for the
+ *    agent.
+ */
+test('an agent turn relays the account the agent wrote, and never invents one (0.93.0)', () => {
+  const src = workSource();
+  // The whole settle body for a parsed result, bounded at both ends.
+  const i = src.indexOf('const reply = await postAgentTurn({');
+  assert.ok(i > -1, 'the parsed-result settle must exist');
+  const j = src.indexOf('});', i);
+  assert.ok(j > i, 'the parsed-result settle must close');
+  const body = src.slice(i, j);
+  assert.ok(
+    body.includes("...(res.progress ? { progress: envScrub(res.progress).slice(0, 1000) } : {})"),
+    'the account must be spread conditionally, scrubbed before it is cut'
+  );
+
+  /**
+   * AND THE `nothing` SETTLES MUST NOT. Asserted over the region BEFORE the
+   * parsed-result settle, which is where both of them live — the limit park and
+   * the no-result backstop. A slice with both anchors checked, the standing
+   * rule: a pin over an empty slice passes over nothing.
+   */
+  const k = src.indexOf('const res = parseTurnResult(out);');
+  assert.ok(k > -1 && k < i, 'the parse must precede the settle it feeds');
+  const backstops = src.slice(k, i);
+  assert.ok(backstops.includes("outcome: 'nothing'"), 'both backstop settles live here');
+  assert.ok(!backstops.includes('progress'), 'a turn that declared nothing has no account to relay');
+});
+
 test('an agent turn re-measures its worktree when its CLI exits', () => {
   const turn = fnBody(workSource(), 'runAgentTurn');
   // Without this the branch diff, head sha and trailered commits an agent

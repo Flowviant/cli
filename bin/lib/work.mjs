@@ -5062,6 +5062,32 @@ export function createWorkManager({
         ...(commits.length ? { commits } : {}),
         ...(res.raised?.length ? { raised: res.raised } : {}),
         ...(usage ? { usage } : {}),
+        /**
+         * THE AGENT'S RUNNING ACCOUNT OF THIS BRANCH (2026-09-22).
+         *
+         * The owner: "we should add a brief summary of what the agent has done
+         * overall at the top that updates." A RELAY — the agent wrote it in its
+         * own final JSON object and nothing here composes, narrows or infers
+         * one. It rides only this settle, which is the one that follows a
+         * PARSED result: the two `nothing` settles above it come from a turn
+         * that declared no outcome at all, so there is no account to carry and
+         * inventing one would be the machine speaking for the agent.
+         *
+         * SCRUBBED BEFORE IT IS CUT, the order that matters and the one the
+         * check's output lane learned the expensive way: `envScrub` replaces
+         * EXACT values, so a paragraph capped first hands the scrub a
+         * credential already cut in half — it matches nothing and the surviving
+         * prefix ships. `parseTurnResult` trims it and bounds it for absurdity
+         * at 8000, DELIBERATELY above the 1000 below, so this slice is the
+         * first one a value of any interest meets and the scrub has already
+         * run when it does. The first cut of this feature bounded the parser at
+         * 1000 as well, which read identically and quietly put the cap first.
+         *
+         * OMITTED WHEN THE TURN DID NOT WRITE ONE, never sent empty. Absence is
+         * the server's signal to KEEP the last account that was true; an empty
+         * string would blank the head because a model dropped a key.
+         */
+        ...(res.progress ? { progress: envScrub(res.progress).slice(0, 1000) } : {}),
         branch,
         worktree: wt,
       });

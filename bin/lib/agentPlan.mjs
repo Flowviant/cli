@@ -158,6 +158,35 @@ export function parseProposal(text) {
 }
 
 /**
+ * The running account, off whichever shape the turn ended with — `{ progress }`
+ * or nothing at all.
+ *
+ * A SPREAD RATHER THAN A FIELD, so an absent account produces no key on the
+ * result and therefore no key on the settle body. That is the whole contract
+ * with the server: absence means KEEP the last account, and an empty string
+ * sent instead would be indistinguishable from an agent saying the branch now
+ * amounts to nothing.
+ *
+ * AN ABSURDITY BOUND HERE, NOT THE DISPLAY CAP (corrected 2026-09-22, in
+ * review). This sliced to the wire's own 1000 first, which quietly INVERTED the
+ * order the caller's own comment claims to keep: `envScrub` replaces EXACT
+ * values, so handing it a paragraph already cut at 1000 hands it a credential
+ * cut in half — it matches nothing and the surviving prefix ships. The scrub is
+ * the only thing standing between a model that pasted a secret into its own
+ * summary and the wire, and a cap must never run ahead of it. So this is the
+ * same absurdity bound `summary` takes one line up (8000): enough that nothing
+ * a model writes reaches the caller unbounded, far enough above the 1000 the
+ * wire cuts to that the scrub always sees whole values. `work.mjs` scrubs and
+ * THEN cuts to 1000, and the server clamps again because the wire never trusts
+ * a machine to have clamped.
+ */
+const MAX_PROGRESS = 8000;
+const progressOf = (v) => {
+  const t = typeof v.progress === 'string' ? v.progress.trim() : '';
+  return t ? { progress: t.slice(0, MAX_PROGRESS) } : {};
+};
+
+/**
  * READING AN AGENT'S ANSWER at the end of a turn.
  *
  * Same lenient-packaging / strict-shape rule as `parseProposal`, and the same
@@ -170,6 +199,28 @@ export function parseProposal(text) {
  * `nothing`, which sends the agent to Stuck. Optimistic status from a machine
  * that quit is the one lie this board cannot afford, so anything ambiguous ends
  * up here rather than being read as success.
+ *
+ * ── AND IT CARRIES THE AGENT'S RUNNING ACCOUNT OF ITSELF (2026-09-22) ─────
+ *
+ * The owner: "we should add a brief summary of what the agent has done overall
+ * at the top that updates." `progress` is one more key on the SAME object —
+ * two or three cumulative sentences about the whole branch, rewritten fresh
+ * every turn — and it is read here because this is where everything the agent
+ * SAYS is already read. Nothing derives it: this file parses, it does not
+ * summarise, and a daemon that read the turn log and wrote its own paragraph
+ * would be the second brain the product forbids.
+ *
+ * ON BOTH SHAPES, because a turn that stopped to ask has still done work — an
+ * agent that built three quarters of a feature and then needed a decision is
+ * exactly the run whose account a person wants. It is NOT read off an
+ * unparseable turn, and that is not an omission: there is no object to read it
+ * from, and a `nothing` outcome means the CLI never got as far as saying
+ * anything about itself.
+ *
+ * MISSING IS MISSING. An older prompt, a resumed conversation that never saw
+ * the key, a model that dropped it — all of them leave it absent, and the
+ * caller omits the field rather than sending an empty string, so the server
+ * keeps the last account that was true instead of blanking the head.
  */
 export function parseTurnResult(text) {
   for (const v of candidateObjects(String(text ?? ''))) {
@@ -179,12 +230,13 @@ export function parseTurnResult(text) {
       // parks an agent with nothing to reply to. Treated as `nothing`, which
       // at least says truthfully that the machine went quiet.
       if (!question) continue;
-      return { outcome: 'question', answer: question.slice(0, 8000) };
+      return { outcome: 'question', answer: question.slice(0, 8000), ...progressOf(v) };
     }
     if (v.status === 'delivered') {
       return {
         outcome: 'delivered',
         answer: (typeof v.summary === 'string' ? v.summary : '').slice(0, 8000),
+        ...progressOf(v),
         raised: Array.isArray(v.raised)
           ? v.raised
               .filter((r) => r && typeof r.title === 'string' && r.title.trim())

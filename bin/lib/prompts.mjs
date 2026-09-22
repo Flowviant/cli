@@ -777,6 +777,7 @@ END YOUR TURN WITH ONE JSON OBJECT AND NOTHING AFTER IT, in a \`\`\`json fence:
 {
   "status": "delivered",
   "summary": "one or two sentences on what you actually changed",
+  "progress": "two or three sentences on what you have done on this branch SO FAR, across every card",
   "raised": [{ "title": "short title", "brief": "what is wrong and what you did" }]
 }
 \`\`\`
@@ -786,13 +787,20 @@ or, if you are stopping to ask:
 \`\`\`json
 {
   "status": "blocked",
+  "progress": "two or three sentences on what you have done on this branch SO FAR, across every card",
   "question": "the specific thing you need decided, in one or two sentences"
 }
 \`\`\`
 
 "raised" is optional and only for work you did that was NOT this card. Do not
 list the card itself there. Do not put commit shas in the summary — they are
-read from git.`;
+read from git.
+
+"progress" is REQUIRED on both shapes. It is the running account a person reads
+at the top of this run, and it REPLACES the previous one whole — so write it
+fresh every turn, covering everything you have done on this branch so far and
+not only this card. Past tense, plain sentences, no commit shas and no card ids.
+"summary" is about this one card; "progress" is about the branch.`;
 
 /**
  * The turn itself.
