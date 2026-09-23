@@ -550,7 +550,7 @@ export const RUNTIMES = {
      * strongest form of it available anywhere: `--append-system-prompt` sits
      * above the conversation rather than inside it.
      */
-    args({ prompt, system, model, effort, resume, streamJson, perm, mcp = [], resultSchemaArgs = [], adoptResumeId, resumeThreadId }) {
+    args({ prompt, system, model, effort, resume, streamJson, perm, mcp = [], resultSchemaArgs = [], adoptResumeId, resumeThreadId, knowledgeDir }) {
       const a = [];
       // THREE ANSWERS TO ONE QUESTION — "what conversation is this?" — and they
       // are mutually exclusive, never combined.
@@ -581,6 +581,11 @@ export const RUNTIMES = {
       a.push('--model', model || MODEL);
       if (effort) a.push('--effort', effort);
       if (streamJson) a.push('--output-format', 'stream-json', '--verbose');
+      // The knowledge library (0.94.0) sits in the checkout, outside a
+      // worktree's cwd: named as a readable directory so a curated profile
+      // does not refuse the path the prompt just handed it. Before `perm`,
+      // because `--allowedTools` is variadic and would swallow the flag.
+      if (knowledgeDir) a.push('--add-dir', knowledgeDir);
       a.push(...perm);
       return a;
     },

@@ -81,7 +81,10 @@ import {
   AGENT_TASK_SPEC,
   AGENT_HUMAN_KICKOFF,
   AGENT_PRECHECK_KICKOFF,
+  withProjectContext,
 } from './prompts.mjs';
+import { knowledgeDirFor, FLOWVIANT_OWN_PATHS } from './knowledge.mjs';
+import { createArtifactReporter, snapshotArtifacts } from './artifacts.mjs';
 import { myPubB64, scrub as envScrub } from './env.mjs';
 import {
   detectRuntimes,
@@ -194,6 +197,15 @@ export function createWorkManager({
    * a hole in it.
    */
   extraLiveTurns = () => 0,
+  /**
+   * DOES THE SERVER TAKE ARTIFACTS (2026-09-22)? The roster's
+   * `artifactsAccepted`, read at SPAWN like the knowledge directory is, so the
+   * first turn after a server deploy already carries the paragraph. A getter
+   * for `getBaseRef`'s reason: the answer is the latest poll's, not startup's.
+   * Absent (false) is what an older server says, and then no turn is told
+   * about a panel that server cannot draw.
+   */
+  getArtifactsAccepted = () => false,
 }) {
   /**
    * WHERE SHIP LANDS, read fresh every time rather than captured at startup.
@@ -235,6 +247,37 @@ export function createWorkManager({
   // that can move origin/<base>: the sweep's fetch, a ship's push, a PR merge
   // this daemon performed. See landed.mjs for the seeding and delivery rules.
   const landed = createLandedObserver({ repoRoot, baseRef });
+  /**
+   * THE ARTIFACT RELAY (2026-09-22, 0.94.0) — what a turn wrote under
+   * `.flowviant/artifacts/`, uploaded after it. One reporter for the life of
+   * the manager so its held bodies survive from one beat to the next; see
+   * artifacts.mjs for the snapshot rule, the bounds and the delivery shape.
+   */
+  const artifacts = createArtifactReporter({
+    fleetUrl: FLEET_URL,
+    token: FLEET_TOKEN,
+    userAgent: USER_AGENT,
+    scrub: envScrub,
+    log: (line) => warn(line),
+  });
+  /**
+   * Snapshot a place's artifact directory before a CLI spawns in it — and make
+   * sure git cannot see what this daemon writes under `.flowviant/` there
+   * first (`FLOWVIANT_OWN_PATHS` — never the whole directory, whose
+   * `check.json` and `deploy.json` are the repo's own). The exclude was only ever
+   * written by an attachment fetch or a knowledge sync, so a turn that wrote
+   * an artifact in a worktree neither had touched left an untracked
+   * `.flowviant/` for the agent's own `git add -A` to commit. Idempotent, and
+   * one call covers every worktree (it resolves `--git-common-dir`).
+   */
+  const beforeArtifacts = (placeDir) => {
+    try {
+      excludeInWorktree(placeDir, FLOWVIANT_OWN_PATHS);
+    } catch {
+      /* a convenience, never a guarantee — the prompt also says never commit */
+    }
+    return snapshotArtifacts(placeDir);
+  };
   const workAnswering = new Set(); // turn ids currently queued/running here
   const workAttempts = new Map(); // turn id -> completed runTurn attempts
   const MAX_WORK_TRIES = 3;
@@ -2074,8 +2117,11 @@ export function createWorkManager({
     // mechanism the materialized env files used until the vault was deleted —
     // the exclude file git actually reads (git.mjs, where the helper moved when
     // env.mjs shrank), which already skips lines it has written before, so
-    // calling it per fetch is idempotent.
-    excludeInWorktree(wt, ['.flowviant/']);
+    // calling it per fetch is idempotent. NARROWED 2026-09-23 to the paths
+    // this daemon writes (`FLOWVIANT_OWN_PATHS`, knowledge.mjs says why): the
+    // whole-directory line also hid a repo's own new `.flowviant/check.json`
+    // from its agent's `git add -A`.
+    excludeInWorktree(wt, FLOWVIANT_OWN_PATHS);
     const written = [];
     for (const a of attachments.slice(0, 8)) {
       if (!a?.id || typeof a.id !== 'string' || !/^[0-9a-f-]{8,64}$/i.test(a.id)) continue;
@@ -2109,6 +2155,9 @@ export function createWorkManager({
 
   let flushingReports = false;
   const flushWorkReports = async () => {
+    // Held artifact uploads ride this beat too — the settle retry's own shape —
+    // and are never awaited: a readout's retry must not hold a settle's.
+    void artifacts.retryPending().catch(() => {});
     if (flushingReports) return;
     if (pendingWorkReports.size === 0 && pendingShipReports.size === 0) return;
     flushingReports = true;
@@ -2887,6 +2936,10 @@ export function createWorkManager({
       sessionPlaces.set(job.sessionId, place);
       // A READER: other turns in this place run alongside it. See `inPlace`.
       inPlace(place, false, async () => {
+        /** This turn's artifact snapshot — set once the place is resolved and
+         *  a CLI is about to spawn there; read in the `finally`. Null on every
+         *  path that never ran a CLI, which is exactly when nothing is new. */
+        let artifactScan = null;
         try {
           const tries = workAttempts.get(job.id) ?? 0;
           if (tries >= MAX_WORK_TRIES) {
@@ -3028,6 +3081,10 @@ export function createWorkManager({
           // which is what every tab ran on until now) — honored by
           // sessionRuntime: on a first turn a named runtime IS the pick, and a
           // named runtime that disagrees with the pin settles below.
+          // What the artifact directory held BEFORE this turn — the capture chat
+          // excepted: it runs read-only, is never told about artifacts, and
+          // whatever sibling tabs wrote in this shared place is theirs.
+          if (job.capture !== true) artifactScan = { dir: dir.wt, before: beforeArtifacts(dir.wt) };
           const rt = sessionRuntime(dir.wt, job.runtime || null, job.sessionId);
           if (rt.mismatch) {
             // Something upstream changed this tab's identity mid-life. A held
@@ -3396,7 +3453,25 @@ export function createWorkManager({
               // speaks once, the fork lives natively here and turn 2+ is the
               // ordinary --continue resume path, unchanged.
               ...(adopting ? { adoptResumeId: job.adopt.id } : {}),
-              system: plainTab ? SYSTEM_WORK_PLAIN : captureTab ? SYSTEM_CAPTURE : SYSTEM_WORK,
+              // THE PROJECT'S KNOWLEDGE LIBRARY (0.94.0) rides as one appended
+              // paragraph, and only while this box holds one — see
+              // `withProjectContext`. Resolved at spawn, not at startup, so a
+              // library that synced a second ago is in THIS turn.
+              ...(() => {
+                const knowledgeDir = knowledgeDirFor(repoRoot);
+                return {
+                  system: withProjectContext(
+                    plainTab ? SYSTEM_WORK_PLAIN : captureTab ? SYSTEM_CAPTURE : SYSTEM_WORK,
+                    // ARTIFACTS (0.94.0): every tab but the read-only capture
+                    // chat, and only while the server can show one.
+                    { knowledgeDir, artifacts: !captureTab && getArtifactsAccepted() }
+                  ),
+                  // The directory is OUTSIDE a worktree's cwd; Claude Code is
+                  // told it may read there (`--add-dir`) rather than left to
+                  // refuse a read-only capture turn a path it was just handed.
+                  knowledgeDir,
+                };
+              })(),
               // Present only when the tab named one — see brainFor.
               ...brain,
               // The tab watches the CLI work. Claude needs the flag to speak
@@ -3633,6 +3708,19 @@ export function createWorkManager({
           // would delay the next turn of that tab behind a readout.
           void reportPlaceWorktrees(job.sessionId).catch(() => {});
           burstListeners(job.sessionId);
+          // …and relay what it wrote to SHOW its owner (2026-09-22) — the same
+          // beat, the same reason it is not awaited. A failed turn's half-drawn
+          // page is still what the turn left, and the tab should see it.
+          if (artifactScan) {
+            void artifacts
+              .report({
+                placeDir: artifactScan.dir,
+                before: artifactScan.before,
+                sessionId: job.sessionId,
+                turnId: job.id,
+              })
+              .catch(() => {});
+          }
         }
       });
     }
@@ -4891,6 +4979,9 @@ export function createWorkManager({
        * what makes `...(usage ? … : {})` the whole guard.
        */
       let usage = null;
+      /** The agent's artifact directory as it stood before this turn — the
+       *  tab lane's rule, in the agent's own worktree (2026-09-22). */
+      const artifactsBefore = beforeArtifacts(wt);
       try {
         out = await runTurn({
           prompt:
@@ -4909,7 +5000,16 @@ export function createWorkManager({
                   position: job.position ?? 1,
                   total: job.total ?? 1,
                 }),
-          system: SYSTEM_AGENT,
+          // The knowledge paragraph, when this box holds a library — the same
+          // composer the tabs use, so an agent and a tab can never be told two
+          // different things about the same directory.
+          system: withProjectContext(SYSTEM_AGENT, {
+            knowledgeDir: knowledgeDirFor(repoRoot),
+            // ARTIFACTS (0.94.0), while the server can show one — an agent's
+            // land on its page, under the facts row.
+            artifacts: getArtifactsAccepted(),
+          }),
+          knowledgeDir: knowledgeDirFor(repoRoot),
           cwd: wt,
           runtime: rt,
           resume,
@@ -5008,6 +5108,12 @@ export function createWorkManager({
          * floor: it must never delay the settle behind it.
          */
         void reportSessionWorktree(place).catch(() => {});
+        // …and what it drew to SHOW the person (2026-09-22): uploaded against
+        // the AGENT, so it lands on the agent's page whoever is looking.
+        // Fire-and-forget for the same reason — never delay the settle.
+        void artifacts
+          .report({ placeDir: wt, before: artifactsBefore, agentId, turnId })
+          .catch(() => {});
       }
 
       const commits = commitsBetween(wt, before);

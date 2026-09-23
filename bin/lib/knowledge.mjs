@@ -1,0 +1,531 @@
+/**
+ * PROJECT KNOWLEDGE, daemon side (2026-09-22, 0.94.0) — the library a person
+ * keeps for their own Claude, materialised where a CLI can read it.
+ *
+ * The owner asked whether the Workbench could be "a clone of claude projects":
+ * files uploaded once and a standing Instructions text, read by every turn on
+ * the project. The server holds the bytes; the roster carries a MANIFEST
+ * (`knowledge: { rev, instructions, files: [{ id, name, bytes, sha256 }] }`);
+ * this module makes `<checkout>/.flowviant/knowledge/` match it, and the turn
+ * prompts name that directory. Nothing here reads a file's CONTENTS for any
+ * purpose but writing it — the only brain is the CLI, reading off a disk.
+ *
+ * ── ONE COPY PER BOX, IN THE CHECKOUT ──
+ *
+ * Not per worktree. Every session, capture and agent turn on this box runs in
+ * some directory under the same user, and every one of them can read an
+ * ABSOLUTE path; a copy per worktree would be a copy per agent, fifty megabytes
+ * times however many agents are open, and N copies that can each go stale on
+ * their own. The prompt hands the absolute path.
+ *
+ * It is never committed: its paths (`FLOWVIANT_OWN_PATHS` — never the whole
+ * `.flowviant/`, 2026-09-23) are written to the exclude file git actually
+ * reads (`excludeInWorktree`, which resolves `--git-common-dir`, so one call
+ * covers the checkout and every linked worktree alike). An untracked
+ * `.flowviant/` in the checkout would make the operator's own `git status`
+ * dirty and, for a tab standing in the checkout, show the library in the
+ * rail's diffstat as session changes.
+ *
+ * ── THE THREE STATES OF THE ROSTER KEY ──
+ *
+ *   ABSENT — an older server, a project that never had knowledge, or a daemon
+ *     below the floor (it never sees this code). LEAVE THE DIRECTORY ALONE. An
+ *     absence is what an older server says on every poll; letting it mean
+ *     "delete the library" would wipe it on a server rollback.
+ *   `{ rev, files: [], instructions: null }` — the project HAD knowledge and
+ *     the person emptied it. The server sends this for as long as the
+ *     project's rev is above zero (forever after the first write), so emptying
+ *     is SAID, never inferred. The directory is removed, and with it the
+ *     prompt paragraph — which is rendered only while the directory exists.
+ *   non-empty — sync to it.
+ *
+ * ── WHAT A SYNC DOES ──
+ *
+ * When `rev` differs from the last one materialised (held in memory AND in a
+ * marker file beside the directory, so a restart does not re-sync a library
+ * that is already on disk): download each file whose sha256 differs from the
+ * local copy — a local copy somebody edited by hand is restored, because the
+ * library is the server's and the directory is its mirror; delete every
+ * regular file the manifest no longer names; write or remove INSTRUCTIONS.md.
+ *
+ * A FAILED DOWNLOAD DOES NOT ADVANCE THE REV. The next poll tries again — but
+ * only the files that still differ, and on a widening backoff, so a server
+ * that 500s one file cannot make this box re-download fifty megabytes every
+ * ten seconds. A file refused on SIZE is not a failure to retry: it is
+ * permanent for that rev, skipped with a warning, and the rest of the library
+ * is written.
+ */
+
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
+import { createHash } from 'node:crypto';
+import { join } from 'node:path';
+
+/** Relative to the checkout, under `.flowviant/` beside the turn uploads and
+ *  the artifacts — see `FLOWVIANT_OWN_PATHS` for why that is NOT one exclude
+ *  line covering all three. */
+export const KNOWLEDGE_DIR = '.flowviant/knowledge';
+
+/**
+ * THE PATHS UNDER `.flowviant/` THAT ARE OURS, and the exclude file names these
+ * and nothing wider (2026-09-23).
+ *
+ * The first cut excluded `/.flowviant/` whole, from every place a turn spawns
+ * in — the attachment fetch's line, which until this release was written only
+ * in repos somebody had attached a file in. But `.flowviant/` is not only ours:
+ * the repo DECLARES `.flowviant/check.json` and `.flowviant/deploy.json` there,
+ * committed like any other file. An exclude line never hides a TRACKED file,
+ * so an existing one was safe — and a NEW one was not: an agent asked to "add a
+ * check command" writes `.flowviant/check.json`, its `git add -A` skips it as
+ * ignored, the commit lands without it, and `git status` shows nothing to
+ * explain why. Writing that line into every worktree on every turn would have
+ * made the product's own configuration uncommittable by the product's own
+ * agents. So the exclude names the four things this daemon writes there, and a
+ * repo's own `.flowviant/*.json` stays ordinary, committable work.
+ *
+ * (A repo that already carries the old `/.flowviant/` line keeps it — it is in
+ * the user's own exclude file, and removing a line we cannot prove we alone
+ * wrote is not ours to do.)
+ */
+export const FLOWVIANT_OWN_PATHS = [
+  '.flowviant/knowledge/',
+  '.flowviant/knowledge.rev*',
+  '.flowviant/artifacts/',
+  '.flowviant/uploads/',
+];
+/** The person's standing brief, written from the manifest's `instructions`.
+ *  A RESERVED name: a library FILE called this gets a suffix, because the
+ *  prompt tells the CLI to read this one first and a stranger's file must
+ *  never be able to stand in for the person's own words. */
+export const INSTRUCTIONS_FILE = 'INSTRUCTIONS.md';
+/** The rev last materialised — OUTSIDE the directory the prompt hands the CLI,
+ *  so the agent listing its library sees only the library. */
+const MARKER = '.flowviant/knowledge.rev';
+/** The server's per-file ceiling (`KNOWLEDGE_FILE_MAX_BYTES`), re-checked here:
+ *  this is somebody's disk, and one place checking is one deploy away from
+ *  zero places — the attachment fetch's own rule. */
+export const KNOWLEDGE_FILE_MAX_BYTES = 10 * 1024 * 1024;
+/** The manifest is capped at the server (25 files); a manifest longer than
+ *  this is not one the product produced, and is cut rather than trusted. */
+const MAX_FILES = 64;
+
+/**
+ * `safeUploadName`, verbatim in effect (work.mjs): keeps the extension, drops
+ * every path separator, never starts with a dot or a dash. Re-applied here
+ * although the server did it, because this string becomes a path on this box.
+ */
+export function safeKnowledgeName(raw) {
+  const base = String(raw ?? '')
+    .split(/[\\/]/)
+    .pop()
+    .replace(/[^A-Za-z0-9._-]/g, '_')
+    .replace(/^[.-]+/, '')
+    .slice(0, 80);
+  return base || 'file';
+}
+
+/**
+ * The LOCAL name each manifest entry is written under, in manifest order.
+ * Collisions get a numeric suffix (`spec.md`, `spec-2.md`) — two files a
+ * person uploaded with one name are two files, and silently writing one over
+ * the other loses one. Deterministic in the manifest's order, so the same
+ * manifest always yields the same names and a re-sync never renames a file.
+ * `INSTRUCTIONS.md` is reserved (compared case-insensitively — macOS and
+ * Windows disks are).
+ */
+export function planKnowledgeNames(files) {
+  const taken = new Set([INSTRUCTIONS_FILE.toLowerCase()]);
+  const out = [];
+  for (const f of files) {
+    const name = safeKnowledgeName(f.name);
+    const dot = name.lastIndexOf('.');
+    const stem = dot > 0 ? name.slice(0, dot) : name;
+    const ext = dot > 0 ? name.slice(dot) : '';
+    let candidate = name;
+    for (let n = 2; taken.has(candidate.toLowerCase()); n++) candidate = `${stem}-${n}${ext}`;
+    taken.add(candidate.toLowerCase());
+    out.push({ ...f, local: candidate });
+  }
+  return out;
+}
+
+const sha256Of = (buf) => createHash('sha256').update(buf).digest('hex');
+
+/** A regular file's sha256, or null for anything else (missing, a directory, a
+ *  symlink — a symlink is never followed, so it is never "the same file"). */
+function localSha(path) {
+  try {
+    const st = lstatSync(path);
+    if (!st.isFile()) return null;
+    return sha256Of(readFileSync(path));
+  } catch {
+    return null;
+  }
+}
+
+/** Write through a temp name and rename, so a CLI reading the library mid-sync
+ *  sees the old file or the new one, never half of one. Anything already at
+ *  the path that is NOT a regular file (a symlink planted there) is removed
+ *  first — `writeFileSync` would otherwise follow it and write wherever it
+ *  pointed. */
+function writeAtomic(path, data) {
+  try {
+    const st = lstatSync(path);
+    if (!st.isFile()) rmSync(path, { recursive: true, force: true });
+  } catch {
+    /* absent — the ordinary case */
+  }
+  const tmp = `${path}.fvtmp`;
+  // THE TEMP NAME IS CHECKED TOO (2026-09-23). The first cut guarded the
+  // destination and then wrote straight through `<name>.fvtmp` — a link planted
+  // THERE would have been followed, the library's bytes written wherever it
+  // pointed, and the link renamed into place. Unlinked first, then created
+  // EXCLUSIVELY (`wx`): if anything reappears at the name between the two, the
+  // write throws into the caller's catch rather than following it.
+  rmSync(tmp, { recursive: true, force: true });
+  writeFileSync(tmp, data, { flag: 'wx' });
+  renameSync(tmp, path);
+}
+
+/**
+ * Is `<checkout>/.flowviant` a real directory, or absent? Anything else — a
+ * symlink, a regular file — REFUSES the sync rather than being touched.
+ *
+ * `.flowviant/` is not only ours: a repo declares `.flowviant/check.json` and
+ * `.flowviant/deploy.json` there, and an operator may have arranged it however
+ * they like. Deleting a file or a link at that path to make room for a library
+ * would be Flowviant destroying something it did not create; following a link
+ * would land downloads, and the emptied library's `rm -r`, wherever it points.
+ * So the parent is checked, never repaired.
+ */
+function flowviantDirOk(checkoutDir) {
+  try {
+    const st = lstatSync(join(checkoutDir, '.flowviant'));
+    return st.isDirectory() && !st.isSymbolicLink();
+  } catch {
+    return true; // absent — ours to create
+  }
+}
+
+/** The library directory, as a real directory. The PARENT is checked by the
+ *  caller; the library path itself is OURS, so a symlink or a file planted
+ *  there is removed (unlinked — the link, never its target) rather than
+ *  followed. */
+function ensureDir(checkoutDir) {
+  const dir = join(checkoutDir, KNOWLEDGE_DIR);
+  try {
+    const st = lstatSync(dir);
+    if (st.isSymbolicLink() || !st.isDirectory()) unlinkSync(dir);
+  } catch {
+    /* absent */
+  }
+  mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+export function readKnowledgeMarker(checkoutDir) {
+  try {
+    const n = Number(readFileSync(join(checkoutDir, MARKER), 'utf8').trim());
+    return Number.isInteger(n) && n >= 0 ? n : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeKnowledgeMarker(checkoutDir, rev) {
+  try {
+    mkdirSync(join(checkoutDir, '.flowviant'), { recursive: true });
+    writeAtomic(join(checkoutDir, MARKER), `${rev}\n`);
+  } catch {
+    /* a lost marker costs one re-sync after a restart — every file already on
+       disk matches by sha and is not downloaded again */
+  }
+}
+
+/** Does this manifest look like one the server produced? Anything else is
+ *  ignored whole rather than half-applied. */
+export function isKnowledgeManifest(k) {
+  return (
+    !!k &&
+    typeof k === 'object' &&
+    Number.isInteger(k.rev) &&
+    k.rev >= 0 &&
+    (k.instructions === null || k.instructions === undefined || typeof k.instructions === 'string') &&
+    Array.isArray(k.files)
+  );
+}
+
+/**
+ * Make `<checkoutDir>/.flowviant/knowledge/` match `manifest`.
+ *
+ * `fetchFile(id)` returns the file's bytes as a Buffer, or throws. Injected so
+ * the sync is testable against a temp directory and a fake server; the daemon
+ * hands the `/fleet/knowledge/:id` fetch.
+ *
+ * @returns {{ ok: boolean, wrote: string[], removed: string[], refused: string[], failed: string[] }}
+ *   `ok` is false when any download FAILED (to be retried); a file REFUSED for
+ *   size is permanent for this rev and does not clear `ok`.
+ */
+export async function syncKnowledge({ checkoutDir, manifest, fetchFile, maxBytes = KNOWLEDGE_FILE_MAX_BYTES }) {
+  const result = { ok: true, wrote: [], removed: [], refused: [], failed: [] };
+  const dirPath = join(checkoutDir, KNOWLEDGE_DIR);
+  const files = (manifest.files ?? [])
+    .filter((f) => f && typeof f.id === 'string' && /^[0-9a-f-]{8,64}$/i.test(f.id))
+    .slice(0, MAX_FILES);
+  const instructions =
+    typeof manifest.instructions === 'string' && manifest.instructions.trim()
+      ? manifest.instructions
+      : null;
+
+  if (!flowviantDirOk(checkoutDir)) {
+    // Not a failure to retry every poll — nothing changes until a person
+    // changes it — but not a success either: the rev must not advance over a
+    // library that was never written.
+    result.ok = false;
+    result.failed.push('.flowviant (not a directory — left untouched)');
+    return result;
+  }
+
+  // EMPTIED: the directory goes, and the prompt paragraph with it.
+  if (files.length === 0 && !instructions) {
+    if (existsSync(dirPath)) {
+      try {
+        const st = lstatSync(dirPath);
+        if (st.isSymbolicLink()) unlinkSync(dirPath);
+        else rmSync(dirPath, { recursive: true, force: true });
+        result.removed.push(KNOWLEDGE_DIR);
+      } catch {
+        result.ok = false;
+      }
+    }
+    return result;
+  }
+
+  const dir = ensureDir(checkoutDir);
+  const planned = planKnowledgeNames(files);
+  const keep = new Set(planned.map((p) => p.local));
+  if (instructions) keep.add(INSTRUCTIONS_FILE);
+
+  for (const f of planned) {
+    const path = join(dir, f.local);
+    if (Number(f.bytes) > maxBytes) {
+      // Permanent for this rev, and NOT a reason to delete the rest. Any stale
+      // local copy under this name goes, because it is not the file the
+      // manifest now names.
+      result.refused.push(f.local);
+      keep.delete(f.local);
+      continue;
+    }
+    if (typeof f.sha256 === 'string' && localSha(path) === f.sha256.toLowerCase()) continue;
+    try {
+      const buf = await fetchFile(f.id);
+      if (!Buffer.isBuffer(buf) || buf.byteLength > maxBytes) {
+        result.refused.push(f.local);
+        keep.delete(f.local);
+        continue;
+      }
+      // The bytes must BE the file the manifest names. A mismatch is a
+      // failure to retry, never a file to trust.
+      if (typeof f.sha256 === 'string' && sha256Of(buf) !== f.sha256.toLowerCase()) {
+        throw new Error('sha256 mismatch');
+      }
+      writeAtomic(path, buf);
+      result.wrote.push(f.local);
+    } catch {
+      result.ok = false;
+      result.failed.push(f.local);
+      // Keep whatever copy is there: a stale file is better than a missing one
+      // until the retry lands.
+    }
+  }
+
+  if (instructions) {
+    const path = join(dir, INSTRUCTIONS_FILE);
+    const body = instructions.endsWith('\n') ? instructions : `${instructions}\n`;
+    let same = false;
+    try {
+      same = lstatSync(path).isFile() && readFileSync(path, 'utf8') === body;
+    } catch {
+      /* absent */
+    }
+    if (!same) {
+      writeAtomic(path, body);
+      result.wrote.push(INSTRUCTIONS_FILE);
+    }
+  }
+
+  // Everything the manifest no longer names — files, stray temp names, and
+  // anything that is not a regular file — leaves.
+  let entries = [];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    entries = [];
+  }
+  for (const name of entries) {
+    if (keep.has(name)) continue;
+    try {
+      rmSync(join(dir, name), { recursive: true, force: true });
+      result.removed.push(name);
+    } catch {
+      /* best-effort; the next sync tries again */
+    }
+  }
+  return result;
+}
+
+/**
+ * The absolute library path, or null when there is nothing there for a turn
+ * to read. The prompt paragraph is rendered only when this is non-null, so a
+ * project with no library costs the prompt nothing.
+ */
+export function knowledgeDirFor(checkoutDir) {
+  if (!checkoutDir || !flowviantDirOk(checkoutDir)) return null;
+  const dir = join(checkoutDir, KNOWLEDGE_DIR);
+  try {
+    if (!lstatSync(dir).isDirectory()) return null;
+    return readdirSync(dir).length > 0 ? dir : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Does the manifest name something the disk no longer has a directory for?
+ *  An EMPTIED manifest over no directory is the synced state, not a loss. */
+function libraryMissing(checkoutDir, manifest) {
+  const named =
+    (Array.isArray(manifest.files) && manifest.files.length > 0) ||
+    (typeof manifest.instructions === 'string' && manifest.instructions.trim() !== '');
+  if (!named) return false;
+  try {
+    lstatSync(join(checkoutDir, KNOWLEDGE_DIR));
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * The per-process driver: called with every roster's `knowledge` key.
+ *
+ * Holds the last-materialised rev in memory (seeded from the marker, so a
+ * restart does not re-sync), serialises syncs (a slow download must never be
+ * overlapped by the next poll's), and backs off after a failure: 30s, 60s,
+ * 120s … capped at ten minutes. Never throws into the poll loop.
+ */
+export function createKnowledgeSync({
+  checkoutDir,
+  fetchFile,
+  onExclude = () => {},
+  log = () => {},
+  now = () => Date.now(),
+}) {
+  let rev = readKnowledgeMarker(checkoutDir);
+  let busy = false;
+  let failures = 0;
+  let retryAt = 0;
+  /** The rev the backoff belongs to. A NEW rev is a new library and is tried
+   *  at once — waiting out a backoff earned by a file the person has since
+   *  removed would hold their next upload hostage to the last one's failure. */
+  let failedRev = null;
+
+  return {
+    /** The rev last fully materialised, or null. */
+    get rev() {
+      return rev;
+    },
+    /** @returns {Promise<null | ReturnType<typeof syncKnowledge>>} null when
+     *  nothing ran (absent key, same rev, busy, or backing off). */
+    async onRoster(knowledge) {
+      if (knowledge === undefined || knowledge === null) return null; // ABSENT: leave it alone
+      if (!isKnowledgeManifest(knowledge)) return null;
+      /**
+       * THE SAME REV IS NOT ALWAYS THE SAME DISK (2026-09-23). The marker says
+       * which rev was written; it cannot say the directory is still there. An
+       * `rm -r .flowviant/knowledge` — by hand, or by an agent tidying its
+       * checkout — left the marker naming the current rev, so every poll after
+       * it matched and returned, the prompt paragraph vanished with the
+       * directory (`knowledgeDirFor` answers null), and every turn ran without
+       * the library until somebody happened to edit it. A manifest that names
+       * something over a directory that does not exist is re-synced; files
+       * already on disk match by hash and are not fetched again.
+       */
+      if (knowledge.rev === rev && !libraryMissing(checkoutDir, knowledge)) return null;
+      if (busy) return null;
+      if (knowledge.rev === failedRev && now() < retryAt) return null;
+      busy = true;
+      try {
+        try {
+          onExclude(checkoutDir);
+        } catch {
+          /* a convenience, never a gate */
+        }
+        const r = await syncKnowledge({ checkoutDir, manifest: knowledge, fetchFile });
+        if (r.ok) {
+          rev = knowledge.rev;
+          failures = 0;
+          retryAt = 0;
+          failedRev = null;
+          writeKnowledgeMarker(checkoutDir, rev);
+          if (r.wrote.length || r.removed.length) {
+            log(
+              `knowledge · synced rev ${rev}` +
+                (r.wrote.length ? ` · ${r.wrote.length} written` : '') +
+                (r.removed.length ? ` · ${r.removed.length} removed` : '')
+            );
+          }
+        } else {
+          failures = knowledge.rev === failedRev ? failures + 1 : 1;
+          failedRev = knowledge.rev;
+          retryAt = now() + Math.min(600_000, 30_000 * 2 ** (failures - 1));
+          log(`knowledge · ${r.failed.length} file(s) did not download — retrying`);
+        }
+        if (r.refused.length) {
+          log(`knowledge · skipped over the size cap: ${r.refused.join(', ')}`);
+        }
+        return r;
+      } catch (e) {
+        failures = knowledge.rev === failedRev ? failures + 1 : 1;
+        failedRev = knowledge.rev;
+        retryAt = now() + Math.min(600_000, 30_000 * 2 ** (failures - 1));
+        log(`knowledge · sync failed: ${e?.message ?? e}`);
+        return null;
+      } finally {
+        busy = false;
+      }
+    },
+  };
+}
+
+/**
+ * The `/fleet/knowledge/:id` download, in the attachment fetch's own shape:
+ * the machine credential as a bearer, a 60s ceiling, and the size checked on
+ * the header AND on the bytes (a lying header must not decide the cap). The
+ * URL is derived from the roster URL the way every `/fleet/*` path is, so a
+ * self-hosted `FLOWVIANT_FLEET_URL` is honoured.
+ */
+export function knowledgeFetcher({ fleetUrl, token, userAgent, maxBytes = KNOWLEDGE_FILE_MAX_BYTES }) {
+  const base = String(fleetUrl).replace(/\/agents\/?$/, '/knowledge');
+  return async (id) => {
+    const res = await fetch(`${base}/${encodeURIComponent(id)}`, {
+      headers: { Authorization: `Bearer ${token}`, 'User-Agent': userAgent },
+      signal: AbortSignal.timeout(60_000),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    if (Number(res.headers.get('content-length') ?? '0') > maxBytes) {
+      // Returned rather than thrown: over the cap is a REFUSAL, permanent for
+      // this rev, not a failure the backoff should keep retrying.
+      return Buffer.alloc(maxBytes + 1);
+    }
+    return Buffer.from(await res.arrayBuffer());
+  };
+}

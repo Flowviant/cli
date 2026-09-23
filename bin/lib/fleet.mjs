@@ -47,6 +47,7 @@ import {
   isValidPrUrl,
   isValidBranch,
   isSafePathSegment,
+  excludeInWorktree,
 } from './git.mjs';
 import { c, info, note, ok, warn, fail } from './ui.mjs';
 import { revertPatch, withPatchLock } from './patch.mjs';
@@ -80,6 +81,7 @@ import {
   THINK_MARKER,
 } from './runtimes.mjs';
 import { createWorkManager } from './work.mjs';
+import { createKnowledgeSync, knowledgeFetcher, FLOWVIANT_OWN_PATHS } from './knowledge.mjs';
 import { effectiveMaxTurns, setServerMaxTurns } from './admission.mjs';
 import { scanLocalSessions, ourConversationIds } from './localSessions.mjs';
 import { repoState } from './repoState.mjs';
@@ -1102,6 +1104,23 @@ export async function runFleetDaemon() {
    */
   let baseRef = detectBaseRef(repoRoot);
   const getBaseRef = () => baseRef;
+  /**
+   * THE PROJECT'S KNOWLEDGE LIBRARY (0.94.0) — synced into THIS checkout's
+   * `.flowviant/knowledge/` whenever the roster's manifest moves. One copy per
+   * box, in the checkout, because every worktree on the box can read an
+   * absolute path (knowledge.mjs says why a copy per worktree is wrong). The
+   * exclude is written first so the library never shows as a change in the
+   * operator's own `git status` or in a checkout tab's diffstat.
+   */
+  /** The roster's `artifactsAccepted`, latest poll — see `getArtifactsAccepted`
+   *  on the work manager. False until a server says otherwise. */
+  let artifactsAccepted = false;
+  const knowledgeSync = createKnowledgeSync({
+    checkoutDir: repoRoot,
+    fetchFile: knowledgeFetcher({ fleetUrl: FLEET_URL, token: FLEET_TOKEN, userAgent: USER_AGENT }),
+    onExclude: (dir) => excludeInWorktree(dir, FLOWVIANT_OWN_PATHS),
+    log: (line) => note(c.dim(line)),
+  });
   info(SAFE ? 'mode   · safe (restricted toolset)' : 'mode   · unattended (skips permission prompts)');
   // WHICH PROJECT, before anything connects — the roster names it again a few
   // seconds later with the server's word, but "which project is this daemon
@@ -1527,6 +1546,12 @@ export async function runFleetDaemon() {
      * same one turn and this can never double-count.
      */
     extraLiveTurns: () => (wikiBusy || wikiChild ? 1 : 0),
+    /**
+     * Whether the server takes artifacts — the roster's own word, latest poll
+     * (2026-09-22). Read lazily for the reason above: the roster loop that
+     * writes it runs long after this manager is built.
+     */
+    getArtifactsAccepted: () => artifactsAccepted,
     /**
      * "THE REPO JUST CHANGED — look again."
      *
@@ -2554,6 +2579,15 @@ export async function runFleetDaemon() {
     // per-session: `git show` runs from the repo ROOT, which can see a closed
     // tab's branch and a shipped commit on main alike.
     processDiffJobs(roster.diffJobs);
+    // The knowledge library: synced when its rev moves, left ALONE when the key
+    // is absent (an older server, or a project that never had one). Never
+    // awaited — a fifty-megabyte library must not hold a roster tick, and the
+    // sync serialises itself. The next turn to spawn after it lands reads it.
+    void knowledgeSync.onRoster(roster.knowledge);
+    // ARTIFACTS (0.94.0): the server's own word on whether it can show one,
+    // re-read every poll. Absent is an older server and means false — the turn
+    // prompts then say nothing about a panel nobody can draw.
+    artifactsAccepted = roster.artifactsAccepted === true;
     // Shares to open or tear down. CLAIMED before acted on — two daemons on one
     // credential are both handed this array, and both opening a tunnel strands
     // a public hostname nobody can settle.

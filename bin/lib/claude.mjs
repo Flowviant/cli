@@ -351,7 +351,7 @@ export function handleStreamLine(line, { cwd, emit, onActivity, onToolEvent, app
 // returned string for sentinel detection, and each activity is handed to
 // `onActivity` so the caller can forward progress. Build-agent turns leave it
 // off and keep the raw text passthrough + line sentinels.
-export function runTurn({ prompt, resume, system, cwd, mcpConfig, mcpArgs, mcpEnv, runtime = 'claude', label, onSpawn, streamJson, answerFromResult, onActivity, onToolEvent, onInit, onUsage, onThreadId, wikiPerm, readOnly, planPerm, vaultDir, resultSchemaArgs, model, effort, adoptResumeId, resumeThreadId, resumeConversationId }) {
+export function runTurn({ prompt, resume, system, cwd, mcpConfig, mcpArgs, mcpEnv, runtime = 'claude', label, onSpawn, streamJson, answerFromResult, onActivity, onToolEvent, onInit, onUsage, onThreadId, wikiPerm, readOnly, planPerm, vaultDir, knowledgeDir, resultSchemaArgs, model, effort, adoptResumeId, resumeThreadId, resumeConversationId }) {
   return new Promise((resolve) => {
     const rt = runtimeById(runtime);
     if (!rt.args) {
@@ -405,6 +405,14 @@ export function runTurn({ prompt, resume, system, cwd, mcpConfig, mcpArgs, mcpEn
       // runtime that can path-scope its writes needs to know WHERE the vault is,
       // and Claude — which cannot — simply ignores it.
       vaultDir,
+      // THE PROJECT'S KNOWLEDGE LIBRARY (0.94.0), when this box holds one. It
+      // lives in the CHECKOUT and a turn usually runs in a worktree, so the
+      // prompt hands an absolute path OUTSIDE the cwd — and a curated Claude
+      // profile (the capture chat's read-only list, `FLOWVIANT_SAFE=1`) may
+      // refuse a read there. `--add-dir` says the directory is one it may read.
+      // Only Claude's adapter uses it; codex's sandboxes read the filesystem
+      // already, and agy's `--add-dir` is spent on the wiki vault.
+      knowledgeDir,
       // Structured-output flags for the MEDIATED path. Handed to the adapter
       // rather than appended here for the same reason `mcp` is: Codex takes its
       // prompt as a trailing positional, so a flag after it is in the wrong
