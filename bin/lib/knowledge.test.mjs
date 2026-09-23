@@ -30,9 +30,13 @@ import {
   FLOWVIANT_OWN_PATHS,
   INSTRUCTIONS_FILE,
   KNOWLEDGE_DIR,
+  LIBRARY_FILE,
   createKnowledgeSync,
   knowledgeDirFor,
+  knowledgeFetcher,
   planKnowledgeNames,
+  renderLibraryCatalog,
+  safeLibraryPath,
   readKnowledgeMarker,
   safeKnowledgeName,
   syncKnowledge,
@@ -405,4 +409,235 @@ test('the same rev over a DELETED library directory re-syncs it (2026-09-23)', a
   rmSync(lib(dir), { recursive: true, force: true });
   await sync.onRoster(manifest);
   assert.deepEqual(ls(dir), ['INSTRUCTIONS.md', 'a.md']);
+});
+
+// ── THE KEPT LIBRARY (2026-09-23, 0.97.0) ──────────────────────────────────
+
+const item = (n, over = {}) => ({
+  id: id(n),
+  name: `designs/landing-v${n}.html`,
+  kind: 'design',
+  title: 'Landing mockup',
+  taskId: 'card-1',
+  taskTitle: 'Redesign landing page',
+  createdAt: '2026-09-23T10:00:00.000Z',
+  bytes: 3,
+  sha256: sha(`<${n}>`),
+  supersedes: null,
+  ...over,
+});
+
+test('library items land in their subdirectory and LIBRARY.md catalogues them, one line each', async () => {
+  const dir = checkout();
+  const srv = fakeServer({ [id(1)]: '<1>', [id(2)]: '<2>', [id(3)]: '# r' });
+  const calls = [];
+  const fetchFile = async (fid, opts) => {
+    calls.push([fid, opts?.library === true]);
+    return srv.fetchFile(fid);
+  };
+  const r = await syncKnowledge({
+    checkoutDir: dir,
+    manifest: {
+      rev: 3,
+      instructions: null,
+      files: [],
+      library: {
+        items: [
+          item(1),
+          item(2, { supersedes: 'designs/landing-v1.html', createdAt: '2026-09-24T09:00:00.000Z' }),
+          item(3, {
+            name: 'research/onboarding-v1.md',
+            kind: 'research',
+            title: 'Onboarding notes',
+            taskTitle: 'Find out how X does onboarding',
+            sha256: sha('# r'),
+          }),
+        ],
+      },
+    },
+    fetchFile,
+  });
+  assert.equal(r.ok, true);
+  assert.deepEqual(ls(dir), [LIBRARY_FILE, 'designs', 'research']);
+  assert.deepEqual(readdirSync(join(lib(dir), 'designs')).sort(), ['landing-v1.html', 'landing-v2.html']);
+  assert.equal(readFileSync(join(lib(dir), 'research', 'onboarding-v1.md'), 'utf8'), '# r');
+  // Fetched through the LIBRARY door, not the knowledge one.
+  assert.ok(calls.every(([, isLib]) => isLib));
+  const catalog = readFileSync(join(lib(dir), LIBRARY_FILE), 'utf8');
+  assert.ok(
+    catalog.includes(
+      '- designs/landing-v2.html — Landing mockup (design, from card "Redesign landing page", 2026-09-24, supersedes designs/landing-v1.html)\n'
+    ),
+    catalog
+  );
+  assert.ok(catalog.includes('- designs/landing-v1.html — Landing mockup (design, from card "Redesign landing page", 2026-09-23)\n'));
+  assert.ok(catalog.includes('- research/onboarding-v1.md — Onboarding notes (research, from card "Find out how X does onboarding", 2026-09-23)\n'));
+  // The prompt paragraph now has a directory to name.
+  assert.equal(knowledgeDirFor(dir), lib(dir));
+});
+
+test('a path off the two prefixes, a traversal, a wrong extension or a third segment is REFUSED, never rewritten', async () => {
+  for (const [name, kind] of [
+    ['../escape.html', 'design'],
+    ['designs/../x.html', 'design'],
+    ['designs/a/b.html', 'design'],
+    ['other/x.html', 'design'],
+    ['designs/x.md', 'design'],
+    ['research/x.html', 'research'],
+    ['designs/.hidden.html', 'design'],
+    ['designs/x.html', 'research'],
+    ['designs/sp ace.html', 'design'],
+    ['/designs/x.html', 'design'],
+  ]) {
+    assert.equal(safeLibraryPath(name, kind), null, name);
+  }
+  assert.equal(safeLibraryPath('designs/landing-v2.html', 'design'), 'designs/landing-v2.html'); // canary
+  assert.equal(safeLibraryPath('research/notes-v1.md', 'research'), 'research/notes-v1.md');
+
+  const dir = checkout();
+  const srv = fakeServer({ [id(1)]: '<1>', [id(2)]: 'evil' });
+  await syncKnowledge({
+    checkoutDir: dir,
+    manifest: {
+      rev: 1,
+      instructions: null,
+      files: [],
+      library: { items: [item(1), item(2, { name: '../../escape.html', sha256: sha('evil') })] },
+    },
+    fetchFile: srv.fetchFile,
+  });
+  assert.deepEqual(srv.calls, [id(1)]);
+  assert.equal(existsSync(join(dir, '.flowviant', 'escape.html')), false);
+  assert.equal(existsSync(join(dir, 'escape.html')), false);
+  assert.ok(!readFileSync(join(lib(dir), LIBRARY_FILE), 'utf8').includes('escape'));
+});
+
+test('a symlink planted at a library subdirectory is removed, never followed', async () => {
+  const dir = checkout();
+  const elsewhere = mkdtempSync(join(tmpdir(), 'fv-elsewhere-'));
+  mkdirSync(lib(dir), { recursive: true });
+  symlinkSync(elsewhere, join(lib(dir), 'designs'));
+  const srv = fakeServer({ [id(1)]: '<1>' });
+  const r = await syncKnowledge({
+    checkoutDir: dir,
+    manifest: { rev: 1, instructions: null, files: [], library: { items: [item(1)] } },
+    fetchFile: srv.fetchFile,
+  });
+  assert.equal(r.ok, true);
+  assert.deepEqual(readdirSync(elsewhere), []);
+  assert.equal(readFileSync(join(lib(dir), 'designs', 'landing-v1.html'), 'utf8'), '<1>');
+});
+
+test('stale items leave, an emptied catalog is SAID and removes both directories and LIBRARY.md', async () => {
+  const dir = checkout();
+  const srv = fakeServer({ [id(1)]: '<1>', [id(2)]: '<2>', [id(9)]: 'keep me' });
+  const file = { id: id(9), name: 'spec.md', bytes: 7, sha256: sha('keep me') };
+  await syncKnowledge({
+    checkoutDir: dir,
+    manifest: { rev: 1, instructions: null, files: [file], library: { items: [item(1), item(2)] } },
+    fetchFile: srv.fetchFile,
+  });
+  writeFileSync(join(lib(dir), 'designs', 'stray.html'), 'x');
+  await syncKnowledge({
+    checkoutDir: dir,
+    manifest: { rev: 2, instructions: null, files: [file], library: { items: [item(2)] } },
+    fetchFile: srv.fetchFile,
+  });
+  assert.deepEqual(readdirSync(join(lib(dir), 'designs')), ['landing-v2.html']);
+  assert.ok(!readFileSync(join(lib(dir), LIBRARY_FILE), 'utf8').includes('landing-v1'));
+
+  await syncKnowledge({
+    checkoutDir: dir,
+    manifest: { rev: 3, instructions: null, files: [file], library: { items: [] } },
+    fetchFile: srv.fetchFile,
+  });
+  assert.deepEqual(ls(dir), ['spec.md']);
+});
+
+test('an ABSENT library key leaves designs/, research/ and LIBRARY.md alone — even under an emptied shelf', async () => {
+  const dir = checkout();
+  const srv = fakeServer({ [id(1)]: '<1>', [id(9)]: 'x' });
+  await syncKnowledge({
+    checkoutDir: dir,
+    manifest: { rev: 1, instructions: null, files: [], library: { items: [item(1)] } },
+    fetchFile: srv.fetchFile,
+  });
+  // An older server: a shelf file, no library key.
+  await syncKnowledge({
+    checkoutDir: dir,
+    manifest: { rev: 2, instructions: null, files: [{ id: id(9), name: 'a.md', bytes: 1, sha256: sha('x') }] },
+    fetchFile: srv.fetchFile,
+  });
+  assert.deepEqual(ls(dir), [LIBRARY_FILE, 'a.md', 'designs']);
+  // …and emptied, it still does not sweep what it never named.
+  await syncKnowledge({
+    checkoutDir: dir,
+    manifest: { rev: 3, instructions: null, files: [] },
+    fetchFile: srv.fetchFile,
+  });
+  assert.deepEqual(ls(dir), [LIBRARY_FILE, 'designs']);
+});
+
+test('the catalog name and the two directories are reserved from shelf files', () => {
+  const out = planKnowledgeNames([
+    { id: id(1), name: 'LIBRARY.md' },
+    { id: id(2), name: 'designs' },
+    { id: id(3), name: 'research' },
+  ]);
+  assert.deepEqual(
+    out.map((f) => f.local),
+    ['LIBRARY-2.md', 'designs-2', 'research-2']
+  );
+});
+
+test('a server string cannot forge a second catalog line', () => {
+  const c = renderLibraryCatalog([
+    { ...item(1), path: 'designs/landing-v1.html', title: 'A\n- designs/evil.html — pwned', taskTitle: 'x\ny' },
+  ]);
+  assert.equal(c.split('\n').filter((l) => l.startsWith('- ')).length, 1);
+  assert.equal(renderLibraryCatalog([]), null);
+});
+
+test('the fetcher asks the library door for a library item and the knowledge door otherwise', async () => {
+  const seen = [];
+  const real = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    seen.push(String(url));
+    return new Response('ok', { status: 200, headers: { 'content-length': '2' } });
+  };
+  try {
+    const f = knowledgeFetcher({ fleetUrl: 'https://api.test/api/fleet/agents', token: 't', userAgent: 'ua' });
+    await f(id(1));
+    await f(id(2), { library: true });
+  } finally {
+    globalThis.fetch = real;
+  }
+  assert.deepEqual(seen, [
+    `https://api.test/api/fleet/knowledge/${id(1)}`,
+    `https://api.test/api/fleet/library/${id(2)}`,
+  ]);
+});
+
+test('the paragraph names the catalog; a card spec prints its references; the capture chat is told to reference', async () => {
+  const p = KNOWLEDGE_PARAGRAPH('/k');
+  assert.match(p.replace(/\s+/g, ' '), /LIBRARY\.md there, if it exists, is the catalog of designs and research the project kept/);
+  assert.match(p, /Read INSTRUCTIONS\.md/); // canary: the paragraph is the one it was
+  const { AGENT_TASK_SPEC } = await import('./prompts.mjs');
+  const bare = { id: 't1', title: 'Implement the landing page' };
+  // A card with no references is byte-for-byte what it was.
+  assert.equal(AGENT_TASK_SPEC({ ...bare, references: [] }), AGENT_TASK_SPEC(bare));
+  const spec = AGENT_TASK_SPEC({
+    ...bare,
+    references: [
+      { name: 'designs/landing-v2.html', title: 'Landing mockup' },
+      { name: '../../etc/passwd', title: 'nope' },
+      { name: 'designs/..', title: 'nope' },
+    ],
+  });
+  assert.ok(
+    spec.endsWith('\nreferences (under the project knowledge directory):\n- designs/landing-v2.html — Landing mockup\n'),
+    spec
+  );
+  const cap = SYSTEM_CAPTURE.replace(/\s+/g, ' ');
+  assert.ok(cap.includes('call list_library and pass its id as `references`'));
 });

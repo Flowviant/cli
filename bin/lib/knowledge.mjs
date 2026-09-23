@@ -54,6 +54,30 @@
  * ten seconds. A file refused on SIZE is not a failure to retry: it is
  * permanent for that rev, skipped with a warning, and the rest of the library
  * is written.
+ *
+ * ── THE KEPT LIBRARY (2026-09-23, 0.97.0) ──
+ *
+ * The manifest may carry `library: { items: [...] }` — the designs and
+ * write-ups the project KEPT when a person accepted them — and each item lands
+ * at its own relative path, `designs/<slug>-v<N>.html` or
+ * `research/<slug>-v<N>.md`, with a generated `LIBRARY.md` at the root naming
+ * every one (path, title, kind, the card that asked for it, the date, what it
+ * supersedes). So "implement design A" is an agent opening LIBRARY.md, finding
+ * design A, and reading the page.
+ *
+ * SUBDIRECTORIES, AND EXACTLY TWO. The safe-name rule for a knowledge file
+ * forbids every separator; a library item is the one thing allowed ONE, and
+ * only after one of the two literal prefixes, with a stem that is already
+ * safe and the extension its kind hands back. `..`, a third segment, another
+ * prefix, a leading dot — refused, never rewritten, because a rewritten path
+ * could collide with another item's real one. The two directories are OURS the
+ * way the library directory is: a symlink or a file planted there is removed
+ * (the link, never its target) and a real directory made.
+ *
+ * ABSENT MEANS "LEAVE IT ALONE", the same rule the whole key keeps: a manifest
+ * with no `library` key is an older server, and `designs/`, `research/` and
+ * `LIBRARY.md` are neither synced nor swept. `library: { items: [] }` is the
+ * emptied catalog, SAID — both directories and the catalog go.
  */
 
 import {
@@ -102,6 +126,16 @@ export const FLOWVIANT_OWN_PATHS = [
   '.flowviant/artifacts/',
   '.flowviant/uploads/',
 ];
+/** The generated catalog of the kept library, at the knowledge root. Reserved
+ *  like INSTRUCTIONS.md: a person's file of that name is suffixed, because the
+ *  prompt tells the CLI this one is the catalog. */
+export const LIBRARY_FILE = 'LIBRARY.md';
+/** The two subdirectories a kept item may live in, by kind. */
+export const LIBRARY_DIRS = { design: 'designs', research: 'research' };
+const LIBRARY_EXT = { design: '.html', research: '.md' };
+/** The server caps a library at 200 items; a longer manifest is cut. */
+const MAX_LIBRARY_ITEMS = 256;
+
 /** The person's standing brief, written from the manifest's `instructions`.
  *  A RESERVED name: a library FILE called this gets a suffix, because the
  *  prompt tells the CLI to read this one first and a stranger's file must
@@ -143,7 +177,14 @@ export function safeKnowledgeName(raw) {
  * Windows disks are).
  */
 export function planKnowledgeNames(files) {
-  const taken = new Set([INSTRUCTIONS_FILE.toLowerCase()]);
+  // The catalog's name and the two library directories are reserved beside
+  // the brief (0.97.0): a person's `LIBRARY.md` or a file called `designs`
+  // must never stand where the catalog or a directory has to.
+  const taken = new Set([
+    INSTRUCTIONS_FILE.toLowerCase(),
+    LIBRARY_FILE.toLowerCase(),
+    ...Object.values(LIBRARY_DIRS),
+  ]);
   const out = [];
   for (const f of files) {
     const name = safeKnowledgeName(f.name);
@@ -251,6 +292,97 @@ function writeKnowledgeMarker(checkoutDir, rev) {
   }
 }
 
+/**
+ * A kept item's relative path, or null when it is not EXACTLY
+ * `<designs|research>/<safe stem>.<its kind's extension>` — see the header.
+ * Refused rather than rewritten: a rewritten path is one the server never
+ * named, and it could land on another item's real one.
+ */
+export function safeLibraryPath(name, kind) {
+  if (typeof name !== 'string' || !(kind in LIBRARY_DIRS)) return null;
+  const parts = name.split('/');
+  if (parts.length !== 2) return null;
+  const [dir, file] = parts;
+  if (dir !== LIBRARY_DIRS[kind]) return null;
+  if (!file || file !== safeKnowledgeName(file)) return null;
+  if (!file.toLowerCase().endsWith(LIBRARY_EXT[kind]) || file.length <= LIBRARY_EXT[kind].length) return null;
+  return `${dir}/${file}`;
+}
+
+/** The manifest's library items that are safe to write, in manifest order, or
+ *  null when the key is ABSENT (an older server — leave everything alone). */
+function libraryItemsOf(manifest) {
+  const lib = manifest?.library;
+  if (lib === undefined || lib === null) return null;
+  if (typeof lib !== 'object' || !Array.isArray(lib.items)) return null;
+  const out = [];
+  const seen = new Set();
+  for (const it of lib.items.slice(0, MAX_LIBRARY_ITEMS)) {
+    if (!it || typeof it.id !== 'string' || !/^[0-9a-f-]{8,64}$/i.test(it.id)) continue;
+    const path = safeLibraryPath(it.name, it.kind);
+    if (!path || seen.has(path.toLowerCase())) continue;
+    seen.add(path.toLowerCase());
+    out.push({ ...it, path });
+  }
+  return out;
+}
+
+/** One line of the catalog: server strings are made single-line and capped —
+ *  they are a person's card title and an artifact's name, headed into a file
+ *  an agent reads, so they may not carry a line break that forges a second
+ *  entry. */
+const catalogText = (v, max) =>
+  String(v ?? '')
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, max);
+
+/**
+ * THE CATALOG, generated whole from the manifest on every sync:
+ *
+ *   - designs/landing-v2.html — Landing mockup (design, from card "Redesign
+ *     landing page", 2026-09-23, supersedes designs/landing-v1.html)
+ *
+ * (one line per item, oldest first — the server's order — so a sync that adds
+ * one item adds one line and moves nothing). Null when there are no items, in
+ * which case the file is removed rather than written empty.
+ */
+export function renderLibraryCatalog(items) {
+  if (!items || items.length === 0) return null;
+  const lines = items.map((it) => {
+    const facts = [it.kind === 'research' ? 'research' : 'design'];
+    const card = catalogText(it.taskTitle, 200);
+    if (card) facts.push(`from card "${card.replace(/"/g, "'")}"`);
+    const day = typeof it.createdAt === 'string' ? it.createdAt.slice(0, 10) : '';
+    if (/^\d{4}-\d{2}-\d{2}$/.test(day)) facts.push(day);
+    const sup = typeof it.supersedes === 'string' ? catalogText(it.supersedes, 200) : '';
+    if (sup) facts.push(`supersedes ${sup}`);
+    const title = catalogText(it.title, 200) || it.path;
+    return `- ${it.path} — ${title} (${facts.join(', ')})`;
+  });
+  return (
+    '# Library\n\n' +
+    'The designs and research this project kept. Paths are relative to this directory;\n' +
+    'a newer version supersedes an older one of the same name.\n\n' +
+    `${lines.join('\n')}\n`
+  );
+}
+
+/** A library subdirectory as a real directory — ours, like the library's own
+ *  path: a symlink or a file planted there is removed, never followed. */
+function ensureSubdir(dir, name) {
+  const path = join(dir, name);
+  try {
+    const st = lstatSync(path);
+    if (st.isSymbolicLink() || !st.isDirectory()) unlinkSync(path);
+  } catch {
+    /* absent */
+  }
+  mkdirSync(path, { recursive: true });
+  return path;
+}
+
 /** Does this manifest look like one the server produced? Anything else is
  *  ignored whole rather than half-applied. */
 export function isKnowledgeManifest(k) {
@@ -285,6 +417,8 @@ export async function syncKnowledge({ checkoutDir, manifest, fetchFile, maxBytes
     typeof manifest.instructions === 'string' && manifest.instructions.trim()
       ? manifest.instructions
       : null;
+  // null = the key is ABSENT (leave the library's paths alone); [] = emptied.
+  const library = libraryItemsOf(manifest);
 
   if (!flowviantDirOk(checkoutDir)) {
     // Not a failure to retry every poll — nothing changes until a person
@@ -295,8 +429,13 @@ export async function syncKnowledge({ checkoutDir, manifest, fetchFile, maxBytes
     return result;
   }
 
-  // EMPTIED: the directory goes, and the prompt paragraph with it.
-  if (files.length === 0 && !instructions) {
+  // EMPTIED: the directory goes, and the prompt paragraph with it — unless the
+  // library key is ABSENT and a synced library is on disk, which an older
+  // server's emptied shelf has no say over.
+  const libraryOnDisk =
+    library === null &&
+    [LIBRARY_FILE, ...Object.values(LIBRARY_DIRS)].some((n) => existsSync(join(dirPath, n)));
+  if (files.length === 0 && !instructions && (library === null ? !libraryOnDisk : library.length === 0)) {
     if (existsSync(dirPath)) {
       try {
         const st = lstatSync(dirPath);
@@ -314,6 +453,11 @@ export async function syncKnowledge({ checkoutDir, manifest, fetchFile, maxBytes
   const planned = planKnowledgeNames(files);
   const keep = new Set(planned.map((p) => p.local));
   if (instructions) keep.add(INSTRUCTIONS_FILE);
+  // ABSENT library key: its paths are neither synced nor swept.
+  if (library === null) {
+    keep.add(LIBRARY_FILE);
+    for (const d of Object.values(LIBRARY_DIRS)) keep.add(d);
+  }
 
   for (const f of planned) {
     const path = join(dir, f.local);
@@ -363,6 +507,10 @@ export async function syncKnowledge({ checkoutDir, manifest, fetchFile, maxBytes
     }
   }
 
+  if (library !== null) {
+    await syncLibrary({ dir, items: library, fetchFile, maxBytes, keep, result });
+  }
+
   // Everything the manifest no longer names — files, stray temp names, and
   // anything that is not a regular file — leaves.
   let entries = [];
@@ -381,6 +529,96 @@ export async function syncKnowledge({ checkoutDir, manifest, fetchFile, maxBytes
     }
   }
   return result;
+}
+
+/**
+ * THE KEPT LIBRARY'S HALF OF A SYNC: each item into its subdirectory (fetched
+ * only when its sha differs, written atomically, the bytes checked against the
+ * manifest), every other entry in the two subdirectories removed, and
+ * `LIBRARY.md` regenerated from the items that are on disk. A download that
+ * fails keeps whatever copy was there and clears `ok`, the file rule; an item
+ * over the cap is refused for this rev and left out of the catalog.
+ */
+async function syncLibrary({ dir, items, fetchFile, maxBytes, keep, result }) {
+  const wanted = { designs: new Set(), research: new Set() };
+  const onDisk = [];
+  for (const kind of Object.keys(LIBRARY_DIRS)) {
+    if (items.some((it) => it.kind === kind)) {
+      ensureSubdir(dir, LIBRARY_DIRS[kind]);
+      keep.add(LIBRARY_DIRS[kind]);
+    }
+  }
+  for (const it of items) {
+    const [sub, file] = it.path.split('/');
+    const path = join(dir, sub, file);
+    wanted[sub].add(file);
+    if (Number(it.bytes) > maxBytes) {
+      result.refused.push(it.path);
+      wanted[sub].delete(file);
+      continue;
+    }
+    if (typeof it.sha256 === 'string' && localSha(path) === it.sha256.toLowerCase()) {
+      onDisk.push(it);
+      continue;
+    }
+    try {
+      const buf = await fetchFile(it.id, { library: true });
+      if (!Buffer.isBuffer(buf) || buf.byteLength > maxBytes) {
+        result.refused.push(it.path);
+        wanted[sub].delete(file);
+        continue;
+      }
+      if (typeof it.sha256 === 'string' && sha256Of(buf) !== it.sha256.toLowerCase()) {
+        throw new Error('sha256 mismatch');
+      }
+      writeAtomic(path, buf);
+      result.wrote.push(it.path);
+      onDisk.push(it);
+    } catch {
+      result.ok = false;
+      result.failed.push(it.path);
+      // A stale copy is better than none until the retry lands — and it stays
+      // in the catalog only if it is actually there.
+      if (localSha(path) !== null) onDisk.push(it);
+    }
+  }
+  // Each subdirectory holds exactly what the manifest names.
+  for (const sub of Object.values(LIBRARY_DIRS)) {
+    const subPath = join(dir, sub);
+    let entries = [];
+    try {
+      if (!lstatSync(subPath).isDirectory()) continue;
+      entries = readdirSync(subPath);
+    } catch {
+      continue;
+    }
+    for (const name of entries) {
+      if (wanted[sub].has(name)) continue;
+      try {
+        rmSync(join(subPath, name), { recursive: true, force: true });
+        result.removed.push(`${sub}/${name}`);
+      } catch {
+        /* best-effort */
+      }
+    }
+    // An emptied subdirectory leaves with its last item.
+    if (wanted[sub].size === 0) keep.delete(sub);
+  }
+  const catalog = renderLibraryCatalog(onDisk);
+  if (catalog) {
+    keep.add(LIBRARY_FILE);
+    const path = join(dir, LIBRARY_FILE);
+    let same = false;
+    try {
+      same = lstatSync(path).isFile() && readFileSync(path, 'utf8') === catalog;
+    } catch {
+      /* absent */
+    }
+    if (!same) {
+      writeAtomic(path, catalog);
+      result.wrote.push(LIBRARY_FILE);
+    }
+  }
 }
 
 /**
@@ -404,7 +642,8 @@ export function knowledgeDirFor(checkoutDir) {
 function libraryMissing(checkoutDir, manifest) {
   const named =
     (Array.isArray(manifest.files) && manifest.files.length > 0) ||
-    (typeof manifest.instructions === 'string' && manifest.instructions.trim() !== '');
+    (typeof manifest.instructions === 'string' && manifest.instructions.trim() !== '') ||
+    (Array.isArray(manifest.library?.items) && manifest.library.items.length > 0);
   if (!named) return false;
   try {
     lstatSync(join(checkoutDir, KNOWLEDGE_DIR));
@@ -515,8 +754,11 @@ export function createKnowledgeSync({
  */
 export function knowledgeFetcher({ fleetUrl, token, userAgent, maxBytes = KNOWLEDGE_FILE_MAX_BYTES }) {
   const base = String(fleetUrl).replace(/\/agents\/?$/, '/knowledge');
-  return async (id) => {
-    const res = await fetch(`${base}/${encodeURIComponent(id)}`, {
+  // A kept library item (0.97.0) is its sibling, `GET /fleet/library/:id` —
+  // the same credential, the same shape, the same caps.
+  const libraryBase = String(fleetUrl).replace(/\/agents\/?$/, '/library');
+  return async (id, { library = false } = {}) => {
+    const res = await fetch(`${library ? libraryBase : base}/${encodeURIComponent(id)}`, {
       headers: { Authorization: `Bearer ${token}`, 'User-Agent': userAgent },
       signal: AbortSignal.timeout(60_000),
     });
