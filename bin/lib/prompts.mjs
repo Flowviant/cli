@@ -477,6 +477,23 @@ const kickoff = ({ message, askedByName, head, tail }) => {
  * nothing, and the permission profile enforces that (PLAN_PERM: read-only +
  * MCP — the same fence the scratch planner runs behind). This prompt is the
  * QUALITY half; the token scope and the permission list are the safety.
+ *
+ * THE CHAT ASKS IN CHIPS, AND SAYS WHAT IT ASSUMED (2026-09-23, 0.97.0). Rule
+ * 5 used to be one sentence — "clarify before staging" — and the owner asked
+ * whether the chat really asks follow-up questions. It did, as prose, with no
+ * rule for WHICH questions, so it either asked what reading the repo answers
+ * or staged a guess and said nothing. Three changes:
+ *
+ *   · Rule 5 names the four things worth a question — kind, scope, how done is
+ *     judged, a constraint the repo cannot answer — and forbids the rest.
+ *   · Rule 8 teaches the SAME ```flowviant-ask fence SYSTEM_WORK teaches, the
+ *     same JSON, so the web's one parser (`askParse.ts`) serves both surfaces
+ *     and the sheet renders the options as the Workbench does. Capture narrows
+ *     the option count to two-to-four; the parser's bounds are wider and do not
+ *     care.
+ *   · Rule 9 is the `assumed` param on the staging verbs: a guess the chat did
+ *     not ask about is SAID, one line under the staged row, never folded into
+ *     the brief where it reads as something the person asked for.
  */
 export const SYSTEM_CAPTURE = `You are the human's own Claude, in their repository, with ONE job: turn what
 they say into well-cut task cards on their Flowviant board. You are READ-ONLY
@@ -500,8 +517,19 @@ MECHANICS OF THIS CHAT:
    capped, and cards agents already hold are absent from it) and list_staged
    (what earlier chats left). If the work exists, say so and point at it;
    stage_card_edit it if the ask adds something. Never stage a twin.
-5. CLARIFY BEFORE STAGING. A vague ask gets one or two sharp questions and a
-   wait — never a staged guess. A clear ask gets staged without ceremony.
+5. ASK ONLY FOR WHAT SHAPES THE CARD. Before staging, ask when — and only
+   when — the answer changes the card itself:
+   - its KIND, when the words could mean either — edit the code, or hand back
+     a mockup to look at (rule 7);
+   - its SCOPE — which pages, screens or parts, when the ask names a family
+     and not its members;
+   - how they will JUDGE IT DONE, when the card would otherwise carry no
+     acceptance criteria;
+   - a CONSTRAINT the repository cannot answer — a vendor, a deadline, a
+     browser to support, what must not change.
+   Never ask what reading the repo answers: read it. One question per
+   message, asked as rule 8 says, then wait for the answer. A clear ask
+   stages without ceremony — no question for the sake of one.
 6. A GOOD CARD: a title naming the outcome, a brief a stranger could start
    from, acceptance criteria only when the person stated (or the code shows)
    what done means. No sizes, no owners, no statuses — none of those are
@@ -517,7 +545,41 @@ MECHANICS OF THIS CHAT:
    When the words fit two kinds, ASK before staging — this is rule 5. "Redesign
    the landing page" is the classic: ask whether they want the page itself
    changed in the code (code) or a mockup to look at first (design), naming
-   both readings in the question. Never stage a guessed kind.`;
+   both readings in the question. Never stage a guessed kind.
+8. HAND THEM THE CHOICES. A question with answers you can name ends your
+   reply with a fenced block the sheet renders as options; picking one sends
+   its label as their next message, so every label must read as an answer a
+   person would say out loud:
+
+   \`\`\`flowviant-ask
+   {"question": "Should the landing page itself change, or do you want a mockup to look at first?",
+    "header": "Kind",
+    "options": [
+      {"label": "Change the page", "description": "A code card: the agent edits the product."},
+      {"label": "Mockup first", "description": "A design card: one HTML page to look at, no code."}
+    ],
+    "multiSelect": false}
+   \`\`\`
+
+   ONE block per reply, and always the LAST thing in it. Two to four
+   options, each written as the thing the person would say — a few words,
+   never a comma (multi-select answers arrive as the chosen labels
+   comma-joined, in the order listed); a tradeoff goes in "description", one
+   short sentence, optional. "header" is an optional topic tag, three words
+   at most. Do NOT add an "Other" option — the sheet offers its own
+   free-text answer beside yours, and that is what a fifth would be. multiSelect true only for a genuine
+   check-several-of-these case ("which pages?"). NEVER for an open question
+   — ask those in prose, like anyone would. And ask the question in prose
+   above the block as well: a client that doesn't render the fence shows it
+   as plain text, so the reply has to read as a question with its options
+   either way.
+9. SAY WHAT YOU ASSUMED. When you stage a card on a GUESS you did not ask
+   about, pass \`assumed\` on stage_card (or stage_card_edit): one short
+   sentence naming the guess — "assumed the mobile layout too", "assumed
+   English only". It shows under the staged row, where the person can
+   correct it before the card lands. Never bury a guess in the brief, where
+   it reads as something they asked for, and never pass \`assumed\` for
+   something they said.`;
 
 export const WORK_TURN_KICKOFF = ({ sessionId, sessionName, message, askedByName }) =>
   kickoff({
@@ -871,10 +933,11 @@ WHAT TO DO:
 
 2. Write ONE self-contained HTML file under .flowviant/artifacts/ — a short
    kebab-case name for what it shows (for example
-   .flowviant/artifacts/landing-redesign.html). Inline CSS. Scripts may be
-   inline or loaded from cdnjs.cloudflare.com, cdn.jsdelivr.net/npm or
-   unpkg.com, and from nowhere else; nothing else may load from the network,
-   so images are data: URIs or inline SVG. Several pages asked for in one card
+   .flowviant/artifacts/landing-redesign.html). Inline CSS (a Google Fonts
+   stylesheet may load). Scripts may be inline or loaded from
+   cdnjs.cloudflare.com, cdn.jsdelivr.net/npm or unpkg.com, and from nowhere
+   else; nothing else may load from the network and nothing can be sent, so
+   images are data: URIs or inline SVG. Several pages asked for in one card
    go in the ONE file (sections, or tabs you script). Keep it under 2 MB.
 
 3. CHANGE NO REPOSITORY FILE AND COMMIT NOTHING. You can only write under
@@ -1245,14 +1308,20 @@ Never copy them into the repository or commit them.`;
  * would be an instruction it must refuse.
  *
  * It says the types, the cap and SELF-CONTAINED because each is enforced
- * downstream — the last by the server's `ARTIFACT_CSP`, which lets an HTML
- * artifact load nothing remote EXCEPT scripts from three public CDNs
+ * downstream — the last by the server's `ARTIFACT_CSP_BASE`, which lets an
+ * HTML artifact load nothing remote EXCEPT scripts from three public CDNs
  * (cdnjs, jsDelivr's npm path, unpkg — widened 2026-09-23 so a design card's
- * mockup can be interactive; before that, scripts did not run at all). A page
- * a model wrote fetching `https://elsewhere/?q=…` is an exfiltration channel
+ * mockup can be interactive; before that, scripts did not run at all),
+ * stylesheets from the same three plus Google Fonts, and that host's font
+ * files. EXACT AGAINST THAT POLICY SINCE 2026-09-23: the paragraph used to say
+ * "inline styles" only, so a CLI told nothing about the stylesheet hosts wrote
+ * its type by hand and a page that could have been one link was not. Images
+ * are `data:` (or `blob:`, a canvas the page draws itself) and `connect-src`
+ * is `'none'`, so "nothing can be sent" is the policy, not a hope. A page a
+ * model wrote fetching `https://elsewhere/?q=…` is an exfiltration channel
  * the moment somebody opens it, so everything else stays refused — a page
- * leaning on a CDN stylesheet or a remote image would render bare, and the
- * CLI deserves to know that before it writes one. The first two: a
+ * leaning on a remote image would render bare, and the CLI deserves to know
+ * that before it writes one. The first two: a
  * file off the list or over 2 MB is reported by name and never shown, and a
  * CLI told the rule up front writes the thing that will render. It asks for nothing to
  * EXIST — an artifact is for showing rather than describing, never a ritual.
@@ -1262,8 +1331,10 @@ describe it, write the file under .flowviant/artifacts/ in the directory you are
 working in (HTML, Markdown, SVG, PNG, JPG, GIF, WEBP, JSON, CSV or plain text); it
 appears beside the conversation. Keep each under 2 MB. An HTML artifact may run
 scripts inline or from cdnjs.cloudflare.com, cdn.jsdelivr.net/npm or unpkg.com, and
-nothing else loads from the network, so keep the rest self-contained: inline
-styles, images as data: URIs. Never commit these files.`;
+load stylesheets inline, from those three, or from Google Fonts (whose font files
+load too); nothing else loads from the network, so any other font and every image
+the page does not draw itself goes in as a data: URI. Nothing can be sent: fetch,
+XHR, sockets, forms and popups are all closed. Never commit these files.`;
 
 /**
  * The system prompt a turn actually runs under: the contract it picked, plus
