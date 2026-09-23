@@ -1409,3 +1409,41 @@ test('a settle that refused before spawning claims no tokens', async (t) => {
   assert.equal('usage' in settle.body, false, 'absent, never a zeroed object');
   await until(() => !m.workBusy());
 });
+
+/**
+ * ITERATION KEEPS THE KIND (2026-09-23). A send-back from the review deck is a
+ * `human` turn, and on an agent whose queue has emptied it names NO card — so a
+ * posture read off `job.task` alone ran it as a BUILD turn under the code
+ * contract, on a design agent. The server now projects the kind onto the JOB;
+ * this pins that the lane reads it there first and the card's key second.
+ */
+test('the agent turn takes its kind from the job before the card', () => {
+  const turn = fnBody(workSource(), 'runAgentTurn');
+  // Canary: this IS the agent lane.
+  assert.ok(turn.includes('AGENT_HUMAN_KICKOFF({'));
+  assert.ok(turn.includes('const taskKind = agentTaskKindOf(job.taskKind ?? job.task?.taskKind);'));
+  assert.ok(!turn.includes('agentTaskKindOf(job.task?.taskKind)'), 'never the card key alone');
+});
+
+/**
+ * …AND AT RUNTIME: a card-less human turn carrying `taskKind: 'design'` is
+ * judged under the design posture — which only Claude declares, so on another
+ * runtime it is refused in the design sentence BEFORE anything spawns. The
+ * canary is the same job with no kind on an unknown runtime: that is a build
+ * turn, refused in the build sentence — so the words, not the refusal, are what
+ * prove the job's key was read.
+ */
+test('a card-less send-back on a design agent runs under the design posture', async (t) => {
+  const { m } = managerIn(t);
+  const { calls } = stubFetch(t);
+  m.processAgentTurnJobs([
+    { id: 'at-k1', agentId: 'ag-k1', placeId: 'a-ag-k1', kind: 'human', body: 'make the hero bigger', runtime: 'codex', taskKind: 'design' },
+    { id: 'at-k2', agentId: 'ag-k2', placeId: 'a-ag-k2', kind: 'human', body: 'make the hero bigger', runtime: 'no-such-cli' },
+  ]);
+  await until(() => calls.filter((c) => c.url.includes('agent-turn-done')).length >= 2);
+  const settle = (id) => calls.find((c) => c.url.includes('agent-turn-done') && c.body.turnId === id).body;
+  assert.equal(settle('at-k1').outcome, 'nothing');
+  assert.equal(settle('at-k1').answer, 'design and research cards run on Claude on this machine');
+  assert.equal(settle('at-k2').answer, 'this machine cannot run no-such-cli');
+  await until(() => !m.workBusy());
+});

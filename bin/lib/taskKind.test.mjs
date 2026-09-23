@@ -183,7 +183,7 @@ test('the agent turn: contract and posture from the kind, refusal off Claude, ar
   const turn = slice(w, 'const runAgentTurn = async (job', 'const lastAgentBeat = new Map();');
   // Canary: this IS the agent lane.
   assert.match(turn, /AGENT_TASK_KICKOFF\(/);
-  assert.match(turn, /const taskKind = agentTaskKindOf\(job\.task\?\.taskKind\);/);
+  assert.match(turn, /const taskKind = agentTaskKindOf\(job\.taskKind \?\? job\.task\?\.taskKind\);/);
   assert.match(turn, /const posture = taskKind === 'code' \? 'build' : taskKind;/);
   assert.match(turn, /if \(!canRun\(RUNTIMES\[rt\], posture\)\)/);
   assert.ok(turn.includes("'design and research cards run on Claude on this machine'"));

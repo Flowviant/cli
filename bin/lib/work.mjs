@@ -4882,8 +4882,20 @@ export function createWorkManager({
        * alternative to refusing is running the card as a BUILD turn with
        * permissions skipped — an agent writing code for an ask that was a
        * mockup, reporting success. `nothing` puts the agent in Stuck saying so.
+       *
+       * THE JOB'S OWN KIND FIRST (2026-09-23). A `human` turn — a send-back
+       * from the review deck, an answer — usually names NO card: the queue has
+       * emptied, or the card it is about was just re-queued behind it. Read off
+       * `job.task` alone, a send-back on a design agent ran as a BUILD turn
+       * under the code contract with permissions skipped — the one turn in the
+       * owner's loop ("iterate in the review column, the agent opened") that
+       * could edit code on an ask that was a mockup. So the server projects the
+       * kind of the card the turn is ABOUT onto the job itself (`taskKind`,
+       * sent only for design and research; the same `DAEMON_TASK_KIND_MIN`
+       * floor as the card's own key, no new one), and the card's key stays the
+       * fallback for a server that sends only that. Absent on both is code.
        */
-      const taskKind = agentTaskKindOf(job.task?.taskKind);
+      const taskKind = agentTaskKindOf(job.taskKind ?? job.task?.taskKind);
       const posture = taskKind === 'code' ? 'build' : taskKind;
       if (!canRun(RUNTIMES[rt], posture)) {
         await postAgentTurn({
