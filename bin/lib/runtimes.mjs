@@ -1224,6 +1224,57 @@ export function knownSkills() {
 }
 
 /**
+ * WHICH MCP SERVERS AND CLAUDE.AI CONNECTORS THE CLI MOUNTED, AND HOW EACH
+ * STANDS (2026-09-23, 0.97.0) — learned off the same `system.init` event the
+ * skills are, so it costs nothing and cannot drift from what a turn reaches.
+ *
+ * MEASURED on Claude Code 2.1.281 (`claude -p hi --model haiku --output-format
+ * stream-json --verbose`): the init event carries `mcp_servers: [{ name,
+ * status, source }]` — statuses seen `connected`, `failed`, `needs-auth` and
+ * `pending`; a claude.ai connector arrives named `claude.ai <Name>` with
+ * `source: "claudeai"`, a server a turn mounts with `--mcp-config` with
+ * `source: "dynamic"`. A connector that needs a one-time sign-in AT THIS BOX
+ * reads `needs-auth` here long before a turn fails on it, and the app's
+ * Machines page names it.
+ *
+ * `flowviant` IS EXCLUDED: it is the server THIS daemon mounts on every tab
+ * turn, always present, and not something a person can act on. A status off
+ * the closed list is relayed as `other` rather than dropped — the CLI said
+ * something about the server, and silence would be the daemon deciding it did
+ * not. Bounded (40 entries, names cut at 60) and sorted, the `recordSkills`
+ * discipline: a stable param, so an unchanged report writes nothing.
+ *
+ * THREE STATES, the skills split: null = no turn has taught us (the param is
+ * not sent), [] = the CLI mounted none of the person's own, a list = the words.
+ * Last turn wins, so a connector somebody signs into shows up connected on the
+ * next turn's init.
+ */
+let mcpServersCache = null;
+
+export const MCP_STATUSES = new Set(['connected', 'failed', 'needs-auth', 'pending']);
+export const MAX_MCP_SERVERS = 40;
+export const MCP_NAME_MAX = 60;
+
+export function recordMcpServers(list) {
+  if (!Array.isArray(list)) return;
+  const seen = new Map();
+  for (const e of list) {
+    if (!e || typeof e !== 'object' || typeof e.name !== 'string') continue;
+    const n = e.name.trim().slice(0, MCP_NAME_MAX).trim();
+    if (!n || n === 'flowviant' || seen.has(n)) continue;
+    seen.set(n, { n, s: MCP_STATUSES.has(e.status) ? e.status : 'other' });
+  }
+  mcpServersCache = [...seen.values()]
+    .sort((a, b) => (a.n < b.n ? -1 : a.n > b.n ? 1 : 0))
+    .slice(0, MAX_MCP_SERVERS);
+}
+
+/** What to send on the roster poll as `mcp` — null until a turn has taught us. */
+export function knownMcpServers() {
+  return mcpServersCache;
+}
+
+/**
  * LEARN WHAT `/` CAN OFFER, ON A MACHINE NO TURN HAS TAUGHT.
  *
  * WHY THIS EXISTS. `recordSkills` above is fed from the init event of a tab
@@ -1352,6 +1403,8 @@ export function parseInitLine(line) {
     // record nothing. Conflating the two would keep the probe scanning a whole
     // turn's output on a CLI that does not report them.
     skills: Array.isArray(ev.skills) ? ev.skills : null,
+    // The CLI's mounted MCP servers (0.97.0) — `recordMcpServers` normalises.
+    mcpServers: Array.isArray(ev.mcp_servers) ? ev.mcp_servers : null,
     sessionId: typeof ev.session_id === 'string' ? ev.session_id : null,
   };
 }
@@ -1413,6 +1466,7 @@ export function probeSkillsOnce(cwd) {
       const init = parseInitLine(line);
       if (!init) continue;
       if (init.skills) recordSkills(init.skills);
+      if (init.mcpServers) recordMcpServers(init.mcpServers);
       finish(init.sessionId);
       return;
     }

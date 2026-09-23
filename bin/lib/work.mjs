@@ -92,6 +92,7 @@ import {
   canRun,
   pickRuntimeFor,
   recordSkills,
+  recordMcpServers,
   toolEventOf,
   removeProbeTranscript,
   CLAUDE_TOOL_PROSE_KINDS,
@@ -172,6 +173,22 @@ const WORK_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
  * the machine's own default — a turn that runs — rather than a flag no CLI
  * understands and a tab that fails every message.
  */
+/**
+ * THE ONE SENTENCE A PLAN TURN'S SYSTEM PROMPT GAINS (0.97.0), composed here
+ * rather than in prompts.mjs because it is a MODIFIER on whichever contract
+ * the tab runs, not a contract of its own.
+ *
+ * The enforcement is not this sentence — it is `--permission-mode plan`, under
+ * which the CLI itself refuses every write (claude.mjs, PLAN_MODE_PERM). What
+ * the sentence buys is the ANSWER: the plain contract above it says "edit
+ * freely, commit", and a turn told only that would spend itself discovering
+ * refusals. It also says not to reach for `ExitPlanMode` (measured: disabled
+ * under `-p`, and the probe turn then asked the person to leave plan mode
+ * themselves) — leaving plan mode is the person's switch in the tab.
+ */
+export const PLAN_TURN_SENTENCE =
+  'THIS IS A PLANNING TURN: the person switched this tab to plan mode, so read what you need, decide, and answer with the plan itself as your reply — change nothing (the CLI refuses every write this turn, whatever the mechanics above say about editing, committing or artifacts), and do not try to leave plan mode; they switch it off in the tab when they want the plan carried out.';
+
 function brainFor(job) {
   const out = {};
   const model = typeof job?.model === 'string' ? job.model.trim() : '';
@@ -3136,6 +3153,22 @@ export function createWorkManager({
             });
             return;
           }
+          /**
+           * A PLAN TURN (0.97.0): the tab's switch, off the job. CLAUDE ONLY —
+           * `--permission-mode plan` is Claude Code's, and a codex or agy turn
+           * has no way to spell it, so it is refused HERE in words rather than
+           * run as a build turn wearing the word. The server never sends the
+           * key for a non-Claude tab; this is the machine's own half. Never on
+           * a capture chat, which is read-only by its own profile already.
+           */
+          const planTurn = job.planMode === true && job.capture !== true;
+          if (planTurn && rt.id !== 'claude') {
+            await settleWorkTurn(job.id, {
+              ok: false,
+              answer: `plan mode runs on Claude Code only, and this tab is ${rt.id} — turn plan off in the tab, then send the message again`,
+            });
+            return;
+          }
           // A PLAIN tab (agy) mounts no MCP: no credential to mint, no config
           // to write. The trade is stated in SYSTEM_WORK_PLAIN — no cards, no
           // streaming — and the honesty survives on the existing rails: the
@@ -3280,9 +3313,17 @@ export function createWorkManager({
           const adoptNote = adopting
             ? '[ADOPTED SESSION — this conversation was brought in from a terminal. Begin your reply with a 2-3 sentence recap of where it left off and what state carried over, then answer the message.]'
             : '';
-          const mcp = plainTab
-            ? { args: [], env: null, dir: null }
-            : mcpFor(rt.id, mint.token, getMcpUrl());
+          // A PLAN TURN RUNS PLAIN TOO (0.97.0): measured on 2.1.281, plan mode
+          // refuses every `mcp__flowviant` call ("Cannot call … while in plan
+          // mode") unless the tool is annotated read-only, and none of the
+          // session tools are — so mounting the control plane would hand the
+          // turn a list of tools it can only fail at. The credential is still
+          // minted above: its lease answers (held elsewhere, gone) are about
+          // the SESSION, and a plan turn needs them as much as any other.
+          const mcp =
+            plainTab || planTurn
+              ? { args: [], env: null, dir: null }
+              : mcpFor(rt.id, mint.token, getMcpUrl());
           // The tab's model/effort, if it named any. Spread into turnArgs so
           // BOTH runTurn calls below carry it — the retry is the same turn on
           // the same brain, not a quieter second opinion.
@@ -3429,7 +3470,7 @@ export function createWorkManager({
             const turnArgs = {
               // A plain tab has no tools to name and no session id to pass —
               // its kickoff asks for one complete report instead of a stream.
-              prompt: plainTab
+              prompt: plainTab || planTurn
                 ? WORK_TURN_KICKOFF_PLAIN({
                     sessionName: job.sessionName,
                     message,
@@ -3449,6 +3490,10 @@ export function createWorkManager({
                     askedByName: job.askedByName,
                   }),
               planPerm: captureTab,
+              // `--permission-mode plan` INSTEAD of the build posture — never
+              // beside `--dangerously-skip-permissions`, which silently wins
+              // (claude.mjs, PLAN_MODE_PERM). Present only on a plan turn.
+              ...(planTurn ? { planMode: true } : {}),
               // The adopt turn resumes the TERMINAL conversation by forking it
               // into this cwd (claude: --resume <id> --fork-session). After it
               // speaks once, the fork lives natively here and turn 2+ is the
@@ -3461,12 +3506,18 @@ export function createWorkManager({
               ...(() => {
                 const knowledgeDir = knowledgeDirFor(repoRoot);
                 return {
-                  system: withProjectContext(
-                    plainTab ? SYSTEM_WORK_PLAIN : captureTab ? SYSTEM_CAPTURE : SYSTEM_WORK,
-                    // ARTIFACTS (0.94.0): every tab but the read-only capture
-                    // chat, and only while the server can show one.
-                    { knowledgeDir, artifacts: !captureTab && getArtifactsAccepted() }
-                  ),
+                  // A PLAN TURN (0.97.0) runs the PLAIN contract — it has no
+                  // Flowviant tools, see `mcp` above — with no artifacts
+                  // paragraph (plan mode cannot write one) and the planning
+                  // sentence appended. Every other tab is untouched.
+                  system: planTurn
+                    ? `${withProjectContext(SYSTEM_WORK_PLAIN, { knowledgeDir, artifacts: false })}\n\n${PLAN_TURN_SENTENCE}`
+                    : withProjectContext(
+                        plainTab ? SYSTEM_WORK_PLAIN : captureTab ? SYSTEM_CAPTURE : SYSTEM_WORK,
+                        // ARTIFACTS (0.94.0): every tab but the read-only capture
+                        // chat, and only while the server can show one.
+                        { knowledgeDir, artifacts: !captureTab && getArtifactsAccepted() }
+                      ),
                   // The directory is OUTSIDE a worktree's cwd; Claude Code is
                   // told it may read there (`--add-dir`) rather than left to
                   // refuse a read-only capture turn a path it was just handed.
@@ -3495,6 +3546,9 @@ export function createWorkManager({
               // learned from a turn rather than looked up.
               onInit: (i) => {
                 recordSkills(i.skills);
+                // The CLI's mounted MCP servers and connectors (0.97.0) — the
+                // same free fact off the same event; see recordMcpServers.
+                recordMcpServers(i.mcpServers);
                 // The conversation this turn is actually speaking under. Held
                 // and persisted after the turn ends, so the NEXT one resumes
                 // this exact thread rather than whatever the directory saw

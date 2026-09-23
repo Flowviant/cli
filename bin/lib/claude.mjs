@@ -154,6 +154,36 @@ const CONSULT_PERM = [
  * commit` could commit the mockup it was told to keep out of git.
  */
 const ARTIFACT_WRITE = 'Edit(.flowviant/artifacts/**)';
+/**
+ * PLAN MODE (0.97.0) — a Workbench tab's `planMode` switch, and Claude Code's
+ * own `--permission-mode plan` INSTEAD OF every list above: the CLI reads,
+ * decides and answers with a plan, and refuses each write itself.
+ *
+ * PROBED on Claude Code 2.1.281 before relying on it (2026-09-23), in a scratch
+ * git repo, `-p … --output-format stream-json --verbose`:
+ *
+ *  · ALONE, asked to "add a subtract(a, b) function to app.js": the init event
+ *    reads `permissionMode: "plan"`, the turn Read the file, ran a read-only
+ *    `find`, wrote its plan to `~/.claude/plans/<slug>.md` (the CLI's own plan
+ *    file, outside the repo), tried `ExitPlanMode` and was told "Error: No such
+ *    tool available: ExitPlanMode. ExitPlanMode is disabled for this session",
+ *    and ended with the plan as its result text. app.js was untouched.
+ *  · BESIDE `--dangerously-skip-permissions`, same ask: the init event reads
+ *    `permissionMode: "bypassPermissions"` — no error, no warning — and the
+ *    edit LANDED. The bypass silently wins. So this list is a REPLACEMENT for
+ *    `perm`, never an addition, and a plan turn can never carry both.
+ *  · WITH `--mcp-config` and `--allowedTools mcp__flowviant`: the server
+ *    connected and its tools were listed, but a call was refused — "Cannot
+ *    call mcp__flowviant__log_work while in plan mode." — and without the
+ *    `--allowedTools` entry, "Claude requested permissions to use
+ *    mcp__flowviant__log_work, but you haven't granted it yet." Plan mode
+ *    admitted the call ONLY when the server annotated the tool
+ *    `readOnlyHint: true`, and none of the session tools (stream_session_turn,
+ *    log_work, file_card …) are read-only or annotated so. So a plan turn runs
+ *    PLAIN — no MCP, the plain tab's contract — rather than mounting a control
+ *    plane whose every call the CLI refuses. See work.mjs.
+ */
+export const PLAN_MODE_PERM = ['--permission-mode', 'plan'];
 export const DESIGN_PERM = [...CONSULT_PERM, ARTIFACT_WRITE];
 export const RESEARCH_PERM = [...CONSULT_PERM, 'WebSearch', 'WebFetch', ARTIFACT_WRITE];
 
@@ -331,10 +361,17 @@ export function handleStreamLine(line, { cwd, emit, onActivity, onToolEvent, app
     // ADOPTABLE — so any headless turn we run for our own purposes would leave
     // a phantom untitled session in the `+` menu. The caller that needs to
     // clean up after itself cannot do so without this id.
-    if (Array.isArray(ev.skills) || typeof ev.session_id === 'string') {
+    //
+    // `mcpServers` (0.97.0) is the same kind of fact from the same event: the
+    // MCP servers and claude.ai connectors the CLI mounted, each with its own
+    // status (`needs-auth` above all — a sign-in that has to happen at this
+    // box). Relayed raw; `recordMcpServers` (runtimes.mjs) normalises it and
+    // drops this daemon's own `flowviant` server.
+    if (Array.isArray(ev.skills) || typeof ev.session_id === 'string' || Array.isArray(ev.mcp_servers)) {
       onInit?.({
         skills: Array.isArray(ev.skills) ? ev.skills.map(String) : undefined,
         sessionId: typeof ev.session_id === 'string' ? ev.session_id : undefined,
+        mcpServers: Array.isArray(ev.mcp_servers) ? ev.mcp_servers : undefined,
       });
     }
   } else if (ev.type === 'result') {
@@ -382,9 +419,19 @@ export function handleStreamLine(line, { cwd, emit, onActivity, onToolEvent, app
 // returned string for sentinel detection, and each activity is handed to
 // `onActivity` so the caller can forward progress. Build-agent turns leave it
 // off and keep the raw text passthrough + line sentinels.
-export function runTurn({ prompt, resume, system, cwd, mcpConfig, mcpArgs, mcpEnv, runtime = 'claude', label, onSpawn, streamJson, answerFromResult, onActivity, onToolEvent, onInit, onUsage, onThreadId, wikiPerm, readOnly, planPerm, posture, vaultDir, knowledgeDir, resultSchemaArgs, model, effort, adoptResumeId, resumeThreadId, resumeConversationId }) {
+export function runTurn({ prompt, resume, system, cwd, mcpConfig, mcpArgs, mcpEnv, runtime = 'claude', label, onSpawn, streamJson, answerFromResult, onActivity, onToolEvent, onInit, onUsage, onThreadId, wikiPerm, readOnly, planPerm, planMode, posture, vaultDir, knowledgeDir, resultSchemaArgs, model, effort, adoptResumeId, resumeThreadId, resumeConversationId }) {
   return new Promise((resolve) => {
     const rt = runtimeById(runtime);
+    // PLAN MODE IS CLAUDE'S (0.97.0). The other adapters build their argv
+    // from `profile` and never read `perm`, so a codex or agy turn handed
+    // `planMode` would run a BUILD turn wearing the word "plan". The caller
+    // refuses first, in words; this is the belt — fail the turn, never
+    // substitute.
+    if (planMode && rt.id !== 'claude') {
+      console.error(`\nerror: plan mode runs on Claude Code only — not '${rt.label}'`);
+      resolve('');
+      return;
+    }
     if (!rt.args) {
       // Reached only if a brief names a runtime this daemon declares but cannot
       // drive. Fail as a turn with no sentinel — the loop already treats that as
@@ -457,8 +504,12 @@ export function runTurn({ prompt, resume, system, cwd, mcpConfig, mcpArgs, mcpEn
       // prompt as a trailing positional, so a flag after it is in the wrong
       // place.
       resultSchemaArgs,
-      perm:
-        profile === 'design'
+      // PLAN MODE REPLACES THE POSTURE, never joins it: beside
+      // `--dangerously-skip-permissions` the bypass wins silently (measured —
+      // see PLAN_MODE_PERM).
+      perm: planMode
+        ? PLAN_MODE_PERM
+        : profile === 'design'
           ? DESIGN_PERM
           : profile === 'research'
             ? RESEARCH_PERM

@@ -159,13 +159,13 @@ test('text is scrubbed before it leaves; an image is sent as it is', () => {
 
 test('an off-list type and an oversized file are reported by NAME, never read', () => {
   const d = place();
-  put(d, 'report.pdf', '%PDF');
+  put(d, 'build.zip', 'PK');
   put(d, 'big.txt', Buffer.alloc(ARTIFACT_MAX_BYTES + 1, 97));
   const entries = scanArtifacts(d);
-  const pdf = buildArtifactUpload(entries.find((e) => e.name === 'report.pdf'), { agentId: 'a1' });
-  assert.equal(pdf.bytes, null);
-  assert.equal(pdf.fields.agentId, 'a1');
-  assert.equal(pdf.fields.tooLarge, undefined);
+  const zip = buildArtifactUpload(entries.find((e) => e.name === 'build.zip'), { agentId: 'a1' });
+  assert.equal(zip.bytes, null);
+  assert.equal(zip.fields.agentId, 'a1');
+  assert.equal(zip.fields.tooLarge, undefined);
   const big = buildArtifactUpload(entries.find((e) => e.name === 'big.txt'), { agentId: 'a1' });
   assert.equal(big.bytes, null);
   assert.equal(big.fields.tooLarge, '1');
@@ -239,4 +239,32 @@ test('both lanes report, the capture chat never does, and the paragraph follows 
   assert.ok(/artifacts: getArtifactsAccepted\(\),/.test(src));
   const fleet = readFileSync(new URL('./fleet.mjs', import.meta.url), 'utf8');
   assert.ok(fleet.includes('artifactsAccepted = roster.artifactsAccepted === true;'));
+});
+
+test('a Word file, a deck, a sheet and a PDF are artifacts, sent as their bytes (0.97.0)', () => {
+  const d = place();
+  // A docx is a zip; a "secret" inside one is not text the scrub can match,
+  // and rewriting its bytes would corrupt the file.
+  const zipBytes = Buffer.from('PK\u0003\u0004sk-live-123', 'latin1');
+  const mimes = {
+    'brief.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    'deck.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    'model.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    'report.pdf': 'application/pdf',
+  };
+  for (const n of Object.keys(mimes)) writeFileSync(join(d, ARTIFACT_DIR, n), zipBytes);
+  const scrub = (s) => s.replaceAll('sk-live-123', '[REDACTED:KEY]');
+  for (const [n, mime] of Object.entries(mimes)) {
+    const up = buildArtifactUpload(scanArtifacts(d).find((e) => e.name === n), { sessionId: 's1' }, scrub);
+    assert.equal(up.fields.mime, mime, n);
+    assert.deepEqual([...up.bytes], [...zipBytes], `${n}: binary, never scrubbed`);
+  }
+});
+
+test('the ARTIFACTS paragraph names the document types, and the CSP wording beside it is untouched', () => {
+  assert.match(ARTIFACTS_PARAGRAPH, /plain text, or a\s+DOCX, PPTX, XLSX or PDF file/);
+  assert.match(ARTIFACTS_PARAGRAPH, /a DOCX, PPTX\s+or XLSX is offered as a download/);
+  // Canary: the policy sentences another pass made exact today are still there.
+  assert.match(ARTIFACTS_PARAGRAPH, /nothing else loads from the network/);
+  assert.match(ARTIFACTS_PARAGRAPH, /Keep each under 2 MB\./);
 });

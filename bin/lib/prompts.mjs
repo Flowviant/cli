@@ -1328,8 +1328,9 @@ Never copy them into the repository or commit them.`;
  */
 export const ARTIFACTS_PARAGRAPH = `ARTIFACTS: to show the person a document, a page, a chart or an image rather than
 describe it, write the file under .flowviant/artifacts/ in the directory you are
-working in (HTML, Markdown, SVG, PNG, JPG, GIF, WEBP, JSON, CSV or plain text); it
-appears beside the conversation. Keep each under 2 MB. An HTML artifact may run
+working in (HTML, Markdown, SVG, PNG, JPG, GIF, WEBP, JSON, CSV, plain text, or a
+DOCX, PPTX, XLSX or PDF file); it appears beside the conversation, and a DOCX, PPTX
+or XLSX is offered as a download. Keep each under 2 MB. An HTML artifact may run
 scripts inline or from cdnjs.cloudflare.com, cdn.jsdelivr.net/npm or unpkg.com, and
 load stylesheets inline, from those three, or from Google Fonts (whose font files
 load too); nothing else loads from the network, so any other font and every image

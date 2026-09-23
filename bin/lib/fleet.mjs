@@ -73,9 +73,11 @@ import { processDeployJobs, reportDeployConfig } from './deploy.mjs';
 import { machineSnapshot } from './resources.mjs';
 import {
   detectRuntimes,
+  knownMcpServers,
   knownSkills,
   pickRuntimeFor,
   probeSkillsOnce,
+  recordMcpServers,
   recordSkills,
   RUNTIMES,
   THINK_MARKER,
@@ -280,6 +282,19 @@ async function fetchRoster(
   try {
     const skills = knownSkills();
     if (skills !== null) url.searchParams.set('skills', skills.join(','));
+  } catch {
+    /* best-effort — the poll must never fail on a readout */
+  }
+  // WHICH MCP SERVERS AND CONNECTORS THE CLI MOUNTED, AND HOW EACH STANDS
+  // (0.97.0) — `[{n, s}]`, learned off the same init event as the skills, this
+  // daemon's own `flowviant` server excluded. The same three states: NOT SENT
+  // until a turn (or the one probe) has taught us, `[]` sent as the fact it is.
+  // The app names every server that is not connected — a connector that needs
+  // a sign-in AT THIS BOX above all — under the serving machine's row. A
+  // daemon→server report: an older server ignores the unknown param.
+  try {
+    const mcp = knownMcpServers();
+    if (mcp !== null) url.searchParams.set('mcp', JSON.stringify(mcp));
   } catch {
     /* best-effort — the poll must never fail on a readout */
   }
@@ -2120,7 +2135,10 @@ export async function runFleetDaemon() {
               // only thing missing was the handler. The wiki turn runs in a
               // detached worktree of THIS repo, so its `.claude/skills` and the
               // machine's personal ones resolve identically to a tab's.
-              onInit: (i) => recordSkills(i.skills),
+              onInit: (i) => {
+                recordSkills(i.skills);
+                recordMcpServers(i.mcpServers);
+              },
               onSpawn: (ch) => {
                 wikiChild = ch;
               },
@@ -2169,7 +2187,10 @@ export async function runFleetDaemon() {
                 streamJson: true,
                 onActivity,
                 // Same free harvest as the sweep above.
-                onInit: (i) => recordSkills(i.skills),
+                onInit: (i) => {
+                  recordSkills(i.skills);
+                  recordMcpServers(i.mcpServers);
+                },
                 onSpawn: (ch) => {
                   wikiChild = ch;
                 },

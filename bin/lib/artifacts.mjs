@@ -91,6 +91,14 @@ export const ARTIFACT_TYPES = {
   json: { mime: 'application/json', text: true },
   csv: { mime: 'text/csv', text: true },
   txt: { mime: 'text/plain', text: true },
+  // DOCUMENTS (0.97.0): a Word file, a deck, a sheet or a PDF — what the
+  // machine's docx/pptx/xlsx/pdf skills write. Binary, so never scrubbed (a
+  // zip or a PDF carries no plain text for `envScrub` to match), and under the
+  // same cap. The app offers the first three as a download and frames the PDF.
+  docx: { mime: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', text: false },
+  pptx: { mime: 'application/vnd.openxmlformats-officedocument.presentationml.presentation', text: false },
+  xlsx: { mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', text: false },
+  pdf: { mime: 'application/pdf', text: false },
 };
 
 export function artifactTypeFor(name) {
