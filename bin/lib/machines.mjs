@@ -277,10 +277,10 @@ export function projectPhrase(e) {
  * daemons for one project. The id on each row said they were different
  * projects; nothing said they were bound to the SAME checkout, which is the
  * fact that makes it a duplicate rather than two rows. So the listing ends
- * with one line per such repo, naming every project on it in full, and the
- * consequence the store already enforces: every start in that directory asks
- * which project to serve. It states no remedy of its own — the menu below it
- * (or the footer, when there is no menu) is where the verbs are.
+ * with one line per such repo, naming every project on it in full, the rule
+ * (a directory serves one project — the owner's 2026-09-23 ruling, which made
+ * the start there a refusal), and the remedy in his order: delete the project
+ * in Flowviant, or disconnect this box from it (the menu below, or the flags).
  *
  * Pure over the entries. An unbound project collides with nothing.
  */
@@ -290,8 +290,8 @@ export function renderCollisions(entries) {
     const list = `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
     return (
       `  ! ${g.entries.length} projects are connected for ${g.repoRoot}: ${list} — ` +
-      'one repo serves one project, so every `npx flowviant` there asks which. ' +
-      'If one of them is a duplicate, disconnect this box from it.'
+      'a directory serves one project, and `npx flowviant` there refuses to start until it does. ' +
+      'Delete the one you do not mean in Flowviant (project settings → General → Delete project), or disconnect this box from it.'
     );
   });
 }

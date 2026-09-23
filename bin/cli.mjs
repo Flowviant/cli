@@ -46,7 +46,10 @@
  * a daemon on another computer is invisible from here; since 0.95.0 it says
  * out loud when two projects are bound to one repo, and on a terminal it is a
  * menu (↑/↓, enter) whose verbs disconnect THIS box from a project or forget
- * a credential here — `--remove <id>` / `--forget <id>` for a script.
+ * a credential here — `--remove <id>` / `--forget <id>` for a script. A
+ * DIRECTORY SERVES ONE PROJECT: login refuses to bind a second project to a
+ * repo, and a store that already holds two for one repo refuses to start
+ * until one is deleted in the app or disconnected here.
  *
  * Env:
  *   FLOWVIANT_MACHINE_TOKEN  the machine credential (or use `flowviant login`);
@@ -89,7 +92,8 @@ if (process.argv[2] === 'login') {
   // A login the person CANCELLED at the second-project question saved nothing,
   // so there is no credential for the child to serve — starting it would end
   // in "no credential found" over a choice they just made on purpose.
-  if (noStart || !login?.saved) process.exit(0);
+  if (!login?.saved) process.exit(1); // refused: the directory already serves another project
+  if (noStart) process.exit(0);
   // Re-exec as a plain `flowviant` rather than falling through. config.mjs reads
   // the credential at IMPORT time — which was before the login we just did — so
   // this process still has an empty FLEET_TOKEN and would exit with "no
@@ -460,7 +464,7 @@ const externalToken =
  *  existed, so this process cannot serve; the child can. */
 async function reexecAfterLogin() {
   const login = await runLogin({ thenStart: false });
-  if (!login?.saved) process.exit(0); // cancelled at the second-project question — nothing to serve
+  if (!login?.saved) process.exit(1); // refused: the directory already serves another project
   const { spawn } = await import('node:child_process');
   const child = spawn(process.execPath, [process.argv[1]], { stdio: 'inherit', env: process.env });
   process.exit(await new Promise((resolve) => child.on('exit', (code) => resolve(code ?? 0))));
@@ -470,7 +474,9 @@ async function reexecAfterLogin() {
 // the connected date to the COLLIDING rows only — production held two projects
 // both called "BRIF AI", both bound to the same checkout, so this picker
 // offered two identical lines and the only way to answer was to guess. See
-// credentials.mjs for why the suffix is not on every row.
+// credentials.mjs for why the suffix is not on every row. (That exact case is
+// a refusal now rather than a picker — a directory serves one project — but
+// two same-named projects can still meet in the no-match picker.)
 function listLines(entries, { projectRowLabel }) {
   return entries
     .map(
@@ -486,6 +492,20 @@ if (!FLEET_TOKEN) {
     console.error(`error: ${CREDENTIAL.error}. \`flowviant projects\` lists what is stored.`);
     process.exit(1);
   }
+  // A DIRECTORY SERVES ONE PROJECT (2026-09-23, the owner, verbatim: "a
+  // directory cannot have more than one project on flowviant. if one already
+  // exists, it would warn the user and ask them to delete the project on
+  // flowviant first. because 2 projects shouldnt be able to edit a directory
+  // at the same time."). This used to be a PICKER — two projects bound to one
+  // checkout, choose which this daemon serves — which is a control offering to
+  // do the forbidden thing politely. It is a refusal now, on a TTY and
+  // headless alike, naming both projects and the remedy. `credentialRefusal`
+  // is the same sentence login prints when it declines to bind a second one.
+  if (CREDENTIAL.reason === 'multiple-bound') {
+    const { directoryTakenRefusal } = await import('./lib/credentials.mjs');
+    console.error(directoryTakenRefusal(CREDENTIAL.choices, CREDENTIAL.repoRoot));
+    process.exit(1);
+  }
   if (CREDENTIAL.choices?.length && interactive) {
     const creds = await import('./lib/credentials.mjs');
     const { originSlug } = await import('./lib/git.mjs');
@@ -494,9 +514,7 @@ if (!FLEET_TOKEN) {
     console.log(
       CREDENTIAL.reason === 'outside-repo'
         ? 'flowviant is not inside a git repo, and more than one project is connected here.'
-        : CREDENTIAL.reason === 'multiple-bound'
-          ? `More than one connected project names this repo (${repoRoot}) — pick which one this daemon serves:`
-          : `This repo (${repoRoot}) is not connected to any project yet. Connected on this machine:`
+        : `This repo (${repoRoot}) is not connected to any project yet. Connected on this machine:`
     );
 
     const loginLabel = `connect ${repoRoot ? 'this repo' : 'a repo'} to a different project (flowviant login)`;
@@ -505,16 +523,13 @@ if (!FLEET_TOKEN) {
     // this only decides which row the cursor starts on, using the repo's folder
     // name and its github repo-name against the stored project names. A unique
     // match becomes ONE keypress; a wrong guess costs nothing, because the human
-    // still confirms. `multiple-bound` gets no hint — every choice already names
-    // this repo, so nothing distinguishes them.
+    // still confirms. (Two projects bound to THIS repo never reach here: that
+    // is a refusal above, since 2026-09-23.)
     const slug = repoRoot ? originSlug(repoRoot) : null;
-    const likely =
-      CREDENTIAL.reason === 'multiple-bound'
-        ? -1
-        : creds.likelyChoiceIndex(choices, {
-            repoBasename: repoRoot ? basename(repoRoot) : null,
-            repoSlugName: slug ? slug.split('/')[1] : null,
-          });
+    const likely = creds.likelyChoiceIndex(choices, {
+      repoBasename: repoRoot ? basename(repoRoot) : null,
+      repoSlugName: slug ? slug.split('/')[1] : null,
+    });
 
     // Bounded like the confirm below, and for the same reason — but silence
     // means something DIFFERENT here and the difference is load-bearing. There

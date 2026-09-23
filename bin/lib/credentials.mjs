@@ -227,6 +227,42 @@ export function boundElsewhere(entries, repoRoot, projectId) {
   return entries.filter((e) => e.projectId !== projectId && samePath(e.repoRoot, repoRoot));
 }
 
+/**
+ * THE REFUSAL, in one place, because two commands print it (2026-09-23).
+ *
+ * The owner, verbatim: "a directory cannot have more than one project on
+ * flowviant. if one already exists, it would warn the user and ask them to
+ * delete the project on flowviant first. because 2 projects shouldnt be able
+ * to edit a directory at the same time." So `flowviant login` refuses to bind
+ * a second project to a repo, and a start in a repo the store already holds
+ * two projects for refuses to serve either — the picker that used to stand
+ * there was a control offering to do the forbidden thing politely.
+ *
+ * It names every project on the directory, the rule, and the remedy in the
+ * owner's own order: delete the project in Flowviant first. The disconnect
+ * this box can do on its own (`flowviant machines`) is named second, for the
+ * case where the project must survive somewhere else — it satisfies the same
+ * rule, because a project this box no longer serves cannot edit the directory
+ * from here.
+ */
+export function directoryTakenRefusal(bound, repoRoot, { incoming } = {}) {
+  // Every project in the sentence is labelled against the WHOLE set, the
+  // incoming one included: a refusal reading "already connected to BRIF AI,
+  // so BRIF AI was not connected" is the puzzle it exists to end.
+  const all = [...bound, ...(incoming ? [incoming] : [])];
+  const names = bound.map((e) => projectRowLabel(e, all));
+  const list = names.length > 1 ? `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}` : names[0];
+  const head = incoming
+    ? `${repoRoot} is already connected to ${list}, so ${projectRowLabel(incoming, all)} was not connected here.`
+    : `${repoRoot} is connected to ${list}.`;
+  return (
+    `${head}\n` +
+    'A directory serves one project — two projects must not edit it at the same time.\n' +
+    'Delete the project you do not mean in Flowviant first (project settings → General → Delete project),\n' +
+    'or disconnect this box from it with `flowviant machines`, then run this again.'
+  );
+}
+
 /** Collapse a name or slug for loose comparison: "My Project", "my-project"
  *  and "myproject" all become "myproject". */
 function normalizeName(s) {
@@ -387,6 +423,9 @@ export function matchStoredProject(ref) {
  * this returns. Shapes:
  *   { entry, source: 'project-flag' | 'repo' | 'only', needsConfirm? }
  *   { choices, reason: 'no-match' | 'multiple-bound' | 'outside-repo', repoRoot }
+ *     (`multiple-bound` is a REFUSAL in cli.mjs since 2026-09-23 — a directory
+ *     serves one project — and never a picker; the shape is kept because it
+ *     names the projects the refusal has to print)
  *   { none: true }
  *   { error }
  *

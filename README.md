@@ -54,7 +54,7 @@ Launch with `@latest` so each start pulls the newest published version — a bar
 
 ## Machines on this box
 
-One box can serve several projects — one daemon per repository directory, each connected with its own `flowviant login` run inside that repo. `flowviant machines` lists every project connected on this box with the id and date it was connected, and under each one every computer that has polled it (the app's Home lists the same across your whole account). Two projects bound to one repository are named out loud at the foot of the listing, because that is the one shape that reads as "the same project connected twice" and is not: every `npx flowviant` in that directory has to ask which of them to serve.
+One box can serve several projects — one daemon per repository directory, each connected with its own `flowviant login` run inside that repo. `flowviant machines` lists every project connected on this box with the id and date it was connected, and under each one every computer that has polled it (the app's Home lists the same across your whole account). Two projects bound to one repository are named out loud at the foot of the listing, because that is the one shape that reads as "the same project connected twice" and is not — and a directory serves one project, so `npx flowviant` there refuses to start until one of them goes.
 
 On a terminal the listing is a menu: ↑/↓ over the projects, enter for what you can do about one, esc to leave. Two verbs, each acting on **this box's own connection** and nothing else:
 
@@ -63,7 +63,7 @@ On a terminal the listing is a menu: ↑/↓ over the projects, enter for what y
 
 Stopping or removing a daemon on **another** computer is done in the app (project settings → Machines), where the person pressing it can see what they are changing.
 
-`flowviant login` asks before it binds a second project to a repository that is already connected to one: keep both (every start there asks which to serve), replace (the repo serves the new project and this box is disconnected from the old one), or cancel.
+**A directory serves one project.** `flowviant login` refuses to bind a second project to a repository that is already connected to one, and a store that already holds two projects for one repository refuses to start there — both name the projects and the remedy: delete the project you do not mean in Flowviant (project settings → General → Delete project), or disconnect this box from it with `flowviant machines`, then try again.
 
 ## Sessions
 

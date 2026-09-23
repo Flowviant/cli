@@ -7,7 +7,7 @@
  */
 
 import { FLEET_URL, USER_AGENT, VERSION } from './config.mjs';
-import { saveLogin, detectRepoRoot, projectLabel, listStoredProjects, boundElsewhere } from './credentials.mjs';
+import { saveLogin, detectRepoRoot, projectLabel, listStoredProjects, boundElsewhere, directoryTakenRefusal } from './credentials.mjs';
 import { c, info, ok, warn, fail } from './ui.mjs';
 import { sleep } from './claude.mjs';
 
@@ -25,58 +25,6 @@ async function post(url, body) {
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const j = await res.json();
   return j.data ?? j;
-}
-
-/**
- * THE THREE ANSWERS to "this repo is already connected to another project",
- * as menu rows — pure, so the wording is provable. Each row says its whole
- * consequence, the same rule the `machines` menu keeps: a verb whose outcome
- * lives in a manual is one you have to be sure about before you can use it.
- *
- *  keep     both stay; `npx flowviant` in this repo asks which to serve.
- *  replace  this repo serves the NEW project; this box is disconnected from
- *           the old one (its daemon here stopped, its row left in the app,
- *           its credential forgotten here) — the whole disconnect, because a
- *           half of it leaves a daemon running on a credential the store no
- *           longer names.
- *  cancel   nothing is saved. The approval in the app minted or reused the
- *           project's credential either way; a credential nobody holds is a
- *           row, not a machine.
- */
-export function secondProjectOptions(clash, entry, repoRoot) {
-  const olds = clash.map(projectLabel).join(' and ');
-  const now = projectLabel(entry);
-  return [
-    `keep both — every \`npx flowviant\` in ${repoRoot} asks whether to serve ${olds} or ${now}`,
-    `replace — ${repoRoot} serves ${now} from now on; this box is disconnected from ${olds} (its daemon here stopped, its credential forgotten here)`,
-    `cancel — save nothing; ${repoRoot} stays connected to ${olds}`,
-  ];
-}
-
-const DECISIONS = ['keep', 'replace', 'cancel'];
-
-/** Ask, on whatever this terminal can draw. No terminal to ask on: KEEP, and
- *  say so — a headless login must not hang, and refusing would strand a
- *  runner that had just been approved in the app. */
-async function secondProjectDecision({ clash, entry, repoRoot }) {
-  const { canPrompt, menuSupported, selectMenu, askWithTimeout } = await import('./tty.mjs');
-  const olds = clash.map(projectLabel).join(' and ');
-  console.log('');
-  warn(`${repoRoot} is already connected to ${olds} on this box.`);
-  if (!canPrompt()) {
-    console.log(`  keeping both — every \`npx flowviant\` there will ask which to serve; \`flowviant machines\` removes one.\n`);
-    return 'keep';
-  }
-  const options = secondProjectOptions(clash, entry, repoRoot);
-  if (menuSupported()) {
-    const res = await selectMenu({ options });
-    if (res.cancelled) return 'cancel';
-    if (!res.unsupported) return DECISIONS[res.index];
-  }
-  console.log(options.map((o, i) => `  ${i + 1}. ${o}`).join('\n'));
-  const raw = await askWithTimeout('  Which? [1-3] ');
-  const n = Number.parseInt(raw ?? '', 10);
-  return DECISIONS[n - 1] ?? 'cancel';
 }
 
 export async function runLogin({ thenStart = false } = {}) {
@@ -125,28 +73,23 @@ export async function runLogin({ thenStart = false } = {}) {
         name: typeof poll.projectName === 'string' && poll.projectName ? poll.projectName : null,
         repoRoot,
       };
-      // A SECOND PROJECT ON A REPO IS A QUESTION, NEVER A SILENT SAVE
-      // (2026-09-23). The owner: "im not sure how it even allowed me to run
-      // npx flowviant login twice and init a daemon twice on the same
-      // project/repository/directory in the first place." It allowed it
-      // because it never looked: the approval names a project, this repo was
-      // already bound to a different one, and both landed in the store — after
-      // which every start here was a picker between two rows that read alike.
-      // Asked while the person is still at the terminal; headless, the save
-      // goes ahead and the fact is printed, because a CI runner cannot answer
-      // and a login that silently refused would be worse than one that said.
+      // A DIRECTORY SERVES ONE PROJECT (2026-09-23). The owner, verbatim: "a
+      // directory cannot have more than one project on flowviant. if one
+      // already exists, it would warn the user and ask them to delete the
+      // project on flowviant first. because 2 projects shouldnt be able to
+      // edit a directory at the same time." And his earlier question — "im not
+      // sure how it even allowed me to run npx flowviant login twice … on the
+      // same repository" — was answered by the fact that login never looked.
+      // It looks now, and REFUSES: the approval in the app minted or reused
+      // the project's credential either way, and a credential nobody holds is
+      // a row, not a machine. The refusal names both projects and the remedy
+      // (`directoryTakenRefusal`, shared with the daemon's own start).
       const clash = boundElsewhere(listStoredProjects(), repoRoot, entry.projectId);
       if (clash.length > 0) {
-        const decision = await secondProjectDecision({ clash, entry, repoRoot });
-        if (decision === 'cancel') {
-          console.log(`\n  nothing saved — ${repoRoot} stays connected to ${clash.map(projectLabel).join(' and ')}.\n`);
-          return { saved: false };
-        }
-        if (decision === 'replace') {
-          const { disconnectHere, realDisconnectDeps, leaveUrlFrom } = await import('./machines.mjs');
-          const deps = await realDisconnectDeps({ url: leaveUrlFrom(FLEET_URL), log: (m) => console.log(`  ${m}`) });
-          for (const old of clash) await disconnectHere(old, deps, { log: (m) => console.log(`  ${m}`) });
-        }
+        console.log('');
+        warn(directoryTakenRefusal(clash, repoRoot, { incoming: entry }));
+        console.log('');
+        return { saved: false };
       }
       saveLogin(entry);
       ok(

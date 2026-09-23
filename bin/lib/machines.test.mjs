@@ -603,9 +603,10 @@ test('two projects bound to one repo are named in one line at the foot of the li
   assert.equal(lines.length, 1);
   assert.match(lines[0], /2 projects are connected for \/home\/whuang\/brif-ai/);
   assert.match(lines[0], /BRIF AI \(fd716bf3…, connected Aug 1\) and BRIF AI \(fdcec6a0…, connected Sep 16\)/);
-  // The consequence the store already enforces, and no remedy of its own — the
-  // menu (or the flags footer) is where the verbs are.
-  assert.match(lines[0], /every `npx flowviant` there asks which/);
+  // The rule, and the remedy in the owner's order: delete the project in
+  // Flowviant first, disconnect this box second.
+  assert.match(lines[0], /a directory serves one project, and `npx flowviant` there refuses to start until it does/);
+  assert.match(lines[0], /Delete the one you do not mean in Flowviant \(project settings → General → Delete project\), or disconnect this box from it/);
   // A store with no collision says nothing at all: a sentence about an absence
   // is chrome.
   assert.deepEqual(renderCollisions([other, a]), []);
