@@ -344,7 +344,10 @@ test('every turn the daemon spawns composes its contract through withProjectCont
   // object: the pin is that the knowledge dir reaches both lanes, and it moved
   // with the call it pins rather than being loosened to a bare name match.)
   assert.ok(/withProjectContext\(\s*plainTab \? SYSTEM_WORK_PLAIN : captureTab \? SYSTEM_CAPTURE : SYSTEM_WORK,[\s\S]{0,300}?\{ knowledgeDir, artifacts: !captureTab && getArtifactsAccepted\(\) \}/.test(src));
-  assert.ok(/system: withProjectContext\(SYSTEM_AGENT, \{\s*knowledgeDir: knowledgeDirFor\(repoRoot\),/.test(src));
+  // (Re-anchored 2026-09-23 when the agent lane started picking its contract
+  // by the card's kind — `SYSTEM_AGENT_FOR(taskKind)` is SYSTEM_AGENT itself
+  // for a code card, and the pin is still that the knowledge dir reaches it.)
+  assert.ok(/system: withProjectContext\(SYSTEM_AGENT_FOR\(taskKind\), \{\s*knowledgeDir: knowledgeDirFor\(repoRoot\),/.test(src));
   // …and nowhere is a bare contract left behind for either lane.
   assert.equal((src.match(/system: SYSTEM_AGENT,/g) ?? []).length, 0);
   // Claude is told the directory is readable, so a curated profile does not

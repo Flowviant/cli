@@ -1348,8 +1348,9 @@ test('an ordinary settle runs no pre-review and posts nothing about one', async 
  * refusals, which are exactly the settles that must carry NO usage. So the
  * runtime tests here prove the absence and this proves the presence.
  *
- * THE THREE THAT CARRY IT are the three that follow the turn: the limit park,
- * the no-result backstop and the main settle. A turn that hit a limit or
+ * THE FOUR THAT CARRY IT are the four that follow the turn: the limit park,
+ * the no-result backstop, the missing-artifact settle (0.97.0) and the main
+ * settle. A turn that hit a limit or
  * produced nothing parseable still spent real tokens, and a counter that only
  * charged the happy path would under-report precisely the runs somebody opens
  * the number to understand.
@@ -1369,10 +1370,13 @@ test('every settle that follows a CLI carries what it spent, and no other does',
     'SET, never accumulated — one turn is one result event, and the adding-up is the server\'s'
   );
   const spread = '...(usage ? { usage } : {}),';
+  // FOUR since 0.97.0: a design or research turn that delivered without
+  // writing its artifact settles `nothing` AFTER the CLI ran, so it spent real
+  // tokens and carries them like the other three.
   assert.equal(
     turn.split(spread).length - 1,
-    3,
-    'the limit park, the no-result backstop and the main settle — those three and no more'
+    4,
+    'the limit park, the no-result backstop, the missing-artifact settle and the main settle — those four and no more'
   );
   // The teardown sweep re-POSTs stored bodies and settles the rest as
   // `nothing`; nothing ran in it, so it may not invent a spend.

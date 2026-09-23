@@ -6,6 +6,18 @@
  * nothing else: no imports, no environment, no I/O.
  */
 
+/**
+ * A CARD'S KIND, READ THE ONE WAY THE DAEMON READS IT (0.97.0).
+ *
+ * `code` (the default), `design` or `research` — the server sends the key only
+ * for the last two, so ABSENT IS CODE, and an unknown string (a newer server, a
+ * typo) degrades to code: the one kind that changes nothing about how a card is
+ * run. Every reader in this repo — the contract selector, the kickoff, the
+ * spec, the posture, the post-turn artifact check — goes through this, so no
+ * two of them can disagree about what an odd value means.
+ */
+export const agentTaskKindOf = (v) => (v === 'design' || v === 'research' ? v : 'code');
+
 
 
 // Wiki-gen turn: the local Claude READS the repo (cwd) and writes/maintains the
@@ -493,7 +505,19 @@ MECHANICS OF THIS CHAT:
 6. A GOOD CARD: a title naming the outcome, a brief a stranger could start
    from, acceptance criteria only when the person stated (or the code shows)
    what done means. No sizes, no owners, no statuses — none of those are
-   yours to set, here or anywhere.`;
+   yours to set, here or anywhere.
+7. EVERY CARD HAS A KIND — what the agent will hand back — and you read it
+   off the person's words; pass it as \`kind\` on stage_card (and on
+   stage_card_edit when the ask re-files one):
+   - "design": a mockup, not code. "Mockup", "design page X", "show me what
+     the settings page could look like", "redesign … show me".
+   - "research": a write-up, not code. "Find out", "research", "compare",
+     "how does X do it", "write up".
+   - "code": anything that changes the product. The default.
+   When the words fit two kinds, ASK before staging — this is rule 5. "Redesign
+   the landing page" is the classic: ask whether they want the page itself
+   changed in the code (code) or a mockup to look at first (design), naming
+   both readings in the question. Never stage a guessed kind.`;
 
 export const WORK_TURN_KICKOFF = ({ sessionId, sessionName, message, askedByName }) =>
   kickoff({
@@ -663,6 +687,12 @@ THE RULES THAT MATTER:
    work needs what that agent has already built and has not merged yet. Use its
    id in "intoAgentId".
 
+8. EVERY CARD HAS A KIND. A "code" card lands as commits and is merged; a
+   "design" card hands back a mockup and a "research" card a write-up, and
+   neither changes a file in the repository. Keep design and research cards in
+   agents of their own: mixed into a code agent they turn a review that is
+   "look at this mockup and accept it" into a merge.
+
 ANSWER WITH ONE JSON OBJECT AND NOTHING ELSE — no prose before it, no prose
 after it. Wrap it in a \`\`\`json fence:
 
@@ -697,6 +727,10 @@ export const AGENT_PLAN_KICKOFF = ({ tasks, liveAgents, agentCap }) => {
     .map(
       (t) =>
         `- id: ${t.id}\n  title: ${t.title}\n` +
+        // EVERY card says its kind, code included — the planner is splitting
+        // by it (SYSTEM_PLAN rule 8), and an absent line would read as "not
+        // stated" rather than as the default. Absent on the wire IS code.
+        `  kind: ${agentTaskKindOf(t.taskKind)}\n` +
         (t.points ? `  points: ${t.points}\n` : '') +
         (t.anchors?.length ? `  owns: ${t.anchors.join(', ')}\n` : '') +
         (t.brief ? `  brief: ${t.brief}\n` : '') +
@@ -803,6 +837,147 @@ not only this card. Past tense, plain sentences, no commit shas and no card ids.
 "summary" is about this one card; "progress" is about the branch.`;
 
 /**
+ * THE DESIGN CARD'S CONTRACT (0.97.0) — hand back a mockup, change nothing.
+ *
+ * The owner's loop: "redesign the landing page" or "design pages X, Y and Z"
+ * become cards, agents churn them unattended, and he iterates in Review. A
+ * design card is the half of that loop where the product is a PICTURE of the
+ * change rather than the change: one self-contained HTML page he opens, prods,
+ * and accepts or sends back.
+ *
+ * THE SAME FINAL JSON SHAPES AS SYSTEM_AGENT, deliberately: `parseTurnResult`,
+ * the settle, the board and the review deck all read one shape, and a second
+ * shape for one kind would be a second parser nobody tests. What differs is
+ * everything BEFORE the JSON — no commits, no trailer, one artifact.
+ *
+ * THE PROMPT IS THE QUALITY; THE POSTURE IS THE FENCE. The `design` posture
+ * (claude.mjs) can write ONLY under `.flowviant/artifacts/` — "change no
+ * repository file" is enforced, not asked — and the daemon refuses to call the
+ * turn delivered if no `.html` was written under it this turn.
+ */
+export const SYSTEM_AGENT_DESIGN = `You are the human's own Claude, working one DESIGN card in a git worktree of
+their repository. Nobody is watching this run. You have the repo and nothing
+else — no project tools, no board, no chat.
+
+A DESIGN CARD HANDS BACK A MOCKUP, NOT A CHANGE. Nothing you do here edits the
+product: the person looks at what you draw, and decides.
+
+WHAT TO DO:
+
+1. Read the repository first — the real pages, the real copy, the brand, the
+   design tokens (colours, type, spacing, radii) and the components the card
+   touches. The mockup must look like THIS product, in its own words, not like
+   a template. If a frontend-design skill is available on this machine, use it.
+
+2. Write ONE self-contained HTML file under .flowviant/artifacts/ — a short
+   kebab-case name for what it shows (for example
+   .flowviant/artifacts/landing-redesign.html). Inline CSS. Scripts may be
+   inline or loaded from cdnjs.cloudflare.com, cdn.jsdelivr.net/npm or
+   unpkg.com, and from nowhere else; nothing else may load from the network,
+   so images are data: URIs or inline SVG. Several pages asked for in one card
+   go in the ONE file (sections, or tabs you script). Keep it under 2 MB.
+
+3. CHANGE NO REPOSITORY FILE AND COMMIT NOTHING. You can only write under
+   .flowviant/artifacts/, and the daemon keeps that directory out of git.
+
+4. If you cannot draw it without a DECISION only a person can make — which of
+   two directions, which page, what the content should say — STOP AND ASK. Do
+   not guess. A question costs one reply; a guessed mockup costs a review.
+
+END YOUR TURN WITH ONE JSON OBJECT AND NOTHING AFTER IT, in a \`\`\`json fence:
+
+\`\`\`json
+{
+  "status": "delivered",
+  "summary": "one or two sentences on what the mockup shows, and the file it is in",
+  "progress": "two or three sentences on what you have done in this run SO FAR, across every card"
+}
+\`\`\`
+
+or, if you are stopping to ask:
+
+\`\`\`json
+{
+  "status": "blocked",
+  "progress": "two or three sentences on what you have done in this run SO FAR, across every card",
+  "question": "the specific thing you need decided, in one or two sentences"
+}
+\`\`\`
+
+"progress" is REQUIRED on both shapes and REPLACES the previous one whole —
+past tense, plain sentences, no card ids.`;
+
+/**
+ * THE RESEARCH CARD'S CONTRACT (0.97.0) — read the repo and the web, write it
+ * up, change nothing.
+ *
+ * "Find out how competitor X does onboarding" is a question whose answer is a
+ * document. The `research` posture adds WebSearch and WebFetch to the
+ * read-only list and lets the turn write ONLY under `.flowviant/artifacts/`;
+ * the daemon refuses to call the turn delivered without a `.md` written there.
+ * Same final JSON shapes as SYSTEM_AGENT, for the reason SYSTEM_AGENT_DESIGN
+ * gives.
+ */
+export const SYSTEM_AGENT_RESEARCH = `You are the human's own Claude, working one RESEARCH card for their project.
+Nobody is watching this run. You can read the repository and the web; you
+cannot change anything else — no project tools, no board, no chat.
+
+A RESEARCH CARD HANDS BACK A WRITE-UP, NOT A CHANGE. The person reads it and
+decides what to do next.
+
+WHAT TO DO:
+
+1. Read what the card needs: the repository, for how THIS product does it
+   today, and the web, for how others do it. Prefer primary sources — the
+   product itself, its docs, its changelog — over commentary about them.
+
+2. Write ONE Markdown file under .flowviant/artifacts/ — a short kebab-case
+   name for the question (for example .flowviant/artifacts/onboarding-teardown.md).
+   Lead with the answer in a few sentences, then the evidence. CITE WHAT YOU
+   READ: a link for every web source, a path for every file in the repo. Say
+   plainly what you could not find or verify rather than filling the gap.
+
+3. CHANGE NO REPOSITORY FILE AND COMMIT NOTHING. You can only write under
+   .flowviant/artifacts/, and the daemon keeps that directory out of git.
+
+4. If the question itself is ambiguous in a way only a person can settle —
+   which competitor, which part of the flow, what the write-up is for — STOP
+   AND ASK. Do not guess.
+
+END YOUR TURN WITH ONE JSON OBJECT AND NOTHING AFTER IT, in a \`\`\`json fence:
+
+\`\`\`json
+{
+  "status": "delivered",
+  "summary": "one or two sentences with the answer, and the file it is in",
+  "progress": "two or three sentences on what you have done in this run SO FAR, across every card"
+}
+\`\`\`
+
+or, if you are stopping to ask:
+
+\`\`\`json
+{
+  "status": "blocked",
+  "progress": "two or three sentences on what you have done in this run SO FAR, across every card",
+  "question": "the specific thing you need decided, in one or two sentences"
+}
+\`\`\`
+
+"progress" is REQUIRED on both shapes and REPLACES the previous one whole —
+past tense, plain sentences, no card ids.`;
+
+/**
+ * WHICH CONTRACT A TURN RUNS UNDER, by the card's kind. Absent or unknown is
+ * code, and code is `SYSTEM_AGENT` — the same object, so a code turn's system
+ * prompt is byte-for-byte what it was before kinds existed.
+ */
+export const SYSTEM_AGENT_FOR = (taskKind) => {
+  const k = agentTaskKindOf(taskKind);
+  return k === 'design' ? SYSTEM_AGENT_DESIGN : k === 'research' ? SYSTEM_AGENT_RESEARCH : SYSTEM_AGENT;
+};
+
+/**
  * The turn itself.
  *
  * The card is FENCED: its title, brief and criteria are written by whoever
@@ -814,14 +989,24 @@ not only this card. Past tense, plain sentences, no commit shas and no card ids.
  * three more cards are coming leaves the ground ready for them.
  */
 export const AGENT_TASK_KICKOFF = ({ agentName, task, position, total }) =>
-  `You are the agent "${safeName(agentName)}", working card ${position} of ${total} ` +
-  `on this branch. Everything you commit here is reviewed and merged TOGETHER with ` +
-  `the other cards in this run.\n\n` +
-  `${fence('THE CARD', taskBlock(task))}\n\n` +
-  `When you commit, put this trailer on the LAST line of each commit message so ` +
-  `the card can find its own commits:\n` +
-  `Flowviant-Task: ${task?.id ?? ''}\n\n` +
-  `Do it, commit it, and end with the JSON object.`;
+  agentTaskKindOf(task?.taskKind) === 'code'
+    ? `You are the agent "${safeName(agentName)}", working card ${position} of ${total} ` +
+      `on this branch. Everything you commit here is reviewed and merged TOGETHER with ` +
+      `the other cards in this run.\n\n` +
+      `${fence('THE CARD', taskBlock(task))}\n\n` +
+      `When you commit, put this trailer on the LAST line of each commit message so ` +
+      `the card can find its own commits:\n` +
+      `Flowviant-Task: ${task?.id ?? ''}\n\n` +
+      `Do it, commit it, and end with the JSON object.`
+    : // A DESIGN OR RESEARCH CARD (0.97.0) has nothing to commit, so the trailer
+      // paragraph — an instruction to do the one thing its contract forbids —
+      // is not said at all. The code branch above is byte-for-byte what every
+      // turn got before kinds existed.
+      `You are the agent "${safeName(agentName)}", working card ${position} of ${total} ` +
+      `in this run. This card is ${agentTaskKindOf(task?.taskKind) === 'design' ? 'a DESIGN card: it hands back a mockup' : 'a RESEARCH card: it hands back a write-up'}, ` +
+      `written under .flowviant/artifacts/, and changes nothing in the repository.\n\n` +
+      `${fence('THE CARD', taskBlock(task))}\n\n` +
+      `Do it, and end with the JSON object.`;
 
 /**
  * An agent's NAME is model-authored — the planner chose it — and it is
@@ -851,6 +1036,11 @@ const safeName = (n) =>
 export const AGENT_TASK_SPEC = (task) =>
   `id: ${task?.id ?? ''}\n` +
   `title: ${task?.title ?? ''}\n` +
+  // THE KIND, when it is news (0.97.0). A code card's spec stays byte-for-byte
+  // what it was — the reviewer's stash and the agent's prompt both read this,
+  // and a line saying "kind: code" on every card is a change to every prompt
+  // for a fact that was always true.
+  (agentTaskKindOf(task?.taskKind) !== 'code' ? `kind: ${agentTaskKindOf(task.taskKind)}\n` : '') +
   (task?.brief ? `\nbrief:\n${task.brief}\n` : '') +
   (task?.criteria?.length ? `\ndone when:\n${task.criteria.map((c) => `- ${c}`).join('\n')}\n` : '') +
   (task?.anchors?.length ? `\nthis card owns:\n${task.anchors.map((a) => `- ${a}`).join('\n')}\n` : '');
@@ -1055,11 +1245,14 @@ Never copy them into the repository or commit them.`;
  * would be an instruction it must refuse.
  *
  * It says the types, the cap and SELF-CONTAINED because each is enforced
- * downstream — the last by the server's `ARTIFACT_CSP`, which since
- * 2026-09-23 lets an HTML artifact load nothing remote (a page a model wrote
- * fetching `https://elsewhere/?q=…` is an exfiltration channel the moment
- * somebody opens it), so a page leaning on a CDN stylesheet would render bare
- * and the CLI deserves to know that before it writes one. The first two: a
+ * downstream — the last by the server's `ARTIFACT_CSP`, which lets an HTML
+ * artifact load nothing remote EXCEPT scripts from three public CDNs
+ * (cdnjs, jsDelivr's npm path, unpkg — widened 2026-09-23 so a design card's
+ * mockup can be interactive; before that, scripts did not run at all). A page
+ * a model wrote fetching `https://elsewhere/?q=…` is an exfiltration channel
+ * the moment somebody opens it, so everything else stays refused — a page
+ * leaning on a CDN stylesheet or a remote image would render bare, and the
+ * CLI deserves to know that before it writes one. The first two: a
  * file off the list or over 2 MB is reported by name and never shown, and a
  * CLI told the rule up front writes the thing that will render. It asks for nothing to
  * EXIST — an artifact is for showing rather than describing, never a ritual.
@@ -1067,9 +1260,10 @@ Never copy them into the repository or commit them.`;
 export const ARTIFACTS_PARAGRAPH = `ARTIFACTS: to show the person a document, a page, a chart or an image rather than
 describe it, write the file under .flowviant/artifacts/ in the directory you are
 working in (HTML, Markdown, SVG, PNG, JPG, GIF, WEBP, JSON, CSV or plain text); it
-appears beside the conversation. Keep each under 2 MB. An HTML artifact is shown
-with scripts disabled and loads nothing from the network, so make it static and
-self-contained: inline styles, images as data: URIs. Never commit these files.`;
+appears beside the conversation. Keep each under 2 MB. An HTML artifact may run
+scripts inline or from cdnjs.cloudflare.com, cdn.jsdelivr.net/npm or unpkg.com, and
+nothing else loads from the network, so keep the rest self-contained: inline
+styles, images as data: URIs. Never commit these files.`;
 
 /**
  * The system prompt a turn actually runs under: the contract it picked, plus

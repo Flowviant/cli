@@ -543,7 +543,12 @@ export const RUNTIMES = {
      * "consult" and "plan" currently mean. That is a statement about where the
      * contract was written, not a claim that only Claude could ever satisfy it.
      */
-    profiles: ['build', 'wiki', 'consult', 'plan'],
+    // `design` and `research` (0.97.0) are Claude's alone: each is an
+    // `--allowedTools` list with a PATH-SCOPED write (claude.mjs), and neither
+    // codex's sandbox modes nor agy's flags were measured to express "write
+    // only this directory". A runtime that does not declare them is refused
+    // such a card before spawn, in words — never handed a build turn instead.
+    profiles: ['build', 'wiki', 'consult', 'plan', 'design', 'research'],
     mcp: claudeMcp,
     /**
      * Claude takes the operating contract as a real system prompt, which is the
@@ -1040,7 +1045,16 @@ export const runtimeById = (id) => RUNTIMES[id] ?? RUNTIMES.claude;
  * the single drivability test, so a machine-wide MCP config disqualified it from
  * two jobs that never open an MCP connection.
  */
-const PROFILE_NEEDS_MCP = { build: true, wiki: false, consult: false, plan: true };
+const PROFILE_NEEDS_MCP = {
+  build: true,
+  wiki: false,
+  consult: false,
+  plan: true,
+  // An agent turn has no MCP at all (SYSTEM_AGENT's header) — everything it
+  // says rides the final JSON — so neither non-code posture needs one.
+  design: false,
+  research: false,
+};
 
 /**
  * A build needs the control plane, but NOT necessarily an MCP config of its own.

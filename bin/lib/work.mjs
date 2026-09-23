@@ -75,7 +75,8 @@ import {
   WORK_TURN_KICKOFF_PLAIN,
   SYSTEM_PLAN,
   AGENT_PLAN_KICKOFF,
-  SYSTEM_AGENT,
+  SYSTEM_AGENT_FOR,
+  agentTaskKindOf,
   SYSTEM_PRECHECK,
   AGENT_TASK_KICKOFF,
   AGENT_TASK_SPEC,
@@ -84,7 +85,7 @@ import {
   withProjectContext,
 } from './prompts.mjs';
 import { knowledgeDirFor, FLOWVIANT_OWN_PATHS } from './knowledge.mjs';
-import { createArtifactReporter, snapshotArtifacts } from './artifacts.mjs';
+import { changedArtifacts, createArtifactReporter, scanArtifacts, snapshotArtifacts } from './artifacts.mjs';
 import { myPubB64, scrub as envScrub } from './env.mjs';
 import {
   detectRuntimes,
@@ -4868,11 +4869,30 @@ export function createWorkManager({
       const branch = readGit(['symbolic-ref', '--quiet', '--short', 'HEAD']);
 
       const rt = job.runtime || 'claude';
-      if (!canRun(RUNTIMES[rt], 'build')) {
+      /**
+       * WHAT THIS CARD HANDS BACK, AND THE POSTURE THAT FOLLOWS (0.97.0).
+       *
+       * `code` (the default — absent on the job IS code) is the build turn,
+       * byte-for-byte what every agent turn was. `design` and `research` run
+       * their own contract (SYSTEM_AGENT_DESIGN / _RESEARCH) under their own
+       * posture, which can write ONLY `.flowviant/artifacts/` (claude.mjs).
+       *
+       * A RUNTIME THAT CANNOT EXPRESS THE POSTURE IS REFUSED, NOT IMPROVISED.
+       * Codex and antigravity declare neither (runtimes.mjs), and the only
+       * alternative to refusing is running the card as a BUILD turn with
+       * permissions skipped — an agent writing code for an ask that was a
+       * mockup, reporting success. `nothing` puts the agent in Stuck saying so.
+       */
+      const taskKind = agentTaskKindOf(job.task?.taskKind);
+      const posture = taskKind === 'code' ? 'build' : taskKind;
+      if (!canRun(RUNTIMES[rt], posture)) {
         await postAgentTurn({
           turnId,
           outcome: 'nothing',
-          answer: `this machine cannot run ${rt}`,
+          answer:
+            posture === 'build'
+              ? `this machine cannot run ${rt}`
+              : 'design and research cards run on Claude on this machine',
           branch,
           worktree: wt,
         });
@@ -5003,13 +5023,16 @@ export function createWorkManager({
           // The knowledge paragraph, when this box holds a library — the same
           // composer the tabs use, so an agent and a tab can never be told two
           // different things about the same directory.
-          system: withProjectContext(SYSTEM_AGENT, {
+          system: withProjectContext(SYSTEM_AGENT_FOR(taskKind), {
             knowledgeDir: knowledgeDirFor(repoRoot),
             // ARTIFACTS (0.94.0), while the server can show one — an agent's
             // land on its page, under the facts row.
             artifacts: getArtifactsAccepted(),
           }),
           knowledgeDir: knowledgeDirFor(repoRoot),
+          // Named only for the two non-code kinds; a code turn passes nothing
+          // and keeps the build branch it always had.
+          ...(posture !== 'build' ? { posture } : {}),
           cwd: wt,
           runtime: rt,
           resume,
@@ -5160,6 +5183,49 @@ export function createWorkManager({
           worktree: wt,
         });
         return;
+      }
+      /**
+       * A DESIGN OR RESEARCH CARD IS NOT DELIVERED UNTIL ITS ARTIFACT EXISTS
+       * (0.97.0) — measured, never taken on the agent's word.
+       *
+       * Its whole product is one file under `.flowviant/artifacts/`: a `.html`
+       * mockup for design, a `.md` write-up for research. A turn that says
+       * "delivered" without having written one would land the agent in Review
+       * with nothing to look at and a summary describing a page that does not
+       * exist — so it settles `nothing` with the measured sentence, and the
+       * agent lands in Stuck with a true reason instead.
+       *
+       * WHAT COUNTS: on a TASK turn, only what the scan found NEW OR CHANGED
+       * this turn (`changedArtifacts` against the snapshot taken before the
+       * spawn) — a second design card in the same agent must not pass on the
+       * first card's page. On a HUMAN turn (an answer, a send-back) a matching
+       * file already standing in the directory also counts: "keep it as it
+       * is" is a legitimate answer to a question the agent asked after
+       * drawing, and the turn did not have to rewrite the page to deliver it.
+       *
+       * Commits are still reported if any exist — the posture prevents them,
+       * and a report never lies by omission about what is on the branch.
+       */
+      if (res.outcome === 'delivered' && taskKind !== 'code') {
+        const want = taskKind === 'design' ? /\.html?$/i : /\.md$/i;
+        const standing = scanArtifacts(wt);
+        const wrote = changedArtifacts(artifactsBefore, standing).some((e) => want.test(e.name));
+        const present = wrote || (job.kind !== 'task' && standing.some((e) => want.test(e.name)));
+        if (!present) {
+          await postAgentTurn({
+            turnId,
+            outcome: 'nothing',
+            answer:
+              taskKind === 'design'
+                ? 'the turn ended without writing a mockup under .flowviant/artifacts/'
+                : 'the turn ended without writing a write-up under .flowviant/artifacts/',
+            ...(commits.length ? { commits } : {}),
+            ...(usage ? { usage } : {}),
+            branch,
+            worktree: wt,
+          });
+          return;
+        }
       }
       const reply = await postAgentTurn({
         turnId,

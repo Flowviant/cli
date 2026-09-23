@@ -126,6 +126,37 @@ const CONSULT_PERM = [
   'Bash(git rev-parse:*)',
 ];
 
+/**
+ * THE TWO NON-CODE POSTURES (0.97.0) — a design card and a research card may
+ * WRITE, and only under `.flowviant/artifacts/`.
+ *
+ * Both start from CONSULT_PERM verbatim, for the reason that list gives: the
+ * card's words are steered by anyone who can file a card, so "change nothing"
+ * as prose is only an instruction, and the permission list is the enforcement.
+ * What each adds is the ONE write its contract needs:
+ *
+ *  · `Edit(.flowviant/artifacts/**)` — PROBED on Claude Code 2.1.281 before
+ *    relying on it (2026-09-23): with `--allowedTools 'Read'
+ *    'Edit(.flowviant/artifacts/**)'`, a `-p` turn told to write
+ *    `.flowviant/artifacts/a.html` AND `b.txt` at the root wrote the first and
+ *    was DENIED the second. The Edit rule governs every file-writing tool,
+ *    Write included. Spelled `Write(.flowviant/artifacts/**)` — or `./`- or
+ *    `//abs`-anchored — the same probe was denied BOTH files, so that spelling
+ *    is not a scoped write at all, it is no write. Relative to the turn's cwd,
+ *    which is the agent's own worktree, which is where the artifact scan looks.
+ *  · research alone adds `WebSearch` and `WebFetch`: it is the one kind whose
+ *    answer lives partly outside the repository. A design card reads the repo's
+ *    own copy and tokens, and a mockup that went looking on the web would be a
+ *    mockup of somebody else's product.
+ *
+ * NO BASH BEYOND CONSULT'S READERS, and no MCP: the agent turn has neither
+ * anyway (see SYSTEM_AGENT's header), and a posture that could run `git
+ * commit` could commit the mockup it was told to keep out of git.
+ */
+const ARTIFACT_WRITE = 'Edit(.flowviant/artifacts/**)';
+export const DESIGN_PERM = [...CONSULT_PERM, ARTIFACT_WRITE];
+export const RESEARCH_PERM = [...CONSULT_PERM, 'WebSearch', 'WebFetch', ARTIFACT_WRITE];
+
 export const sleep = (s) => new Promise((r) => setTimeout(r, s * 1000));
 
 // Sentinels must appear on their OWN line (the prompts require it). Substring
@@ -351,7 +382,7 @@ export function handleStreamLine(line, { cwd, emit, onActivity, onToolEvent, app
 // returned string for sentinel detection, and each activity is handed to
 // `onActivity` so the caller can forward progress. Build-agent turns leave it
 // off and keep the raw text passthrough + line sentinels.
-export function runTurn({ prompt, resume, system, cwd, mcpConfig, mcpArgs, mcpEnv, runtime = 'claude', label, onSpawn, streamJson, answerFromResult, onActivity, onToolEvent, onInit, onUsage, onThreadId, wikiPerm, readOnly, planPerm, vaultDir, knowledgeDir, resultSchemaArgs, model, effort, adoptResumeId, resumeThreadId, resumeConversationId }) {
+export function runTurn({ prompt, resume, system, cwd, mcpConfig, mcpArgs, mcpEnv, runtime = 'claude', label, onSpawn, streamJson, answerFromResult, onActivity, onToolEvent, onInit, onUsage, onThreadId, wikiPerm, readOnly, planPerm, posture, vaultDir, knowledgeDir, resultSchemaArgs, model, effort, adoptResumeId, resumeThreadId, resumeConversationId }) {
   return new Promise((resolve) => {
     const rt = runtimeById(runtime);
     if (!rt.args) {
@@ -385,7 +416,15 @@ export function runTurn({ prompt, resume, system, cwd, mcpConfig, mcpArgs, mcpEn
     // of the two and a planning turn that fell through to 'consult' would lose
     // the control plane it exists to use — it would read the repo, decide what
     // the slices are, and have no way to write any of them down.
-    const profile = planPerm ? 'plan' : readOnly ? 'consult' : wikiPerm ? 'wiki' : 'build';
+    // A DESIGN OR RESEARCH CARD'S POSTURE (0.97.0) is asked before all of
+    // them, by NAME, because it is the narrowest promise here: write only the
+    // artifacts directory. It is set only by the agent lane, from the card's
+    // kind; every other caller passes nothing and gets exactly the branch it
+    // got before this existed.
+    const profile =
+      posture === 'design' || posture === 'research'
+        ? posture
+        : planPerm ? 'plan' : readOnly ? 'consult' : wikiPerm ? 'wiki' : 'build';
     const args = rt.args({
       prompt,
       system,
@@ -418,7 +457,12 @@ export function runTurn({ prompt, resume, system, cwd, mcpConfig, mcpArgs, mcpEn
       // prompt as a trailing positional, so a flag after it is in the wrong
       // place.
       resultSchemaArgs,
-      perm: planPerm ? PLAN_PERM : readOnly ? CONSULT_PERM : wikiPerm ? WIKI_PERM : PERM,
+      perm:
+        profile === 'design'
+          ? DESIGN_PERM
+          : profile === 'research'
+            ? RESEARCH_PERM
+            : planPerm ? PLAN_PERM : readOnly ? CONSULT_PERM : wikiPerm ? WIKI_PERM : PERM,
       // Handed to the adapter rather than appended here, because WHERE these go
       // is a property of the CLI: Codex reads its prompt as a trailing
       // positional, so a flag after it is a flag in the wrong place.
