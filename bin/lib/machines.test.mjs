@@ -36,10 +36,15 @@ import {
   agoFrom,
   boxesUrlFrom,
   connectedOn,
+  disconnectHere,
   fetchBoxesFor,
+  leaveBoxFor,
+  leaveUrlFrom,
+  MACHINES_FLAGS_FOOTER,
   MACHINES_FOOTER,
   otherBoxesLine,
   renderBox,
+  renderCollisions,
   renderMachines,
 } from './machines.mjs';
 import { machineAskPending, spendMachineAsk } from './fleet.mjs';
@@ -578,4 +583,169 @@ test('the `machines` command never reaches for a keypair it would have to create
   );
   assert.ok(branch.includes('readStoredPubB64()'), 'it reads the stored key');
   assert.ok(!branch.includes('ensureKeypair'), 'and never mints one');
+});
+
+// ── 0.95.0: the collision is SAID, and the command has verbs ────────────────
+
+/**
+ * THE OWNER READ TWO SAME-NAMED PROJECTS AS ONE PROJECT CONNECTED TWICE
+ * (2026-09-23): "BRIF AI appears twice meaning I likely have 2 daemon or
+ * 'machine profiles' on my machine for the same BRIF AI project". The id on
+ * every row (2026-09-19) said "different" and never said "same repo" — so the
+ * listing now ends with a sentence per repo that two projects are bound to,
+ * naming each in full. Pure, and absent when nothing collides.
+ */
+test('two projects bound to one repo are named in one line at the foot of the listing', () => {
+  const a = entry({ projectId: 'fd716bf3-aaaa', name: 'BRIF AI', repoRoot: '/home/whuang/brif-ai', savedAt: '2026-08-01T12:00:00Z' });
+  const b = entry({ projectId: 'fdcec6a0-bbbb', name: 'BRIF AI', repoRoot: '/home/whuang/brif-ai', savedAt: '2026-09-16T12:00:00Z' });
+  const other = entry();
+  const lines = renderCollisions([other, a, b]);
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /2 projects are connected for \/home\/whuang\/brif-ai/);
+  assert.match(lines[0], /BRIF AI \(fd716bf3…, connected Aug 1\) and BRIF AI \(fdcec6a0…, connected Sep 16\)/);
+  // The consequence the store already enforces, and no remedy of its own — the
+  // menu (or the flags footer) is where the verbs are.
+  assert.match(lines[0], /every `npx flowviant` there asks which/);
+  // A store with no collision says nothing at all: a sentence about an absence
+  // is chrome.
+  assert.deepEqual(renderCollisions([other, a]), []);
+  // …and the whole listing carries it, after the rows and a blank line.
+  const results = { [other.projectId]: { boxes: [] }, [a.projectId]: { boxes: [] }, [b.projectId]: { boxes: [] } };
+  const all = renderMachines([other, a, b], results);
+  assert.equal(all[all.length - 1], lines[0]);
+  assert.equal(all[all.length - 2], '');
+  // Three on one repo reads as a list, not a pair.
+  const c = entry({ projectId: 'fe000000-cccc', name: 'BRIF AI', repoRoot: '/home/whuang/brif-ai' });
+  assert.match(renderCollisions([a, b, c])[0], /3 projects are connected .*fd716bf3…[^]*, BRIF AI \(fdcec6a0…[^]* and BRIF AI \(fe000000…\)/);
+});
+
+test('the leave URL is the boxes URL with the verb on the end', () => {
+  assert.equal(leaveUrlFrom('https://api.flowviant.com/api/fleet/agents'), 'https://api.flowviant.com/api/fleet/boxes/leave');
+});
+
+/**
+ * FOUR ANSWERS FROM THE SERVER, FOUR SHAPES — and the two that matter most are
+ * the ones a lazy collapse would merge: a 404 is an OLDER SERVER that has the
+ * read and not the verb (the row goes quiet on its own), a 401 is a credential
+ * the app already killed (nothing to leave). Never a throw: one failed leave
+ * must not abort the forget that follows it.
+ */
+test('leaving a project posts our own box id and answers in shapes, never throws', async () => {
+  const calls = [];
+  const fetchImpl = (status, body) => async (url, init) => {
+    calls.push({ url: String(url), init });
+    return { status, ok: status >= 200 && status < 300, json: async () => body };
+  };
+  const e = entry();
+  const ok = await leaveBoxFor(e, { url: 'https://x/fleet/boxes/leave', envpub: 'ME', fetchImpl: fetchImpl(200, { data: { removed: true, wasHolder: true } }) });
+  assert.deepEqual(ok, { removed: true, wasHolder: true });
+  assert.equal(calls[0].init.method, 'POST');
+  assert.equal(JSON.parse(calls[0].init.body).envpub, 'ME');
+  assert.match(calls[0].init.headers.Authorization, /^Bearer fva_x$/);
+  assert.deepEqual(await leaveBoxFor(e, { url: 'https://x', envpub: 'ME', fetchImpl: fetchImpl(401, {}) }), { rejected: true });
+  assert.deepEqual(await leaveBoxFor(e, { url: 'https://x', envpub: 'ME', fetchImpl: fetchImpl(404, {}) }), { unsupported: true });
+  assert.deepEqual(await leaveBoxFor(e, { url: 'https://x', envpub: 'ME', fetchImpl: fetchImpl(500, {}) }), { error: 'HTTP 500' });
+  assert.deepEqual(await leaveBoxFor(e, { url: 'https://x', envpub: 'ME', fetchImpl: fetchImpl(200, { data: {} }) }), { error: 'unexpected answer shape' });
+  assert.deepEqual(await leaveBoxFor(e, { url: 'https://x', envpub: 'ME', fetchImpl: async () => { throw new Error('ECONNRESET'); } }), { error: 'ECONNRESET' });
+  // NO IDENTITY, NO CALL: a box that never ran a daemon never polled, so there
+  // is no row to remove and nothing to send.
+  assert.deepEqual(await leaveBoxFor(e, { url: 'https://x', envpub: null, fetchImpl: async () => { throw new Error('must not be called'); } }), { skipped: true });
+});
+
+/**
+ * THE DISCONNECT IS THREE STEPS IN ONE ORDER — stop, leave, forget — and a
+ * daemon that would not stop ABORTS before either of the others. Forgetting a
+ * credential under a running daemon changes nothing about the daemon, and a
+ * leave under a still-polling box is a row that comes back in ten seconds.
+ * Injected deps: the order is the contract, and it is provable without a lock
+ * directory, a socket or a credential file.
+ */
+test('disconnect stops, then leaves, then forgets — and a daemon that would not stop aborts it', async () => {
+  const order = [];
+  const lines = [];
+  const e = entry({ name: 'BRIF AI', savedAt: '2026-09-16T12:00:00Z' });
+  const deps = (stopTally, leaveShape) => ({
+    stopDaemon: (token) => { order.push(`stop:${token}`); return stopTally; },
+    leave: async (en) => { order.push(`leave:${en.projectId}`); return leaveShape; },
+    forget: (id) => { order.push(`forget:${id}`); return { entry: e }; },
+  });
+  const log = (m) => lines.push(m);
+
+  // The ordinary case: a daemon was running, it stopped, the app removed the row.
+  let res = await disconnectHere(e, deps({ stopped: 1, unconfirmed: 0, failed: 0, running: 1 }, { removed: true, wasHolder: true }), { log });
+  assert.equal(res.ok, true);
+  assert.deepEqual(order, ['stop:fva_x', `leave:${e.projectId}`, `forget:${e.projectId}`]);
+  assert.match(lines.join('\n'), /removed this box from BRIF AI \(f5f7db90…, connected Sep 16\)’s machines list in the app/);
+  assert.match(lines.join('\n'), /has none until another polls/);
+  assert.match(lines.join('\n'), /forgot BRIF AI .* credential on this box/);
+  assert.ok(!lines.some((l) => /no daemon .* was running/.test(l)), 'a running daemon is not described as absent');
+
+  // Nothing running here is the ORDINARY disconnect, and says so.
+  order.length = 0; lines.length = 0;
+  res = await disconnectHere(e, deps({ stopped: 0, unconfirmed: 0, failed: 0, running: 0 }, { removed: false }), { log });
+  assert.equal(res.ok, true);
+  assert.match(lines[0], /no daemon for BRIF AI .* was running here/);
+  assert.match(lines[1], /the app was not listing this box/);
+
+  // A daemon alive and NOT stopped: abort, nothing left, nothing forgotten.
+  order.length = 0; lines.length = 0;
+  res = await disconnectHere(e, deps({ stopped: 0, unconfirmed: 1, failed: 1, running: 1 }, { removed: true }), { log });
+  assert.equal(res.ok, false);
+  assert.deepEqual(order, ['stop:fva_x']);
+  assert.match(lines[0], /not disconnected .* still running here and was not stopped/);
+
+  // The four server shapes each get their own sentence, and the forget still
+  // happens under every one of them — the daemon is stopped, so the store is
+  // the last thing left to clean.
+  for (const [shape, words] of [
+    [{ skipped: true }, /never run a daemon, so the app has no row/],
+    [{ rejected: true }, /already disconnected or deleted .* nothing to leave/],
+    [{ unsupported: true }, /older server.*project settings → Machines/],
+    [{ error: 'HTTP 500' }, /could not tell the app .*HTTP 500/],
+  ]) {
+    order.length = 0; lines.length = 0;
+    res = await disconnectHere(e, deps({ stopped: 0, unconfirmed: 0, failed: 0, running: 0 }, shape), { log });
+    assert.equal(res.ok, true, JSON.stringify(shape));
+    assert.match(lines.join('\n'), words);
+    assert.equal(order[order.length - 1], `forget:${e.projectId}`, JSON.stringify(shape));
+  }
+});
+
+/**
+ * THE CLI'S WIRING: the menu is gated on BOTH `canPrompt()` and
+ * `menuSupported()` (a pipe gets the listing and the flags, a backgrounded
+ * job is never asked), `--remove` runs the same `disconnectHere` the menu
+ * does, and the listing is RE-ASKED of the server after a verb rather than
+ * redrawn from what this process hoped happened.
+ */
+test('the `machines` menu exists only where a person can drive it, and re-asks the server after a verb', () => {
+  const cli = readFileSync(new URL('../cli.mjs', import.meta.url), 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .split('\n')
+    .filter((l) => !/^\s*\/\//.test(l))
+    .join('\n');
+  const branch = between(cli, "if (process.argv[2] === 'machines') {", "if (process.argv[2] === 'mcp') {", 'the machines subcommand');
+  assert.ok(branch.includes('if (!(canPrompt() && menuSupported())) {'), 'both gates, together');
+  // The non-menu exit prints the flags, so a script's reader learns the verbs.
+  const noMenu = between(branch, 'if (!(canPrompt() && menuSupported())) {', 'process.exit(0);', 'the no-menu exit');
+  assert.ok(noMenu.includes('MACHINES_FLAGS_FOOTER'));
+  // One disconnect implementation for the flag and the menu.
+  assert.equal(branch.split('disconnectHere(').length - 1, 2, '--remove and the menu, nothing else');
+  // After a verb, the server is asked again.
+  const loop = between(branch, 'for (;;) {', 'for (const line of MACHINES_FOOTER) console.log(line);', 'the menu loop');
+  assert.ok(loop.includes('await listing();'), 're-fetched, never redrawn from hope');
+  assert.ok(loop.includes('entries = creds.listStoredProjects();'), 're-read the store too');
+  // Two verbs and a way back, in that order — the destructive one first is what
+  // the person came for, and "back" is never the default row.
+  assert.ok(/disconnect this box from \$\{who\}[\s\S]*forget \$\{who\} here only[\s\S]*'back',/.test(loop));
+  // --remove refuses ambiguity through the same matcher --project uses.
+  assert.ok(branch.includes("creds.matchStoredProject(process.argv[removeAt + 1])"));
+});
+
+test('the flags footer names both scripted verbs and what each reaches', () => {
+  const text = MACHINES_FLAGS_FOOTER.join('\n');
+  assert.match(text, /--remove <id>/);
+  assert.match(text, /stops its daemon here/);
+  assert.match(text, /removes this box from that project’s machines list in the app/);
+  assert.match(text, /--forget <id>` forgets the credential here only/);
 });

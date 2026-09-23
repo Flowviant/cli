@@ -52,3 +52,44 @@ test('an unnamed project can never be the hint', () => {
   // name null must not match a null/empty want and pre-select a nameless row.
   assert.equal(likelyChoiceIndex([{ name: null, projectId: 'z' }], { repoBasename: '' }), -1);
 });
+
+// ── 0.95.0: two projects on one repo ────────────────────────────────────────
+
+import { boundElsewhere, repoCollisions } from './credentials.mjs';
+
+const E = (projectId, repoRoot, name = 'BRIF AI') => ({ projectId, repoRoot, name });
+
+/**
+ * THE DUPLICATE THE OWNER MET was two PROJECTS bound to ONE checkout, and the
+ * store's answer is a fact about the repo: which entries name the same
+ * directory. Compared by realpath like every path here; unbound entries
+ * collide with nothing, because nothing has decided about them yet.
+ */
+test('repoCollisions groups entries bound to one directory and ignores the rest', () => {
+  const a = E('fd716bf3', '/home/whuang/brif-ai');
+  const b = E('fdcec6a0', '/home/whuang/brif-ai/');
+  const other = E('f5f7db90', '/home/w/code/merriam-one', 'Merriam One');
+  const unbound = E('deadbeef', null);
+  const groups = repoCollisions([other, a, unbound, b]);
+  assert.equal(groups.length, 1);
+  assert.deepEqual(groups[0].entries.map((e) => e.projectId), ['fd716bf3', 'fdcec6a0']);
+  assert.equal(groups[0].repoRoot, '/home/whuang/brif-ai');
+  assert.deepEqual(repoCollisions([other, a, unbound]), []);
+  assert.deepEqual(repoCollisions([]), []);
+});
+
+/**
+ * WHAT LOGIN ASKS ABOUT: the projects ALREADY bound to the repo it is running
+ * in, other than the one just approved. Re-logging into the same project is an
+ * upsert and asks nothing; a login outside any repo has nothing to clash with.
+ */
+test('boundElsewhere names the other projects on this repo, never the one being logged into', () => {
+  const a = E('fd716bf3', '/home/whuang/brif-ai');
+  const b = E('fdcec6a0', '/home/whuang/brif-ai');
+  const other = E('f5f7db90', '/home/w/code/merriam-one', 'Merriam One');
+  assert.deepEqual(boundElsewhere([a, other], '/home/whuang/brif-ai', 'fdcec6a0').map((e) => e.projectId), ['fd716bf3']);
+  assert.deepEqual(boundElsewhere([a, b, other], '/home/whuang/brif-ai', 'fd716bf3').map((e) => e.projectId), ['fdcec6a0']);
+  assert.deepEqual(boundElsewhere([a, other], '/home/whuang/brif-ai', 'fd716bf3'), []);
+  assert.deepEqual(boundElsewhere([a, other], null, 'zzz'), []);
+  assert.deepEqual(boundElsewhere([a, other], '/somewhere/else', 'zzz'), []);
+});

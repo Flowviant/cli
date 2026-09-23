@@ -84,9 +84,14 @@ test('the picker and the binding confirm pass NO timeout', async () => {
   assert.ok(!cli.includes('PICK_TIMEOUT_MS'), 'PICK_TIMEOUT_MS is deleted');
   assert.ok(!cli.includes('CONFIRM_TIMEOUT_MS'), 'CONFIRM_TIMEOUT_MS is deleted');
   assert.ok(!cli.includes('no answer in'), 'no start-path sentence blames a clock');
-  // Every start-path ask is a one-argument call; every menu carries no timeoutMs.
+  // Every ask in cli.mjs is a one-argument call; every menu carries no timeoutMs.
+  // THREE since 0.95.0: the picker fallback, the binding confirm, and the
+  // `machines` menu's y/N confirm — which is not on the start path but keeps
+  // the same rule for the same reason: a person reading a sentence that ends
+  // in "delete a credential" is waited for. `toBe`-shaped, never "at most":
+  // `<=` cannot tell a removed prompt from a pattern that stopped matching.
   const asks = cli.match(/askWithTimeout\(\s*`[^`]*`\s*(,[^)]*)?\)/gs) ?? [];
-  assert.equal(asks.length, 2, 'the picker fallback and the binding confirm');
+  assert.equal(asks.length, 3, 'the picker fallback, the binding confirm, the machines confirm');
   for (const call of asks) assert.ok(!/,\s*\w/.test(call.slice(call.indexOf('`', 1) + 1)), `no budget: ${call.slice(0, 60)}`);
   assert.ok(!cli.includes('timeoutMs:'), 'selectMenu is called without a budget');
   // …and the install prompt, which is NOT on the start path, keeps its own

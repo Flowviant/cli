@@ -781,6 +781,101 @@ function makeRelease(path) {
 }
 
 /**
+ * ONE LOCK FILE, EXAMINED AND — IF IT NAMES A LIVE DAEMON WE CAN IDENTIFY —
+ * STOPPED. The per-file half of `stopAllDaemons`, split out (0.95.0) so that
+ * `stopDaemonFor` can run the identical ritual on ONE credential's lock: the
+ * `machines` command's disconnect stops the daemon serving the project being
+ * disconnected and must not touch the daemons serving anything else on the
+ * box, which a sweep of every lock cannot promise. Same tri-state, same
+ * sentences, same refusal to guess — there is one copy of this on purpose,
+ * for the reason `standDown` gives about SIGKILLs.
+ *
+ * `tally` is mutated in place: `running` counts locks naming a process we
+ * believe is, or might be, a daemon; the rest are what the caller reports.
+ */
+function stopLock(path, log, tally) {
+  const holder = readHolder(path);
+  if (!holder) return; // absent, truncated, half-written — no claim to answer
+  const where = holder.repoRoot ? ` in ${holder.repoRoot}` : '';
+  const what = holder.version ? ` ${holder.version}` : '';
+
+  if (!alive(holder.pid)) {
+    log(`pid ${holder.pid}${where} is already gone — nothing to stop.`);
+    return;
+  }
+  // Us. standDown refuses this too, but reaching it would print a stand-down
+  // line and then a failure for the one pid we are certain is not a daemon.
+  if (holder.pid === process.pid) return;
+
+  const identified = stillTheHolder(holder);
+  if (identified === false) {
+    // A live pid, but measured NOT to be the process that wrote this lock. The
+    // daemon is gone; the number was handed to something else. Not counted as
+    // running, and deliberately not counted as a failure either.
+    log(`pid ${holder.pid} is no longer the daemon that took this lock — nothing signalled.`);
+    return;
+  }
+  tally.running++;
+  if (identified === null) {
+    tally.unconfirmed++;
+    tally.failed++;
+    // NAMES BOTH CAUSES, because null has two and we did not measure which:
+    // the lock may carry no witness to match against (neither `entry` nor
+    // `startedAt` — a hand-edited or half-written file), or this host may hide
+    // the process from us (hidepid=2, a pid namespace, an image with no `ps`).
+    // "no readable /proc" alone is what takeover says, and said HERE it would
+    // assert a diagnosis nobody established — over a live process we are about
+    // to tell someone to kill.
+    // `kill` is not a command on Windows, where platform() is 'win32' and
+    // processStartedAt has no implementation at all — so EVERY lock lands in
+    // this branch and the whole command is a no-op that exits 1. Say that
+    // once, in the platform's own vocabulary, rather than handing someone a
+    // remedy their shell does not have.
+    const byHand =
+      platform() === 'win32'
+        ? `taskkill /PID ${holder.pid} /F`
+        : `kill ${holder.pid}`;
+    log(
+      `could not confirm that pid ${holder.pid} is still a flowviant daemon — its lock carries ` +
+        `nothing to match it against, or this host hides the process from us` +
+        `${platform() === 'win32' ? ' (identifying a process is not implemented on Windows)' : ''}` +
+        ` — so it was NOT signalled. Stop it by hand: ${byHand}`
+    );
+    return;
+  }
+
+  const bad = standDown(holder, path, log);
+  if (bad) {
+    tally.failed++;
+    log(`could not stop daemon pid ${holder.pid}${where}: ${bad.failed}`);
+    return;
+  }
+  tally.stopped++;
+  log(`stopped daemon${what} pid ${holder.pid}${where}.`);
+}
+
+/**
+ * STOP THE DAEMON SERVING ONE CREDENTIAL — `flowviant machines` disconnecting
+ * this box from one project (0.95.0).
+ *
+ * `stopAllDaemons` is the right shape for a person who does not know what is
+ * running; this is for a person who has just NAMED a project in a menu and
+ * expects exactly that project's daemon to stop. The lock is keyed on the
+ * credential (`instanceLockPath`), so the file to examine is known without a
+ * sweep, and a daemon serving a sibling project in another directory is never
+ * examined, let alone signalled.
+ *
+ * NO LOCK IS NOT AN ERROR: a project connected here but not currently running
+ * is the ordinary case for a disconnect, and the caller says "nothing was
+ * running" rather than failing. Returns the same tally `stopAllDaemons` does.
+ */
+export function stopDaemonFor(fleetToken, { log = (m) => console.log(m) } = {}) {
+  const tally = { stopped: 0, unconfirmed: 0, failed: 0, running: 0 };
+  stopLock(instanceLockPath(fleetToken), log, tally);
+  return tally;
+}
+
+/**
  * STOP EVERY FLOWVIANT DAEMON ON THIS MACHINE — `flowviant stop`.
  *
  * WHY IT IS "EVERY" AND NOT "THIS REPO'S". The friction this exists to remove is
@@ -828,71 +923,9 @@ function makeRelease(path) {
  * exit code.
  */
 export function stopAllDaemons({ log = (m) => console.log(m) } = {}) {
-  let stopped = 0;
-  let unconfirmed = 0;
-  let failed = 0;
-  let running = 0; // locks naming a process we believe is, or might be, a daemon
-
-  for (const path of lockFiles()) {
-    const holder = readHolder(path);
-    if (!holder) continue; // absent, truncated, half-written — no claim to answer
-    const where = holder.repoRoot ? ` in ${holder.repoRoot}` : '';
-    const what = holder.version ? ` ${holder.version}` : '';
-
-    if (!alive(holder.pid)) {
-      log(`pid ${holder.pid}${where} is already gone — nothing to stop.`);
-      continue;
-    }
-    // Us. standDown refuses this too, but reaching it would print a stand-down
-    // line and then a failure for the one pid we are certain is not a daemon.
-    if (holder.pid === process.pid) continue;
-
-    const identified = stillTheHolder(holder);
-    if (identified === false) {
-      // A live pid, but measured NOT to be the process that wrote this lock. The
-      // daemon is gone; the number was handed to something else. Not counted as
-      // running, and deliberately not counted as a failure either.
-      log(`pid ${holder.pid} is no longer the daemon that took this lock — nothing signalled.`);
-      continue;
-    }
-    running++;
-    if (identified === null) {
-      unconfirmed++;
-      failed++;
-      // NAMES BOTH CAUSES, because null has two and we did not measure which:
-      // the lock may carry no witness to match against (neither `entry` nor
-      // `startedAt` — a hand-edited or half-written file), or this host may hide
-      // the process from us (hidepid=2, a pid namespace, an image with no `ps`).
-      // "no readable /proc" alone is what takeover says, and said HERE it would
-      // assert a diagnosis nobody established — over a live process we are about
-      // to tell someone to kill.
-      // `kill` is not a command on Windows, where platform() is 'win32' and
-      // processStartedAt has no implementation at all — so EVERY lock lands in
-      // this branch and the whole command is a no-op that exits 1. Say that
-      // once, in the platform's own vocabulary, rather than handing someone a
-      // remedy their shell does not have.
-      const byHand =
-        platform() === 'win32'
-          ? `taskkill /PID ${holder.pid} /F`
-          : `kill ${holder.pid}`;
-      log(
-        `could not confirm that pid ${holder.pid} is still a flowviant daemon — its lock carries ` +
-          `nothing to match it against, or this host hides the process from us` +
-          `${platform() === 'win32' ? ' (identifying a process is not implemented on Windows)' : ''}` +
-          ` — so it was NOT signalled. Stop it by hand: ${byHand}`
-      );
-      continue;
-    }
-
-    const bad = standDown(holder, path, log);
-    if (bad) {
-      failed++;
-      log(`could not stop daemon pid ${holder.pid}${where}: ${bad.failed}`);
-      continue;
-    }
-    stopped++;
-    log(`stopped daemon${what} pid ${holder.pid}${where}.`);
-  }
+  const tally = { stopped: 0, unconfirmed: 0, failed: 0, running: 0 };
+  for (const path of lockFiles()) stopLock(path, log, tally);
+  const { stopped, unconfirmed, failed, running } = tally;
 
   // WHAT WE ACTUALLY MEASURED IS LOCKS, so that is what this says. The old
   // sentence — "no flowviant daemon is running on this machine" — was asserted

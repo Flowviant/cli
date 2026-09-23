@@ -172,6 +172,61 @@ export function projectRowLabel(e, entries) {
   return `${label} (id ${String(e?.projectId ?? '').slice(0, 8)}…${when})`;
 }
 
+/**
+ * WHICH STORED PROJECTS SHARE ONE REPO — the duplicate the owner met and could
+ * not name (2026-09-23).
+ *
+ * `npx flowviant machines` printed "BRIF AI" twice, and he read it as two
+ * daemons or two "machine profiles" on one box for one project: *"when I go to
+ * BRIF AI to disconnect the duplicate, I only see one."* It was two PROJECTS
+ * with one name, both bound to one checkout — and the id-on-every-row rule
+ * (2026-09-19) had not made that legible, because two hex prefixes say
+ * "different" without saying "same repo". A project's Machines page shows its
+ * own credential's boxes, so neither page could show the other project at
+ * all.
+ *
+ * So the collision is stated as a FACT ABOUT THE REPO: every group of two or
+ * more entries bound to one directory, compared by realpath the way every
+ * other path here is. Pure over the entries; the listing prints each group as
+ * one line and the picker's row labels already carry the id and date.
+ *
+ * ONE REPO SERVES ONE PROJECT is the owner's own model ("i can have 1 daemon in
+ * one directory, 1 in another as a differentiator of projects"), which is why
+ * this is worth a sentence and an unbound duplicate is not: two projects with
+ * no repo are two things nothing has decided about yet.
+ */
+export function repoCollisions(entries) {
+  const groups = [];
+  for (const e of entries) {
+    if (!e?.repoRoot) continue;
+    const g = groups.find((x) => samePath(x.repoRoot, e.repoRoot));
+    if (g) g.entries.push(e);
+    else groups.push({ repoRoot: e.repoRoot, entries: [e] });
+  }
+  return groups.filter((g) => g.entries.length > 1);
+}
+
+/**
+ * THE OTHER PROJECTS ALREADY BOUND TO THIS REPO — what `flowviant login` asks
+ * about before it saves a second one (2026-09-23).
+ *
+ * The owner: *"im not sure how it even allowed me to run npx flowviant login
+ * twice and init a daemon twice on the same project/repository/directory in
+ * the first place."* Login binds the approved project to the repo it was run
+ * in and never looked at what was bound there already, so a second project —
+ * approved in a browser tab that happened to be open on a different project of
+ * the same name — landed beside the first without a word. The store's own
+ * resolution then turned every start into a picker between two identical
+ * rows.
+ *
+ * Excludes the project being logged into: re-running login for the SAME
+ * project is an upsert and asks nothing.
+ */
+export function boundElsewhere(entries, repoRoot, projectId) {
+  if (!repoRoot) return [];
+  return entries.filter((e) => e.projectId !== projectId && samePath(e.repoRoot, repoRoot));
+}
+
 /** Collapse a name or slug for loose comparison: "My Project", "my-project"
  *  and "myproject" all become "myproject". */
 function normalizeName(s) {

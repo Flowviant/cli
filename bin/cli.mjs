@@ -41,9 +41,12 @@
  * Ambiguity is a picker on a TTY and a worded refusal headless — never a
  * guess. `flowviant projects` lists what is stored; `--project <name|id>`
  * picks without a prompt. `flowviant machines` (0.91.0) asks the server which
- * BOXES have polled each of those credentials — the view-only answer to "am I
- * running duplicate or redundant daemons?", which the store alone cannot give
- * because a daemon on another computer is invisible from here.
+ * BOXES have polled each of those credentials — the answer to "am I running
+ * duplicate or redundant daemons?", which the store alone cannot give because
+ * a daemon on another computer is invisible from here; since 0.95.0 it says
+ * out loud when two projects are bound to one repo, and on a terminal it is a
+ * menu (↑/↓, enter) whose verbs disconnect THIS box from a project or forget
+ * a credential here — `--remove <id>` / `--forget <id>` for a script.
  *
  * Env:
  *   FLOWVIANT_MACHINE_TOKEN  the machine credential (or use `flowviant login`);
@@ -82,8 +85,11 @@ import { runLogin } from './lib/login.mjs';
 // long-running process.
 if (process.argv[2] === 'login') {
   const noStart = process.argv.includes('--no-start');
-  await runLogin({ thenStart: !noStart });
-  if (noStart) process.exit(0);
+  const login = await runLogin({ thenStart: !noStart });
+  // A login the person CANCELLED at the second-project question saved nothing,
+  // so there is no credential for the child to serve — starting it would end
+  // in "no credential found" over a choice they just made on purpose.
+  if (noStart || !login?.saved) process.exit(0);
   // Re-exec as a plain `flowviant` rather than falling through. config.mjs reads
   // the credential at IMPORT time — which was before the login we just did — so
   // this process still has an empty FLEET_TOKEN and would exit with "no
@@ -224,16 +230,19 @@ if (process.argv[2] === 'projects') {
 }
 
 // ── `flowviant machines` — every project connected on THIS box, and every box
-//    that has polled each of them.
+//    that has polled each of them; and, on a terminal, a menu over them.
 //
 // A THIRD COMMAND, and the owner's ruling it amends is his own: the terminal
 // surface is `npx flowviant` and `npx flowviant login`, full stop — which is
 // what deleted the old terminal flag for moving a machine — and he asked for
-// this one directly ("the CLI gets a command to list connections"). So it is
-// amended in the narrowest form that ruling allows: VIEW-ONLY. It starts
-// nothing, stops nothing, moves nothing, takes no lock and reaches no daemon.
-// The only state it can change is this box's credential file, and only behind
-// an explicit `--forget`.
+// this one directly ("the CLI gets a command to list connections"). It shipped
+// VIEW-ONLY, and on 2026-09-23 he asked for the rest: "it seems to be only a
+// read cmd but I want to be able to interact with it and use arrow keys to
+// select the machines or to remove them." So: the listing, then — only where a
+// person can drive one — a menu. Its verbs act on THIS BOX'S OWN CONNECTIONS
+// (stop the daemon here, leave the project's list in the app, forget the
+// credential here) and never on another computer's daemon; machines.mjs
+// carries the argument.
 //
 // The question is the owner's, verbatim: "is there a way to view ALL the
 // connected flowviants? because im not sure if i have any duplicate or
@@ -250,14 +259,16 @@ if (process.argv[2] === 'projects') {
 //
 // EXIT 0 whatever it finds, including nothing: the listing is the answer the
 // asker came for, and a non-zero code over "you have no projects connected"
-// would make this command unusable in anything that checks one.
+// would make this command unusable in anything that checks one. `--remove`
+// is the one exit that can be 1, when the daemon it had to stop would not.
 if (process.argv[2] === 'machines') {
   const creds = await import('./lib/credentials.mjs');
   const forgetAt = process.argv.indexOf('--forget');
   if (forgetAt >= 0) {
-    // THE ONE WRITE. Named explicitly, matched by full id or a ≥6 prefix, and
-    // AMBIGUITY REFUSES rather than guessing — this deletes a credential, and
-    // two projects that look alike is the case that produced the command.
+    // THE LOCAL-ONLY WRITE. Named explicitly, matched by full id or a ≥6
+    // prefix, and AMBIGUITY REFUSES rather than guessing — this deletes a
+    // credential, and two projects that look alike is the case that produced
+    // the command.
     const res = creds.forgetStoredProject(process.argv[forgetAt + 1]);
     if (res.error) {
       console.error(`error: ${res.error}`);
@@ -269,16 +280,29 @@ if (process.argv[2] === 'machines') {
     );
     process.exit(0);
   }
+  const { boxesUrlFrom, leaveUrlFrom, fetchBoxesFor, renderMachines, disconnectHere, realDisconnectDeps, MACHINES_FOOTER, MACHINES_FLAGS_FOOTER } =
+    await import('./lib/machines.mjs');
+  const { FLEET_URL } = await import('./lib/config.mjs');
+  const removeAt = process.argv.indexOf('--remove');
+  if (removeAt >= 0) {
+    // THE SCRIPTED DISCONNECT — the menu's first verb, named by id for a
+    // terminal nobody is sitting at. Same matcher and the same refusal of an
+    // ambiguous prefix as --forget: a name two projects share is exactly the
+    // input this command exists to untangle, and it must not pick one.
+    const m = creds.matchStoredProject(process.argv[removeAt + 1]);
+    if (m.error) {
+      console.error(`error: ${m.error}. \`flowviant machines\` lists what is stored.`);
+      process.exit(1);
+    }
+    const res = await disconnectHere(m.entry, await realDisconnectDeps({ url: leaveUrlFrom(FLEET_URL) }));
+    process.exit(res.ok ? 0 : 1);
+  }
 
-  const entries = creds.listStoredProjects();
+  let entries = creds.listStoredProjects();
   if (entries.length === 0) {
     console.log('no projects connected on this machine yet — run `flowviant login` inside a repo.');
     process.exit(0);
   }
-  const { boxesUrlFrom, fetchBoxesFor, renderMachines, MACHINES_FOOTER } = await import(
-    './lib/machines.mjs'
-  );
-  const { FLEET_URL } = await import('./lib/config.mjs');
   // OUR OWN BOX ID, so the listing can mark "← this box".
   //
   // READ, NEVER CREATED. This called `ensureKeypair()` until 2026-09-19, which
@@ -299,16 +323,83 @@ if (process.argv[2] === 'machines') {
     /* unreadable keypair — nothing is marked, and nothing is claimed */
   }
   const url = boxesUrlFrom(FLEET_URL);
-  const results = {};
-  // SEQUENTIAL, not a fan-out: this is a handful of credentials on somebody's
-  // laptop, and a parallel burst against the API buys nothing a person waiting
-  // two seconds can perceive.
-  for (const e of entries) {
-    results[e.projectId] = await fetchBoxesFor(e, { url, envpub: me });
+  const listing = async () => {
+    const results = {};
+    // SEQUENTIAL, not a fan-out: this is a handful of credentials on somebody's
+    // laptop, and a parallel burst against the API buys nothing a person
+    // waiting two seconds can perceive.
+    for (const e of entries) {
+      results[e.projectId] = await fetchBoxesFor(e, { url, envpub: me });
+    }
+    console.log('');
+    for (const line of renderMachines(entries, results)) console.log(line);
+    console.log('');
+  };
+  await listing();
+
+  // THE MENU, only where a person can drive one. `canPrompt()` is the same
+  // gate the start path keeps — a backgrounded job or a pipe gets the listing
+  // and the flags, never a prompt that stops the process — and `menuSupported`
+  // is whether ↑/↓ can be read at all. Without both this is the command it was.
+  const { canPrompt, menuSupported, selectMenu, askWithTimeout } = await import('./lib/tty.mjs');
+  if (!(canPrompt() && menuSupported())) {
+    for (const line of MACHINES_FOOTER) console.log(line);
+    for (const line of MACHINES_FLAGS_FOOTER) console.log(line);
+    process.exit(0);
   }
-  console.log('');
-  for (const line of renderMachines(entries, results)) console.log(line);
-  console.log('');
+  const deps = await realDisconnectDeps({ url: leaveUrlFrom(FLEET_URL) });
+  for (;;) {
+    // A ROW PER PROJECT connected on this box — the things this box can act on.
+    // The other computers under each project are printed above for the
+    // duplicate to be visible, and are not rows here: stopping or removing
+    // THEM is the app's verb, and a menu row that answers "not from here" is
+    // a control wired to a refusal.
+    console.log('  projects connected on this box — enter one for what you can do about it:');
+    const rowLabel = (e) => creds.projectRowLabel(e, entries) + (e.repoRoot ? `  — ${e.repoRoot}` : '  — not tied to a repo');
+    const pick = await selectMenu({ options: [...entries.map(rowLabel), 'done'] });
+    if (pick.cancelled || pick.unsupported || pick.index === entries.length) break;
+    const picked = entries[pick.index];
+    const who = creds.projectRowLabel(picked, entries);
+    // TWO VERBS, each row saying its whole consequence — the app's ⋯ menu on a
+    // machine row says the same two things, and a menu whose rows are verbs
+    // with the outcome in a manual somewhere is one you have to be sure about
+    // before you can use it.
+    const action = await selectMenu({
+      options: [
+        `disconnect this box from ${who} — stops its daemon here, removes this box from its machines list in the app, forgets its credential here`,
+        `forget ${who} here only — nothing is stopped; the app keeps listing this box until it goes quiet`,
+        'back',
+      ],
+    });
+    if (action.cancelled || action.unsupported || action.index === 2) continue;
+    // ONE CONFIRM, in words, because both verbs delete a credential and the
+    // arrow keys make a slip cheap. A read that failed (stdin gone) is "no".
+    const verb = action.index === 0 ? 'Disconnect this box from' : 'Forget';
+    const answer = await askWithTimeout(`  ${verb} ${who}? [y/N] `);
+    if (!/^y(es)?$/i.test(answer ?? '')) {
+      console.log('  left as it was.\n');
+      continue;
+    }
+    if (action.index === 0) {
+      await disconnectHere(picked, deps, { log: (m) => console.log(`  ${m}`) });
+    } else {
+      const res = creds.forgetStoredProject(picked.projectId);
+      console.log(
+        res.error
+          ? `  ${res.error}`
+          : `  forgot ${creds.projectLabel(res.entry)} (${res.entry.projectId.slice(0, 8)}…) on this box. Nothing was stopped or deleted anywhere else — \`flowviant login\` connects it again.`
+      );
+    }
+    entries = creds.listStoredProjects();
+    if (entries.length === 0) {
+      console.log('\n  no projects are connected on this box now.\n');
+      break;
+    }
+    // THE LISTING AGAIN, re-asked: the server's rows are the only true account
+    // of what the leave did, and a menu redrawn over a stale listing would be
+    // this command asserting the outcome it hoped for.
+    await listing();
+  }
   for (const line of MACHINES_FOOTER) console.log(line);
   process.exit(0);
 }
@@ -368,7 +459,8 @@ const externalToken =
  *  pattern: config.mjs read the store at IMPORT time, before the credential
  *  existed, so this process cannot serve; the child can. */
 async function reexecAfterLogin() {
-  await runLogin({ thenStart: false });
+  const login = await runLogin({ thenStart: false });
+  if (!login?.saved) process.exit(0); // cancelled at the second-project question — nothing to serve
   const { spawn } = await import('node:child_process');
   const child = spawn(process.execPath, [process.argv[1]], { stdio: 'inherit', env: process.env });
   process.exit(await new Promise((resolve) => child.on('exit', (code) => resolve(code ?? 0))));

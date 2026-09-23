@@ -41,7 +41,29 @@ Prefer an explicit token? Create a machine credential in the app and pass it dir
 FLOWVIANT_MACHINE_TOKEN=fva_… npx flowviant@latest   # FLOWVIANT_FLEET still works
 ```
 
+Prefer a plain command to `npx`? Install it once and every `npx flowviant@latest` in this README is just `flowviant`:
+
+```bash
+npm i -g flowviant
+flowviant login
+```
+
+Either way is fine and both stay current on their own (below). npx is the zero-install door; a global install is what you want on a box you keep running, so the daemon, `flowviant login` and `flowviant machines` are ordinary commands.
+
 Launch with `@latest` so each start pulls the newest published version — a bare `npx flowviant` can reuse a stale cache. A running daemon also keeps itself current: from **0.58.0** it restarts itself through `npx flowviant@latest` when a new version ships, so npx launches stay up to date the same way a global install does. (Before 0.58.0 that was only true of a global install — under npx the daemon printed a notice and stayed put, which is how machines ended up sitting several releases back.) It only ever restarts when no turn is running. `FLOWVIANT_NO_UPDATE=1` makes it nag-only; `flowviant update` updates now.
+
+## Machines on this box
+
+One box can serve several projects — one daemon per repository directory, each connected with its own `flowviant login` run inside that repo. `flowviant machines` lists every project connected on this box with the id and date it was connected, and under each one every computer that has polled it (the app's Home lists the same across your whole account). Two projects bound to one repository are named out loud at the foot of the listing, because that is the one shape that reads as "the same project connected twice" and is not: every `npx flowviant` in that directory has to ask which of them to serve.
+
+On a terminal the listing is a menu: ↑/↓ over the projects, enter for what you can do about one, esc to leave. Two verbs, each acting on **this box's own connection** and nothing else:
+
+- **disconnect this box from it** — stops the daemon serving that project here (that one credential's daemon, never the others), removes this box from the project's machines list in the app, and forgets the credential here. `flowviant machines --remove <project id>` is the same thing for a script.
+- **forget it here only** — the credential is dropped from `~/.flowviant/credentials.json` and nothing else happens; the app keeps listing this box until it goes quiet. `--forget <project id>` for a script.
+
+Stopping or removing a daemon on **another** computer is done in the app (project settings → Machines), where the person pressing it can see what they are changing.
+
+`flowviant login` asks before it binds a second project to a repository that is already connected to one: keep both (every start there asks which to serve), replace (the repo serves the new project and this box is disconnected from the old one), or cancel.
 
 ## Sessions
 
