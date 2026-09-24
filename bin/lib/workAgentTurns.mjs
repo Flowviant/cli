@@ -2,7 +2,8 @@
 import { limitLine } from './workAgentReview.mjs';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { FLEET_URL, FLEET_TOKEN, USER_AGENT } from './config.mjs';
+import { FLEET_URL, FLEET_TOKEN, USER_AGENT, PROJECT_ID } from './config.mjs';
+import { setRuntimeLimit } from './desktopContract.mjs';
 import { git, isSafePathSegment } from './git.mjs';
 import { parseTurnResult } from './agentPlan.mjs';
 import { stashCard } from './agentCards.mjs';
@@ -813,7 +814,9 @@ export function createWorkAgentTurns({
        * sentence it failed with.
        */
       const limit = res ? null : limitLine(out);
+      if (res) setRuntimeLimit(PROJECT_ID, rt, null);
       if (limit) {
+        setRuntimeLimit(PROJECT_ID, rt, limit);
         // Every agent ON THIS CLI parks, because that account is shared: one
         // hitting the limit means all of them have. Named since 2026-09-24 —
         // a machine can hold a Claude login and a Codex login, and a Codex

@@ -14,8 +14,8 @@ export function runningViaNpx() {
 }
 
 /** Name the command that launched this process when giving a person a next step. */
-export function launchCommand({ viaNpx = runningViaNpx() } = {}) {
-  return viaNpx ? 'npx flowviant' : 'flowviant';
+export function launchCommand() {
+  return 'flowviant';
 }
 
 export function terminalCommand(args = '') {

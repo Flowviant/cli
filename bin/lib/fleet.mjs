@@ -39,7 +39,8 @@ import {
 } from './config.mjs';
 import { projectLabel, safeName, setStoredProjectName } from './credentials.mjs';
 import { credentialRejected } from './authReject.mjs';
-import { handleVersionSignal } from './update.mjs';
+import { handleVersionSignal, cmpVersion } from './update.mjs';
+import { emitMachineEvent, writeDaemonState } from './desktopContract.mjs';
 import {
   git,
   gitNetAsync,
@@ -1128,6 +1129,8 @@ export async function standDownDisplaced({
         ? `this project's machine moved to ${name} — standing down.`
         : "this project's machine moved to another box — standing down."
   );
+  if (removed) emitMachineEvent({ event: 'stopped', reason: 'removed' });
+  else emitMachineEvent({ event: 'displaced', message: displacedTurnSentence(by) });
   // FIRST, and awaited: an unsettled turn is the one thing here that no later
   // poll from anybody can fix — this process holds the only copy of the fact
   // that it was running.
@@ -1160,6 +1163,10 @@ export async function standDownDisplaced({
 // base between tasks (fresh conversation), resume in place while on a blocker.
 
 export async function runFleetDaemon({ afterLock = null } = {}) {
+  let desktopProjectId = CREDENTIAL?.entry?.projectId ?? null;
+  let wasServing = false;
+  if (process.env.FLOWVIANT_UPDATE_TARGET && cmpVersion(VERSION, process.env.FLOWVIANT_UPDATE_TARGET) >= 0)
+    emitMachineEvent({ event: 'update-applied', from: process.env.FLOWVIANT_UPDATE_FROM ?? null, to: VERSION });
   console.log('');
   console.log(`  ${c.bold(c.cyan('◣ flowviant'))}  ${c.dim(`machine daemon · v${VERSION}`)}`);
   console.log(`  ${c.dim('──────────────────────────────────────────────')}`);
@@ -1279,6 +1286,7 @@ export async function runFleetDaemon({ afterLock = null } = {}) {
   } catch {
     /* the binding is asked again next time */
   }
+  writeDaemonState(desktopProjectId, { limits: {}, holder: null });
 
   await preflight({ needGit: true });
 
@@ -1443,6 +1451,7 @@ export async function runFleetDaemon({ afterLock = null } = {}) {
     // A SAME-REPO TAKEOVER IS DELIBERATELY NOT DISTINGUISHED, and that is a
   };
   process.on('SIGINT', () => {
+    emitMachineEvent({ event: 'stopped', reason: 'signal' });
     console.log('');
     note('shutting down — stopping workers. Worktrees are kept: in-flight work resumes next run.');
     teardown();
@@ -1452,6 +1461,7 @@ export async function runFleetDaemon({ afterLock = null } = {}) {
   // handler every child survived a `systemctl stop` — the exact orphaning the
   // teardown exists to prevent.
   process.on('SIGTERM', () => {
+    emitMachineEvent({ event: 'stopped', reason: 'signal' });
     console.log('');
     note('shutting down (SIGTERM) — stopping workers. Worktrees are kept: in-flight work resumes next run.');
     teardown();
@@ -2407,6 +2417,7 @@ export async function runFleetDaemon({ afterLock = null } = {}) {
       );
     } catch (e) {
       if (e.auth) {
+        emitMachineEvent({ event: 'stopped', reason: 'credential-revoked' });
         fail(`${e.message} — credential revoked or invalid. Shutting down.`);
         teardown();
         // EXIT 0, for the same reason the commanded-stop path does: a revoked
@@ -2467,6 +2478,8 @@ export async function runFleetDaemon({ afterLock = null } = {}) {
         }
       })();
     }
+    if (roster.project?.id) desktopProjectId = roster.project.id;
+    writeDaemonState(desktopProjectId, { lastPoll: new Date().toISOString() });
     if (roster.mcpUrl) mcpUrl = roster.mcpUrl;
     /**
      * HOW MANY TURNS THE APP SAYS THIS MACHINE MAY RUN (2026-09-17).
@@ -2495,6 +2508,7 @@ export async function runFleetDaemon({ afterLock = null } = {}) {
     // going away.
     const stopSignal = shouldStop(roster.daemon);
     if (stopSignal) {
+      emitMachineEvent({ event: 'stopped', reason: stopSignal.reason ?? null });
       warn(
         stopSignal.reason
           ? `stopped by Flowviant — ${stopSignal.reason}`
@@ -2599,6 +2613,12 @@ export async function runFleetDaemon({ afterLock = null } = {}) {
      * would start deleting worktrees it cannot see the tabs for.
      */
     holderState = holderWatch.observe(roster.holder);
+    writeDaemonState(desktopProjectId, {
+      lastPoll: new Date().toISOString(),
+      holder: ({ mine: 'serving', standby: 'inactive' })[holderState] ?? null,
+    });
+    if (holderState === 'mine' && !wasServing) emitMachineEvent({ event: 'serving' });
+    wasServing = holderState === 'mine';
     // Keep the daemon current. Safe = no worker mid-task (true at startup, since
     // no workers are spawned yet). If it self-updates it re-execs into the new
     // version and this process becomes a proxy — stop the loop.

@@ -164,6 +164,7 @@ function reexec(teardown, { viaNpx = false, viaBinary = false, target = null } =
       // the global path there is no install step whose failure would throw and
       // stop it.
       ...(target ? { FLOWVIANT_UPDATE_TARGET: target } : {}),
+      FLOWVIANT_UPDATE_FROM: VERSION,
     },
   });
   child.on('exit', (code) => process.exit(code ?? 0));
@@ -200,7 +201,7 @@ export async function runUpdateCommand() {
     return;
   }
   if (runningViaNpx()) {
-    note('running via npx — just relaunch with `npx flowviant@latest` to get the newest.');
+    note('running via npx — relaunch `flowviant` to get the newest.');
     return;
   }
   try {
@@ -250,7 +251,7 @@ export async function handleVersionSignal({ latest, min, autoUpdate, safeToUpdat
       naggedFor = target;
       warn(
         `restarted to pick up ${target} but came back as ${cur} — staying put. Update by hand: ${
-          binary ? 'run `flowviant update`' : npx ? 'relaunch with `npx flowviant@latest`' : `run \`${terminalCommand('update')}\``
+          binary ? 'run `flowviant update`' : npx ? 'relaunch `flowviant`' : `run \`${terminalCommand('update')}\``
         }.`
       );
     }
@@ -357,7 +358,7 @@ export async function handleVersionSignal({ latest, min, autoUpdate, safeToUpdat
   // Can't or won't auto-install → nag once per target version.
   if (naggedFor !== target) {
     naggedFor = target;
-    const how = binary ? 'run `flowviant update`' : npx ? 'relaunch with `npx flowviant@latest`' : `run \`${terminalCommand('update')}\``;
+    const how = binary ? 'run `flowviant update`' : npx ? 'relaunch `flowviant`' : `run \`${terminalCommand('update')}\``;
     if (belowMin) {
       warn(`flowviant ${cur} is below the minimum ${min} — live mode may not work. Update: ${how}.`);
     } else {
