@@ -6,6 +6,8 @@ import { homedir, tmpdir } from 'node:os';
 
 const MAX_TOOLS = 40;
 const MAX_REPORT_TOOLS = 80; // 40 MCP servers plus 40 instruction directories
+const MAX_INSTRUCTION_FILES = 80;
+const MAX_INSTRUCTION_BYTES = 512 * 1024;
 const nameOk = (name) => /^[A-Za-z0-9_-]{1,80}$/.test(name) && name !== 'flowviant';
 const toml = (value) => JSON.stringify(String(value));
 const show = (root, ref, path) => {
@@ -88,10 +90,15 @@ export function readBaseTools(root, ref, env = process.env) {
   const instructions = [];
   const paths = execFileSync('git', ['ls-tree', '-r', '--name-only', commit], {
     cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 1024 * 1024,
-  }).split('\n').filter((path) => /(^|\/)(CLAUDE|AGENTS)\.md$/.test(path)).slice(0, 80);
+  }).split('\n').filter((path) => /(^|\/)(CLAUDE|AGENTS)\.md$/.test(path));
+  if (paths.length > MAX_INSTRUCTION_FILES) throw new Error('Base branch has too many agent instruction files');
+  let instructionBytes = 0;
   for (const path of paths) {
     const body = show(root, commit, path);
-    if (body != null) instructions.push({ path, body });
+    if (body == null) throw new Error(`Cannot read base instruction ${path}`);
+    instructionBytes += Buffer.byteLength(body);
+    if (instructionBytes > MAX_INSTRUCTION_BYTES) throw new Error('Base branch agent instructions exceed the turn limit');
+    instructions.push({ path, body });
   }
   return { tools, skills, skillFiles, instructions };
 }
@@ -129,15 +136,18 @@ function isolatedCodexHome(dir, env, worktree) {
   if (worktree) {
     // Codex discovers these even in an untrusted project. Disable exactly the
     // worktree skill paths; the person's ~/.codex/skills and config remain.
-    if (/^\s*skills\.config\s*=/m.test(config)) throw new Error('Cannot isolate Codex project skills with inline skills.config');
+    const worktreeSkills = [];
     for (const sourceDir of ['.agents/skills', '.codex/skills', '.claude/skills']) {
       const skillsDir = join(worktree, sourceDir);
       if (!existsSync(skillsDir)) continue;
       for (const name of readdirSync(skillsDir)) {
         const skill = join(skillsDir, name, 'SKILL.md');
-        if (existsSync(skill)) config += `\n[[skills.config]]\npath = ${toml(skill)}\nenabled = false\n`;
+        if (existsSync(skill)) worktreeSkills.push(skill);
       }
     }
+    if (worktreeSkills.length && /^\s*skills\.config\s*=/m.test(config))
+      throw new Error('Cannot isolate Codex project skills with inline skills.config');
+    for (const skill of worktreeSkills) config += `\n[[skills.config]]\npath = ${toml(skill)}\nenabled = false\n`;
   }
   writeFileSync(join(dest, 'config.toml'), config, { mode: 0o600 });
   return { path: dest, personalDeveloperInstructions };

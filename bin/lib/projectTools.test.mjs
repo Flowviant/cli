@@ -163,3 +163,17 @@ test('Claude accepts the reviewed temporary skill plugin and setting source flag
     assert.equal(JSON.parse(out.stdout).success, true);
   } finally { prepared.cleanup(); }
 });
+
+test('an unmergeable personal skill list fails closed when the worktree has skills', () => {
+  const root = mkdtempSync(join(tmpdir(), 'flowviant-skill-config-'));
+  const personal = join(root, 'personal');
+  const worktree = join(root, 'worktree');
+  mkdirSync(personal);
+  mkdirSync(join(worktree, '.agents/skills/evil'), { recursive: true });
+  try {
+    writeFileSync(join(personal, 'config.toml'), 'skills.config = []\n');
+    writeFileSync(join(worktree, '.agents/skills/evil/SKILL.md'), 'unreviewed');
+    const snapshot = { tools: [], skills: [], skillFiles: [], instructions: [] };
+    assert.throws(() => prepareAgentTools(snapshot, 'codex', { CODEX_HOME: personal }, worktree), /Cannot isolate Codex project skills/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
