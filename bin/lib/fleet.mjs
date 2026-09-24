@@ -93,6 +93,7 @@ import { scanLocalSessions, ourConversationIds } from './localSessions.mjs';
 import { repoState } from './repoState.mjs';
 import { claudeAuthContext } from './claudeAuth.mjs';
 import { readBaseTools, runnerToolCapabilities, toolReadout } from './projectTools.mjs';
+import { runtimeOfferings } from './runtimeOfferings.mjs';
 
 /** Said once per process — see the catch around `envQueryParams` below. */
 let warnedEnvIdentity = false;
@@ -168,7 +169,8 @@ async function fetchRoster(
    *  rather than re-derived: `repoRootOrDie` is resolved once at startup and
    *  running git on every poll to re-learn a constant would be a syscall for
    *  a readout. */
-  repoRoot = null
+  repoRoot = null,
+  baseRef = null
 ) {
   const url = new URL(FLEET_URL);
   if (haveIds.length) url.searchParams.set('have', haveIds.join(','));
@@ -305,6 +307,18 @@ async function fetchRoster(
     if (mcp !== null) url.searchParams.set('mcp', JSON.stringify(mcp));
   } catch {
     /* best-effort — the poll must never fail on a readout */
+  }
+  if (repoRoot && baseRef) {
+    try {
+      const offerings = detectRuntimes().some((rt) => rt.id === 'codex' && rt.installed)
+        ? runtimeOfferings(repoRoot, baseRef) : {};
+      for (const [param, report] of Object.entries(offerings)) {
+        if (Object.keys(report).length) {
+          const payload = JSON.stringify(report);
+          if (payload.length <= 8_000 && url.toString().length + encodeURIComponent(payload).length <= 14_000) url.searchParams.set(param, payload);
+        }
+      }
+    } catch { /* local readouts never fail the poll */ }
   }
   // THIS BOX'S IDENTITY — `envpub`, and since 2026-09-21 nothing else.
   //
@@ -2388,7 +2402,8 @@ export async function runFleetDaemon({ afterLock = null } = {}) {
         livePreviewIds(),
         heldSessionIds(),
         admit('churn'),
-        repoRoot
+        repoRoot,
+        getBaseRef()
       );
     } catch (e) {
       if (e.auth) {
