@@ -139,6 +139,20 @@ function readHolder(path) {
   }
 }
 
+/** Read-only desktop measurement. No lock is unknown because an unguarded or
+ * older daemon may still run; a stale lock with a dead pid measures empty. */
+export function daemonRunningFor(fleetToken) {
+  const path = instanceLockPath(fleetToken);
+  let raw;
+  try { raw = readFileSync(path, 'utf8'); }
+  catch { return null; }
+  let holder;
+  try { holder = JSON.parse(raw); } catch { return null; }
+  if (!Number.isInteger(holder?.pid) || holder.pid <= 0) return null;
+  if (!alive(holder.pid)) return false;
+  return stillTheHolder(holder);
+}
+
 /**
  * argv[1] AS IT WAS TYPED, when that differs from the resolved form.
  *

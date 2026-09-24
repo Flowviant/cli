@@ -28,24 +28,35 @@ async function post(url, body) {
   return j.data ?? j;
 }
 
-export async function runLogin({ thenStart = false } = {}) {
-  console.log(`\n  ${c.bold(c.cyan('◣ flowviant'))}  ${c.dim(`login · v${VERSION}`)}\n`);
+export async function runLogin({ thenStart = false, json = false, dir = process.cwd() } = {}) {
+  const event = (value) => { if (json) process.stdout.write(`${JSON.stringify(value)}\n`); };
+  const selectedRepo = json ? detectRepoRoot(dir) : null;
+  if (json && !selectedRepo) { event({ event: 'error', message: `No git repository found in ${dir}.` }); return { saved: false }; }
+  if (!json) console.log(`\n  ${c.bold(c.cyan('◣ flowviant'))}  ${c.dim(`login · v${VERSION}`)}\n`);
   let start;
   try {
     start = await post(DEVICE_START, {});
   } catch (e) {
+    if (json) { event({ event: 'error', message: `couldn't reach Flowviant (${e.message}).` }); return { saved: false }; }
     fail(`couldn't reach Flowviant (${e.message}).`);
     process.exit(1);
   }
   const { deviceCode, userCode, intervalSeconds = 5, expiresInSeconds = 600 } = start;
+  if (json && (typeof deviceCode !== 'string' || typeof userCode !== 'string' || userCode.length < 8)) {
+    event({ event: 'error', message: 'Flowviant returned an invalid login code.' });
+    return { saved: false };
+  }
   const pretty = `${userCode.slice(0, 4)}-${userCode.slice(4)}`;
   // Where the control ACTUALLY is. It was "the Agents panel", a settings
   // section deleted 2026-08-17; connecting a machine is offered on the surface
   // you are on when it matters, and for a new operator that is the Workbench —
   // the project's empty state says so before it can show you any sessions.
-  console.log(`  1. Open ${c.cyan(APP_URL)} → your project → the ${c.bold('Workbench')} → ${c.bold('Connect a machine')}.`);
-  console.log(`  2. Enter this code:   ${c.bold(c.green(pretty))}\n`);
-  info('waiting for you to approve…');
+  if (json) event({ event: 'open_url', url: APP_URL, code: pretty });
+  else {
+    console.log(`  1. Open ${c.cyan(APP_URL)} → your project → the ${c.bold('Workbench')} → ${c.bold('Connect a machine')}.`);
+    console.log(`  2. Enter this code:   ${c.bold(c.green(pretty))}\n`);
+    info('waiting for you to approve…');
+  }
 
   const deadline = Date.now() + expiresInSeconds * 1000;
   while (Date.now() < deadline) {
@@ -57,6 +68,10 @@ export async function runLogin({ thenStart = false } = {}) {
       continue; // transient — keep polling
     }
     if (poll.status === 'approved') {
+      if (json && (!poll.projectId || !(poll.machineToken ?? poll.fleetToken))) {
+        event({ event: 'error', message: 'Flowviant did not return a project credential.' });
+        return { saved: false };
+      }
       // `machineToken` is the wire's new name; `fleetToken` is the one every
       // published daemon reads. The server dual-sends until DAEMON_MIN clears
       // the release that reads the new one (0.54.2+) — reading both here is
@@ -66,7 +81,7 @@ export async function runLogin({ thenStart = false } = {}) {
       // know for certain which checkout this project means, and the binding is
       // what lets a multi-project VM resolve `npx flowviant` by DIRECTORY
       // instead of by whichever login happened last.
-      const repoRoot = detectRepoRoot();
+      const repoRoot = selectedRepo ?? detectRepoRoot(dir);
       const entry = {
         fleetToken: poll.machineToken ?? poll.fleetToken,
         projectId: poll.projectId,
@@ -87,12 +102,18 @@ export async function runLogin({ thenStart = false } = {}) {
       // (`directoryTakenRefusal`, shared with the daemon's own start).
       const clash = boundElsewhere(listStoredProjects(), repoRoot, entry.projectId);
       if (clash.length > 0) {
+        if (json) { event({ event: 'error', message: directoryTakenRefusal(clash, repoRoot, { incoming: entry }) }); return { saved: false }; }
         console.log('');
         warn(directoryTakenRefusal(clash, repoRoot, { incoming: entry }));
         console.log('');
         return { saved: false };
       }
-      saveLogin(entry);
+      try { saveLogin(entry); }
+      catch (e) {
+        if (json) { event({ event: 'error', message: `Could not save this connection: ${e.message}` }); return { saved: false }; }
+        throw e;
+      }
+      if (json) { event({ event: 'bound', projectId: entry.projectId, name: entry.name, dir: repoRoot }); return { saved: true }; }
       ok(
         `connected to ${c.bold(projectLabel(entry))}` +
           `${repoRoot ? ` for ${c.dim(repoRoot)}` : ''} — saved to ~/.flowviant/credentials.json`
@@ -108,10 +129,12 @@ export async function runLogin({ thenStart = false } = {}) {
       return { saved: true };
     }
     if (poll.status === 'expired') {
+      if (json) { event({ event: 'error', message: 'Login code expired.' }); return { saved: false }; }
       warn(`that code expired — run \`${terminalCommand('login')}\` again.`);
       process.exit(1);
     }
   }
+  if (json) { event({ event: 'error', message: 'Login timed out.' }); return { saved: false }; }
   warn(`login timed out — run \`${terminalCommand('login')}\` again.`);
   process.exit(1);
 }

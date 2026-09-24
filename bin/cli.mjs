@@ -70,10 +70,26 @@
  * env (the box keypair, the uplink scrubber, the env-comparison scan) + vault
  * (the knowledge wiki, not secrets), resources, deploy, shot.
  */
-import { FLEET_TOKEN, CREDENTIAL, VERSION, adoptStoredCredential } from './lib/config.mjs';
-import { runFleetDaemon } from './lib/fleet.mjs';
-import { runLogin } from './lib/login.mjs';
-import { launchCommand, terminalCommand } from './lib/launchCommand.mjs';
+// Resolve --dir before config reads the project bound to cwd. A tray process
+// starts outside the checkout; its explicit folder is the daemon's checkout.
+const dirAt = process.argv.indexOf('--dir');
+const noCheckoutCommand = new Set(['--version', '-v', 'version', 'status', 'stop', 'machines', 'projects', 'update', 'shot', 'clean', 'gh-auth', 'mcp']);
+if (dirAt >= 0 && !noCheckoutCommand.has(process.argv[2])) {
+  const dir = process.argv[dirAt + 1];
+  try {
+    if (!dir || dir.startsWith('--')) throw new Error('missing directory');
+    process.chdir(dir);
+  } catch (e) {
+    if (process.argv.includes('--json') && process.argv[2] === 'login')
+      process.stdout.write(`${JSON.stringify({ event: 'error', message: `Cannot use directory ${dir ?? ''}: ${e.message}` })}\n`);
+    else console.error(`error: cannot use directory ${dir ?? ''}: ${e.message}`);
+    process.exit(1);
+  }
+}
+const { FLEET_TOKEN, CREDENTIAL, VERSION, adoptStoredCredential } = await import('./lib/config.mjs');
+const { runFleetDaemon } = await import('./lib/fleet.mjs');
+const { runLogin } = await import('./lib/login.mjs');
+const { launchCommand, terminalCommand } = await import('./lib/launchCommand.mjs');
 
 // `flowviant login` — device auth (recommended): approve a code in the app, the
 // credential is stored locally, and then we KEEP GOING into the daemon.
@@ -96,7 +112,8 @@ if (process.argv[2] === '--version' || process.argv[2] === '-v' || process.argv[
 
 if (process.argv[2] === 'login') {
   const noStart = process.argv.includes('--no-start');
-  const login = await runLogin({ thenStart: !noStart });
+  const json = process.argv.includes('--json');
+  const login = await runLogin({ thenStart: !noStart, json, dir: process.cwd() });
   // A login the person CANCELLED at the second-project question saved nothing,
   // so there is no credential for the child to serve — starting it would end
   // in "no credential found" over a choice they just made on purpose.
@@ -109,7 +126,8 @@ if (process.argv[2] === 'login') {
   // re-exec: stay alive as a thin proxy so the user's shell keeps one foreground
   // process.
   const { spawn } = await import('node:child_process');
-  const child = spawn(process.execPath, process.argv[1]?.startsWith('/$bunfs/') ? [] : [process.argv[1]], {
+  const startArgs = process.argv[1]?.startsWith('/$bunfs/') ? [] : [process.argv[1]];
+  const child = spawn(process.execPath, [...startArgs, ...(json ? ['--json-events'] : [])], {
     stdio: 'inherit',
     env: process.env,
   });
@@ -117,6 +135,12 @@ if (process.argv[2] === 'login') {
   // of this file in the parent — which has no credential — and print "no
   // credential found" over the daemon that just started in the child.
   process.exit(await new Promise((resolve) => child.on('exit', (code) => resolve(code ?? 0))));
+}
+
+if (process.argv[2] === 'status' && process.argv.includes('--json')) {
+  const { desktopStatus } = await import('./lib/desktopContract.mjs');
+  process.stdout.write(`${JSON.stringify(desktopStatus())}\n`);
+  process.exit(0);
 }
 
 // `flowviant update` — install the latest published version now. The daemon also
@@ -200,8 +224,16 @@ if (process.argv[2] === 'shot') {
 // daemon is running on this machine." is the answer the asker came for, not an
 // error. Non-zero only when something was alive and could not be stopped.
 if (process.argv[2] === 'stop') {
-  const { stopAllDaemons } = await import('./lib/instance.mjs');
-  const { failed } = stopAllDaemons({ log: (m) => console.log(m) });
+  const { stopAllDaemons, stopDaemonFor } = await import('./lib/instance.mjs');
+  let result;
+  if (process.argv.includes('--project')) {
+    const { matchStoredProject } = await import('./lib/credentials.mjs');
+    const at = process.argv.indexOf('--project');
+    const match = matchStoredProject(process.argv[at + 1]);
+    if (match.error) { console.error(`error: ${match.error}`); process.exit(1); }
+    result = stopDaemonFor(match.entry.fleetToken, { log: (m) => console.log(m) });
+  } else result = stopAllDaemons({ log: (m) => console.log(m) });
+  const { failed } = result;
   process.exit(failed > 0 ? 1 : 0);
 }
 
@@ -275,17 +307,24 @@ if (process.argv[2] === 'projects') {
 // is the one exit that can be 1, when the daemon it had to stop would not.
 if (process.argv[2] === 'machines') {
   const creds = await import('./lib/credentials.mjs');
+  const machineJson = process.argv.includes('--json');
   const forgetAt = process.argv.indexOf('--forget');
   if (forgetAt >= 0) {
+    if (machineJson && !process.argv.includes('--yes')) {
+      process.stdout.write(`${JSON.stringify({ ok: false, error: '--yes is required with --json' })}\n`);
+      process.exit(1);
+    }
     // THE LOCAL-ONLY WRITE. Named explicitly, matched by full id or a ≥6
     // prefix, and AMBIGUITY REFUSES rather than guessing — this deletes a
     // credential, and two projects that look alike is the case that produced
     // the command.
     const res = creds.forgetStoredProject(process.argv[forgetAt + 1]);
     if (res.error) {
+      if (machineJson) { process.stdout.write(`${JSON.stringify({ ok: false, error: res.error })}\n`); process.exit(1); }
       console.error(`error: ${res.error}`);
       process.exit(1);
     }
+    if (machineJson) { process.stdout.write(`${JSON.stringify({ ok: true, action: 'forget', projectId: res.entry.projectId })}\n`); process.exit(0); }
     console.log(
       `forgot ${creds.projectLabel(res.entry)} (${res.entry.projectId.slice(0, 8)}…) on this box.\n` +
         `  Nothing was stopped or deleted anywhere else — \`${terminalCommand('login')}\` connects it again.`
@@ -297,16 +336,22 @@ if (process.argv[2] === 'machines') {
   const { FLEET_URL } = await import('./lib/config.mjs');
   const removeAt = process.argv.indexOf('--remove');
   if (removeAt >= 0) {
+    if (machineJson && !process.argv.includes('--yes')) {
+      process.stdout.write(`${JSON.stringify({ ok: false, error: '--yes is required with --json' })}\n`);
+      process.exit(1);
+    }
     // THE SCRIPTED DISCONNECT — the menu's first verb, named by id for a
     // terminal nobody is sitting at. Same matcher and the same refusal of an
     // ambiguous prefix as --forget: a name two projects share is exactly the
     // input this command exists to untangle, and it must not pick one.
     const m = creds.matchStoredProject(process.argv[removeAt + 1]);
     if (m.error) {
+      if (machineJson) { process.stdout.write(`${JSON.stringify({ ok: false, error: m.error })}\n`); process.exit(1); }
       console.error(`error: ${m.error}. \`${terminalCommand('machines')}\` lists what is stored.`);
       process.exit(1);
     }
-    const res = await disconnectHere(m.entry, await realDisconnectDeps({ url: leaveUrlFrom(FLEET_URL) }));
+    const res = await disconnectHere(m.entry, await realDisconnectDeps({ url: leaveUrlFrom(FLEET_URL), log: machineJson ? () => {} : undefined }), { log: machineJson ? () => {} : undefined });
+    if (machineJson) process.stdout.write(`${JSON.stringify({ ok: res.ok, action: 'disconnect', projectId: m.entry.projectId })}\n`);
     process.exit(res.ok ? 0 : 1);
   }
 
@@ -674,4 +719,6 @@ if (!FLEET_TOKEN) {
   }
 }
 
+const { installDaemonLogging } = await import('./lib/desktopContract.mjs');
+installDaemonLogging(CREDENTIAL?.entry?.projectId, { jsonEvents: process.argv.includes('--json-events') });
 await runFleetDaemon({ afterLock });
