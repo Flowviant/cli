@@ -802,3 +802,35 @@ test('an ABSENT library key expects nothing — an older server over a plain she
   assert.equal(readFileSync(join(dir, '.flowviant/knowledge.rev'), 'utf8'), '1\n', 'no `:lib` without a library key');
   assert.equal(await sync.onRoster(manifest), null);
 });
+
+test('a design bundle syncs its entry, relative model and PNG as one catalogued folder', async () => {
+  const dir = checkout();
+  const entry = 'designs/landing-v1/scene/page.html';
+  const model = 'designs/landing-v1/scene/mesh file.glb';
+  const preview = 'designs/landing-v1/preview.png';
+  const manifest = { rev: 1, instructions: null, files: [], library: { items: [{
+    id: id(1), kind: 'design', name: entry, title: 'Landing', bytes: 9,
+    sha256: sha('<p>Hi</p>'), taskTitle: 'Landing', taskId: 't1', createdAt: '2026-09-24T00:00:00Z', supersedes: null,
+    files: [{ name: model, bytes: 4, sha256: sha('mesh') }],
+    preview: { name: preview, bytes: 3, sha256: sha('png') },
+  }] } };
+  const calls = [];
+  const fetchFile = async (_id, opts) => { calls.push(opts); return Buffer.from(opts?.preview ? 'png' : opts?.fileIndex === 0 ? 'mesh' : '<p>Hi</p>'); };
+  const first = await syncKnowledge({ checkoutDir: dir, manifest, fetchFile });
+  assert.equal(first.ok, true);
+  assert.equal(readFileSync(join(lib(dir), entry), 'utf8'), '<p>Hi</p>');
+  assert.equal(readFileSync(join(lib(dir), model), 'utf8'), 'mesh');
+  assert.equal(readFileSync(join(lib(dir), preview), 'utf8'), 'png');
+  assert.match(readFileSync(join(lib(dir), LIBRARY_FILE), 'utf8'), /designs\/landing-v1\/scene\/page\.html/);
+  assert.deepEqual(calls.map((x) => x?.fileIndex ?? (x?.preview ? 'preview' : 'entry')), ['entry', 'preview', 0]);
+  // A path component replaced by a symlink never redirects the next sync.
+  const outside = checkout();
+  rmSync(join(lib(dir), 'designs/landing-v1'), { recursive: true });
+  symlinkSync(outside, join(lib(dir), 'designs/landing-v1'));
+  const second = await syncKnowledge({ checkoutDir: dir, manifest, fetchFile });
+  assert.equal(second.ok, true);
+  assert.equal(readFileSync(join(lib(dir), model), 'utf8'), 'mesh');
+  assert.equal(existsSync(join(outside, 'scene/mesh file.glb')), false);
+  assert.equal(safeLibraryPath('designs/landing-v1/../escape.glb', 'design'), null);
+  assert.equal(safeLibraryPath('/designs/landing-v1/page.html', 'design'), null);
+});

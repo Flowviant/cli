@@ -158,23 +158,23 @@ export function scanArtifacts(placeDir) {
   } catch {
     return [];
   }
-  let names;
-  try {
-    names = readdirSync(dir);
-  } catch {
-    return [];
-  }
   const out = [];
-  for (const name of names) {
-    if (name.startsWith('.')) continue; // editor swap files, `.DS_Store`
-    try {
-      const st = lstatSync(join(dir, name));
-      if (!st.isFile()) continue; // symlinks, directories, sockets: nothing
-      out.push({ name, path: join(dir, name), size: st.size, mtimeMs: st.mtimeMs });
-    } catch {
-      /* vanished between the list and the stat */
+  const walk = (at, prefix = '', depth = 0) => {
+    if (depth > 4) return;
+    let names;
+    try { names = readdirSync(at); } catch { return; }
+    for (const part of names) {
+      if (part.startsWith('.')) continue;
+      const name = prefix ? `${prefix}/${part}` : part;
+      const path = join(at, part);
+      try {
+        const st = lstatSync(path);
+        if (st.isDirectory() && !st.isSymbolicLink()) walk(path, name, depth + 1);
+        else if (st.isFile() && !st.isSymbolicLink()) out.push({ name, path, size: st.size, mtimeMs: st.mtimeMs });
+      } catch { /* vanished */ }
     }
-  }
+  };
+  walk(dir);
   out.sort((a, b) => b.mtimeMs - a.mtimeMs || a.name.localeCompare(b.name));
   return out.slice(0, ARTIFACT_MAX_FILES);
 }
@@ -225,9 +225,9 @@ function artifactFnv1a8(s) {
 const ARTIFACT_SAFE_EXT_RE = /^[A-Za-z0-9]{1,10}$/;
 /**
  * `safeFileName`, verbatim in effect (apps/api/src/routes/sessionsAttachments.
- * routes.ts): keeps the extension through a cut. `entry.name` is already a
- * real, depth-one, separator-free basename off this disk, so this only ever
- * differs from it on an over-long name — but that is exactly the case the
+ * routes.ts): keeps the extension through a cut. Applied to each relative
+ * path component, so a model under `scene/` keeps that relation to its page.
+ * This only differs from a component on an over-long name — but that is exactly the case the
  * server's own `safeFileName(rawName)` would otherwise re-cut DIFFERENTLY
  * from whatever this reported, since a bare truncation and an
  * extension-preserving one disagree past 80 characters. Applying the same
@@ -235,6 +235,7 @@ const ARTIFACT_SAFE_EXT_RE = /^[A-Za-z0-9]{1,10}$/;
  * design or research delivery is judged by is the one this machine reported.
  */
 function safeArtifactName(raw) {
+  if (typeof raw === 'string' && raw.length <= 80 && /^[A-Za-z0-9][A-Za-z0-9._ -]*$/.test(raw) && !raw.endsWith('.')) return raw;
   const clean = String(raw ?? '').replace(/[^A-Za-z0-9._-]/g, '_');
   if (clean.length <= 80) return clean || 'artifact';
   const dot = clean.lastIndexOf('.');
@@ -255,7 +256,7 @@ export function buildArtifactUpload(entry, { sessionId, agentId, turnId }, scrub
   const fields = {
     ...(sessionId ? { sessionId } : { agentId }),
     ...(turnId ? { turnId } : {}),
-    name: safeArtifactName(entry.name),
+    name: entry.name.split('/').map(safeArtifactName).join('/'),
     bytes: String(entry.size),
   };
   if (!type) return { fields, bytes: null }; // reported by name only

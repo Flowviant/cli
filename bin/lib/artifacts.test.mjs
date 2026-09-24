@@ -96,7 +96,7 @@ test('rendering measures PNG, cannot render, and rejects an invalid image', asyn
   assert.deepEqual(await renderDesignPreview(Buffer.from('<p/>'), async ({ out }) => { writeFileSync(out, 'bad'); return { ok: true }; }), { renderState: 'unavailable' });
 });
 
-test('scans regular files only, depth one, newest first, and never follows a symlink', () => {
+test('scans nested relative files, newest first, and never follows a symlink', () => {
   const d = place();
   put(d, 'old.md', '# old', 1_000);
   put(d, 'new.html', '<p>new</p>', 2_000);
@@ -105,10 +105,11 @@ test('scans regular files only, depth one, newest first, and never follows a sym
   const secret = join(d, 'secret.txt');
   writeFileSync(secret, 'the key');
   symlinkSync(secret, join(d, ARTIFACT_DIR, 'planted.txt'));
+  symlinkSync(secret, join(d, ARTIFACT_DIR, 'nested', 'planted.txt'));
   put(d, '.swp', 'x');
   assert.deepEqual(
     scanArtifacts(d).map((e) => e.name),
-    ['new.html', 'old.md']
+    ['nested/deep.txt', 'new.html', 'old.md']
   );
 });
 
@@ -174,6 +175,16 @@ test('text is scrubbed before it leaves; an image is sent as it is', () => {
   assert.equal(html.fields.turnId, 't1');
   assert.equal(html.fields.bytes, String(html.bytes.byteLength));
   assert.deepEqual([...png.bytes], [0x89, 0x50, 0x4e, 0x47]);
+});
+
+test('a nested model keeps its relative path in the upload', () => {
+  const d = place();
+  mkdirSync(join(d, ARTIFACT_DIR, 'scene'));
+  writeFileSync(join(d, ARTIFACT_DIR, 'scene', 'mesh file.glb'), Buffer.from([1, 2]));
+  const entry = scanArtifacts(d).find((e) => e.name === 'scene/mesh file.glb');
+  const upload = buildArtifactUpload(entry, { agentId: 'a1' });
+  assert.equal(upload.fields.name, 'scene/mesh file.glb');
+  assert.deepEqual([...upload.bytes], [1, 2]);
 });
 
 test('an off-list type and an oversized file are reported by NAME, never read', () => {

@@ -63,7 +63,8 @@
  * `research/<slug>-v<N>.md`, with a generated `LIBRARY.md` at the root naming
  * every one (path, title, kind, the card that asked for it, the date, what it
  * supersedes). So "implement design A" is an agent opening LIBRARY.md, finding
- * design A, and reading the page.
+ * design A, and reading the page. At 0.99.0 a kept design is one folder,
+ * including its original relative sidecar paths and measured preview.
  *
  * SUBDIRECTORIES, AND EXACTLY TWO. The safe-name rule for a knowledge file
  * forbids every separator; a library item is the one thing allowed ONE, and
@@ -132,7 +133,7 @@ export const FLOWVIANT_OWN_PATHS = [
 export const LIBRARY_FILE = 'LIBRARY.md';
 /** The two subdirectories a kept item may live in, by kind. */
 export const LIBRARY_DIRS = { design: 'designs', research: 'research' };
-const LIBRARY_EXT = { design: ['.html', '.gltf', '.obj', '.glb', '.bin'], research: ['.md'] };
+const LIBRARY_EXT = { design: ['.html', '.htm', '.gltf', '.obj', '.glb', '.bin'], research: ['.md'] };
 /** The server caps a library at 200 items; a longer manifest is cut. */
 const MAX_LIBRARY_ITEMS = 256;
 
@@ -358,12 +359,30 @@ function writeKnowledgeMarker(checkoutDir, rev, lib = false) {
 export function safeLibraryPath(name, kind) {
   if (typeof name !== 'string' || !(kind in LIBRARY_DIRS)) return null;
   const parts = name.split('/');
-  if (parts.length !== 2) return null;
-  const [dir, file] = parts;
+  if (parts.length !== 2 && !(kind === 'design' && parts.length >= 3 && parts.length <= 7)) return null;
+  const [dir, ...rest] = parts;
+  const file = rest.at(-1);
   if (dir !== LIBRARY_DIRS[kind]) return null;
-  if (!file || file !== safeKnowledgeName(file)) return null;
+  if (rest.length >= 2 && !/^[a-z0-9-]+-v[1-9][0-9]*$/.test(rest[0])) return null;
+  if (rest.slice(1, -1).some((p) => !safeBundleSegment(p))) return null;
+  if (!file || (rest.length === 1 ? file !== safeKnowledgeName(file) : !safeBundleSegment(file))) return null;
   if (!LIBRARY_EXT[kind].some((ext) => file.toLowerCase().endsWith(ext) && file.length > ext.length)) return null;
-  return `${dir}/${file}`;
+  return name;
+}
+
+function safeBundleSegment(part) {
+  return typeof part === 'string' && part.length > 0 && part.length <= 80 &&
+    /^[A-Za-z0-9][A-Za-z0-9._ -]*$/.test(part) && !part.endsWith('.');
+}
+
+function safeBundleFile(path, rootDir) {
+  if (typeof path !== 'string' || !path.startsWith(`${rootDir}/`)) return null;
+  const relative = path.slice(rootDir.length + 1);
+  if (relative === 'preview.png') return null;
+  const parts = relative.split('/');
+  if (!parts.length || parts.some((p) => !safeBundleSegment(p))) return null;
+  if (!/\.(gltf|obj|glb|bin|png|jpg|jpeg|gif|webp|svg|json)$/i.test(relative)) return null;
+  return path;
 }
 
 /** The manifest's library items that are safe to write, in manifest order, or
@@ -379,11 +398,14 @@ function libraryItemsOf(manifest) {
     const path = safeLibraryPath(it.name, it.kind);
     if (!path || seen.has(path.toLowerCase())) continue;
     seen.add(path.toLowerCase());
-    const previewPath = it.kind === 'design' && it.preview &&
-      it.preview.name === it.name.replace(/\.html$/, '.png') &&
-      safeLibraryPath(it.preview.name.replace(/\.png$/, '.html'), 'design')
-      ? `designs/${it.preview.name.split('/')[1]}` : null;
-    out.push({ ...it, path, previewPath, previewUnknown: it.kind === 'design' && path.endsWith('.html') && it.preview === undefined });
+    const bundleDir = path.split('/').length >= 3 ? path.split('/').slice(0, 2).join('/') : null;
+    const expectedPreview = bundleDir ? `${bundleDir}/preview.png` : it.name.replace(/\.html$/, '.png');
+    const previewPath = it.kind === 'design' && it.preview && it.preview.name === expectedPreview ? expectedPreview : null;
+    const files = bundleDir && Array.isArray(it.files) ? it.files.map((f, index) => ({ ...f,
+      index, path: safeBundleFile(f.name, bundleDir),
+    })).filter((f) => f.path && !seen.has(f.path.toLowerCase())) : [];
+    for (const f of files) seen.add(f.path.toLowerCase());
+    out.push({ ...it, path, files, previewPath, previewUnknown: it.kind === 'design' && path.endsWith('.html') && it.preview === undefined });
   }
   return out;
 }
@@ -443,6 +465,32 @@ function ensureSubdir(dir, name) {
   mkdirSync(path, { recursive: true });
   return path;
 }
+
+function ensureLibraryParents(dir, relativePath) {
+  const parts = relativePath.split('/');
+  let at = dir;
+  for (const part of parts.slice(0, -1)) at = ensureSubdir(at, part);
+}
+
+function sweepLibraryTree(dir, sub, wanted, result) {
+  const walk = (at, prefix = '') => {
+    let entries;
+    try { entries = readdirSync(at); } catch { return; }
+    for (const name of entries) {
+      const rel = prefix ? `${prefix}/${name}` : name;
+      const path = join(at, name);
+      let st;
+      try { st = lstatSync(path); } catch { continue; }
+      if (st.isDirectory() && !st.isSymbolicLink()) {
+        walk(path, rel);
+        try { if (readdirSync(path).length === 0) rmSync(path, { recursive: true, force: true }); } catch { /* next sync */ }
+      } else if (!wanted.has(rel)) {
+        try { rmSync(path, { recursive: true, force: true }); result.removed.push(`${sub}/${rel}`); } catch { /* next sync */ }
+      }
+    }
+  };
+  walk(join(dir, sub));
+};
 
 /** Does this manifest look like one the server produced? Anything else is
  *  ignored whole rather than half-applied. */
@@ -611,14 +659,16 @@ async function syncLibrary({ dir, items, fetchFile, maxBytes, keep, result }) {
     }
   }
   for (const it of items) {
-    const [sub, file] = it.path.split('/');
-    const path = join(dir, sub, file);
+    const [sub, ...tail] = it.path.split('/');
+    const file = tail.join('/');
+    const path = join(dir, ...it.path.split('/'));
+    ensureLibraryParents(dir, it.path);
     const itemMax = knowledgeMaxFor(it.path, maxBytes);
     wanted[sub].add(file);
-    if (it.previewPath) wanted[sub].add(it.previewPath.split('/')[1]);
+    if (it.previewPath) wanted[sub].add(it.previewPath.split('/').slice(1).join('/'));
     if (it.previewUnknown) {
-      const oldPng = file.replace(/\.html$/, '.png');
-      if (localSha(join(dir, sub, oldPng)) !== null) wanted[sub].add(oldPng);
+      const oldPng = file.includes('/') ? `${file.slice(0, file.lastIndexOf('/'))}/preview.png` : file.replace(/\.html$/, '.png');
+      if (localSha(join(dir, sub, ...oldPng.split('/'))) !== null) wanted[sub].add(oldPng);
     }
     if (Number(it.bytes) > itemMax) {
       result.refused.push(it.path);
@@ -638,6 +688,7 @@ async function syncLibrary({ dir, items, fetchFile, maxBytes, keep, result }) {
         if (typeof it.sha256 === 'string' && sha256Of(buf) !== it.sha256.toLowerCase()) {
           throw new Error('sha256 mismatch');
         }
+        ensureLibraryParents(dir, it.path);
         writeAtomic(path, buf);
         result.wrote.push(it.path);
         onDisk.push(it);
@@ -648,11 +699,13 @@ async function syncLibrary({ dir, items, fetchFile, maxBytes, keep, result }) {
       }
     }
     if (it.previewPath && it.preview?.sha256) {
+      ensureLibraryParents(dir, it.previewPath);
       const previewFile = join(dir, ...it.previewPath.split('/'));
       if (localSha(previewFile) !== it.preview.sha256.toLowerCase()) {
         try {
           const buf = await fetchFile(it.id, { library: true, preview: true });
           if (!Buffer.isBuffer(buf) || buf.byteLength > 2 * 1024 * 1024 || sha256Of(buf) !== it.preview.sha256.toLowerCase()) throw new Error('preview mismatch');
+          ensureLibraryParents(dir, it.previewPath);
           writeAtomic(previewFile, buf);
           result.wrote.push(it.previewPath);
         } catch {
@@ -661,26 +714,29 @@ async function syncLibrary({ dir, items, fetchFile, maxBytes, keep, result }) {
         }
       }
     }
+    for (const f of it.files ?? []) {
+      ensureLibraryParents(dir, f.path);
+      const rel = f.path.split('/').slice(1).join('/');
+      wanted[sub].add(rel);
+      const filePath = join(dir, ...f.path.split('/'));
+      const fileMax = knowledgeMaxFor(f.path, maxBytes);
+      if (Number(f.bytes) > fileMax) { result.refused.push(f.path); wanted[sub].delete(rel); continue; }
+      if (localSha(filePath) === String(f.sha256).toLowerCase()) continue;
+      try {
+        const buf = await fetchFile(it.id, { library: true, fileIndex: f.index });
+        if (!Buffer.isBuffer(buf) || buf.byteLength > fileMax) { result.refused.push(f.path); wanted[sub].delete(rel); continue; }
+        if (sha256Of(buf) !== String(f.sha256).toLowerCase()) throw new Error('sha256 mismatch');
+        ensureLibraryParents(dir, f.path);
+        writeAtomic(filePath, buf);
+        result.wrote.push(f.path);
+      } catch { result.ok = false; result.failed.push(f.path); }
+    }
   }
   // Each subdirectory holds exactly what the manifest names.
   for (const sub of Object.values(LIBRARY_DIRS)) {
     const subPath = join(dir, sub);
-    let entries = [];
-    try {
-      if (!lstatSync(subPath).isDirectory()) continue;
-      entries = readdirSync(subPath);
-    } catch {
-      continue;
-    }
-    for (const name of entries) {
-      if (wanted[sub].has(name)) continue;
-      try {
-        rmSync(join(subPath, name), { recursive: true, force: true });
-        result.removed.push(`${sub}/${name}`);
-      } catch {
-        /* best-effort */
-      }
-    }
+    try { if (!lstatSync(subPath).isDirectory()) continue; } catch { continue; }
+    sweepLibraryTree(dir, sub, wanted[sub], result);
     // An emptied subdirectory leaves with its last item.
     if (wanted[sub].size === 0) keep.delete(sub);
   }
@@ -757,6 +813,12 @@ function libraryStale(checkoutDir, manifest, { synced, refused }) {
   const dir = join(checkoutDir, KNOWLEDGE_DIR);
   const isFile = (p) => {
     try {
+      let parent = dir;
+      for (const part of p.slice(dir.length + 1).split('/').slice(0, -1)) {
+        parent = join(parent, part);
+        const st = lstatSync(parent);
+        if (st.isSymbolicLink() || !st.isDirectory()) return false;
+      }
       return lstatSync(p).isFile();
     } catch {
       return false;
@@ -764,7 +826,8 @@ function libraryStale(checkoutDir, manifest, { synced, refused }) {
   };
   if (!isFile(join(dir, LIBRARY_FILE))) return true;
   return expected.some((it) => !isFile(join(dir, ...it.path.split('/'))) ||
-    (it.previewPath && !refused.has(it.previewPath) && !isFile(join(dir, ...it.previewPath.split('/')))));
+    (it.previewPath && !refused.has(it.previewPath) && !isFile(join(dir, ...it.previewPath.split('/')))) ||
+    (it.files ?? []).some((f) => !refused.has(f.path) && !isFile(join(dir, ...f.path.split('/')))));
 }
 
 /**
@@ -888,8 +951,9 @@ export function knowledgeFetcher({ fleetUrl, token, userAgent, maxBytes = KNOWLE
   // A kept library item (0.97.0) is its sibling, `GET /fleet/library/:id` —
   // the same credential, the same shape, the same caps.
   const libraryBase = String(fleetUrl).replace(/\/agents\/?$/, '/library');
-  return async (id, { library = false, preview = false } = {}) => {
-    const res = await fetch(`${library ? libraryBase : base}/${encodeURIComponent(id)}${preview ? '/preview' : ''}`, {
+  return async (id, { library = false, preview = false, fileIndex = null } = {}) => {
+    const suffix = preview ? '/preview' : Number.isSafeInteger(fileIndex) && fileIndex >= 0 ? `/file/${fileIndex}` : '';
+    const res = await fetch(`${library ? libraryBase : base}/${encodeURIComponent(id)}${suffix}`, {
       headers: { Authorization: `Bearer ${token}`, 'User-Agent': userAgent },
       signal: AbortSignal.timeout(60_000),
     });
