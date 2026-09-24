@@ -601,7 +601,9 @@ MECHANICS OF THIS CHAT:
    something they said.
 10. REFERENCE WHAT THE PROJECT KEPT. When the ask names a kept design or
    write-up ("implement design A"), call list_library and pass its id as
-   \`references\` on the card you stage, so the agent reads it.`;
+   \`references\` on the card you stage, so the agent reads it. When the person's
+   message includes attached library items, pass those ids as \`references\` on
+   the cards you stage from that message.`;
 
 export const WORK_TURN_KICKOFF = ({ sessionId, sessionName, message, askedByName }) =>
   kickoff({

@@ -724,6 +724,7 @@ test('the paragraph names the catalog; a card spec prints its references; the ca
   );
   const cap = SYSTEM_CAPTURE.replace(/\s+/g, ' ');
   assert.ok(cap.includes('call list_library and pass its id as `references`'));
+  assert.ok(cap.includes('message includes attached library items, pass those ids as `references`'));
 });
 
 // ── THE SAME REV OVER A LIBRARY THE DISK DOES NOT HOLD (2026-09-23) ────────
