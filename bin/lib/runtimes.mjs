@@ -589,7 +589,7 @@ export const RUNTIMES = {
      * strongest form of it available anywhere: `--append-system-prompt` sits
      * above the conversation rather than inside it.
      */
-    args({ prompt, system, model, effort, resume, streamJson, perm, mcp = [], resultSchemaArgs = [], adoptResumeId, resumeThreadId, knowledgeDir }) {
+    args({ prompt, system, model, effort, resume, streamJson, perm, profile = 'build', mcp = [], resultSchemaArgs = [], adoptResumeId, resumeThreadId, knowledgeDir }) {
       const a = [];
       // THREE ANSWERS TO ONE QUESTION — "what conversation is this?" — and they
       // are mutually exclusive, never combined.
@@ -616,6 +616,10 @@ export const RUNTIMES = {
       else if (resumeThreadId) a.push('--resume', resumeThreadId);
       else if (resume) a.push('--continue');
       a.push('-p', prompt, '--append-system-prompt', system);
+      // These fenced postures have no project MCP, even if Claude discovers a
+      // .mcp.json in the agent's worktree. Build gets its reviewed base config
+      // explicitly from the caller; the plan profile keeps its own principal.
+      if (['consult', 'wiki', 'design', 'research'].includes(profile)) a.push('--strict-mcp-config');
       a.push(...mcp, ...resultSchemaArgs);
       a.push('--model', model || MODEL);
       if (effort) a.push('--effort', effort);

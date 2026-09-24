@@ -738,7 +738,7 @@ export function runTurn({ prompt, resume, system, cwd, mcpConfig, mcpArgs, mcpEn
       // is a property of the CLI: Codex reads its prompt as a trailing
       // positional, so a flag after it is a flag in the wrong place.
       // Wiki-vault turns are pure file work and pass neither — no MCP at all.
-      mcp: mcpConfig ? ['--mcp-config', mcpConfig] : (mcpArgs ?? []),
+      mcp: planMode ? ['--strict-mcp-config'] : mcpConfig ? ['--mcp-config', mcpConfig] : (mcpArgs ?? []),
       // Resuming a SPECIFIC held conversation by its own id (work.mjs, codex
       // sessions). Runtimes without a by-id resume ignore it and keep their
       // `resume` behavior unchanged.

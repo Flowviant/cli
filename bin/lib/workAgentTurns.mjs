@@ -14,6 +14,7 @@ import { changedArtifacts, scanArtifacts } from './artifacts.mjs';
 import { scrub as envScrub } from './env.mjs';
 import { canRun, recordSkills, recordMcpServers, toolEventOf, CLAUDE_TOOL_PROSE_KINDS, RUNTIMES } from './runtimes.mjs';
 import { makeTraceRelay } from './trace.mjs';
+import { readBaseTools, prepareAgentTools } from './projectTools.mjs';
 
 export function createWorkAgentTurns({
   REJECT_RETRY_MS,
@@ -602,7 +603,11 @@ export function createWorkAgentTurns({
       /** The agent's artifact directory as it stood before this turn — the
        *  tab lane's rule, in the agent's own worktree (2026-09-22). */
       const artifactsBefore = beforeArtifacts(wt);
+      let projectTools = null;
       try {
+        // A turn reads the base ref afresh. Changes the agent has made to its
+        // own worktree cannot silently change the next turn's tools.
+        projectTools = prepareAgentTools(readBaseTools(repoRoot, baseRef()), rt);
         const agentTurnArgs = {
           prompt:
             job.kind === 'task' && job.task
@@ -628,7 +633,12 @@ export function createWorkAgentTurns({
             // ARTIFACTS (0.94.0), while the server can show one — an agent's
             // land on its page, under the facts row.
             artifacts: getArtifactsAccepted(),
-          }),
+          }) + (projectTools.instructions ? `\n\n${projectTools.instructions}` : ''),
+          ...(posture === 'build' && rt === 'claude'
+            ? { mcpArgs: ['--strict-mcp-config', '--mcp-config', projectTools.mcpPath] }
+            : posture === 'build' && rt === 'codex'
+              ? { mcpArgs: projectTools.codexArgs }
+              : {}),
           knowledgeDir: knowledgeDirFor(repoRoot),
           // Named only for the two non-code kinds; a code turn passes nothing
           // and keeps the build branch it always had.
@@ -734,6 +744,7 @@ export function createWorkAgentTurns({
           out = await runTurn({ ...agentTurnArgs, resume: false, resumeThreadId: undefined });
         }
       } finally {
+        projectTools?.cleanup();
         /**
          * THE TAIL, BEFORE THE SETTLE — so the last thing the agent did is on
          * the record by the time the board is told the turn is over.
