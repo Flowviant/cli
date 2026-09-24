@@ -70,7 +70,7 @@
  * env (the box keypair, the uplink scrubber, the env-comparison scan) + vault
  * (the knowledge wiki, not secrets), resources, deploy, shot.
  */
-import { FLEET_TOKEN, CREDENTIAL, adoptStoredCredential } from './lib/config.mjs';
+import { FLEET_TOKEN, CREDENTIAL, VERSION, adoptStoredCredential } from './lib/config.mjs';
 import { runFleetDaemon } from './lib/fleet.mjs';
 import { runLogin } from './lib/login.mjs';
 
@@ -86,6 +86,13 @@ import { runLogin } from './lib/login.mjs';
 //
 // `--no-start` for scripts and CI, which want the credential and not a
 // long-running process.
+// `flowviant --version` prints and exits — the first thing a person runs after
+// a curl install, and it must never start a daemon.
+if (process.argv[2] === '--version' || process.argv[2] === '-v' || process.argv[2] === 'version') {
+  console.log(VERSION);
+  process.exit(0);
+}
+
 if (process.argv[2] === 'login') {
   const noStart = process.argv.includes('--no-start');
   const login = await runLogin({ thenStart: !noStart });
