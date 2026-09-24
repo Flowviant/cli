@@ -422,7 +422,7 @@ test('an agent turn relays the account the agent wrote, and never invents one (0
    * the no-result backstop. A slice with both anchors checked, the standing
    * rule: a pin over an empty slice passes over nothing.
    */
-  const k = src.indexOf('const res = parseTurnResult(out);');
+  const k = src.indexOf('const res = (lastAnswer && parseTurnResult(lastAnswer)) || parseTurnResult(out);');
   assert.ok(k > -1 && k < i, 'the parse must precede the settle it feeds');
   const backstops = src.slice(k, i);
   assert.ok(backstops.includes("outcome: 'nothing'"), 'both backstop settles live here');
@@ -453,7 +453,9 @@ test('an agent turn carries the container\'s pinned brain into its CLI, on brain
    */
   const turn = fnBody(workSource(), 'runAgentTurn');
   const brainAt = turn.indexOf('const brain = brainFor(job);');
-  const callAt = turn.indexOf('out = await runTurn({');
+  // The argument object, not the call: the lane builds it once so the fresh
+  // retry after a lost resume wears the same brain.
+  const callAt = turn.indexOf('const agentTurnArgs = {');
   assert.ok(brainAt > -1, 'the agent lane must resolve a brain');
   assert.ok(callAt > brainAt, 'a brain resolved after the call is a brain the turn never wore');
   const args = turn.slice(callAt);
@@ -1478,7 +1480,7 @@ test('every settle that follows a CLI carries what it spent, and no other does',
   const turn = fnBody(src, 'runAgentTurn');
   assert.ok(turn.includes('let usage = null;'), 'held across the turn, for every settle below');
   assert.ok(
-    /onUsage: \(u\) => \{\s*usage = u;\s*\},/.test(turn),
+    /onUsage: \(u\) => \{\s*usage = \{ \.\.\.u, runtime: rt \};\s*\},/.test(turn),
     'SET, never accumulated — one turn is one result event, and the adding-up is the server\'s'
   );
   const spread = '...(usage ? { usage } : {}),';
@@ -1500,7 +1502,7 @@ test('every settle that follows a CLI carries what it spent, and no other does',
   // the container's.
   const pre = fnBody(src, 'runPrecheck');
   assert.ok(pre.includes('let usage = null;'));
-  assert.ok(/onUsage: \(u\) => \{\s*usage = u;\s*\},/.test(pre));
+  assert.ok(/onUsage: \(u\) => \{\s*usage = \{ \.\.\.u, runtime: rt \};\s*\},/.test(pre));
   assert.ok(pre.includes(spread), 'on the /fleet/agent-precheck body');
 });
 
