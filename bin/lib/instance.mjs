@@ -97,7 +97,7 @@ import {
 import { homedir, platform } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
-import { VERSION } from './config.mjs';
+import { VERSION, PROCESS_STARTED_AT } from './config.mjs';
 
 /** Deliberately a HASH: a credential must never become a filename. */
 export function instanceLockPath(fleetToken) {
@@ -139,11 +139,42 @@ function readHolder(path) {
   }
 }
 
+/**
+ * argv[1] AS IT WAS TYPED, when that differs from the resolved form.
+ *
+ * Node resolves `process.argv[1]` to an absolute path, while `/proc/<pid>/cmdline`
+ * and `ps` show the argv the process was actually given. A daemon started as
+ * `node bin/cli.mjs` (a dev checkout, `npm start`, a Docker CMD with a WORKDIR)
+ * therefore recorded `/abs/bin/cli.mjs` and was matched against `node
+ * bin/cli.mjs`, judged stale WHILE ALIVE — a second start ran beside it and
+ * `flowviant stop` signalled nothing. The raw token is recorded beside `entry`
+ * so both spellings identify the process. Linux only: `ps` joins argv with
+ * spaces, so no token can be recovered from it reliably, and there the absolute
+ * form plus the start-time check stand as before.
+ */
+function rawEntry() {
+  if (platform() !== 'linux') return null;
+  try {
+    const tokens = readFileSync('/proc/self/cmdline', 'utf8').split('\0');
+    const raw = tokens[1 + process.execArgv.length];
+    return raw && raw !== process.argv[1] ? raw : null;
+  } catch {
+    return null;
+  }
+}
+
 const record = (repoRoot) =>
   JSON.stringify({
     pid: process.pid,
     repoRoot,
-    startedAt: new Date().toISOString(),
+    // THE PROCESS'S START, not the moment the lock was written. The start path
+    // can wait on a person at the picker or the binding confirm for as long as
+    // they take (there is no answer time limit), and a lock line written three
+    // minutes after the process began put a LIVE daemon outside the 120s window
+    // startedAroundLockWrite brackets — so a second start cleared its "stale"
+    // lock and ran beside it, and stop and disconnect skipped it. The window now
+    // measures clock granularity only, whatever a prompt cost.
+    startedAt: PROCESS_STARTED_AT,
     // The script we were started from, and what we are. A takeover matches the
     // live command line against `entry` before signalling anything — a lock
     // records a PID, and a crashed daemon's PID can be reused by anything.
@@ -151,8 +182,67 @@ const record = (repoRoot) =>
     // matched on the holder's process START TIME instead; stillTheHolder says
     // why that is the weaker of the two claims and still strong enough.
     entry: process.argv[1] || '',
+    ...(rawEntry() ? { entryRaw: rawEntry() } : {}),
     version: VERSION,
   });
+
+/** Up to this many parents are walked looking for the daemon we re-exec'd from.
+ *  `npx -y flowviant@latest` puts `npm exec` (and a `sh -c`) between the old
+ *  daemon and the new one; eight is several times that chain. */
+const ANCESTOR_DEPTH = 8;
+
+/** The parent pid of `pid`, or null where it cannot be read. */
+function parentOf(pid) {
+  try {
+    if (platform() === 'linux') {
+      const raw = readFileSync(`/proc/${pid}/stat`, 'utf8');
+      const close = raw.lastIndexOf(')');
+      if (close < 0) return null;
+      const ppid = Number.parseInt(raw.slice(close + 1).trim().split(/\s+/)[1], 10);
+      return Number.isInteger(ppid) && ppid > 0 ? ppid : null;
+    }
+    if (platform() === 'darwin') {
+      const out = execFileSync('ps', ['-o', 'ppid=', '-p', String(pid)], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        timeout: 3000,
+      });
+      const ppid = Number.parseInt(out.trim(), 10);
+      return Number.isInteger(ppid) && ppid > 0 ? ppid : null;
+    }
+  } catch {
+    /* unreadable — ancestry unknown */
+  }
+  return null;
+}
+
+/**
+ * IS THIS HOLDER THE DAEMON THAT RE-EXEC'D US? — the self-update case.
+ *
+ * The direct parent is the global-install path: update.mjs spawns
+ * `process.execPath` itself, so the successor's ppid IS the holder. Under npx
+ * — the documented launch — the successor is spawned by `npm exec`, which the
+ * old daemon spawned, so the holder is a GRANDPARENT and a ppid check read it
+ * as a rival: the new daemon SIGTERMed its own proxy, the foreground process
+ * exited 143 while the successor ran on detached (or, with --no-takeover, both
+ * exited and the machine went dark after every update). So update.mjs names
+ * the pid it re-exec'd from, and that pid is adopted only when it really is an
+ * ANCESTOR of this process: the env var alone is inherited by anything the
+ * daemon spawns and proves nothing on its own. Ancestry that cannot be read
+ * adopts nothing — the pre-existing takeover rules then apply.
+ */
+function isOurReexecParent(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  if (pid === process.ppid) return true;
+  if (process.env.FLOWVIANT_REEXEC_FROM !== String(pid)) return false;
+  let p = process.ppid;
+  for (let i = 0; i < ANCESTOR_DEPTH && p && p > 1; i++) {
+    const up = parentOf(p);
+    if (up === pid) return true;
+    p = up;
+  }
+  return false;
+}
 
 /** Same directory, whatever it is spelled as — symlinks and trailing slashes
  *  included. A repo compared by string would let `/repo` and `/repo/` past. */
@@ -208,7 +298,7 @@ export function daemonInSameRepo(repoRoot, ownPath) {
     if (path === ownPath) continue; // our own credential — the lock above owns that question
     const holder = readHolder(path);
     if (!holder || !alive(holder.pid)) continue;
-    if (holder.pid === process.ppid) continue; // ourselves mid self-update re-exec
+    if (isOurReexecParent(holder.pid)) continue; // ourselves mid self-update re-exec
     if (samePath(holder.repoRoot, repoRoot)) {
       NEIGHBOUR_PATHS.set(holder, path);
       return holder;
@@ -226,7 +316,10 @@ export function daemonInSameRepo(repoRoot, ownPath) {
  *  around 41s. 120s is ~3x that worst path and ~4000x the typical one, and it is
  *  still short enough that pid reuse cannot reach into it: reuse means cycling
  *  the entire pid space (4194304 by default), which no machine does inside two
- *  minutes. */
+ *  minutes. (Since the lock records the PROCESS start rather than the moment it
+ *  was written, a lock from this version sits a few milliseconds from its
+ *  process whatever the start path cost; the window's width is for locks older
+ *  daemons wrote, which still stamp the write.) */
 const TAKEOVER_START_WINDOW_MS = 120_000;
 
 /** ...and how far the OTHER way, which is a unit problem rather than a real
@@ -421,15 +514,20 @@ function stillTheHolder(holder) {
   // alive, so it takes the same road as a missing one.
   if (!want) return startedAroundLockWrite(holder);
   let cmdline;
+  let tokens;
   try {
-    cmdline =
-      platform() === 'linux'
-        ? readFileSync(`/proc/${holder.pid}/cmdline`, 'utf8').replace(/\0/g, ' ')
-        : execFileSync('ps', ['-o', 'command=', '-p', String(holder.pid)], {
-            encoding: 'utf8',
-            stdio: ['ignore', 'pipe', 'ignore'],
-            timeout: 3000,
-          });
+    if (platform() === 'linux') {
+      const raw = readFileSync(`/proc/${holder.pid}/cmdline`, 'utf8');
+      tokens = raw.split('\0');
+      cmdline = raw.replace(/\0/g, ' ');
+    } else {
+      cmdline = execFileSync('ps', ['-o', 'command=', '-p', String(holder.pid)], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        timeout: 3000,
+      });
+      tokens = cmdline.trim().split(/\s+/);
+    }
   } catch {
     // NOT `false`. takeOverFrom already returned early if the pid were gone, so
     // reaching here means the process is alive and we could not READ it —
@@ -437,7 +535,10 @@ function stillTheHolder(holder) {
     // here is what made the refusal claim the pid belonged to somebody else.
     return null;
   }
-  if (!cmdline.includes(want)) return false;
+  // The typed spelling is matched as a whole TOKEN, never a substring: a
+  // relative `bin/cli.mjs` is a fragment of countless command lines.
+  const raw = typeof holder.entryRaw === 'string' && holder.entryRaw ? holder.entryRaw : null;
+  if (!cmdline.includes(want) && !(raw && tokens.includes(raw))) return false;
   // AN ENTRY MATCH ALONE IS NOT IDENTITY. Every daemon on the box shares one
   // entry path under a global install, so "cmdline contains this cli.mjs"
   // proves "is SOME flowviant daemon", not "is the daemon that wrote THIS
@@ -711,7 +812,7 @@ export function acquireInstanceLock(fleetToken, repoRoot, opts = {}) {
       // ownership-checked, so it will not delete the lock it handed over.
       // (`flowviant login` also proxies a child, but that parent never reached
       // the daemon and holds nothing — the child simply acquires.)
-      if (holder.pid === process.ppid) {
+      if (isOurReexecParent(holder.pid)) {
         try {
           writeFileSync(path, record(repoRoot));
         } catch {

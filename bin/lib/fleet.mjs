@@ -34,8 +34,11 @@ import {
   LIVE,
   AUTO_UPDATE,
   CREDENTIAL,
+  learnProjectId,
+  storedCredentialInUse,
 } from './config.mjs';
-import { projectLabel, setStoredProjectName } from './credentials.mjs';
+import { projectLabel, safeName, setStoredProjectName } from './credentials.mjs';
+import { credentialRejected } from './authReject.mjs';
 import { handleVersionSignal } from './update.mjs';
 import {
   git,
@@ -424,10 +427,16 @@ async function fetchRoster(
     signal: AbortSignal.timeout(30_000), // a black-holed poll must not stall the loop
   });
   if (res.status === 401 || res.status === 403) {
-    // Fleet credential revoked/expired — retrying can't recover; signal exit.
-    const e = new Error(`fleet credential rejected (${res.status})`);
-    e.auth = true;
-    throw e;
+    // Revoked or expired — retrying can't recover, so signal exit. But ONLY on
+    // the API's own refusal: an edge 403 (Cloudflare's bot checks, which this
+    // very client class trips) is a retryable failure, and exiting on one took
+    // a machine offline for good over a credential that was still valid.
+    if (await credentialRejected(res)) {
+      const e = new Error(`fleet credential rejected (${res.status})`);
+      e.auth = true;
+      throw e;
+    }
+    throw new Error(`fleet poll refused by something in front of the API (${res.status})`);
   }
   if (!res.ok) throw new Error(`fleet poll failed (${res.status})`);
   // THE ASK IS SPENT HERE AND NOWHERE ELSE — on a poll the server actually
@@ -1104,7 +1113,7 @@ export async function standDownDisplaced({
 // One roster agent's loop: persistent worktree, one intent per turn, reset to
 // base between tasks (fresh conversation), resume in place while on a blocker.
 
-export async function runFleetDaemon() {
+export async function runFleetDaemon({ afterLock = null } = {}) {
   console.log('');
   console.log(`  ${c.bold(c.cyan('◣ flowviant'))}  ${c.dim(`machine daemon · v${VERSION}`)}`);
   console.log(`  ${c.dim('──────────────────────────────────────────────')}`);
@@ -1145,7 +1154,7 @@ export async function runFleetDaemon() {
   // about to serve" must not require a network round trip to answer. Only when
   // the credential came from the STORE: a --fleet/env token names no project
   // until the roster does.
-  if (CREDENTIAL?.entry) {
+  if (CREDENTIAL?.entry && storedCredentialInUse()) {
     info(`serves · ${projectLabel(CREDENTIAL.entry)} ${c.dim(`(${CREDENTIAL.entry.projectId.slice(0, 8)}…)`)}`);
   }
   info(`repo   · ${repoRoot}`);
@@ -1214,6 +1223,16 @@ export async function runFleetDaemon() {
   }
   if (instance.unguarded)
     warn('could not take the single-instance lock (unwritable ~/.flowviant) — running unguarded');
+  // The repo binding the start path's picker or confirm was answered with.
+  // Persisted HERE, after the lock, so a refused start moves nothing: moving it
+  // first stranded the daemon already serving that project's own checkout at
+  // its next unattended restart. Best-effort — an unwritable store costs the
+  // next start a question, never this one its machine.
+  try {
+    afterLock?.();
+  } catch {
+    /* the binding is asked again next time */
+  }
 
   await preflight({ needGit: true });
 
@@ -2361,7 +2380,7 @@ export async function runFleetDaemon() {
       // you're viewing project B's wiki) is obvious instead of a silent no-op.
       if (roster.project) {
         note(
-          `${c.cyan('project')} · ${c.bold(roster.project.name)} ${c.dim(`(${roster.project.id})`)}`
+          `${c.cyan('project')} · ${c.bold(projectLabel({ name: roster.project.name, projectId: roster.project.id }))} ${c.dim(`(${safeName(roster.project.id) ?? ''})`)}`
         );
         note(c.dim('  wiki + agents stream to THIS project — view its Code canvas in Flowviant.'));
         // Remember the NAME beside the stored credential, so the picker and
@@ -2416,6 +2435,9 @@ export async function runFleetDaemon() {
      */
     setServerMaxTurns(roster.maxTurns);
     if (roster.project?.id) wikiProjectId = roster.project.id; // keys the vault dir
+    // The server's word on which project this token serves — settles the env
+    // report's salt for a token that came from --fleet or the environment.
+    learnProjectId(roster.project?.id);
     if (roster.leaseTtlSeconds) leaseTtlSeconds = roster.leaseTtlSeconds;
     // A COMMANDED STOP OUTRANKS AN UPDATE, and that ordering is the whole reason
     // this sits ABOVE the version signal rather than inside it. Both read the
@@ -2510,7 +2532,7 @@ export async function runFleetDaemon() {
         // The project's NAME rather than the box that took over, because no box
         // took over. Falls back to "this project" inside — an unnamed project
         // says so rather than being guessed at.
-        project: roster.standDown.project ?? roster.project?.name,
+        project: safeName(roster.standDown.project) ?? safeName(roster.project?.name) ?? undefined,
         settleAgentTurns,
         flushReports: flushWorkReports,
         teardown,

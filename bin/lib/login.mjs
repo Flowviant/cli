@@ -7,7 +7,7 @@
  */
 
 import { FLEET_URL, USER_AGENT, VERSION } from './config.mjs';
-import { saveLogin, detectRepoRoot, projectLabel, listStoredProjects, boundElsewhere, directoryTakenRefusal } from './credentials.mjs';
+import { saveLogin, detectRepoRoot, projectLabel, safeName, listStoredProjects, boundElsewhere, directoryTakenRefusal } from './credentials.mjs';
 import { c, info, ok, warn, fail } from './ui.mjs';
 import { sleep } from './claude.mjs';
 
@@ -70,7 +70,7 @@ export async function runLogin({ thenStart = false } = {}) {
         fleetToken: poll.machineToken ?? poll.fleetToken,
         projectId: poll.projectId,
         mcpUrl: poll.mcpUrl,
-        name: typeof poll.projectName === 'string' && poll.projectName ? poll.projectName : null,
+        name: safeName(poll.projectName),
         repoRoot,
       };
       // A DIRECTORY SERVES ONE PROJECT (2026-09-23). The owner, verbatim: "a

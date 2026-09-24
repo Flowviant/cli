@@ -133,7 +133,26 @@ export function listStoredProjects() {
 
 /** What a project is CALLED on a terminal: its name, or an id you can grep. */
 export function projectLabel(e) {
-  return e?.name ?? (e?.projectId ? `project ${e.projectId.slice(0, 8)}…` : 'an unnamed project');
+  return safeName(e?.name) ?? (e?.projectId ? `project ${e.projectId.slice(0, 8)}…` : 'an unnamed project');
+}
+
+/**
+ * A SERVER-SUPPLIED NAME, SAFE TO PRINT ON A TERMINAL — or null.
+ *
+ * A project's name is whatever an owner typed in the app, and the server's
+ * schema caps its length and nothing else. Printed raw it reaches every
+ * terminal that connects a machine to the project — `login`, the banner, the
+ * picker, `projects`, `machines` — and a name carrying an escape sequence can
+ * rewrite the clipboard (OSC 52 in kitty, WezTerm, Windows Terminal) or hide
+ * lines of the very listing whose job is to say which project is which. C0,
+ * DEL and C1 controls are dropped (the server's own `parseBoxName` makes the
+ * same cut for hostnames), and what is left is trimmed; nothing left is null,
+ * so the caller's id fallback speaks instead of an empty label.
+ */
+export function safeName(name) {
+  if (typeof name !== 'string') return null;
+  const clean = name.replace(/[\u0000-\u001f\u007f-\u009f]/g, '').trim();
+  return clean || null;
 }
 
 /**
@@ -316,7 +335,7 @@ export function saveLogin({ fleetToken, projectId, mcpUrl, name, repoRoot }) {
       ...(f.projects[projectId] ?? {}),
       fleetToken,
       mcpUrl: mcpUrl ?? null,
-      ...(name ? { name } : {}),
+      ...(safeName(name) ? { name: safeName(name) } : {}),
       ...(repoRoot ? { repoRoot } : {}),
       savedAt: new Date().toISOString(),
     };
@@ -391,8 +410,9 @@ export function bindStoredRepo(projectId, repoRoot) {
 
 /** The roster names the project on every poll; remember it so the picker and
  *  `flowviant projects` can say a NAME instead of an id. */
-export function setStoredProjectName(projectId, name) {
-  if (!projectId || typeof name !== 'string' || !name) return;
+export function setStoredProjectName(projectId, raw) {
+  const name = safeName(raw);
+  if (!projectId || !name) return;
   const entries = listStoredProjects();
   const e = entries.find((x) => x.projectId === projectId);
   if (!e || e.name === name) return;

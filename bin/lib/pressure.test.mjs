@@ -27,7 +27,7 @@ import { readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { platform } from 'node:os';
-import { memAvailableBytes, pressureVerdict, pressureGuardOff } from './resources.mjs';
+import { memAvailableBytes, pressureVerdict, pressureGuardOff, loadCores } from './resources.mjs';
 import { createAdmission } from './admission.mjs';
 
 const MiB = 1024 * 1024;
@@ -164,6 +164,52 @@ test('the ignorance is not swallowed on the way to the verdict', {
   assert.equal(m.memAvailable, null);
   assert.equal(pressureVerdict('churn', m), null);
   assert.equal(pressureVerdict('interactive', m), null);
+});
+
+/**
+ * A CONTAINER'S CHARGE IS NOT ITS PRESSURE. `memory.current` includes the page
+ * cache charged to the cgroup, which sits just under `memory.max` on any
+ * container that has read a repo; the kernel reclaims it only when something
+ * allocates, and a deferred turn allocates nothing — so reading the raw charge
+ * deferred every unattended turn forever over a false "low memory".
+ */
+test('the reclaimable file cache of a cgroup is not counted as used', {
+  skip: platform() !== 'linux' ? 'the Linux reader is the one with an injectable source' : false,
+}, () => {
+  const files = {
+    '/proc/meminfo': `MemAvailable:    ${20 * 1024 * 1024} kB`,
+    '/sys/fs/cgroup/memory.max': String(4 * GiB),
+    '/sys/fs/cgroup/memory.current': String(Math.round(3.9 * GiB)),
+    '/sys/fs/cgroup/memory.stat': `anon ${512 * MiB}\nfile ${3 * GiB}\ninactive_file ${3 * GiB}\nactive_file 0`,
+  };
+  const avail = memAvailableBytes((p) => files[p] ?? null);
+  // 4 GiB − (3.9 GiB − 3 GiB of inactive cache) ≈ 3.1 GiB, not 102 MiB.
+  assert.ok(avail > 3 * GiB, `expected ~3.1 GiB, got ${avail}`);
+  assert.equal(pressureVerdict('churn', { memAvailable: avail, memTotal: 4 * GiB, load1: 1, cores: 2 }), null);
+  // No memory.stat: the charge stands as it was — conservative, never a guess.
+  delete files['/sys/fs/cgroup/memory.stat'];
+  const raw = memAvailableBytes((p) => files[p] ?? null);
+  assert.ok(raw < 200 * MiB);
+});
+
+test('the load average is compared with the cores of the HOST, since it is a host figure', () => {
+  // A --cpus=2 container on a busy 32-core host: loadavg reads the host.
+  assert.equal(loadCores(32), 32);
+  assert.equal(pressureVerdict('churn', easy({ load1: 10, cores: loadCores(32) })), null);
+  // An os module that reports no cpus falls back to the machine's own figure.
+  assert.ok(loadCores(0) >= 1);
+  // …and the reading the verdict is actually handed pairs the host load with
+  // it. `measurePressure` reads the live box and cannot be injected, so the
+  // pairing is pinned in its source: on a box with no cgroup quota the quota
+  // figure and the host figure agree, and a behavioural check could not tell a
+  // revert to `MACHINE.cores` apart. Both anchors are asserted before slicing.
+  const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'resources.mjs'), 'utf8');
+  const start = src.indexOf('export function measurePressure()');
+  const end = src.indexOf('lastMeasure = { at: now, m };', start);
+  assert.ok(start > 0 && end > start, 'measurePressure anchors');
+  const body = src.slice(start, end);
+  assert.match(body, /cores:\s*loadCores\(\)/);
+  assert.doesNotMatch(body, /cores:\s*MACHINE\.cores/);
 });
 
 // ── the operator's overrides ────────────────────────────────────────────────

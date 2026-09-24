@@ -46,7 +46,7 @@
 
 import { execFileSync } from 'node:child_process';
 import { readFileSync, readdirSync, statfsSync } from 'node:fs';
-import { freemem, loadavg, platform } from 'node:os';
+import { cpus, freemem, loadavg, platform } from 'node:os';
 import { MACHINE } from './config.mjs';
 
 const MiB = 1024 * 1024;
@@ -71,10 +71,36 @@ const readFile = (p) => {
 function memoryUsed() {
   const cur = readFile('/sys/fs/cgroup/memory.current');
   if (cur !== null) {
-    const n = Number(cur);
+    const n = cgroupWorkingSet(Number(cur), readFile);
     if (Number.isFinite(n) && n > 0) return n;
   }
   return Math.max(0, MACHINE.memBytes - freemem());
+}
+
+/**
+ * THE CGROUP'S WORKING SET, NOT ITS CHARGE.
+ *
+ * `memory.current` counts the page cache charged to the cgroup — every file a
+ * worktree add, an npm install or a repo read touched. On a container that has
+ * been up a while it sits just under `memory.max` while almost all of it is
+ * reclaimable, and the kernel reclaims only when something ALLOCATES. A guard
+ * reading the raw charge therefore defers every unattended turn, which spawns
+ * nothing, which allocates nothing, which never reclaims: a permanent refusal
+ * relaying a "low memory" figure that is false. This is the same trap
+ * `memAvailableBytes` rejects `freemem()` for, one layer down.
+ *
+ * So subtract `inactive_file` from `memory.stat`, which is what kubelet and
+ * `docker stats` call the working set. An unreadable or malformed stat leaves
+ * the charge as it was — the conservative direction, and never a guess.
+ */
+function cgroupWorkingSet(current, read) {
+  if (!Number.isFinite(current)) return current;
+  const stat = read('/sys/fs/cgroup/memory.stat');
+  const m = stat && stat.match(/^inactive_file\s+(\d+)$/m);
+  if (!m) return current;
+  const inactive = Number(m[1]);
+  if (!Number.isFinite(inactive) || inactive < 0) return current;
+  return Math.max(0, current - inactive);
 }
 
 /**
@@ -176,7 +202,8 @@ export function memAvailableBytes(read = readFile) {
     const max = read('/sys/fs/cgroup/memory.max');
     if (max && max !== 'max') {
       const limit = Number(max);
-      const cur = Number(read('/sys/fs/cgroup/memory.current'));
+      const raw = read('/sys/fs/cgroup/memory.current');
+      const cur = raw === null ? NaN : cgroupWorkingSet(Number(raw), read);
       if (Number.isFinite(limit) && limit > 0 && Number.isFinite(cur)) {
         const room = Math.max(0, limit - cur);
         avail = avail === null ? room : Math.min(avail, room);
@@ -248,6 +275,21 @@ const sizeWord = (n) =>
 const PRESSURE_CACHE_MS = 2_000;
 let lastMeasure = { at: 0, m: null };
 
+/**
+ * THE CORES THE LOAD AVERAGE IS A LOAD ON.
+ *
+ * `/proc/loadavg` is not namespaced: inside a container it reports the whole
+ * HOST. `MACHINE.cores` is clamped to the cgroup's `cpu.max`, which is right
+ * for sizing how many turns this box runs and wrong as the divisor of a host
+ * figure — a `--cpus=2` container on a busy 32-core host read "load 10 on 2
+ * cores" and deferred every unattended turn over load it did not cause. Compare
+ * like with like: a host figure against the host's core count. Exported so the
+ * pairing can be pinned.
+ */
+export function loadCores(hostCores = cpus().length) {
+  return Number.isFinite(hostCores) && hostCores > 0 ? hostCores : MACHINE.cores;
+}
+
 /** What the box says about itself, cached briefly. Exported so a caller can
  *  hold one reading across several verdicts — and so tests can pass their own
  *  instead of depending on the machine they run on. */
@@ -260,7 +302,7 @@ export function measurePressure() {
     // Unix only; Windows reports zeroes, which are sent as null rather than as
     // a very calm-looking 0.00 — the same rule the snapshot keeps.
     load1: loadavg()[0] || null,
-    cores: MACHINE.cores,
+    cores: loadCores(),
   };
   lastMeasure = { at: now, m };
   return m;

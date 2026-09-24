@@ -202,13 +202,23 @@ export function createLandedObserver({ repoRoot, baseRef }) {
         for (const r of j?.data?.deployRefused ?? []) {
           warn(`deploy-on-merge refused for target "${r?.targetId}": ${r?.reason}`);
         }
+      } else if (res.status === 408 || res.status === 429) {
+        // A TIMEOUT OR A RATE LIMIT IS "NOT NOW", NOT "NEVER". Both used to
+        // land in the drop below, so one 429 — a busy operator IP past the
+        // limiter — skipped the range for good: its trailers and receipt shas
+        // never closed their cards (in PR mode the observer is the ONLY road
+        // to Done) and deploy-on-merge for that tip was never queued. Keep the
+        // stored tip, exactly as a 5xx does; the next beat re-walks it.
       } else if (res.status >= 400 && res.status < 500) {
         // A persistent 4xx (deploy skew, a payload this server refuses) would
         // otherwise re-send the same poison range on every beat forever.
-        // Drop the range — the closes it carried re-run at the next REAL tip
-        // move only if their cards are still open, which is the idempotent
-        // half; the honest cost is stated out loud.
-        writeState({ ref, tip });
+        // Drop THIS BATCH — to `reportedTip`, the last commit it carried, never
+        // the full tip: a range past the cap has a remainder this batch never
+        // sent, and advancing to the tip discarded that too. The closes it
+        // carried re-run at the next REAL tip move only if their cards are
+        // still open, which is the idempotent half; the honest cost is stated
+        // out loud.
+        writeState({ ref, tip: reportedTip });
         warn(`base-landed report refused (${res.status}) — skipped ${commits.length} commit(s)`);
       }
     } catch {

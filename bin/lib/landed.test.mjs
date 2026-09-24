@@ -179,3 +179,55 @@ test('an unanswerable range reseeds; the walk reports nothing', async (t) => {
   assert.equal(calls.length, 1);
   assert.deepEqual(calls[0].commits.map((c) => c.sha), [sha2]);
 });
+
+/** Answer every report with `status`, capturing the bodies. */
+function answerFetch(t, status) {
+  const calls = [];
+  const orig = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    calls.push(JSON.parse(init.body));
+    return { ok: status < 400, status, json: async () => ({}) };
+  };
+  t.after(() => {
+    globalThis.fetch = orig;
+  });
+  return calls;
+}
+
+test('a 429 or 408 keeps the range for the next beat — a rate limit is not a refusal', async (t) => {
+  for (const status of [429, 408]) {
+    const dir = repo();
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const obs = createLandedObserver({ repoRoot: dir, baseRef: () => 'main' });
+    const orig = globalThis.fetch;
+    globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => ({}) });
+    await obs.observe(); // seed
+    const seeded = readState(dir).tip;
+    const calls = answerFetch(t, status);
+    commit(dir, 'x.txt', 'landed\n\nFlowviant-Task: card-x');
+    await obs.observe();
+    assert.equal(calls.length, 1);
+    assert.equal(readState(dir).tip, seeded, `a ${status} must not advance the tip`);
+    await obs.observe();
+    assert.equal(calls.length, 2, 'the next beat re-sends the same range');
+    assert.deepEqual(calls[1].commits.map((c) => c.taskIds), [['card-x']]);
+    globalThis.fetch = orig;
+  }
+});
+
+test('a refused batch drops only itself — the remainder past the cap is still walked', async (t) => {
+  const dir = repo();
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const obs = createLandedObserver({ repoRoot: dir, baseRef: () => 'main' });
+  const seedCalls = captureFetch(t);
+  await obs.observe(); // seed
+  assert.equal(seedCalls.length, 0);
+  const shas = [];
+  for (let i = 0; i < 55; i++) shas.push(commit(dir, `r${i}.txt`, `c ${i}\n\nFlowviant-Task: card-${i}`));
+  const calls = answerFetch(t, 400);
+  await obs.observe();
+  assert.equal(readState(dir).tip, shas[49], 'advanced past the refused batch, not to the tip');
+  await obs.observe();
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[1].commits.map((c) => c.sha), shas.slice(50), 'the remainder is still sent');
+});

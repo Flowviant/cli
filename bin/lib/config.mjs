@@ -327,7 +327,30 @@ export let FLEET_TOKEN =
  * A frozen copy read at import would salt a picked project's report with null
  * and report nothing at all, for the whole life of the process.
  */
-export let PROJECT_ID = CREDENTIAL.entry?.projectId ?? null;
+export let PROJECT_ID =
+  CREDENTIAL.entry?.fleetToken && CREDENTIAL.entry.fleetToken === FLEET_TOKEN
+    ? (CREDENTIAL.entry.projectId ?? null)
+    : null;
+
+/**
+ * THE STORE'S PROJECT IS THIS DAEMON'S ONLY WHEN IT IS THIS DAEMON'S TOKEN.
+ * `FLEET_TOKEN` prefers `--fleet` and the environment over the store, and the
+ * id above used to come from the store unconditionally — so a box holding one
+ * unbound project A, started with project B's token in the environment, salted
+ * B's env report with A's id (every variable then read `differs` beside B's
+ * other boxes, the confident wrong answer the salt exists to prevent) and
+ * printed "serves · A". It starts null in that case, and the ROSTER's own word
+ * settles it here on the first poll — the "names no project until the roster
+ * does" the paragraph above always promised and nothing ever did.
+ */
+export function learnProjectId(id) {
+  if (typeof id === 'string' && id) PROJECT_ID = id;
+}
+
+/** Whether the stored resolution describes the token actually in use. */
+export function storedCredentialInUse() {
+  return Boolean(CREDENTIAL.entry?.fleetToken) && CREDENTIAL.entry.fleetToken === FLEET_TOKEN;
+}
 
 /** cli.mjs's picker chose. Must run BEFORE runFleetDaemon — nothing here
  *  re-authenticates a connection already made. */

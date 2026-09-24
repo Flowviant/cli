@@ -100,6 +100,11 @@ function reexec(teardown, { viaNpx = false, target = null } = {}) {
     env: {
       ...process.env,
       FLOWVIANT_REEXEC: '1',
+      // WHICH DAEMON THE SUCCESSOR IS REPLACING. Under npx the successor's
+      // parent is `npm exec`, not us, so the instance lock's ppid check read us
+      // as a rival and the new daemon SIGTERMed this proxy. instance.mjs adopts
+      // the lock from this pid when it is really an ancestor of the successor.
+      FLOWVIANT_REEXEC_FROM: String(process.pid),
       // WHAT WE RESTARTED IN ORDER TO BECOME. The successor compares its own
       // VERSION against this: if it came back still short, the update did not
       // take (a registry serving a stale `latest`, an npx cache that refused to

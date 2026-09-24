@@ -349,11 +349,17 @@ test('a fetch failure is a SHAPE, never a throw — one dead project keeps the l
   const seen = [];
   const fake = (status, body) => async (url) => {
     seen.push(String(url));
-    return { status, ok: status >= 200 && status < 300, json: async () => body };
+    return {
+      status,
+      ok: status >= 200 && status < 300,
+      headers: { get: () => 'application/json' },
+      json: async () => body,
+    };
   };
-  assert.deepEqual(await fetchBoxesFor(entry(), { url: 'https://x/fleet/boxes', fetchImpl: fake(401) }), {
-    rejected: true,
-  });
+  assert.deepEqual(
+    await fetchBoxesFor(entry(), { url: 'https://x/fleet/boxes', fetchImpl: fake(401, { success: false, error: {} }) }),
+    { rejected: true }
+  );
   assert.deepEqual(await fetchBoxesFor(entry(), { url: 'https://x/fleet/boxes', fetchImpl: fake(404) }), {
     unsupported: true,
   });
@@ -635,7 +641,12 @@ test('leaving a project posts our own box id and answers in shapes, never throws
   const calls = [];
   const fetchImpl = (status, body) => async (url, init) => {
     calls.push({ url: String(url), init });
-    return { status, ok: status >= 200 && status < 300, json: async () => body };
+    return {
+      status,
+      ok: status >= 200 && status < 300,
+      headers: { get: (h) => (h.toLowerCase() === 'content-type' ? 'application/json' : null) },
+      json: async () => body,
+    };
   };
   const e = entry();
   const ok = await leaveBoxFor(e, { url: 'https://x/fleet/boxes/leave', envpub: 'ME', fetchImpl: fetchImpl(200, { data: { removed: true, wasHolder: true } }) });
@@ -643,7 +654,11 @@ test('leaving a project posts our own box id and answers in shapes, never throws
   assert.equal(calls[0].init.method, 'POST');
   assert.equal(JSON.parse(calls[0].init.body).envpub, 'ME');
   assert.match(calls[0].init.headers.Authorization, /^Bearer fva_x$/);
-  assert.deepEqual(await leaveBoxFor(e, { url: 'https://x', envpub: 'ME', fetchImpl: fetchImpl(401, {}) }), { rejected: true });
+  assert.deepEqual(await leaveBoxFor(e, { url: 'https://x', envpub: 'ME', fetchImpl: fetchImpl(401, { success: false, error: { message: 'Token revoked' } }) }), { rejected: true });
+  // An edge 403 (an HTML challenge page) is not the app rejecting the
+  // credential, and must not read as "already disconnected".
+  const edge = async () => ({ status: 403, ok: false, headers: { get: () => 'text/html' }, json: async () => { throw new Error('html'); } });
+  assert.deepEqual(await leaveBoxFor(e, { url: 'https://x', envpub: 'ME', fetchImpl: edge }), { error: 'HTTP 403 from something in front of the app' });
   assert.deepEqual(await leaveBoxFor(e, { url: 'https://x', envpub: 'ME', fetchImpl: fetchImpl(404, {}) }), { unsupported: true });
   assert.deepEqual(await leaveBoxFor(e, { url: 'https://x', envpub: 'ME', fetchImpl: fetchImpl(500, {}) }), { error: 'HTTP 500' });
   assert.deepEqual(await leaveBoxFor(e, { url: 'https://x', envpub: 'ME', fetchImpl: fetchImpl(200, { data: {} }) }), { error: 'unexpected answer shape' });

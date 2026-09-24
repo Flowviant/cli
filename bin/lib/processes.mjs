@@ -47,7 +47,13 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync, readdirSync } from 'node:fs';
 import { platform } from 'node:os';
 
-/** A box with more processes than this is not one we walk per sweep. */
+/** Matched rows collected per scan before the walk stops early — a bound on
+ *  the WORK done for one pathological group, never on which part of /proc is
+ *  looked at. It used to cut the pid LIST before filtering, and readdir answers
+ *  in string order, so a busy box kept '1', '10', '100'… and dropped a tab's
+ *  watcher at pid 912345 while `liveGroups` (which has no cap) still called its
+ *  group alive: the tab read "looked, found none" and a Stop on it answered
+ *  not_found. */
 const MAX_PIDS = 4000;
 /** Rows reported per session. A watcher, a dev server and its child is three;
  *  twenty is somebody's compose stack and the extra rows say nothing. */
@@ -113,25 +119,32 @@ function cmdlineOf(pid) {
   }
 }
 
-function scanLinux(pgids) {
+/** Exported with its readers injectable ONLY so the scan-order property can be
+ *  pinned without a box that runs four thousand processes. Nothing in the
+ *  daemon passes `io`. */
+export function scanLinux(pgids, io = {}) {
+  const list = io.list ?? (() => readdirSync('/proc'));
+  const pgrpFor = io.pgrpOf ?? pgrpOf;
+  const cmdFor = io.cmdlineOf ?? cmdlineOf;
+  const rssFor = io.rssBytes ?? rssBytes;
   let pids;
   try {
-    pids = readdirSync('/proc').filter((d) => /^\d+$/.test(d));
+    pids = list().filter((d) => /^\d+$/.test(d));
   } catch {
     return [];
   }
-  if (pids.length > MAX_PIDS) pids = pids.slice(0, MAX_PIDS);
 
   const out = [];
   for (const raw of pids) {
+    if (out.length >= MAX_PIDS) break;
     const pid = Number(raw);
-    const pgrp = pgrpOf(raw);
+    const pgrp = pgrpFor(raw);
     if (pgrp === null || !pgids.has(pgrp)) continue;
     // The CLI itself — its argv is the prompt. See the header.
     if (pid === pgrp) continue;
-    const cmd = cmdlineOf(raw);
+    const cmd = cmdFor(raw);
     if (!cmd) continue;
-    const rss = rssBytes(raw);
+    const rss = rssFor(raw);
     out.push({ pid, pgid: pgrp, cmd, ...(rss != null ? { rss } : {}) });
   }
   return out;

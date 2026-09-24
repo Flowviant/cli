@@ -487,6 +487,10 @@ function listLines(entries, { projectRowLabel }) {
     .join('\n');
 }
 
+/** A repo binding the person just consented to, persisted by runFleetDaemon
+ *  only after the instance lock is taken — never before a refusal. */
+let afterLock = null;
+
 if (!FLEET_TOKEN) {
   if (CREDENTIAL.error) {
     console.error(`error: ${CREDENTIAL.error}. \`flowviant projects\` lists what is stored.`);
@@ -589,7 +593,12 @@ if (!FLEET_TOKEN) {
       console.log(`note: ${creds.projectLabel(picked)} was connected for ${picked.repoRoot} — now serving ${repoRoot} instead.`);
     }
     adoptStoredCredential(picked);
-    creds.selectStoredProject(picked.projectId, { bindRepoRoot: repoRoot ?? undefined });
+    // BOUND ONLY ONCE THE START HAS THE LOCK. Written here, the answer moved
+    // the binding even when the instance lock then refused the start — a live
+    // daemon for the same project in its own checkout — and that daemon's next
+    // unattended self-update re-exec'd into a store that no longer bound its
+    // repo, found no match headless, and exited with the machine dark.
+    afterLock = () => creds.selectStoredProject(picked.projectId, { bindRepoRoot: repoRoot ?? undefined });
     console.log(`serving ${creds.projectLabel(picked)}${repoRoot ? ` from ${repoRoot}` : ''}.`);
   } else if (CREDENTIAL.choices?.length) {
     const creds = await import('./lib/credentials.mjs');
@@ -646,7 +655,8 @@ if (!FLEET_TOKEN) {
         `without tying it to this repo. Run \`flowviant\` here and answer to make it stick.`
     );
   } else if (raw === '' || raw === 'y' || raw === 'yes') {
-    creds.bindStoredRepo(CREDENTIAL.entry.projectId, CREDENTIAL.repoRoot);
+    // After the lock, for the reason the picker's bind gives above.
+    afterLock = () => creds.bindStoredRepo(CREDENTIAL.entry.projectId, CREDENTIAL.repoRoot);
   } else {
     console.error(
       `nothing started. Connect this repo to its own project with \`flowviant login\`, ` +
@@ -656,4 +666,4 @@ if (!FLEET_TOKEN) {
   }
 }
 
-await runFleetDaemon();
+await runFleetDaemon({ afterLock });

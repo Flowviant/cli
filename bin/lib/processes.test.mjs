@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { processesInGroups, liveGroups, processesSupported, MAX_PROCS } from './processes.mjs';
+import { processesInGroups, liveGroups, processesSupported, MAX_PROCS, scanLinux } from './processes.mjs';
 
 /** A detached `sh` that outlives its parent's attention, with a child of its
  *  own — the shape the feature exists for: a backgrounded watcher. */
@@ -96,4 +96,18 @@ test('a dead group is pruned, so the remembered set cannot grow forever', async 
 
 test('the row cap is a real bound', () => {
   assert.ok(MAX_PROCS > 0 && MAX_PROCS <= 32);
+});
+
+test('a busy box still finds a high pid: the scan is not cut in string order', () => {
+  // readdir('/proc') answers in string order, so the first 4000 names on a busy
+  // box are '1', '10', '100'… — cutting there dropped a tab's watcher at a
+  // large pid while liveGroups still called its group alive.
+  const names = Array.from({ length: 6000 }, (_, i) => String(i + 1)).sort();
+  const rows = scanLinux(new Set([912000]), {
+    list: () => [...names, '912345'],
+    pgrpOf: (raw) => (raw === '912345' ? 912000 : 1),
+    cmdlineOf: () => 'rbxtsc -w',
+    rssBytes: () => null,
+  });
+  assert.deepEqual(rows.map((r) => r.pid), [912345]);
 });

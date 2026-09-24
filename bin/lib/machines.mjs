@@ -73,6 +73,7 @@
 
 import { USER_AGENT } from './config.mjs';
 import { projectLabel, repoCollisions } from './credentials.mjs';
+import { credentialRejected } from './authReject.mjs';
 
 /** The boxes read, derived from the roster URL the way the diffstat post is —
  *  one place configures the API base and everything else is a suffix swap. */
@@ -223,7 +224,7 @@ export function renderMachines(entries, results, { now = Date.now() } = {}) {
   // to notice a suffix to know whether it matters has already been asked to do
   // the work this listing is for.
   for (const e of entries) {
-    const label = e.name || `project ${e.projectId.slice(0, 8)}…`;
+    const label = projectLabel(e);
     const connected = connectedOn(e.savedAt);
     const id = `(id ${e.projectId.slice(0, 8)}…${connected ? `, connected ${connected}` : ''})`;
     lines.push(
@@ -340,7 +341,8 @@ export async function fetchBoxesFor(entry, { url, envpub, fetchImpl = fetch } = 
       headers: { Authorization: `Bearer ${entry.fleetToken}`, 'User-Agent': USER_AGENT },
       signal: AbortSignal.timeout(15_000),
     });
-    if (res.status === 401 || res.status === 403) return { rejected: true };
+    if (await credentialRejected(res)) return { rejected: true };
+    if (res.status === 401 || res.status === 403) return { error: `HTTP ${res.status} from something in front of the app` };
     if (res.status === 404) return { unsupported: true };
     if (!res.ok) return { error: `HTTP ${res.status}` };
     const body = await res.json();
@@ -403,7 +405,8 @@ export async function leaveBoxFor(entry, { url, envpub, fetchImpl = fetch } = {}
       body: JSON.stringify({ envpub }),
       signal: AbortSignal.timeout(15_000),
     });
-    if (res.status === 401 || res.status === 403) return { rejected: true };
+    if (await credentialRejected(res)) return { rejected: true };
+    if (res.status === 401 || res.status === 403) return { error: `HTTP ${res.status} from something in front of the app` };
     if (res.status === 404) return { unsupported: true };
     if (!res.ok) return { error: `HTTP ${res.status}` };
     const body = await res.json();
