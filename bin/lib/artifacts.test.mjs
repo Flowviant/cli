@@ -17,6 +17,9 @@ import { join } from 'node:path';
 import {
   ARTIFACT_DIR,
   ARTIFACT_MAX_BYTES,
+  ARTIFACT_BINARY_MODEL_MAX_BYTES,
+  artifactMaxBytesFor,
+  renderDesignPreview,
   ARTIFACT_MAX_FILES,
   buildArtifactUpload,
   changedArtifacts,
@@ -77,6 +80,21 @@ const reporter = (srv, scrub = (s) => s) =>
     scrub,
     fetchImpl: srv.fetchImpl,
   });
+
+test('binary models get the larger cap while text model files keep the text cap', () => {
+  assert.equal(artifactMaxBytesFor('mesh.glb'), ARTIFACT_BINARY_MODEL_MAX_BYTES);
+  assert.equal(artifactMaxBytesFor('buffer.bin'), ARTIFACT_BINARY_MODEL_MAX_BYTES);
+  assert.equal(artifactMaxBytesFor('mesh.gltf'), ARTIFACT_MAX_BYTES);
+  assert.equal(artifactMaxBytesFor('mesh.obj'), ARTIFACT_MAX_BYTES);
+});
+
+test('rendering measures PNG, cannot render, and rejects an invalid image', async () => {
+  const png = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 1]);
+  const render = async ({ out }) => { writeFileSync(out, png); return { ok: true }; };
+  assert.deepEqual(await renderDesignPreview(Buffer.from('<p/>'), render), { renderState: 'rendered', preview: png });
+  assert.deepEqual(await renderDesignPreview(Buffer.from('<p/>'), async () => ({ ok: false })), { renderState: 'unavailable' });
+  assert.deepEqual(await renderDesignPreview(Buffer.from('<p/>'), async ({ out }) => { writeFileSync(out, 'bad'); return { ok: true }; }), { renderState: 'unavailable' });
+});
 
 test('scans regular files only, depth one, newest first, and never follows a symlink', () => {
   const d = place();

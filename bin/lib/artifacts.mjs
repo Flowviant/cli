@@ -75,15 +75,23 @@
  * that cannot show an artifact must not have the CLI told it will.
  */
 
-import { constants, closeSync, fstatSync, lstatSync, openSync, readdirSync, readSync } from 'node:fs';
+import { constants, closeSync, fstatSync, lstatSync, openSync, readdirSync, readSync, mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { pathToFileURL } from 'node:url';
+import { captureScreenshot } from './shot.mjs';
 
 /** Relative to the directory the turn stands in. Under `.flowviant/`, which
  *  the exclude file already hides from git (`excludeInWorktree`). */
 export const ARTIFACT_DIR = '.flowviant/artifacts';
 /** The server's per-file ceiling, re-checked here. */
 export const ARTIFACT_MAX_BYTES = 2 * 1024 * 1024;
+export const ARTIFACT_BINARY_MODEL_MAX_BYTES = 20 * 1024 * 1024;
+export const DESIGN_PREVIEW_MAX_BYTES = 2 * 1024 * 1024;
+const PREVIEW_CSP = "default-src 'none'; script-src 'unsafe-inline' https://cdnjs.cloudflare.com https://cdn.jsdelivr.net/npm/ https://unpkg.com; style-src 'unsafe-inline' https://cdnjs.cloudflare.com https://cdn.jsdelivr.net/npm/ https://unpkg.com https://fonts.googleapis.com; img-src data: blob:; font-src data: https://fonts.gstatic.com; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'";
+export const artifactMaxBytesFor = (name) => /\.(?:glb|bin)$/i.test(name)
+  ? ARTIFACT_BINARY_MODEL_MAX_BYTES : ARTIFACT_MAX_BYTES;
 /** Listed per scan, newest first — the server keeps as many per owner. */
 export const ARTIFACT_MAX_FILES = 40;
 /** A held upload is tried this many times in all, then dropped with a line. */
@@ -114,6 +122,10 @@ export const ARTIFACT_TYPES = {
   pptx: { mime: 'application/vnd.openxmlformats-officedocument.presentationml.presentation', text: false },
   xlsx: { mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', text: false },
   pdf: { mime: 'application/pdf', text: false },
+  gltf: { mime: 'model/gltf+json', text: true },
+  obj: { mime: 'model/obj', text: true },
+  glb: { mime: 'model/gltf-binary', text: false },
+  bin: { mime: 'application/octet-stream', text: false },
 };
 
 export function artifactTypeFor(name) {
@@ -247,10 +259,11 @@ export function buildArtifactUpload(entry, { sessionId, agentId, turnId }, scrub
     bytes: String(entry.size),
   };
   if (!type) return { fields, bytes: null }; // reported by name only
-  if (entry.size > ARTIFACT_MAX_BYTES) return { fields: { ...fields, tooLarge: '1' }, bytes: null };
+  const maxBytes = artifactMaxBytesFor(entry.name);
+  if (entry.size > maxBytes) return { fields: { ...fields, tooLarge: '1' }, bytes: null };
   let bytes;
   try {
-    bytes = readNoFollow(entry.path, ARTIFACT_MAX_BYTES);
+    bytes = readNoFollow(entry.path, maxBytes);
   } catch {
     return null; // vanished, or a symlink swapped in: nothing to say
   }
@@ -262,7 +275,7 @@ export function buildArtifactUpload(entry, { sessionId, agentId, turnId }, scrub
   } else {
     bytes = Buffer.from(String(scrub(bytes.toString('utf8'))), 'utf8');
     // A redaction marker can be longer than the value it replaced.
-    if (bytes.byteLength > ARTIFACT_MAX_BYTES) {
+    if (bytes.byteLength > maxBytes) {
       return { fields: { ...fields, bytes: String(bytes.byteLength), tooLarge: '1' }, bytes: null };
     }
   }
@@ -275,6 +288,33 @@ export function buildArtifactUpload(entry, { sessionId, agentId, turnId }, scrub
     },
     bytes,
   };
+}
+
+/** Render the scrubbed HTML, never the checkout's unsanitized source. A
+ * failed browser measurement is explicit; older daemon reports are absent. */
+export async function renderDesignPreview(bytes, capture = captureScreenshot) {
+  const dir = mkdtempSync(join(tmpdir(), 'flowviant-design-'));
+  try {
+    const html = join(dir, 'design.html');
+    const png = join(dir, 'design.png');
+    // A fresh Chrome profile has no Flowviant credentials. Put the artifact
+    // box's network fence before any model-written markup executes.
+    writeFileSync(html, Buffer.concat([
+      Buffer.from(`<meta http-equiv="Content-Security-Policy" content="${PREVIEW_CSP}">`),
+      bytes,
+    ]));
+    const result = await capture({ url: pathToFileURL(html).href, out: png, width: 720, height: 450, timeoutMs: 15_000 });
+    if (!result.ok) return { renderState: 'unavailable' };
+    const image = readFileSync(png);
+    if (image.byteLength > DESIGN_PREVIEW_MAX_BYTES || !image.subarray(0, 8).equals(Buffer.from([137,80,78,71,13,10,26,10]))) {
+      return { renderState: 'unavailable' };
+    }
+    return { renderState: 'rendered', preview: image };
+  } catch {
+    return { renderState: 'unavailable' };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 /**
@@ -292,6 +332,7 @@ export function createArtifactReporter({ fleetUrl, token, userAgent, scrub, secr
     const form = new FormData();
     for (const [k, v] of Object.entries(body.fields)) form.set(k, v);
     if (body.bytes) form.set('file', new Blob([body.bytes]), body.fields.name);
+    if (body.preview) form.set('preview', new Blob([body.preview], { type: 'image/png' }), 'preview.png');
     try {
       const res = await doFetch(url, {
         method: 'POST',
@@ -377,6 +418,11 @@ export function createArtifactReporter({ fleetUrl, token, userAgent, scrub, secr
       if (body.withheld) {
         log(`artifact ${entry.name}: not uploaded — it contains the value of ${body.withheld} from this machine's environment`);
         continue;
+      }
+      if (body.bytes && /\.html?$/i.test(entry.name)) {
+        const measured = await renderDesignPreview(body.bytes);
+        body.fields.renderState = measured.renderState;
+        if (measured.preview) body.preview = measured.preview;
       }
       const key = `${sessionId ?? agentId}:${entry.name}`;
       pending.delete(key); // this copy supersedes a held older one

@@ -453,6 +453,32 @@ const item = (n, over = {}) => ({
   ...over,
 });
 
+test('a measured preview syncs beside HTML and an absent preview is not fetched', async () => {
+  const dir = checkout();
+  const png = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 1]);
+  const calls = [];
+  const fetchFile = async (fid, opts) => {
+    calls.push(opts?.preview === true ? 'preview' : 'html');
+    return opts?.preview ? png : Buffer.from('<1>');
+  };
+  const preview = { name: 'designs/landing-v1.png', bytes: png.length, sha256: sha(png) };
+  const manifest = { rev: 1, instructions: null, files: [], library: { items: [item(1, { preview })] } };
+  const sync = createKnowledgeSync({ checkoutDir: dir, fetchFile });
+  assert.equal((await sync.onRoster(manifest)).ok, true);
+  assert.deepEqual(readFileSync(join(lib(dir), preview.name)), png);
+  assert.deepEqual(calls, ['html', 'preview']);
+  assert.equal(await sync.onRoster(manifest), null);
+  rmSync(join(lib(dir), preview.name));
+  assert.equal((await sync.onRoster(manifest)).ok, true);
+  assert.deepEqual(calls, ['html', 'preview', 'preview']);
+  const unknown = { ...manifest, rev: 2, library: { items: [item(1)] } };
+  assert.equal((await sync.onRoster(unknown)).ok, true);
+  assert.deepEqual(readFileSync(join(lib(dir), preview.name)), png);
+  const measuredEmpty = { ...manifest, rev: 3, library: { items: [item(1, { preview: null })] } };
+  assert.equal((await sync.onRoster(measuredEmpty)).ok, true);
+  assert.equal(existsSync(join(lib(dir), preview.name)), false);
+});
+
 test('library items land in their subdirectory and LIBRARY.md catalogues them, one line each', async () => {
   const dir = checkout();
   const srv = fakeServer({ [id(1)]: '<1>', [id(2)]: '<2>', [id(3)]: '# r' });
