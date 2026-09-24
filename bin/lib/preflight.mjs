@@ -8,6 +8,7 @@ import { execFileSync } from 'node:child_process';
 import { ok, warn, info, c } from './ui.mjs';
 import { addLocalBinToPath, promptYesNo, installClaude, installGh } from './install.mjs';
 import { RUNTIMES, detectRuntimes, mediatedSafeGap } from './runtimes.mjs';
+import { terminalCommand } from './launchCommand.mjs';
 
 function present(cmd) {
   try {
@@ -106,7 +107,7 @@ export async function preflight({ needGit = true } = {}) {
       if (await installGh((m) => info(m))) gh = present('gh');
     }
     gh
-      ? ok('gh installed to ~/.flowviant/bin — authenticate with: flowviant gh-auth')
+      ? ok(`gh installed to ~/.flowviant/bin — authenticate with: ${terminalCommand('gh-auth')}`)
       : info(c.dim('or install it later: https://cli.github.com, then: gh auth login'));
   }
 

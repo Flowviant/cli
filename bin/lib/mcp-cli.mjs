@@ -18,15 +18,16 @@
  */
 
 import { FLEET_TOKEN, USER_AGENT, MCP_URL, FLEET_URL } from './config.mjs';
+import { terminalCommand } from './launchCommand.mjs';
 
 const CLI_TOKEN_URL = FLEET_URL.replace(/\/agents\/?$/, '/cli-token');
 
 export async function runMcpCommand(args = []) {
   if (!FLEET_TOKEN) {
     console.error(
-      'error: no credential resolves here. Run `flowviant login` first — or, with\n' +
+      `error: no credential resolves here. Run \`${terminalCommand('login')}\` first — or, with\n` +
         'several projects connected on this box, run this inside the project\'s own\n' +
-        'repo or pass `--project <name|id>` (`flowviant projects` lists them).'
+        `repo or pass \`--project <name|id>\` (\`${terminalCommand('projects')}\` lists them).`
     );
     process.exit(1);
   }
@@ -50,7 +51,7 @@ export async function runMcpCommand(args = []) {
     console.error(
       `error: could not mint a CLI credential (${res.status}). ` +
         (res.status === 401 || res.status === 403
-          ? 'Your credential may have been revoked — try `flowviant login` again.'
+          ? `Your credential may have been revoked — try \`${terminalCommand('login')}\` again.`
           : 'Try again in a moment.')
     );
     process.exit(1);

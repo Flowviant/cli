@@ -74,6 +74,7 @@
 import { USER_AGENT } from './config.mjs';
 import { projectLabel, repoCollisions, safeName } from './credentials.mjs';
 import { credentialRejected } from './authReject.mjs';
+import { launchCommand, terminalCommand } from './launchCommand.mjs';
 
 /** The boxes read, derived from the roster URL the way the diffstat post is —
  *  one place configures the API base and everything else is a suffix swap. */
@@ -246,7 +247,7 @@ export function renderMachines(entries, results, { now = Date.now() } = {}) {
     if (r.rejected) {
       lines.push(
         '    credential rejected — this project was disconnected or deleted. ' +
-          `\`flowviant machines --forget ${e.projectId.slice(0, 8)}\` removes it here.`
+          `\`${terminalCommand(`machines --forget ${e.projectId.slice(0, 8)}`)}\` removes it here.`
       );
       continue;
     }
@@ -297,7 +298,7 @@ export function renderCollisions(entries) {
     const list = `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
     return (
       `  ! ${g.entries.length} projects are connected for ${g.repoRoot}: ${list} — ` +
-      'a directory serves one project, and `npx flowviant` there refuses to start until it does. ' +
+      `a directory serves one project, and \`${launchCommand()}\` there refuses to start until it does. ` +
       'Delete the one you do not mean in Flowviant (project settings → General → Delete project), or disconnect this box from it.'
     );
   });
@@ -317,7 +318,7 @@ export function renderCollisions(entries) {
  */
 export const MACHINES_FOOTER = [
   '  stop a machine from the app: project settings → Machine → Disconnect;',
-  '  a new `npx flowviant` on another box takes the project over.',
+  `  a new \`${launchCommand()}\` on another box takes the project over.`,
   '  this lists the projects connected on THIS box; the app’s Home lists every machine on your account.',
 ];
 
@@ -325,7 +326,7 @@ export const MACHINES_FOOTER = [
  *  terminal that could draw the menu was offered the same two things by name,
  *  and repeating the flags under it would be a manual under a control. */
 export const MACHINES_FLAGS_FOOTER = [
-  '  `flowviant machines --remove <id>` disconnects this box from a project: stops its daemon here,',
+  `  \`${terminalCommand('machines --remove <id>')}\` disconnects this box from a project: stops its daemon here,`,
   '  removes this box from that project’s machines list in the app, and forgets its credential here.',
   '  `--forget <id>` forgets the credential here only.',
 ];
@@ -487,7 +488,7 @@ export async function disconnectHere(entry, deps, { log = (m) => console.log(m) 
     log(`could not forget the credential here: ${gone.error}`);
     return { ok: false };
   }
-  log(`forgot ${who}’s credential on this box. \`flowviant login\` in its repo connects it again.`);
+  log(`forgot ${who}’s credential on this box. \`${terminalCommand('login')}\` in its repo connects it again.`);
   return { ok: true };
 }
 

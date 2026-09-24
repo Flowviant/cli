@@ -73,6 +73,7 @@
 import { FLEET_TOKEN, CREDENTIAL, VERSION, adoptStoredCredential } from './lib/config.mjs';
 import { runFleetDaemon } from './lib/fleet.mjs';
 import { runLogin } from './lib/login.mjs';
+import { launchCommand, terminalCommand } from './lib/launchCommand.mjs';
 
 // `flowviant login` — device auth (recommended): approve a code in the app, the
 // credential is stored locally, and then we KEEP GOING into the daemon.
@@ -213,7 +214,7 @@ if (process.argv[2] === 'projects') {
   const { listStoredProjects, projectLabel } = await import('./lib/credentials.mjs');
   const entries = listStoredProjects();
   if (entries.length === 0) {
-    console.log('no projects connected on this machine yet — run `flowviant login` inside a repo.');
+    console.log(`no projects connected on this machine yet — run \`${terminalCommand('login')}\` inside a repo.`);
     process.exit(0);
   }
   for (const e of entries) {
@@ -234,8 +235,8 @@ if (process.argv[2] === 'projects') {
     );
   }
   console.log(
-    '\n  `npx flowviant` picks by the repo it is started in; `--project <name|id>` overrides;\n' +
-      '  `flowviant login` in a new repo connects another project.'
+    `\n  \`${launchCommand()}\` picks by the repo it is started in; \`--project <name|id>\` overrides;\n` +
+      `  \`${terminalCommand('login')}\` in a new repo connects another project.`
   );
   process.exit(0);
 }
@@ -287,7 +288,7 @@ if (process.argv[2] === 'machines') {
     }
     console.log(
       `forgot ${creds.projectLabel(res.entry)} (${res.entry.projectId.slice(0, 8)}…) on this box.\n` +
-        '  Nothing was stopped or deleted anywhere else — `flowviant login` connects it again.'
+        `  Nothing was stopped or deleted anywhere else — \`${terminalCommand('login')}\` connects it again.`
     );
     process.exit(0);
   }
@@ -302,7 +303,7 @@ if (process.argv[2] === 'machines') {
     // input this command exists to untangle, and it must not pick one.
     const m = creds.matchStoredProject(process.argv[removeAt + 1]);
     if (m.error) {
-      console.error(`error: ${m.error}. \`flowviant machines\` lists what is stored.`);
+      console.error(`error: ${m.error}. \`${terminalCommand('machines')}\` lists what is stored.`);
       process.exit(1);
     }
     const res = await disconnectHere(m.entry, await realDisconnectDeps({ url: leaveUrlFrom(FLEET_URL) }));
@@ -311,7 +312,7 @@ if (process.argv[2] === 'machines') {
 
   let entries = creds.listStoredProjects();
   if (entries.length === 0) {
-    console.log('no projects connected on this machine yet — run `flowviant login` inside a repo.');
+    console.log(`no projects connected on this machine yet — run \`${terminalCommand('login')}\` inside a repo.`);
     process.exit(0);
   }
   // OUR OWN BOX ID, so the listing can mark "← this box".
@@ -398,7 +399,7 @@ if (process.argv[2] === 'machines') {
       console.log(
         res.error
           ? `  ${res.error}`
-          : `  forgot ${creds.projectLabel(res.entry)} (${res.entry.projectId.slice(0, 8)}…) on this box. Nothing was stopped or deleted anywhere else — \`flowviant login\` connects it again.`
+          : `  forgot ${creds.projectLabel(res.entry)} (${res.entry.projectId.slice(0, 8)}…) on this box. Nothing was stopped or deleted anywhere else — \`${terminalCommand('login')}\` connects it again.`
       );
     }
     entries = creds.listStoredProjects();
@@ -500,7 +501,7 @@ let afterLock = null;
 
 if (!FLEET_TOKEN) {
   if (CREDENTIAL.error) {
-    console.error(`error: ${CREDENTIAL.error}. \`flowviant projects\` lists what is stored.`);
+    console.error(`error: ${CREDENTIAL.error}. \`${terminalCommand('projects')}\` lists what is stored.`);
     process.exit(1);
   }
   // A DIRECTORY SERVES ONE PROJECT (2026-09-23, the owner, verbatim: "a
@@ -528,7 +529,7 @@ if (!FLEET_TOKEN) {
         : `This repo (${repoRoot}) is not connected to any project yet. Connected on this machine:`
     );
 
-    const loginLabel = `connect ${repoRoot ? 'this repo' : 'a repo'} to a different project (flowviant login)`;
+    const loginLabel = `connect ${repoRoot ? 'this repo' : 'a repo'} to a different project (${terminalCommand('login')})`;
     // WHICH ONE LOOKS RIGHT — a pre-selection, never an auto-serve. The resolver
     // refuses to serve a project the repo PATH did not name (the skadooble law);
     // this only decides which row the cursor starts on, using the repo's folder
@@ -612,14 +613,14 @@ if (!FLEET_TOKEN) {
     console.error(
       'error: more than one project is connected on this machine and this repo is not bound to any of them:\n' +
         listLines(CREDENTIAL.choices, creds) +
-        '\nPick one with `--project <name|id>`, bind this repo by running `flowviant` here in a terminal once,\n' +
-        'or connect this repo to its own project with `flowviant login`.'
+        `\nPick one with \`--project <name|id>\`, bind this repo by running \`${terminalCommand()}\` here in a terminal once,\n` +
+        `or connect this repo to its own project with \`${terminalCommand('login')}\`.`
     );
     process.exit(1);
   } else {
     console.error(
       'error: no credential found. Easiest:\n' +
-        '  flowviant login      (approve in the app — recommended)\n' +
+        `  ${terminalCommand('login')}      (approve in the app — recommended)\n` +
         'Or set:\n' +
         '  FLOWVIANT_FLEET=fva_…   (machine token, from the app)'
     );
@@ -659,15 +660,15 @@ if (!FLEET_TOKEN) {
   if (raw === null) {
     console.log(
       `\n  could not read an answer — serving ${label} for this run ` +
-        `without tying it to this repo. Run \`flowviant\` here and answer to make it stick.`
+        `without tying it to this repo. Run \`${terminalCommand()}\` here and answer to make it stick.`
     );
   } else if (raw === '' || raw === 'y' || raw === 'yes') {
     // After the lock, for the reason the picker's bind gives above.
     afterLock = () => creds.bindStoredRepo(CREDENTIAL.entry.projectId, CREDENTIAL.repoRoot);
   } else {
     console.error(
-      `nothing started. Connect this repo to its own project with \`flowviant login\`, ` +
-        `or see what is stored with \`flowviant projects\`.`
+      `nothing started. Connect this repo to its own project with \`${terminalCommand('login')}\`, ` +
+        `or see what is stored with \`${terminalCommand('projects')}\`.`
     );
     process.exit(1);
   }

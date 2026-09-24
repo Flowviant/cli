@@ -37,7 +37,7 @@ import { dirname, join } from 'node:path';
 import { platform, arch } from 'node:process';
 import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
-import { fileURLToPath } from 'node:url';
+import { runningViaNpx, terminalCommand } from './launchCommand.mjs';
 import { VERSION } from './config.mjs';
 import { note, ok, warn } from './ui.mjs';
 
@@ -50,24 +50,6 @@ export function cmpVersion(a, b) {
     if (d !== 0) return d > 0 ? 1 : -1;
   }
   return 0;
-}
-
-/**
- * npx runs from a per-invocation cache dir. `npm i -g` would install to a
- * DIFFERENT location than the one executing, so re-execing our own path would
- * loop on the stale cached copy. Detect npx and skip the install (nag instead —
- * relaunching with `npx flowviant@latest` is the npx-native update).
- */
-export function runningViaNpx() {
-  const ua = process.env.npm_config_user_agent || '';
-  const argv1 = process.argv[1] || '';
-  let self = '';
-  try {
-    self = fileURLToPath(import.meta.url);
-  } catch {
-    /* non-file URL — ignore */
-  }
-  return /\bnpx\b/.test(ua) || /[\\/]_npx[\\/]/.test(argv1) || /[\\/]_npx[\\/]/.test(self);
 }
 
 /** Bun marks compiled entrypoints with a virtual /$bunfs/ script path. */
@@ -226,7 +208,7 @@ export async function runUpdateCommand() {
     installLatest();
     ok('updated. Relaunch `flowviant` to run the new version.');
   } catch (e) {
-    warn(`update failed (${e?.message ?? e}). Try: npm i -g flowviant@latest`);
+    warn(`update failed (${e?.message ?? e}). Try: ${terminalCommand('update')}`);
   }
 }
 
@@ -268,7 +250,7 @@ export async function handleVersionSignal({ latest, min, autoUpdate, safeToUpdat
       naggedFor = target;
       warn(
         `restarted to pick up ${target} but came back as ${cur} — staying put. Update by hand: ${
-          binary ? 'run `flowviant update`' : npx ? 'relaunch with `npx flowviant@latest`' : 'npm i -g flowviant@latest'
+          binary ? 'run `flowviant update`' : npx ? 'relaunch with `npx flowviant@latest`' : `run \`${terminalCommand('update')}\``
         }.`
       );
     }
@@ -366,7 +348,7 @@ export async function handleVersionSignal({ latest, min, autoUpdate, safeToUpdat
     } catch (e) {
       lastInstallFailAt = Date.now();
       warn(
-        `self-update failed (${e?.message ?? e}) — retrying in 15m; to fix it now: npm i -g flowviant@latest`
+        `self-update failed (${e?.message ?? e}) — retrying in 15m; to fix it now: ${terminalCommand('update')}`
       );
       return false;
     }
@@ -375,7 +357,7 @@ export async function handleVersionSignal({ latest, min, autoUpdate, safeToUpdat
   // Can't or won't auto-install → nag once per target version.
   if (naggedFor !== target) {
     naggedFor = target;
-    const how = binary ? 'run `flowviant update`' : npx ? 'relaunch with `npx flowviant@latest`' : 'run `npm i -g flowviant@latest`';
+    const how = binary ? 'run `flowviant update`' : npx ? 'relaunch with `npx flowviant@latest`' : `run \`${terminalCommand('update')}\``;
     if (belowMin) {
       warn(`flowviant ${cur} is below the minimum ${min} — live mode may not work. Update: ${how}.`);
     } else {

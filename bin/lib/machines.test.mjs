@@ -49,6 +49,7 @@ import {
 } from './machines.mjs';
 import { machineAskPending, spendMachineAsk } from './fleet.mjs';
 import { projectRowLabel } from './credentials.mjs';
+import { launchCommand } from './launchCommand.mjs';
 
 /** CODE ONLY — the comments quote the shapes they replaced, and a source pin
  *  that matches its own documentation trains the next person to weaken it. */
@@ -330,7 +331,7 @@ test('the footer states the verbs elsewhere AND this command’s own scope', () 
   const text = MACHINES_FOOTER.join('\n');
   // There are no verbs here, so it says where they are.
   assert.match(text, /project settings → Machine → Disconnect/);
-  assert.match(text, /npx flowviant` on another box takes the project over/);
+  assert.match(text, new RegExp(`${launchCommand()}\` on another box takes the project over`));
   // …and the one thing a reader cannot see from the output: this lists what is
   // connected on THIS box, and a daemon on a computer this one has never met is
   // invisible to it.
@@ -636,7 +637,7 @@ test('two projects bound to one repo are named in one line at the foot of the li
   assert.match(lines[0], /BRIF AI \(fd716bf3…, connected Aug 1\) and BRIF AI \(fdcec6a0…, connected Sep 16\)/);
   // The rule, and the remedy in the owner's order: delete the project in
   // Flowviant first, disconnect this box second.
-  assert.match(lines[0], /a directory serves one project, and `npx flowviant` there refuses to start until it does/);
+  assert.match(lines[0], new RegExp(`a directory serves one project, and \`${launchCommand()}\` there refuses to start until it does`));
   assert.match(lines[0], /Delete the one you do not mean in Flowviant \(project settings → General → Delete project\), or disconnect this box from it/);
   // A store with no collision says nothing at all: a sentence about an absence
   // is chrome.
@@ -649,6 +650,19 @@ test('two projects bound to one repo are named in one line at the foot of the li
   // Three on one repo reads as a list, not a pair.
   const c = entry({ projectId: 'fe000000-cccc', name: 'BRIF AI', repoRoot: '/home/whuang/brif-ai' });
   assert.match(renderCollisions([a, b, c])[0], /3 projects are connected .*fd716bf3…[^]*, BRIF AI \(fdcec6a0…[^]* and BRIF AI \(fe000000…\)/);
+});
+
+test('a machine launched through the Node package runner names that launch in its remedy', () => {
+  const previous = process.env.npm_config_user_agent;
+  try {
+    process.env.npm_config_user_agent = 'npm/11 npx/11';
+    const a = entry({ projectId: 'one', repoRoot: '/repo' });
+    const b = entry({ projectId: 'two', repoRoot: '/repo' });
+    assert.match(renderCollisions([a, b])[0], /`npx flowviant` there refuses/);
+  } finally {
+    if (previous === undefined) delete process.env.npm_config_user_agent;
+    else process.env.npm_config_user_agent = previous;
+  }
 });
 
 test('the leave URL is the boxes URL with the verb on the end', () => {

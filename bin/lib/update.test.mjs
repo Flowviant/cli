@@ -26,6 +26,21 @@ import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { cmpVersion, installBinaryUpdate, runningCompiledBinary, updateRestartFailed } from './update.mjs';
+import { launchCommand, runningViaNpx, terminalCommand } from './launchCommand.mjs';
+
+test('terminal command follows the launch channel', () => {
+  assert.equal(launchCommand({ viaNpx: false }), 'flowviant');
+  assert.equal(launchCommand({ viaNpx: true }), 'npx flowviant');
+  assert.equal(terminalCommand('login'), launchCommand() + ' login');
+  const previous = process.env.npm_config_user_agent;
+  try {
+    process.env.npm_config_user_agent = 'npm/11 npx/11';
+    assert.equal(runningViaNpx(), true);
+  } finally {
+    if (previous === undefined) delete process.env.npm_config_user_agent;
+    else process.env.npm_config_user_agent = previous;
+  }
+});
 
 afterEach(() => {
   delete process.env.FLOWVIANT_UPDATE_TARGET;

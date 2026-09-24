@@ -10,6 +10,7 @@ import { FLEET_URL, USER_AGENT, VERSION } from './config.mjs';
 import { saveLogin, detectRepoRoot, projectLabel, safeName, listStoredProjects, boundElsewhere, directoryTakenRefusal } from './credentials.mjs';
 import { c, info, ok, warn, fail } from './ui.mjs';
 import { sleep } from './claude.mjs';
+import { launchCommand, terminalCommand } from './launchCommand.mjs';
 
 const DEVICE_START = FLEET_URL.replace(/\/agents\/?$/, '/device/start');
 const DEVICE_POLL = FLEET_URL.replace(/\/agents\/?$/, '/device/poll');
@@ -102,15 +103,15 @@ export async function runLogin({ thenStart = false } = {}) {
       console.log(
         thenStart
           ? `\n  ${c.dim('starting your agent — leave this running')}\n`
-          : `\n  Now run:  ${c.bold('flowviant')} (or npx flowviant)\n`
+          : `\n  Now run:  ${c.bold(launchCommand())}\n`
       );
       return { saved: true };
     }
     if (poll.status === 'expired') {
-      warn('that code expired — run `flowviant login` again.');
+      warn(`that code expired — run \`${terminalCommand('login')}\` again.`);
       process.exit(1);
     }
   }
-  warn('login timed out — run `flowviant login` again.');
+  warn(`login timed out — run \`${terminalCommand('login')}\` again.`);
   process.exit(1);
 }

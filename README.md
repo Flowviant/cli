@@ -4,10 +4,8 @@ Run your own coding CLIs as build agents for [Flowviant](https://flowviant.com) 
 
 ```sh
 curl -fsSL https://api.flowviant.com/install.sh | sh
-~/.flowviant/bin/flowviant   # approve the code in Flowviant → connected
+flowviant   # approve the code in Flowviant → connected
 ```
-
-With Node already installed: `npx flowviant@latest login`.
 
 Login keeps going straight into the daemon — there is no second command to run.
 
@@ -24,7 +22,7 @@ Because it drives the CLIs you're already logged into, **the cost is yours** (yo
 On the machine that runs the daemon:
 
 - **at least one coding CLI** installed and signed in — [Claude Code](https://claude.com/claude-code) (`claude`), Codex (`codex`) or Antigravity (`agy`)
-- **git** (Node 20+ is needed only for the npx/npm install)
+- **git** (Node 20+ is needed only for a Node-based install)
 - **[GitHub CLI](https://cli.github.com)** (`gh`) — optional; the daemon offers to fetch an isolated copy, and `flowviant gh-auth` signs it in
 - run it from inside the git repository you want worked
 
@@ -34,33 +32,29 @@ Download the standalone binary, then start it in your checkout:
 
 ```sh
 curl -fsSL https://api.flowviant.com/install.sh | sh
-~/.flowviant/bin/flowviant
+flowviant
 ```
 
 It shows a short code. Open your project's **Workbench** in Flowviant and enter the code where it offers to connect a machine. The credential is stored at `~/.flowviant/credentials.json`, and from then on `flowviant` just runs. The installer prints a PATH hint if needed; `FLOWVIANT_INSTALL_DIR` changes its destination. It verifies SHA-256 and never uses sudo.
 
-With Node already installed: `npx flowviant@latest login`.
-
 Prefer an explicit token? Create a machine credential in the app and pass it directly:
 
 ```bash
-FLOWVIANT_MACHINE_TOKEN=fva_… npx flowviant@latest   # FLOWVIANT_FLEET still works
+FLOWVIANT_MACHINE_TOKEN=fva_… flowviant   # FLOWVIANT_FLEET still works
 ```
 
-Prefer a plain command to `npx`? Install it once and every `npx flowviant@latest` in this README is just `flowviant`:
+With Node already installed, a global install also gives you the same command:
 
 ```bash
 npm i -g flowviant
 flowviant login
 ```
 
-The binary, npx and global npm installs all update when idle. The binary fetches the release manifest and verifies the new executable before replacing itself. `flowviant update` updates it on demand.
-
-For npx, launch with `@latest` so each start pulls the newest published version — a bare `npx flowviant` can reuse a stale cache. A running daemon also keeps itself current: from **0.58.0** it restarts itself through `npx flowviant@latest` when a new version ships. It only ever restarts when no turn is running. `FLOWVIANT_NO_UPDATE=1` makes it nag-only; `flowviant update` updates now.
+The binary and global npm installs update when idle. The binary fetches the release manifest and verifies the new executable before replacing itself. The global install refreshes from npm before restarting. `flowviant update` checks on demand. `FLOWVIANT_NO_UPDATE=1` makes updates manual.
 
 ## Machines on this box
 
-One box can serve several projects — one daemon per repository directory, each connected with its own `flowviant login` run inside that repo. `flowviant machines` lists every project connected on this box with the id and date it was connected, and under each one every computer that has polled it (the app's Home lists the same across your whole account). Two projects bound to one repository are named out loud at the foot of the listing, because that is the one shape that reads as "the same project connected twice" and is not — and a directory serves one project, so `npx flowviant` there refuses to start until one of them goes.
+One box can serve several projects — one daemon per repository directory, each connected with its own `flowviant login` run inside that repo. `flowviant machines` lists every project connected on this box with the id and date it was connected, and under each one every computer that has polled it (the app's Home lists the same across your whole account). Two projects bound to one repository are named out loud at the foot of the listing, because that is the one shape that reads as "the same project connected twice" and is not — and a directory serves one project, so `flowviant` there refuses to start until one of them goes.
 
 On a terminal the listing is a menu: ↑/↓ over the projects, enter for what you can do about one, esc to leave. Two verbs, each acting on **this box's own connection** and nothing else:
 
@@ -133,6 +127,8 @@ Two knobs bound the blast radius, and both are worth setting on a shared box:
 The posture is reported on every poll and shown in the project's
 Settings → Machine section, so the team can see whether the box runs the
 guarded toolset or full permissions.
+
+With Node: `npx flowviant@latest login` runs without a global install and updates by restarting through the package runner when idle.
 
 ## License
 

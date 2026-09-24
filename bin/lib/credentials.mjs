@@ -49,6 +49,7 @@ import { mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { printable } from './printable.mjs';
+import { terminalCommand } from './launchCommand.mjs';
 
 const CRED_DIR = join(homedir(), '.flowviant');
 const CRED_FILE = join(CRED_DIR, 'credentials.json');
@@ -281,7 +282,7 @@ export function directoryTakenRefusal(bound, repoRoot, { incoming } = {}) {
     `${head}\n` +
     'A directory serves one project — two projects must not edit it at the same time.\n' +
     'Delete the project you do not mean in Flowviant first (project settings → General → Delete project),\n' +
-    'or disconnect this box from it with `flowviant machines`, then run this again.'
+    `or disconnect this box from it with \`${terminalCommand('machines')}\`, then run this again.`
   );
 }
 
