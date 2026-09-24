@@ -2620,7 +2620,7 @@ export async function runFleetDaemon({ afterLock = null } = {}) {
         safeToUpdate,
         teardown,
       });
-      if (updating) return;
+      if (await updating) return;
     }
     // Settle any turn/ship answers whose earlier report POST failed BEFORE
     // taking new work — the skip-if-pending guards make the ordering safe, but

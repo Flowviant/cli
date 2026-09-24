@@ -102,7 +102,7 @@ export async function runLogin({ thenStart = false } = {}) {
       console.log(
         thenStart
           ? `\n  ${c.dim('starting your agent — leave this running')}\n`
-          : `\n  Now run:  ${c.bold('npx flowviant')}\n`
+          : `\n  Now run:  ${c.bold('flowviant')} (or npx flowviant)\n`
       );
       return { saved: true };
     }

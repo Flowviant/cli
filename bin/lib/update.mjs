@@ -30,6 +30,13 @@
  */
 
 import { execFileSync, spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { createReadStream, createWriteStream } from 'node:fs';
+import { chmod, mkdtemp, open, rename, rm } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
+import { platform, arch } from 'node:process';
+import { pipeline } from 'node:stream/promises';
+import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { VERSION } from './config.mjs';
 import { note, ok, warn } from './ui.mjs';
@@ -63,6 +70,68 @@ export function runningViaNpx() {
   return /\bnpx\b/.test(ua) || /[\\/]_npx[\\/]/.test(argv1) || /[\\/]_npx[\\/]/.test(self);
 }
 
+/** Bun marks compiled entrypoints with a virtual /$bunfs/ script path. */
+export function runningCompiledBinary() {
+  return Boolean(process.versions.bun && process.argv[1]?.startsWith('/$bunfs/'));
+}
+
+const RELEASE_ORIGIN = 'https://api.flowviant.com';
+
+/** Download and verify before replacing the executable. Exposed for temp-dir tests. */
+export async function installBinaryUpdate({
+  executable = process.execPath,
+  target = `${platform === 'darwin' ? 'darwin' : platform}-${arch}`,
+  fetchImpl = fetch,
+  origin = RELEASE_ORIGIN,
+  minimumVersion = null,
+} = {}) {
+  if (!/^(linux|darwin)-(x64|arm64)$/.test(target)) throw new Error(`unsupported binary target ${target}`);
+  const manifestResponse = await fetchImpl(`${origin}/dl/latest.json`);
+  if (!manifestResponse.ok) throw new Error(`release manifest: HTTP ${manifestResponse.status}`);
+  const manifest = await manifestResponse.json();
+  const version = manifest?.version;
+  const file = manifest?.files?.[target];
+  if (!/^\d+\.\d+\.\d+$/.test(version) ||
+      file?.name !== `flowviant-${version}-${target}` ||
+      !/^[a-f0-9]{64}$/.test(file?.sha256) ||
+      !Number.isSafeInteger(file?.bytes) || file.bytes <= 0) {
+    throw new Error('invalid release manifest');
+  }
+  if (minimumVersion && cmpVersion(version, minimumVersion) < 0) {
+    throw new Error(`release manifest still serves ${version}; waiting for ${minimumVersion}`);
+  }
+  const binaryResponse = await fetchImpl(`${origin}/dl/${version}/${file.name}`);
+  if (!binaryResponse.ok || !binaryResponse.body) throw new Error(`binary download: HTTP ${binaryResponse.status}`);
+  const parent = dirname(executable);
+  const temporaryDir = await mkdtemp(join(parent, '.flowviant-update-'));
+  const temporaryFile = join(temporaryDir, file.name);
+  try {
+    await pipeline(Readable.fromWeb(binaryResponse.body), createWriteStream(temporaryFile, { mode: 0o755 }));
+    const digest = createHash('sha256');
+    let bytes = 0;
+    for await (const chunk of createReadStream(temporaryFile)) {
+      digest.update(chunk);
+      bytes += chunk.length;
+    }
+    if (bytes !== file.bytes || digest.digest('hex') !== file.sha256) {
+      throw new Error('downloaded binary failed SHA-256 or size verification');
+    }
+    await chmod(temporaryFile, 0o755);
+    const handle = await open(temporaryFile, 'r');
+    try { await handle.sync(); } finally { await handle.close(); }
+    await rename(temporaryFile, executable);
+    // The rename has committed. Directory fsync is best effort on filesystems
+    // that do not support it; a failure here must not claim the binary survived.
+    try {
+      const dirHandle = await open(parent, 'r');
+      try { await dirHandle.sync(); } finally { await dirHandle.close(); }
+    } catch { /* rename already succeeded */ }
+    return version;
+  } finally {
+    await rm(temporaryDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
 /**
  * Replace this process with a fresh one running the just-installed version.
  * `npm i -g` overwrote the global package in place, so re-running argv[1] loads
@@ -70,7 +139,7 @@ export function runningViaNpx() {
  * this process alive only as a thin proxy waiting on the child, so the user's
  * shell stays attached to one foreground process.
  */
-function reexec(teardown, { viaNpx = false, target = null } = {}) {
+function reexec(teardown, { viaNpx = false, viaBinary = false, target = null } = {}) {
   try {
     teardown?.();
   } catch {
@@ -84,7 +153,7 @@ function reexec(teardown, { viaNpx = false, target = null } = {}) {
   // on npx's install prompt — the same rule FLOWVIANT_REEXEC keeps below.
   const [cmd, args] = viaNpx
     ? ['npx', ['-y', 'flowviant@latest', ...process.argv.slice(2)]]
-    : [process.execPath, process.argv.slice(1)];
+    : [process.execPath, process.argv.slice(viaBinary ? 2 : 1)];
   const child = spawn(cmd, args, {
     stdio: 'inherit',
     // MARK THE CHILD AS A RESTART, not as a person typing `flowviant`.
@@ -138,7 +207,16 @@ function installLatest() {
 
 /** `flowviant update` — explicit, manual update. Does not re-exec into a daemon
  *  (the user ran a one-shot command); it installs and tells them to relaunch. */
-export function runUpdateCommand() {
+export async function runUpdateCommand() {
+  if (runningCompiledBinary()) {
+    try {
+      const version = await installBinaryUpdate();
+      ok(`updated to ${version}. Relaunch \`flowviant\` to run the new version.`);
+    } catch (e) {
+      warn(`update failed (${e?.message ?? e}) — running binary untouched.`);
+    }
+    return;
+  }
   if (runningViaNpx()) {
     note('running via npx — just relaunch with `npx flowviant@latest` to get the newest.');
     return;
@@ -170,13 +248,14 @@ const INSTALL_RETRY_MS = 15 * 60_000;
  * React to the server's {latest, min} signal from a roster poll.
  * @returns true if it kicked off a self-update + re-exec (caller must stop).
  */
-export function handleVersionSignal({ latest, min, autoUpdate, safeToUpdate, teardown }) {
+export async function handleVersionSignal({ latest, min, autoUpdate, safeToUpdate, teardown }) {
   const cur = VERSION;
   const belowMin = min && cmpVersion(cur, min) < 0;
   const belowLatest = latest && cmpVersion(cur, latest) < 0;
   if (!belowMin && !belowLatest) return false; // current — nothing to do
   const target = latest || min;
   const npx = runningViaNpx();
+  const binary = runningCompiledBinary();
   const wantInstall = belowMin || autoUpdate;
 
   // A RESTART THAT DID NOT TAKE must not be tried again on the next poll. The
@@ -189,11 +268,33 @@ export function handleVersionSignal({ latest, min, autoUpdate, safeToUpdate, tea
       naggedFor = target;
       warn(
         `restarted to pick up ${target} but came back as ${cur} — staying put. Update by hand: ${
-          npx ? 'relaunch with `npx flowviant@latest`' : 'npm i -g flowviant@latest'
+          binary ? 'run `flowviant update`' : npx ? 'relaunch with `npx flowviant@latest`' : 'npm i -g flowviant@latest'
         }.`
       );
     }
     return false;
+  }
+
+  if (wantInstall && binary) {
+    if (!safeToUpdate) {
+      if (naggedFor !== target) {
+        naggedFor = target;
+        note(`flowviant ${cur} → ${target} available — self-updating once no turn is running.`);
+      }
+      return false;
+    }
+    if (Date.now() - lastInstallFailAt < INSTALL_RETRY_MS) return false;
+    try {
+      note(`flowviant ${cur} → ${target}: downloading binary…`);
+      const installed = await installBinaryUpdate({ minimumVersion: target });
+      ok('updated — restarting into the new version.');
+      reexec(teardown, { viaBinary: true, target: installed });
+      return true;
+    } catch (e) {
+      lastInstallFailAt = Date.now();
+      warn(`binary self-update failed (${e?.message ?? e}) — running binary untouched; retrying in 15m.`);
+      return false;
+    }
   }
 
   // UNDER NPX THERE IS NOTHING TO INSTALL — the relaunch IS the update, because
@@ -215,7 +316,7 @@ export function handleVersionSignal({ latest, min, autoUpdate, safeToUpdate, tea
     return true;
   }
 
-  if (wantInstall && !npx) {
+  if (wantInstall && !npx && !binary) {
     if (!safeToUpdate) {
       // Outdated but a turn is running — wait until the machine is quiet. Nag
       // once meanwhile.
@@ -274,7 +375,7 @@ export function handleVersionSignal({ latest, min, autoUpdate, safeToUpdate, tea
   // Can't or won't auto-install → nag once per target version.
   if (naggedFor !== target) {
     naggedFor = target;
-    const how = npx ? 'relaunch with `npx flowviant@latest`' : 'run `npm i -g flowviant@latest`';
+    const how = binary ? 'run `flowviant update`' : npx ? 'relaunch with `npx flowviant@latest`' : 'run `npm i -g flowviant@latest`';
     if (belowMin) {
       warn(`flowviant ${cur} is below the minimum ${min} — live mode may not work. Update: ${how}.`);
     } else {

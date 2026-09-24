@@ -101,7 +101,7 @@ if (process.argv[2] === 'login') {
   // re-exec: stay alive as a thin proxy so the user's shell keeps one foreground
   // process.
   const { spawn } = await import('node:child_process');
-  const child = spawn(process.execPath, [process.argv[1]], {
+  const child = spawn(process.execPath, process.argv[1]?.startsWith('/$bunfs/') ? [] : [process.argv[1]], {
     stdio: 'inherit',
     env: process.env,
   });
@@ -115,7 +115,7 @@ if (process.argv[2] === 'login') {
 // self-updates on its own (at startup + when idle); this is the manual path.
 if (process.argv[2] === 'update') {
   const { runUpdateCommand } = await import('./lib/update.mjs');
-  runUpdateCommand();
+  await runUpdateCommand();
   process.exit(0);
 }
 
@@ -466,7 +466,7 @@ async function reexecAfterLogin() {
   const login = await runLogin({ thenStart: false });
   if (!login?.saved) process.exit(1); // refused: the directory already serves another project
   const { spawn } = await import('node:child_process');
-  const child = spawn(process.execPath, [process.argv[1]], { stdio: 'inherit', env: process.env });
+  const child = spawn(process.execPath, process.argv[1]?.startsWith('/$bunfs/') ? [] : [process.argv[1]], { stdio: 'inherit', env: process.env });
   process.exit(await new Promise((resolve) => child.on('exit', (code) => resolve(code ?? 0))));
 }
 

@@ -21,7 +21,11 @@
 
 import { test, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { cmpVersion, updateRestartFailed } from './update.mjs';
+import { createHash } from 'node:crypto';
+import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { cmpVersion, installBinaryUpdate, runningCompiledBinary, updateRestartFailed } from './update.mjs';
 
 afterEach(() => {
   delete process.env.FLOWVIANT_UPDATE_TARGET;
@@ -34,6 +38,41 @@ test('cmpVersion orders releases, and missing parts read as zero', () => {
   assert.equal(cmpVersion('0.57', '0.57.0'), 0);
   // Not string comparison: '0.9.0' < '0.10.0' is only true numerically.
   assert.equal(cmpVersion('0.9.0', '0.10.0'), -1);
+});
+
+test('compiled binary detection does not mistake an npm or npx launch for a binary', () => {
+  assert.equal(runningCompiledBinary(), false);
+});
+
+test('binary update verifies bytes before atomically replacing the executable', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'flowviant-update-'));
+  const executable = join(dir, 'flowviant');
+  const bytes = Buffer.from('new binary');
+  const file = { name: 'flowviant-0.100.0-linux-x64', sha256: createHash('sha256').update(bytes).digest('hex'), bytes: bytes.length };
+  const manifest = { version: '0.100.0', files: { 'linux-x64': file } };
+  const fetchImpl = async (url) => url.endsWith('latest.json')
+    ? new Response(JSON.stringify(manifest))
+    : new Response(bytes);
+  try {
+    await writeFile(executable, 'old binary');
+    assert.equal(await installBinaryUpdate({ executable, target: 'linux-x64', fetchImpl }), '0.100.0');
+    assert.deepEqual(await readFile(executable), bytes);
+    assert.equal((await readFile(executable)).length, file.bytes);
+    await writeFile(executable, 'old binary');
+    await assert.rejects(
+      installBinaryUpdate({ executable, target: 'linux-x64', fetchImpl: async (url) =>
+        url.endsWith('latest.json') ? new Response(JSON.stringify(manifest)) : new Response('tampered') }),
+      /SHA-256 or size verification/
+    );
+    assert.equal(await readFile(executable, 'utf8'), 'old binary');
+    await assert.rejects(
+      installBinaryUpdate({ executable, target: 'linux-x64', minimumVersion: '0.101.0', fetchImpl }),
+      /waiting for 0.101.0/
+    );
+    assert.equal(await readFile(executable, 'utf8'), 'old binary');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 // THE LOOP GUARD, and it matters more on the npx path than the global one. A
