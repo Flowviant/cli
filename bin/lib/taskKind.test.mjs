@@ -244,7 +244,7 @@ test('only Claude declares the two postures, and they need no MCP', () => {
 });
 
 test('the agent turn: contract and posture from the kind, refusal off Claude, artifact before delivered', () => {
-  const w = src('work.mjs');
+  const w = src('workAgentTurns.mjs');
   const turn = slice(w, 'const runAgentTurn = async (job', 'const lastAgentBeat = new Map();');
   // Canary: this IS the agent lane.
   assert.match(turn, /AGENT_TASK_KICKOFF\(/);

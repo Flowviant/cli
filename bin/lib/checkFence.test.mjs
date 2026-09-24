@@ -72,7 +72,7 @@ test('the check runs without the machine credential and with everything else the
 });
 
 test('the check clears the directory first and runs under checkEnv', () => {
-  const src = readFileSync(new URL('./work.mjs', import.meta.url), 'utf8')
+  const src = readFileSync(new URL('./workAgentReview.mjs', import.meta.url), 'utf8')
     .replace(/\/\*[\s\S]*?\*\//g, '')
     .split('\n')
     .filter((l) => !/^\s*(\/\/|\*)/.test(l))

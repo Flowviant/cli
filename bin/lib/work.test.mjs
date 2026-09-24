@@ -300,7 +300,20 @@ test('a preview claim and its attribution refusal both echo the job’s shareId'
  * that trains the next person to weaken the pin.
  */
 const workSource = () =>
-  readFileSync(new URL('./work.mjs', import.meta.url), 'utf8')
+  [
+    'work.mjs',
+    'workAgentPlans.mjs',
+    'workAgentReview.mjs',
+    'workAgentTurns.mjs',
+    'workAgentMerges.mjs',
+    'workDiffs.mjs',
+    'workPreviews.mjs',
+    'workProcesses.mjs',
+    'workPullRequests.mjs',
+    'workShip.mjs',
+  ]
+    .map((file) => readFileSync(new URL(`./${file}`, import.meta.url), 'utf8'))
+    .join('\n')
     .replace(/\/\*[\s\S]*?\*\//g, '')
     .split('\n')
     .filter((l) => !/^\s*(\/\/|\*)/.test(l))
@@ -310,7 +323,10 @@ const fnBody = (src, name) => {
   const i = src.indexOf(`const ${name} = `);
   assert.ok(i > -1, `${name} must exist`);
   const j = src.indexOf('\n  const ', i + 10);
-  return src.slice(i, j > -1 ? j : src.length);
+  const end = src.indexOf('\n  return { ', i + 10);
+  const stop = j < 0 ? end : end < 0 ? j : Math.min(j, end);
+  assert.ok(stop > i, `${name} must have a closing anchor`);
+  return src.slice(i, stop);
 };
 
 test('the planning turn relays the CLI, and the relay cannot outrun its own throttle', () => {

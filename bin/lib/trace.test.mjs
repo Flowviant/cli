@@ -579,7 +579,7 @@ test('an empty thought carries the marker and no full text', () => {
 // ── the wiring, pinned as source ─────────────────────────────────────────────
 
 const here = dirname(fileURLToPath(import.meta.url));
-const workSrc = readFileSync(join(here, 'work.mjs'), 'utf8');
+const workSrc = readFileSync(join(here, 'workAgentTurns.mjs'), 'utf8');
 const claudeSrc = readFileSync(join(here, 'claude.mjs'), 'utf8');
 
 const between = (src, from, to, what) => {

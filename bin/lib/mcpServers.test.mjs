@@ -158,10 +158,11 @@ test('every reader of an init event records the servers beside the skills', () =
   assert.match(tab, /recordMcpServers\(i\.mcpServers\);/);
   // The AGENT lane too (2026-09-23): a box that only runs agents otherwise
   // learned its skills and connectors once, from the startup probe, forever.
-  const agent = slice(w, 'const runAgentTurn = async (job', 'const lastAgentBeat = new Map();');
+  const a = src('workAgentTurns.mjs');
+  const agent = slice(a, 'const runAgentTurn = async (job', 'const lastAgentBeat = new Map();');
   assert.match(agent, /AGENT_TASK_KICKOFF\(/); // canary: this is the agent lane
   assert.match(agent, /onInit: \(i\) => \{\s*recordSkills\(i\.skills\);\s*recordMcpServers\(i\.mcpServers\);\s*\},/);
-  assert.equal(w.split('recordMcpServers(i.mcpServers);').length - 1, 2, 'the tab lane and the agent lane');
+  assert.equal(`${w}\n${a}`.split('recordMcpServers(i.mcpServers);').length - 1, 2, 'the tab lane and the agent lane');
   const f = src('fleet.mjs');
   assert.equal(f.split('recordMcpServers(i.mcpServers);').length - 1, 2, 'both wiki lanes');
   assert.equal(f.split('recordSkills(i.skills);').length - 1, 2, 'canary: the two wiki lanes are the ones');

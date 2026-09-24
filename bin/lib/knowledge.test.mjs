@@ -366,7 +366,9 @@ test('the prompt paragraph is present only when a library directory is', async (
 });
 
 test('every turn the daemon spawns composes its contract through withProjectContext', () => {
-  const src = readFileSync(new URL('./work.mjs', import.meta.url), 'utf8');
+  const src = ['work.mjs', 'workAgentTurns.mjs']
+    .map((file) => readFileSync(new URL(`./${file}`, import.meta.url), 'utf8'))
+    .join('\n');
   // The tab lane (work / plain / capture) and the agent lane.
   // (Re-anchored 2026-09-22 when the ARTIFACTS flag joined the same options
   // object: the pin is that the knowledge dir reaches both lanes, and it moved

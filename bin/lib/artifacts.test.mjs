@@ -256,7 +256,9 @@ test('the ARTIFACTS paragraph is rendered only when asked for, after the knowled
 });
 
 test('both lanes report, the capture chat never does, and the paragraph follows the roster', () => {
-  const src = readFileSync(new URL('./work.mjs', import.meta.url), 'utf8');
+  const src = ['work.mjs', 'workAgentTurns.mjs']
+    .map((file) => readFileSync(new URL(`./${file}`, import.meta.url), 'utf8'))
+    .join('\n');
   assert.ok(src.includes("if (job.capture !== true) artifactScan = { dir: dir.wt, before: beforeArtifacts(dir.wt) };"));
   assert.ok(src.includes('{ knowledgeDir, artifacts: !captureTab && getArtifactsAccepted() }'));
   assert.ok(src.includes('.report({ placeDir: wt, before: artifactsBefore, agentId, turnId })'));

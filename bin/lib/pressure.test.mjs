@@ -370,6 +370,9 @@ test('the level is passed through to the verdict — the two lanes differ', () =
 
 const here = dirname(fileURLToPath(import.meta.url));
 const workSrc = readFileSync(join(here, 'work.mjs'), 'utf8');
+const turnSrc = readFileSync(join(here, 'workAgentTurns.mjs'), 'utf8');
+const mergeSrc = readFileSync(join(here, 'workAgentMerges.mjs'), 'utf8');
+const planSrc = readFileSync(join(here, 'workAgentPlans.mjs'), 'utf8');
 const fleetSrc = readFileSync(join(here, 'fleet.mjs'), 'utf8');
 
 const between = (src, from, to, what) => {
@@ -411,17 +414,17 @@ test('every admitted lane takes the slot before the next job is judged', () => {
   );
   assert.ok(session.includes('admit.reserve()'));
   const agentLane = between(
-    workSrc,
+    turnSrc,
     'const processAgentTurnJobs = (jobs) => {',
-    "// ── THE PROJECT'S OWN CHECK",
+    'return { processAgentTurnJobs, settleAgentTurns, agentTurns, agentChildren, agentReported };',
     'processAgentTurnJobs'
   );
   assert.ok(agentLane.includes('admit.reserve()'));
   assert.ok(agentLane.includes('runAgentTurn(job, releaseSlot)'));
   const planLane = between(
-    workSrc,
+    planSrc,
     'const processAgentPlanJobs = (jobs) => {',
-    '// ── AGENT TURNS: one task per prompt',
+    'return { processAgentPlanJobs, planning };',
     'processAgentPlanJobs'
   );
   assert.ok(planLane.includes('admit.reserve()'));
@@ -429,7 +432,7 @@ test('every admitted lane takes the slot before the next job is judged', () => {
   // whole life would count one CLI twice and halve the ceiling.
   for (const anchor of ['workChildren.set(ch, job.sessionId);', 'workChildren.set(ch, agentId);'])
     assert.ok(
-      between(workSrc, anchor, '\n\n', 'release at the spawn').includes('releaseSlot()'),
+      between(anchor.includes('agentId') ? turnSrc : workSrc, anchor, '\n\n', 'release at the spawn').includes('releaseSlot()'),
       `the reservation must be released where the child registers — ${anchor}`
     );
   // The wiki lane has no child for most of its life and counts the FLAG, which
@@ -439,9 +442,9 @@ test('every admitted lane takes the slot before the next job is judged', () => {
 
 test('a deferred AGENT turn is not settled either', () => {
   const lane = between(
-    workSrc,
+    turnSrc,
     'const processAgentTurnJobs = (jobs) => {',
-    "// ── THE PROJECT'S OWN CHECK",
+    'return { processAgentTurnJobs, settleAgentTurns, agentTurns, agentChildren, agentReported };',
     'processAgentTurnJobs'
   );
   const region = between(
@@ -459,9 +462,9 @@ test('a deferred AGENT turn is not settled either', () => {
 
 test('a Deploy press is declined by NOT CLAIMING it', () => {
   const lane = between(
-    workSrc,
+    planSrc,
     'const processAgentPlanJobs = (jobs) => {',
-    '// ── AGENT TURNS: one task per prompt',
+    'return { processAgentPlanJobs, planning };',
     'processAgentPlanJobs'
   );
   const admitAt = lane.indexOf("admit('churn')");
@@ -488,9 +491,9 @@ test('the wiki drain yields without consuming its queue', () => {
 
 test('a merge is NOT gated — it ends work and frees the box', () => {
   const lane = between(
-    workSrc,
+    mergeSrc,
     'const processAgentMergeJobs =',
-    'const workBusy = ',
+    'return { processAgentMergeJobs, agentMerges };',
     'processAgentMergeJobs'
   );
   assert.ok(!lane.includes('admit('));
