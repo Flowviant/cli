@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { turnLockedByLivePid } from './work.mjs';
@@ -24,7 +24,10 @@ function lockFile(t, content) {
   return p;
 }
 
-test("a lock naming another uid's live process is stale and cleared", { skip: process.getuid?.() === 0 && 'root can signal pid 1' }, (t) => {
+const pidOneIsOtherUid = process.getuid?.() !== undefined && (() => {
+  try { return statSync('/proc/1').uid !== process.getuid(); } catch { return false; }
+})();
+test("a lock naming another uid's live process is stale and cleared", { skip: !pidOneIsOtherUid && 'pid 1 belongs to this uid or its owner is unknown' }, (t) => {
   // pid 1 is init — alive, and not signalable by an ordinary user (EPERM).
   const p = lockFile(t, '1');
   assert.equal(turnLockedByLivePid(p), false);

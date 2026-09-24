@@ -658,7 +658,7 @@ test('a machine launched through the Node package runner names that launch in it
     process.env.npm_config_user_agent = 'npm/11 npx/11';
     const a = entry({ projectId: 'one', repoRoot: '/repo' });
     const b = entry({ projectId: 'two', repoRoot: '/repo' });
-    assert.match(renderCollisions([a, b])[0], /`npx flowviant` there refuses/);
+    assert.match(renderCollisions([a, b])[0], /`flowviant` there refuses/);
   } finally {
     if (previous === undefined) delete process.env.npm_config_user_agent;
     else process.env.npm_config_user_agent = previous;

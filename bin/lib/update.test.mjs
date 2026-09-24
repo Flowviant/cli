@@ -28,9 +28,8 @@ import { join } from 'node:path';
 import { cmpVersion, installBinaryUpdate, runningCompiledBinary, updateRestartFailed } from './update.mjs';
 import { launchCommand, runningViaNpx, terminalCommand } from './launchCommand.mjs';
 
-test('terminal command follows the launch channel', () => {
-  assert.equal(launchCommand({ viaNpx: false }), 'flowviant');
-  assert.equal(launchCommand({ viaNpx: true }), 'npx flowviant');
+test('terminal copy names flowviant while channel detection remains measured', () => {
+  assert.equal(launchCommand(), 'flowviant');
   assert.equal(terminalCommand('login'), launchCommand() + ' login');
   const previous = process.env.npm_config_user_agent;
   try {
