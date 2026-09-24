@@ -282,12 +282,40 @@ export function createArtifactReporter({ fleetUrl, token, userAgent, scrub, secr
     }
     pending.delete(key); // re-insert at the tail, so the cap sheds the oldest
     pending.set(key, { body, tries });
-    while (pending.size > MAX_PENDING) pending.delete(pending.keys().next().value);
+    while (pending.size > MAX_PENDING) {
+      const shed = pending.keys().next().value;
+      pending.delete(shed);
+      if (!chains.has(shed)) genOf.delete(shed);
+    }
   };
 
-  const send = async (key, body, tries) => {
-    if (await post(body)) pending.delete(key);
-    else hold(key, body, tries + 1);
+  // ONE COPY OF A FILE IS IN FLIGHT AT A TIME, AND ONLY THE NEWEST MAY
+  // DECIDE. Each report of a (owner, name) takes a fresh generation, and every
+  // post for that key is chained behind the previous one — so a slow retry of
+  // an OLD body can neither land on the server after the newer copy (the
+  // server upserts by name, so the last write wins) nor re-hold itself over
+  // the newer one when it fails. A body superseded before it went out is not
+  // sent at all; one superseded while in flight has its answer discarded.
+  let generation = 0;
+  const genOf = new Map(); // key -> the generation allowed to decide
+  const chains = new Map(); // key -> the tail of that key's post chain
+
+  const send = (key, body, tries, gen) => {
+    const run = (chains.get(key) ?? Promise.resolve()).then(async () => {
+      if (genOf.get(key) !== gen) return; // superseded before it went out
+      const ok = await post(body);
+      if (genOf.get(key) !== gen) return; // a newer copy decides for this key
+      if (ok) pending.delete(key);
+      else hold(key, body, tries + 1);
+    });
+    const tail = run.catch(() => {});
+    chains.set(key, tail);
+    tail.then(() => {
+      if (chains.get(key) !== tail) return;
+      chains.delete(key);
+      if (!pending.has(key)) genOf.delete(key); // settled: nothing left to order
+    });
+    return run;
   };
 
   let retrying = false;
@@ -297,7 +325,7 @@ export function createArtifactReporter({ fleetUrl, token, userAgent, scrub, secr
     try {
       for (const [key, held] of [...pending]) {
         if (pending.get(key) !== held) continue; // superseded meanwhile
-        await send(key, held.body, held.tries);
+        await send(key, held.body, held.tries, genOf.get(key));
       }
     } finally {
       retrying = false;
@@ -319,7 +347,9 @@ export function createArtifactReporter({ fleetUrl, token, userAgent, scrub, secr
       }
       const key = `${sessionId ?? agentId}:${entry.name}`;
       pending.delete(key); // this copy supersedes a held older one
-      await send(key, body, 0);
+      const gen = ++generation;
+      genOf.set(key, gen); // …and one still in flight
+      await send(key, body, 0, gen);
       n++;
     }
     return n;

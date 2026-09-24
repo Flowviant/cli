@@ -669,3 +669,27 @@ test('the tail is flushed BEFORE the settle', () => {
   // Bounded: the settle is the turn's contract and this is a readout.
   assert.ok(lane.includes('TRACE_FINAL_FLUSH_MS'));
 });
+
+test('a shed during an in-flight batch loses only what was shed, never unsent entries behind it (audit 2026-09-24)', async () => {
+  let release;
+  const sent = [];
+  const post = async (body) => {
+    sent.push(body);
+    if (sent.length === 1) await new Promise((r) => { release = r; });
+    return true;
+  };
+  const r = makeTraceRelay({ agentId: 'a1', turnId: 't1', post });
+  for (let i = 0; i < TRACE_BUFFER; i++) r.prose('say', `line ${i}`);
+  const first = r.flush();
+  await new Promise((res) => setImmediate(res));
+  // Ten more arrive while batch 0..39 is on the wire: 0..9 are shed.
+  for (let i = TRACE_BUFFER; i < TRACE_BUFFER + 10; i++) r.prose('say', `line ${i}`);
+  r.stop();
+  release();
+  await first;
+  await r.flush();
+  const got = new Set(sent.flatMap((b) => b.entries.map((e) => e.t)));
+  // Everything from the batch's end onward reached the server.
+  for (let i = TRACE_BATCH; i < TRACE_BUFFER + 10; i++) assert.ok(got.has(`line ${i}`), `line ${i} was sent`);
+  assert.equal(sent[1].seq, TRACE_BATCH);
+});

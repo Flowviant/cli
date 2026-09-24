@@ -335,3 +335,39 @@ test('the work manager hands the reporter the byte check', () => {
   assert.match(block, /scrub: envScrub,/); // canary
   assert.match(block, /secretIn: envSecretIn,/);
 });
+
+test('a newer copy of a file wins over an older retry still in flight — it goes out after it, and the old answer decides nothing (audit 2026-09-24)', async () => {
+  const d = place();
+  put(d, 'landing.html', '<p>v1</p>');
+  const order = [];
+  let releaseOld;
+  let call = 0;
+  const fetchImpl = async (url, init) => {
+    const text = Buffer.from(await init.body.get('file').arrayBuffer()).toString('utf8');
+    call++;
+    if (call === 1) return { ok: false, status: 503 }; // first upload is held
+    if (call === 2) {
+      // the retry of v1: a slow uplink, and it fails in the end
+      await new Promise((r) => { releaseOld = r; });
+      order.push(text);
+      return { ok: false, status: 503 };
+    }
+    order.push(text);
+    return { ok: true, status: 200 };
+  };
+  const r = createArtifactReporter({ fleetUrl: 'https://x.test/api/v2/fleet/agents', token: 't', userAgent: 'ua', scrub: (s) => s, fetchImpl });
+  await r.report({ placeDir: d, before: new Map(), agentId: 'a1', turnId: 't1' });
+  assert.equal(r.pendingCount(), 1);
+  const retry = r.retryPending(); // v1 goes out again and hangs
+  await new Promise((res) => setImmediate(res));
+  put(d, 'landing.html', '<p>v2</p>', Math.floor(Date.now() / 1000) + 60);
+  const newer = r.report({ placeDir: d, before: new Map(), agentId: 'a1', turnId: 't2' });
+  await new Promise((res) => setImmediate(res));
+  releaseOld();
+  await Promise.all([retry, newer]);
+  // v2 reached the server LAST, and the failed v1 did not re-hold itself.
+  assert.deepEqual(order, ['<p>v1</p>', '<p>v2</p>']);
+  assert.equal(r.pendingCount(), 0);
+  await r.retryPending();
+  assert.equal(call, 3);
+});

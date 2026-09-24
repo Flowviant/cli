@@ -99,3 +99,87 @@ test('with no classification the order degrades to the old port sort', () => {
     [3001, 9230, 45947]
   );
 });
+
+// ── the dial address (audit 2026-09-24) ─────────────────────────────────────
+
+import { originFor, pickOrigin } from './listeners.mjs';
+import { spawn } from 'node:child_process';
+import { createServer } from 'node:net';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir, platform } from 'node:os';
+import { join } from 'node:path';
+
+test('the dial address follows the attributed socket, never a neighbour on the other family', () => {
+  // The reproduction: this worktree on [::1], an unrelated process on 127.0.0.1.
+  assert.deepEqual(
+    pickOrigin(
+      [
+        { family: 6, addr: '::1', ours: true },
+        { family: 4, addr: '127.0.0.1', ours: false },
+      ],
+      5173
+    ),
+    { host: '::1' }
+  );
+  // A wildcard is reached on its own family's loopback, v4 preferred.
+  assert.deepEqual(pickOrigin([{ family: 6, addr: '::', ours: true }], 1), { host: '::1' });
+  assert.deepEqual(
+    pickOrigin(
+      [
+        { family: 6, addr: '::', ours: true },
+        { family: 4, addr: '0.0.0.0', ours: true },
+      ],
+      1
+    ),
+    { host: '127.0.0.1' }
+  );
+  // A foreign process on the SAME address (or the same wildcard) is refused in
+  // words, never published.
+  const contested = pickOrigin(
+    [
+      { family: 4, addr: '0.0.0.0', ours: true },
+      { family: 4, addr: '127.0.0.1', ours: false },
+    ],
+    3000
+  );
+  assert.match(contested.error, /outside this worktree/);
+  // Nothing of ours: the ordinary sentence.
+  assert.match(pickOrigin([{ family: 4, addr: '127.0.0.1', ours: false }], 3000).error, /nothing is listening/);
+});
+
+test('on a real box: a dev server on [::1] is dialled on ::1 while an outsider holds 127.0.0.1', { skip: platform() !== 'linux' }, async (t) => {
+  // Is there an IPv6 loopback at all?
+  const probe = createServer();
+  const v6 = await new Promise((r) => {
+    probe.once('error', () => r(false));
+    probe.listen(0, '::1', () => r(true));
+  });
+  if (!v6) return t.skip('no IPv6 loopback on this box');
+  const port = probe.address().port;
+  await new Promise((r) => probe.close(r));
+  const wt = mkdtempSync(join(tmpdir(), 'fv-origin-'));
+  const child = spawn(
+    process.execPath,
+    ['-e', `require('net').createServer().listen(${port}, '::1', () => console.log('up'))`],
+    { cwd: wt, stdio: ['ignore', 'pipe', 'ignore'] }
+  );
+  try {
+    await new Promise((r, j) => {
+      child.stdout.once('data', r);
+      child.once('exit', () => j(new Error('child exited')));
+    });
+    // The outsider: this test process, whose cwd is not the worktree.
+    const outsider = createServer();
+    const v4 = await new Promise((r) => {
+      outsider.once('error', () => r(false));
+      outsider.listen(port, '127.0.0.1', () => r(true));
+    });
+    try {
+      assert.deepEqual(originFor(wt, port), { host: '::1' });
+    } finally {
+      if (v4) await new Promise((r) => outsider.close(r));
+    }
+  } finally {
+    child.kill('SIGKILL');
+  }
+});

@@ -444,3 +444,55 @@ test('an EXPIRED grant re-bounces rather than counting as an attempt', async () 
   assert.equal(loc.searchParams.get('t'), 'tok-1');
   assert.equal(loc.searchParams.get('x'), '1');
 });
+
+test("the app's OWN Authorization rides through — a Bearer is not a wrong password (audit 2026-09-24)", async () => {
+  const ip = { 'cf-connecting-ip': '192.0.2.44' };
+  for (let i = 0; i < 30; i++) {
+    const r = await get('/api/me', {
+      ...ip,
+      cookie: `${GRANT_COOKIE}=${mint()}`,
+      authorization: 'Bearer app-token-123',
+    });
+    assert.equal(r.status, 200, 'a vouched-for viewer is not challenged over the app header');
+    const seen = (await r.json()).headers;
+    assert.equal(seen.authorization, 'Bearer app-token-123', 'the origin gets its own header');
+  }
+  // None of that counted: the same source's password still works, not 429.
+  const auth = 'Basic ' + Buffer.from(`${gate.user}:${gate.password}`).toString('base64');
+  const r = await get('/x', { ...ip, authorization: auth });
+  assert.equal(r.status, 200);
+  // …and the gate's own password still never reaches the origin.
+  assert.equal((await r.json()).headers.authorization, undefined);
+  // A Bearer with no cookie is simply unauthenticated — a 401, never a count.
+  for (let i = 0; i < 30; i++) {
+    const b = await get('/api/me', { ...ip, authorization: 'Bearer x' });
+    assert.equal(b.status, 401);
+  }
+  assert.equal((await get('/x', { ...ip, authorization: auth })).status, 200);
+});
+
+test("an app that speaks Basic itself keeps its header when the viewer holds a grant", async () => {
+  const appBasic = 'Basic ' + Buffer.from('appuser:apppass').toString('base64');
+  const r = await get('/x', { cookie: `${GRANT_COOKIE}=${mint()}`, authorization: appBasic, 'cf-connecting-ip': '192.0.2.45' });
+  assert.equal(r.status, 200);
+  assert.equal((await r.json()).headers.authorization, appBasic);
+});
+
+test('the gate dials the address it is told — a dev server on [::1] is reachable (audit 2026-09-24)', async (t) => {
+  const o6 = createServer((req, res) => res.end('v6-origin'));
+  const ok6 = await new Promise((r) => {
+    o6.once('error', () => r(false));
+    o6.listen(0, '::1', () => r(true));
+  });
+  if (!ok6) return t.skip('no IPv6 loopback on this box');
+  const g = await startAuthProxy({ targetPort: o6.address().port, targetHost: '::1' });
+  try {
+    const auth = 'Basic ' + Buffer.from(`${g.user}:${g.password}`).toString('base64');
+    const r = await fetch(`http://127.0.0.1:${g.port}/`, { headers: { authorization: auth } });
+    assert.equal(r.status, 200);
+    assert.equal(await r.text(), 'v6-origin');
+  } finally {
+    g.stop();
+    o6.close();
+  }
+});

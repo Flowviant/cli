@@ -163,8 +163,13 @@ export function makeTraceRelay({ agentId, turnId, post, scrub = (s) => s, run = 
         dirty = true;
         return;
       }
-      queue.splice(0, entries.length);
-      base += entries.length;
+      // Remove only what of the batch is STILL at the head: a push during the
+      // await may have shed some of it already (advancing `base`), and
+      // splicing the whole batch length would then drop entries that were
+      // never sent — a gap the buffer had room to avoid.
+      const drop = Math.max(0, seq + entries.length - base);
+      queue.splice(0, drop);
+      base += drop;
     }
   };
 

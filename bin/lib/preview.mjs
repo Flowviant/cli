@@ -46,7 +46,7 @@ import {
 import { join } from 'node:path';
 import { homedir, platform, arch } from 'node:os';
 import { startAuthProxy } from './authproxy.mjs';
-import { forgetInfraPid, isListening, noteInfraPid } from './listeners.mjs';
+import { forgetInfraPid, isListening, noteInfraPid, originFor } from './listeners.mjs';
 
 // ── cloudflared: pinned, verified, or not fetched at all ───────────────────
 
@@ -138,7 +138,19 @@ async function ensureCloudflared(log) {
   }
 }
 
-const TUNNEL_RE = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/i;
+/**
+ * The hostname cloudflared ASSIGNED, and nothing else it happens to print.
+ *
+ * `[a-z0-9-]+\.trycloudflare\.com` also matched cloudflared's own FAILURE line
+ * — `failed to request quick Tunnel: Post "https://api.trycloudflare.com/tunnel":
+ * dial tcp: lookup api.trycloudflare.com: …` — so on any box that could not
+ * reach the quick-tunnel API (offline, DNS failure, a proxy blocking it) the
+ * share was reported LIVE at Cloudflare's own API host, and cloudflared's real
+ * sentence, which the tail exists to relay, was replaced by a wrong one (audit
+ * 2026-09-24). `api.` is the service's endpoint and never an assigned name, and
+ * the trailing guard stops a longer hostname matching on its prefix.
+ */
+export const TUNNEL_RE = /https:\/\/(?!api\.)[a-z0-9-]+\.trycloudflare\.com(?![a-z0-9.-])/i;
 
 // ── Orphan reaping ─────────────────────────────────────────────────────────
 // cloudflared is detached so we can kill its whole group — which also means it
@@ -228,6 +240,39 @@ function mutateRegistry(fn) {
   }
 }
 
+/**
+ * WHEN a process started, as the kernel reports it — or null when this box
+ * will not say. Paired with a pid it names ONE process: a pid alone is
+ * recycled, and the owner check below trusted signal 0 on a bare pid.
+ */
+export function processStartOf(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  if (platform() === 'linux') {
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+      // Field 22 (starttime), counted after the LAST ')' — the comm field in
+      // parentheses may itself hold spaces and parentheses.
+      const rest = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+      return rest[19] ? `l:${rest[19]}` : null;
+    } catch {
+      return null;
+    }
+  }
+  if (platform() === 'darwin') {
+    try {
+      const out = execFileSync('ps', ['-p', String(pid), '-o', 'lstart='], {
+        encoding: 'utf8',
+        timeout: 5_000,
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim();
+      return out ? `d:${out}` : null;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
 /** Signal-0 liveness (EPERM = alive and not ours), for the OWNER check below. */
 function processAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
@@ -246,7 +291,15 @@ function recordPreviewPid(pid, sig) {
   // starting daemon reaped its PEER's live tunnels: killed them, wiped their
   // entries, and the peer kept heartbeating a URL that 530s (its probe watches
   // the origin port, which was still alive).
-  mutateRegistry((list) => [...list, { pid, sig, owner: process.pid }]);
+  //
+  // `ownerStart` pins the owner to ONE process (audit 2026-09-24). A daemon that
+  // is SIGKILLed with a share open leaves cloudflared up; if its pid is reused
+  // by the next start — any process, another user's included, since EPERM
+  // counts as alive — a pid-only check read the entry as a live peer's and
+  // skipped it forever, leaving a public hostname aimed at a dead gate's
+  // ephemeral port for anything that binds it next.
+  const ownerStart = processStartOf(process.pid);
+  mutateRegistry((list) => [...list, { pid, sig, owner: process.pid, ...(ownerStart ? { ownerStart } : {}) }]);
 }
 
 function forgetPreviewPid(pid) {
@@ -311,13 +364,24 @@ function stillOurs(pid, sig) {
  *  own teardown handles it) — killing those and wiping their entries was a
  *  peer daemon's startup silently breaking every live share on the box. Only
  *  the entries this pass handled are removed; a peer's records survive. */
+/** Is the daemon that recorded an entry still the process at that pid? With
+ *  a recorded start time, only when the pid's start time still matches (a
+ *  recycled pid is an orphaned entry); where this box cannot report a start
+ *  time now, or the entry predates the field, signal 0 is all there is. */
+function ownerStillRunning(owner, ownerStart) {
+  if (!processAlive(owner)) return false;
+  if (typeof ownerStart !== 'string') return true;
+  const now = processStartOf(owner);
+  return now == null ? true : now === ownerStart;
+}
+
 export function reapOrphanPreviews(log) {
   const list = readRegistry();
   if (list.length === 0) return;
   let killed = 0;
   const handled = new Set();
-  for (const { pid, sig, owner } of list) {
-    if (Number.isInteger(owner) && owner !== process.pid && processAlive(owner)) continue;
+  for (const { pid, sig, owner, ownerStart } of list) {
+    if (Number.isInteger(owner) && owner !== process.pid && ownerStillRunning(owner, ownerStart)) continue;
     const ours = stillOurs(pid, sig);
     /**
      * THE RECORD OUTLIVES A REAP THAT COULD NOT LOOK. `handled.add` ran BEFORE
@@ -396,6 +460,11 @@ export async function openTunnel({
   onAbuse,
   onTunnelGone,
   stillServing,
+  // The worktree the port was attributed to. When given, the gate dials the
+  // address the ATTRIBUTED socket holds (`originFor`) rather than assuming
+  // 127.0.0.1, and every liveness check re-derives it — so a neighbour on the
+  // other loopback family is never what the tunnel publishes.
+  worktree,
   probeMs = 20_000,
   // The members-gate triple, all three or none. Absent = an older server, or a
   // password-mode share: the gate runs exactly as it always has.
@@ -406,8 +475,15 @@ export async function openTunnel({
   // ONE predicate for every liveness question this function asks. Attribution
   // when the caller gave it, a bare TCP connect only when it did not; an
   // attribution check that errors is not a "yes".
+  // `origin` is decided once, at the gate's start; after that a change of
+  // address is a different process and reads as "not serving".
+  let origin = null;
   const serving = async () => {
     try {
+      if (worktree) {
+        const o = originFor(worktree, port);
+        if (o.error || (origin && o.host !== origin)) return false;
+      }
       return stillServing ? await stillServing() : await isListening(port);
     } catch {
       return false;
@@ -455,8 +531,14 @@ export async function openTunnel({
 
   // The gate comes up FIRST and the tunnel points at it, never at the origin —
   // so there is no window in which the public hostname is un-gated.
+  if (worktree) {
+    const o = originFor(worktree, port);
+    if (o.error) return { error: o.error };
+    origin = o.host;
+  }
   gate = await startAuthProxy({
     targetPort: port,
+    ...(origin ? { targetHost: origin } : {}),
     log,
     // Never logged, never written to previews.json, never in the reap
     // signature, never in argv or a child env — /proc/<pid>/cmdline is
@@ -529,7 +611,14 @@ export async function openTunnel({
     const onOut = (d) => {
       const s = d.toString();
       tail = (tail + s).slice(-TAIL_BYTES);
-      const m = TUNNEL_RE.exec(s);
+      // ONE URL, ONE PROBE. A second match after we settled (cloudflared
+      // repeats the banner, or a later line names another host) used to start
+      // a second probe interval and a second close listener on a tunnel whose
+      // answer had already been given.
+      if (settled) return;
+      // Matched over the TAIL, not the chunk: a pipe read can split the
+      // hostname across two chunks, and a half never matches.
+      const m = TUNNEL_RE.exec(tail);
       if (!m) return;
 
       // Watch the ORIGIN — with the caller's ATTRIBUTION check when it gave

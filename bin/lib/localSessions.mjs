@@ -105,7 +105,7 @@ export function titleForSession(cwd, sessionId) {
     /* the place is gone — nothing to read */
   }
   for (const dir of dirs) {
-    const file = join(projects, dir.replace(/[/.]/g, '-'), `${sessionId}.jsonl`);
+    const file = join(projects, claudeProjectDir(dir), `${sessionId}.jsonl`);
     try {
       return transcriptTitle(file, statSync(file).mtimeMs);
     } catch {
@@ -113,6 +113,27 @@ export function titleForSession(cwd, sessionId) {
     }
   }
   return null;
+}
+
+/**
+ * THE DIRECTORY CLAUDE CODE FILES A CWD'S TRANSCRIPTS UNDER — its own rule,
+ * copied exactly (2.1.281): every character that is not an ASCII letter or
+ * digit becomes `-`, and a name past 200 characters is cut there and suffixed
+ * with a base-36 Java-style string hash of the ORIGINAL path.
+ *
+ * This file used `replace(/[/.]/g, '-')`, which agrees with Claude Code only
+ * while a path holds nothing but letters, digits, `/` and `.` — so a repo at
+ * `~/code/my_app` or `~/My Projects/x` never offered an ended terminal session
+ * for adoption and never got a tab auto-title, silently (audit 2026-09-24).
+ */
+const CLAUDE_DIR_MAX = 200;
+export function claudeProjectDir(path) {
+  const p = String(path);
+  const s = p.replace(/[^a-zA-Z0-9]/g, '-');
+  if (s.length <= CLAUDE_DIR_MAX) return s;
+  let h = 0;
+  for (let i = 0; i < p.length; i++) h = ((h << 5) - h + p.charCodeAt(i)) | 0;
+  return `${s.slice(0, CLAUDE_DIR_MAX)}-${Math.abs(h).toString(36)}`;
 }
 
 /** Path-prefix containment on already-realpath'd absolute paths. */
@@ -373,7 +394,7 @@ export function scanLocalSessions({ repoRoot, excludeDirs = [], excludeIds }) {
           homedir(),
           '.claude',
           'projects',
-          cwd.replace(/[/.]/g, '-'),
+          claudeProjectDir(cwd),
           `${rec.sessionId}.jsonl`
         );
         liveTitle = transcriptTitle(liveFile, statSync(liveFile).mtimeMs);
@@ -400,7 +421,11 @@ export function scanLocalSessions({ repoRoot, excludeDirs = [], excludeIds }) {
     // But so does a sibling repo ('flowviant-two' shares 'flowviant' + '-'),
     // which is why every candidate is verified against the cwd its own records
     // embed rather than trusted on its directory name.
-    const munged = realRoot.replace(/[/.]/g, '-');
+    const munged = claudeProjectDir(realRoot);
+    // A root past Claude's 200-character cut carries a hash of ITSELF, which a
+    // subdirectory's name does not share — so the prefix a subdirectory can
+    // match is the cut, and the cwd verification below does the rest.
+    const mungedStem = munged.length > CLAUDE_DIR_MAX ? munged.slice(0, CLAUDE_DIR_MAX) : `${munged}-`;
     const projectsDir = join(homedir(), '.claude', 'projects');
     let projDirs = [];
     try {
@@ -411,7 +436,7 @@ export function scanLocalSessions({ repoRoot, excludeDirs = [], excludeIds }) {
     const cutoff = Date.now() - ENDED_WINDOW_MS;
     const candidates = [];
     for (const dirName of projDirs) {
-      if (dirName !== munged && !dirName.startsWith(`${munged}-`)) continue;
+      if (dirName !== munged && !dirName.startsWith(mungedStem)) continue;
       let entries = [];
       try {
         entries = readdirSync(join(projectsDir, dirName), { withFileTypes: true });

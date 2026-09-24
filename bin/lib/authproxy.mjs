@@ -116,6 +116,10 @@ const MAX_SOURCES = 500;
 
 const digest = (s) => createHash('sha256').update(String(s)).digest();
 
+/** An Authorization header in the Basic scheme — the only shape the gate's own
+ *  password ever arrives in, and so the only one it grades. */
+const isBasic = (v) => typeof v === 'string' && /^\s*basic(\s|$)/i.test(v);
+
 /** Constant-time over sha256 digests, so length never leaks and a missing
  *  header costs the same as a wrong one. */
 function sameSecret(a, b) {
@@ -137,7 +141,18 @@ function sameSecret(a, b) {
  * URL under attack. A single source is blocked on its own, at MAX_FAILED,
  * without ending anybody else's share.
  */
-export function startAuthProxy({ targetPort, log, onAbuse, grantSecret, shareId, authorizeUrl }) {
+export function startAuthProxy({
+  targetPort,
+  // The address that reaches the ATTRIBUTED socket (listeners.mjs `originFor`)
+  // — `::1` for a dev server bound to the IPv6 loopback. Defaults to the IPv4
+  // loopback it always dialled, for a caller that measured nothing.
+  targetHost = '127.0.0.1',
+  log,
+  onAbuse,
+  grantSecret,
+  shareId,
+  authorizeUrl,
+}) {
   // ALL THREE OR NONE. Two of the three is a gate that cannot bounce anybody:
   // a secret with no authorize URL has nowhere to send them, an authorize URL
   // with no secret cannot verify what comes back. An older SERVER sends none of
@@ -217,7 +232,36 @@ export function startAuthProxy({ targetPort, log, onAbuse, grantSecret, shareId,
     // whole thing down. An expired-but-validly-signed grant must never count
     // either, or a viewer who left a tab open overnight closes the share on
     // their own reload.
-    if (req.headers['authorization']) {
+    //
+    // AND ONLY A *BASIC* HEADER IS A PASSWORD ATTEMPT (audit 2026-09-24). Any
+    // Authorization header used to be graded against the gate password, so a
+    // previewed SPA calling its own `/api` with `Authorization: Bearer …` was
+    // answered 401 with a Basic challenge — over a valid grant cookie — and 25
+    // such calls blocked that viewer, eight viewers tore the share down, and
+    // the origin never saw its own header. A Bearer (or any other scheme) is
+    // the APP's credential: it is not ours to grade and it rides through.
+    //
+    // A VALID GRANT COOKIE IS ASKED FIRST, for the same reason: an app that
+    // itself speaks Basic sends a header that is not our password, and a
+    // viewer the app has vouched for must not be graded on it. A grant is
+    // HMAC-verified, so asking it first opens no brute-force path.
+    let grantVerdict = 'none';
+    if (grants) {
+      // EVERY value for our name, not the first — a duplicate must not shadow.
+      for (const raw of cookieValues(req.headers.cookie, GRANT_COOKIE)) {
+        const r = verifyGrant(raw, { secret: grantSecret, shareId });
+        if (r.ok) return 'ok';
+        if (r.reason === 'exp' && grantVerdict === 'none') {
+          lastExpired = r.payload;
+          grantVerdict = 'expired';
+        }
+      }
+      if (grantVerdict === 'none' && String(req.headers.cookie ?? '').includes(GRANT_COOKIE)) {
+        grantVerdict = 'forged';
+      }
+    }
+
+    if (isBasic(req.headers['authorization'])) {
       // A blocked source is refused BEFORE the comparison — a block that
       // still grades guesses would let the brute force run to a correct hit.
       if (sourceBlocked(req)) return 'blocked';
@@ -230,18 +274,7 @@ export function startAuthProxy({ targetPort, log, onAbuse, grantSecret, shareId,
       noteFailure(req);
       return 'badpass';
     }
-
-    if (!grants) return 'none';
-    // EVERY value for our name, not the first — a duplicate must not shadow.
-    for (const raw of cookieValues(req.headers.cookie, GRANT_COOKIE)) {
-      const r = verifyGrant(raw, { secret: grantSecret, shareId });
-      if (r.ok) return 'ok';
-      if (r.reason === 'exp') {
-        lastExpired = r.payload;
-        return 'expired';
-      }
-    }
-    return String(req.headers.cookie ?? '').includes(GRANT_COOKIE) ? 'forged' : 'none';
+    return grantVerdict;
   };
 
   /**
@@ -338,7 +371,10 @@ export function startAuthProxy({ targetPort, log, onAbuse, grantSecret, shareId,
   // its request would be us editing their app's input.
   const forwardOpts = (req) => {
     const headers = { ...req.headers };
-    delete headers.authorization;
+    // Only when it IS the gate credential. Anything else in Authorization is
+    // the previewed app's own (a Bearer to its API, its own Basic realm) and
+    // the app breaks without it; ours must still never reach branch code.
+    if (sameSecret(headers.authorization, expected)) delete headers.authorization;
     delete headers['proxy-authorization'];
     // ONLY OURS. The driver's app owns its own cookies and breaks without them;
     // our grant is a signed bearer token and must not reach branch code.
@@ -346,7 +382,7 @@ export function startAuthProxy({ targetPort, log, onAbuse, grantSecret, shareId,
     if (rest) headers.cookie = rest;
     else delete headers.cookie; // never send a bare empty `cookie:`
     return {
-      host: '127.0.0.1',
+      host: targetHost,
       port: targetPort,
       method: req.method,
       path: req.url,

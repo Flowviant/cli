@@ -55,12 +55,26 @@ const MAX_COMMITS = 50;
  * a plausible id is dropped here rather than shipped: the server drops unknown
  * ids too, but a readout should not spend a request on obvious noise.
  */
+/** A trailer line is short; one past this is not a trailer, and is never fed
+ *  to a pattern at all. */
+const MAX_TRAILER_LINE = 2000;
+
 export function taskIdsFromMessage(body) {
   const ids = [];
-  for (const line of String(body || '').split('\n')) {
-    const m = line.match(/^\s*Flowviant-Task\s*:\s*(.+?)\s*$/i);
+  for (const rawLine of String(body || '').split('\n')) {
+    // LINEAR, NEVER BACKTRACKING (audit 2026-09-24). This was
+    // `/^\s*Flowviant-Task\s*:\s*(.+?)\s*$/i`, whose lazy group against a
+    // trailing `\s*$` is QUADRATIC in the line: `Flowviant-Task: a` + 900k
+    // spaces + `b` — one commit any agent can write — held the daemon's event
+    // loop for minutes on every 60s sweep (and the landed observer re-parses
+    // it after a restart), so the machine read as offline. A length cap first,
+    // then an anchored prefix with no ambiguity, then plain string work.
+    if (rawLine.length > MAX_TRAILER_LINE) continue;
+    const line = rawLine.trim();
+    const m = /^Flowviant-Task[ \t]*:/i.exec(line);
     if (!m) continue;
-    for (const raw of m[1].split(/[\s,]+/)) {
+    for (const raw of line.slice(m[0].length).split(/[\s,]+/)) {
+      if (!raw || raw.length > 80) continue; // an id is at most 64
       const id = raw.replace(/^[#<]+|[>,.]+$/g, '');
       if (id && id.length <= 64 && /^[A-Za-z0-9_-]+$/.test(id) && !ids.includes(id)) {
         ids.push(id);
@@ -100,58 +114,100 @@ export const stripDelims = (s) => String(s ?? '').replace(/[\x1e\x1f]/g, '');
  * sha is the same forgery wearing a real commit's name, and the delimiter
  * bytes are stripped from every surviving field.
  */
+/**
+ * ONE COMMIT'S OWN RECORD, asked for BY SHA (audit 2026-09-24).
+ *
+ * The batched log above (`%H%x1f…%B%x1e` over the whole range) could be forged
+ * even with the rev-list set as authority: `git log` is newest first, so a
+ * commit whose body carried a fabricated record NAMING AN OLDER REAL SHA was
+ * parsed before that commit's own record, the "first record wins" rule kept the
+ * forgery, and the real one was dropped as a repeat — re-attributing somebody
+ * else's commit to other cards under a forged author and suppressing its real
+ * trailer. Asking git for one sha at a time makes the association structural:
+ * whatever this record says, it is about the sha we named, so a body can only
+ * ever speak for its own commit — which is what a trailer is.
+ *
+ * The body is the LAST field, so a NUL inside it (git refuses one in a message;
+ * a hand-built object might not) is body; the numstat follows it. Returns null
+ * when git will not answer.
+ */
+export function commitRecord(sha, cwd, { numstat = false } = {}) {
+  let out;
+  try {
+    out = gitRaw(
+      [
+        'show',
+        '--no-color',
+        ...(numstat ? ['--numstat'] : ['-s']),
+        '--format=%an%x00%aI%x00%B%x00',
+        sha,
+        '--',
+      ],
+      cwd
+    );
+  } catch {
+    return null;
+  }
+  const parts = out.split('\0');
+  if (parts.length < 4) return null;
+  const author = parts[0];
+  const at = parts[1];
+  const body = parts.slice(2, -1).join('\n');
+  // %s is the subject PARAGRAPH with its newlines folded, derived here from
+  // the body rather than asked for as a field a message could shift.
+  const subject = body.split(/\n[ \t]*\n/)[0].replace(/\s*\n\s*/g, ' ').trim();
+  let additions = 0;
+  let deletions = 0;
+  if (numstat) {
+    for (const l of parts[parts.length - 1].split('\n')) {
+      if (!l.trim()) continue;
+      const [a, d] = l.split('\t');
+      if (a === '-' || d === '-') continue; // binary
+      additions += Number(a) || 0;
+      deletions += Number(d) || 0;
+    }
+  }
+  return { sha, subject, author, at, body, additions, deletions };
+}
+
 function branchCommits(wt, base) {
   if (!base) return [];
   const out = [];
   try {
-    const real = new Set(
-      git(['rev-list', '--no-merges', '-n', String(MAX_COMMITS), `${base}..HEAD`], wt)
+    const real = git(['rev-list', '--no-merges', '-n', String(MAX_COMMITS), `${base}..HEAD`], wt)
+      .split('\n')
+      .filter((x) => /^[0-9a-f]{40,64}$/.test(x));
+    if (real.length === 0) return [];
+    // One cheap look first: git's own grep names the commits whose message
+    // mentions the trailer at all, so a branch that never uses it pays one
+    // exec per sweep rather than one per commit, and no body is ever pulled
+    // through a pipe just to be searched. Only a HINT — each named commit is
+    // then read as itself below, and a sha outside the rev-list set is ignored.
+    const named = new Set(
+      git(
+        ['log', '--no-merges', '-i', '--grep=flowviant-task', '--format=%H', `${base}..HEAD`],
+        wt
+      )
         .split('\n')
         .filter(Boolean)
     );
-    if (real.size === 0) return [];
-    const raw = git(
-      [
-        'log',
-        '--no-merges',
-        '-n',
-        String(MAX_COMMITS),
-        '--format=%H%x1f%s%x1f%an%x1f%aI%x1f%B%x1e',
-        `${base}..HEAD`,
-      ],
-      wt
-    );
-    for (const rec of raw.split('\x1e')) {
-      const line = rec.replace(/^\n+/, '');
-      if (!line.trim()) continue;
-      const [sha, subject, author, at, ...bodyParts] = line.split('\x1f');
-      if (!real.has(sha)) continue;
-      real.delete(sha);
-      const taskIds = taskIdsFromMessage(stripDelims(bodyParts.join('\n')));
+    for (const sha of real) {
+      if (!named.has(sha)) continue;
+      // A commit we cannot stat (a numstat past the pipe's buffer) still names
+      // its cards — send it with zero counts rather than drop it, as before.
+      const rec = commitRecord(sha, wt, { numstat: true }) ?? commitRecord(sha, wt);
+      if (!rec) continue;
+      const taskIds = taskIdsFromMessage(stripDelims(rec.body));
       if (taskIds.length === 0) continue;
-      let additions = 0;
-      let deletions = 0;
-      try {
-        const stat = git(['show', '--numstat', '--format=', sha], wt);
-        for (const l of stat.split('\n')) {
-          if (!l.trim()) continue;
-          const [a, d] = l.split('\t');
-          if (a === '-' || d === '-') continue; // binary
-          additions += Number(a) || 0;
-          deletions += Number(d) || 0;
-        }
-      } catch {
-        /* a commit we cannot stat still names its cards — send it anyway */
-      }
       out.push({
         // Clamped to the server's zod caps, same rule as everything else in
         // this file: one over-cap string 400s the whole batch.
         sha: sha.slice(0, 64),
-        subject: stripDelims(subject).slice(0, 200),
-        author: stripDelims(author).slice(0, 80),
-        at: stripDelims(at).slice(0, 40),
-        additions,
-        deletions,
+        subject: stripDelims(rec.subject).slice(0, 200),
+        author: stripDelims(rec.author).slice(0, 80),
+        at: stripDelims(rec.at).slice(0, 40),
+        additions: rec.additions,
+        deletions: rec.deletions,
         taskIds: taskIds.slice(0, 8),
       });
     }

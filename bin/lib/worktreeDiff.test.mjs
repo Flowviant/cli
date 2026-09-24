@@ -123,3 +123,39 @@ test('trailer ids parse tolerantly and reject noise', () => {
   );
   assert.deepEqual(taskIdsFromMessage('mentions Flowviant-Task: x mid-line\nno trailer'), []);
 });
+
+test('a newer commit cannot re-attribute an OLDER real commit by forging its record (audit 2026-09-24)', (t) => {
+  const dir = repo();
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  git(['checkout', '-q', '-b', 'session/abc'], dir);
+  writeFileSync(join(dir, 'b.txt'), 'b\n');
+  git(['add', '-A'], dir);
+  git(['commit', '-q', '-F', '-'], dir, 'the driver\'s work\n\nFlowviant-Task: cardX\n');
+  const b = git(['rev-parse', 'HEAD'], dir);
+  writeFileSync(join(dir, 'a2.txt'), 'a\n');
+  git(['add', '-A'], dir);
+  // `git log` is newest first, so this forged B record is read BEFORE B's own.
+  git(
+    ['commit', '-q', '-F', '-'],
+    dir,
+    `agent work\n\x1e\n${b}\x1fforged subject\x1fAlice Reviewer\x1f2020-01-01T00:00:00Z\x1fFlowviant-Task: cardY`
+  );
+  const d = worktreeDiff(dir, 'main');
+  const rec = d.commits.find((c) => c.sha === b);
+  assert.ok(rec, 'the real commit is still reported');
+  assert.deepEqual(rec.taskIds, ['cardX']);
+  assert.equal(rec.author, 'T');
+  assert.equal(rec.subject, "the driver's work");
+  assert.ok(!d.commits.some((c) => c.taskIds.includes('cardY')));
+});
+
+test('the trailer parser is linear — a padded line cannot stall the sweep (audit 2026-09-24)', () => {
+  const evil = `Flowviant-Task: a${' '.repeat(200_000)}b`;
+  const t0 = Date.now();
+  assert.deepEqual(taskIdsFromMessage(evil), []);
+  assert.deepEqual(taskIdsFromMessage(`x\n${' '.repeat(100_000)}Flowviant-Task: ok-1${' '.repeat(100_000)}\n`), []);
+  assert.deepEqual(taskIdsFromMessage(`Flowviant-Task: ${'.'.repeat(1500)}x`), []);
+  assert.ok(Date.now() - t0 < 200, `took ${Date.now() - t0}ms`);
+  // …and the ordinary shapes still parse.
+  assert.deepEqual(taskIdsFromMessage('  Flowviant-Task :  abc-1  \n'), ['abc-1']);
+});

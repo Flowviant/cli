@@ -509,3 +509,214 @@ export function isListening(port, timeoutMs = 1500) {
     sock.once('error', () => finish(false));
   });
 }
+
+// ── the address a share dials ────────────────────────────────────────────────
+
+/**
+ * WHICH ADDRESS REACHES THE ATTRIBUTED PROCESS on `port`, or why none does
+ * (audit 2026-09-24).
+ *
+ * Attribution above is keyed on the PORT, and the gate used to dial
+ * `127.0.0.1:<port>` whatever socket had been attributed. Linux and macOS let
+ * two processes hold one port on the two loopback families side by side, so a
+ * dev server in this worktree on `[::1]:5173` and an unrelated process on
+ * `127.0.0.1:5173` passed the attribution check while the tunnel published the
+ * UNRELATED one — the exact thing attribution exists to prevent. And the
+ * ordinary case broke the other way: Vite's default `localhost` bind resolves
+ * to `::1` on a Mac, so the share opened and every request answered 502.
+ *
+ * So the dial address is DERIVED FROM THE ATTRIBUTED SOCKET: a wildcard bind is
+ * reached on its own family's loopback, a specific bind on its own address —
+ * and a candidate is REFUSED when a process outside the worktree holds that
+ * same address (or the same wildcard, via SO_REUSEPORT) on that port, because
+ * the kernel may then hand the connection to either. IPv4 is preferred when
+ * both reach the attributed process, since that is what every dev server's
+ * own printed URL means.
+ *
+ * `{ host }` on success, `{ error }` with a sentence otherwise. A platform this
+ * file cannot measure answers the loopback it always dialled — the same
+ * behaviour as before, never a refusal invented from ignorance.
+ */
+export function originFor(worktree, port) {
+  if (!worktree || !Number.isInteger(port) || port <= 0 || port > 65535) {
+    return { error: `nothing is listening on port ${port} in this worktree.` };
+  }
+  let sockets;
+  try {
+    sockets =
+      platform() === 'linux'
+        ? socketsOnPortLinux(worktree, port)
+        : platform() === 'darwin'
+          ? socketsOnPortDarwin(worktree, port)
+          : null;
+  } catch {
+    sockets = null;
+  }
+  if (sockets == null) return { host: '127.0.0.1' };
+  return pickOrigin(sockets, port);
+}
+
+/**
+ * The rule alone, over `[{ family: 4|6, addr, ours }]` — split out so it is
+ * testable without two address families on the test box.
+ */
+export function pickOrigin(sockets, port) {
+  const ours = sockets.filter((s) => s.ours);
+  if (!ours.length) return { error: `nothing is listening on port ${port} in this worktree.` };
+  const foreign = sockets.filter((s) => !s.ours);
+  const dialOf = (s) =>
+    s.family === 6 ? (s.addr === '::' ? '::1' : s.addr) : s.addr === '0.0.0.0' ? '127.0.0.1' : s.addr;
+  const rank = (s) => {
+    const d = dialOf(s);
+    return d === '127.0.0.1' ? 0 : d === '::1' ? 1 : s.family === 4 ? 2 : 3;
+  };
+  let contested = false;
+  for (const s of [...ours].sort((a, b) => rank(a) - rank(b))) {
+    const dial = dialOf(s);
+    const shadowed = foreign.some((f) => f.family === s.family && (f.addr === dial || f.addr === s.addr));
+    if (shadowed) {
+      contested = true;
+      continue;
+    }
+    return { host: dial };
+  }
+  return contested
+    ? {
+        error: `another process on this machine, outside this worktree, also listens on port ${port} at the same address, so it was not shared.`,
+      }
+    : { error: `nothing is listening on port ${port} in this worktree.` };
+}
+
+/** /proc/net/tcp{,6} address hex → a printable address. Each 32-bit word is
+ *  stored little-endian. */
+function hexAddr(hex, family) {
+  const words = hex.match(/.{8}/g) || [];
+  const bytes = [];
+  for (const w of words) for (let i = 6; i >= 0; i -= 2) bytes.push(parseInt(w.slice(i, i + 2), 16));
+  if (family === 4) return bytes.join('.');
+  if (bytes.slice(0, 10).every((b) => b === 0) && bytes[10] === 0xff && bytes[11] === 0xff) {
+    return `::ffff:${bytes.slice(12).join('.')}`;
+  }
+  const groups = [];
+  for (let i = 0; i < 16; i += 2) groups.push(((bytes[i] << 8) | bytes[i + 1]).toString(16));
+  // Compress the longest run of zero groups, the way the address is written.
+  let best = [-1, 0];
+  for (let i = 0; i < 8; ) {
+    if (groups[i] !== '0') {
+      i++;
+      continue;
+    }
+    let j = i;
+    while (j < 8 && groups[j] === '0') j++;
+    if (j - i > best[1]) best = [i, j - i];
+    i = j;
+  }
+  if (best[1] < 2) return groups.join(':');
+  const head = groups.slice(0, best[0]).join(':');
+  const tail = groups.slice(best[0] + best[1]).join(':');
+  return `${head}::${tail}`;
+}
+
+function socketsOnPortLinux(worktree, port) {
+  const byInode = new Map(); // inode -> { family, addr }
+  for (const [f, family] of [
+    ['/proc/net/tcp', 4],
+    ['/proc/net/tcp6', 6],
+  ]) {
+    let text;
+    try {
+      text = readFileSync(f, 'utf8');
+    } catch {
+      continue;
+    }
+    for (const line of text.split('\n').slice(1)) {
+      const c = line.trim().split(/\s+/);
+      if (c.length < 10 || c[3] !== '0A') continue;
+      const [a, p] = String(c[1]).split(':');
+      if (parseInt(p, 16) !== port) continue;
+      if (c[9] && c[9] !== '0') byInode.set(c[9], { family, addr: hexAddr(a, family) });
+    }
+  }
+  if (byInode.size === 0) return [];
+  let root;
+  try {
+    root = realpathSync(worktree);
+  } catch {
+    return [];
+  }
+  const prefix = root.endsWith(sep) ? root : root + sep;
+  const ours = new Set();
+  let pids;
+  try {
+    pids = readdirSync('/proc').filter((d) => /^\d+$/.test(d));
+  } catch {
+    return null;
+  }
+  if (pids.length > MAX_PIDS) pids = pids.slice(0, MAX_PIDS);
+  for (const pid of pids) {
+    let cwd;
+    try {
+      cwd = readlinkSync(`/proc/${pid}/cwd`);
+    } catch {
+      continue;
+    }
+    if (cwd !== root && !cwd.startsWith(prefix)) continue;
+    if (Number(pid) === process.pid || infraPids.has(Number(pid))) continue;
+    let fds;
+    try {
+      fds = readdirSync(`/proc/${pid}/fd`);
+    } catch {
+      continue;
+    }
+    for (const fd of fds) {
+      let link;
+      try {
+        link = readlinkSync(`/proc/${pid}/fd/${fd}`);
+      } catch {
+        continue;
+      }
+      const m = /^socket:\[(\d+)\]$/.exec(link);
+      if (m && byInode.has(m[1])) ours.add(m[1]);
+    }
+  }
+  // A socket whose holder we could not read (another user's process) is
+  // FOREIGN — the safe reading for a refusal check.
+  return [...byInode.entries()].map(([inode, s]) => ({ ...s, ours: ours.has(inode) }));
+}
+
+function socketsOnPortDarwin(worktree, port) {
+  const rows = []; // { pid, family, addr }
+  let pid = null;
+  let family = null;
+  for (const line of lsof(['-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-F', 'ptn']).split('\n')) {
+    if (line.startsWith('p')) pid = line.slice(1);
+    else if (line.startsWith('t')) family = line.slice(1) === 'IPv6' ? 6 : line.slice(1) === 'IPv4' ? 4 : null;
+    else if (line.startsWith('n') && pid && family) {
+      const m = /^n(.*):(\d+)$/.exec(line);
+      if (!m || Number(m[2]) !== port) continue;
+      let addr = m[1].replace(/^\[|\]$/g, '');
+      if (addr === '*') addr = family === 6 ? '::' : '0.0.0.0';
+      rows.push({ pid, family, addr });
+    }
+  }
+  if (!rows.length) return [];
+  let root;
+  try {
+    root = realpathSync(worktree);
+  } catch {
+    return [];
+  }
+  const prefix = root.endsWith(sep) ? root : root + sep;
+  const inside = new Set();
+  const self = String(process.pid);
+  let cur = null;
+  const pids = [...new Set(rows.map((r) => r.pid))];
+  for (const line of lsof(['-a', '-d', 'cwd', '-F', 'pn', '-p', pids.join(',')]).split('\n')) {
+    if (line.startsWith('p')) cur = line.slice(1);
+    else if (line.startsWith('n') && cur) {
+      const cwd = line.slice(1);
+      if ((cwd === root || cwd.startsWith(prefix)) && cur !== self && !infraPids.has(Number(cur))) inside.add(cur);
+    }
+  }
+  return rows.map((r) => ({ family: r.family, addr: r.addr, ours: inside.has(r.pid) }));
+}

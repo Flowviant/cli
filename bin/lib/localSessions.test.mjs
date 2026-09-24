@@ -86,3 +86,51 @@ test('a path that is not a repo yields an EMPTY fence, never a throw', () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ── Claude Code's own directory rule (audit 2026-09-24) ─────────────────────
+
+import { claudeProjectDir, scanLocalSessions, titleForSession } from './localSessions.mjs';
+import { realpathSync } from 'node:fs';
+
+test("the transcript directory is Claude Code's munge, not ours", () => {
+  assert.equal(claudeProjectDir('/home/w/code/flowviant'), '-home-w-code-flowviant');
+  assert.equal(claudeProjectDir('/h/my_repo'), '-h-my-repo');
+  assert.equal(claudeProjectDir('/Users/a/My Projects/x@y+z'), '-Users-a-My-Projects-x-y-z');
+  // Past 200 characters: cut, then a base-36 hash of the ORIGINAL path — the
+  // CLI's `Math.abs(javaHash(path)).toString(36)`.
+  const long = `/${'a'.repeat(250)}`;
+  let h = 0;
+  for (let i = 0; i < long.length; i++) h = ((h << 5) - h + long.charCodeAt(i)) | 0;
+  assert.equal(claudeProjectDir(long), `-${'a'.repeat(199)}-${Math.abs(h).toString(36)}`);
+});
+
+test('a repo whose path holds an underscore still offers its ended session and its title', () => {
+  const home = mkdtempSync(join(tmpdir(), 'fv-ls-home-'));
+  const was = process.env.HOME;
+  process.env.HOME = home;
+  const base = mkdtempSync(join(tmpdir(), 'fv-ls-'));
+  const repo = join(base, 'my_repo');
+  mkdirSync(repo);
+  try {
+    execFileSync('git', ['init', '-q'], { cwd: repo });
+    const real = realpathSync(repo);
+    const dir = join(home, '.claude', 'projects', real.replace(/[^a-zA-Z0-9]/g, '-'));
+    mkdirSync(dir, { recursive: true });
+    const id = 'aaaaaaaa-1111-2222-3333-444444444444';
+    writeFileSync(
+      join(dir, `${id}.jsonl`),
+      `${JSON.stringify({ type: 'user', cwd: real, sessionId: id })}\n${JSON.stringify({ type: 'ai-title', aiTitle: 'Fix login bug' })}\n`
+    );
+    assert.equal(titleForSession(real, id), 'Fix login bug');
+    const found = scanLocalSessions({ repoRoot: real });
+    const rows = Array.isArray(found) ? found : (found?.sessions ?? []);
+    assert.ok(
+      rows.some((s) => s.id === id),
+      `the ended session is offered: ${JSON.stringify(found)}`
+    );
+  } finally {
+    process.env.HOME = was;
+    rmSync(base, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true });
+  }
+});
