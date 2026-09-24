@@ -132,7 +132,7 @@ export const FLOWVIANT_OWN_PATHS = [
 export const LIBRARY_FILE = 'LIBRARY.md';
 /** The two subdirectories a kept item may live in, by kind. */
 export const LIBRARY_DIRS = { design: 'designs', research: 'research' };
-const LIBRARY_EXT = { design: '.html', research: '.md' };
+const LIBRARY_EXT = { design: ['.html', '.gltf', '.obj', '.glb', '.bin'], research: ['.md'] };
 /** The server caps a library at 200 items; a longer manifest is cut. */
 const MAX_LIBRARY_ITEMS = 256;
 
@@ -148,6 +148,9 @@ const MARKER = '.flowviant/knowledge.rev';
  *  this is somebody's disk, and one place checking is one deploy away from
  *  zero places — the attachment fetch's own rule. */
 export const KNOWLEDGE_FILE_MAX_BYTES = 10 * 1024 * 1024;
+export const KNOWLEDGE_BINARY_MODEL_MAX_BYTES = 20 * 1024 * 1024;
+const knowledgeMaxFor = (name, base) => /\.(glb|bin)$/i.test(name)
+  ? Math.max(base, KNOWLEDGE_BINARY_MODEL_MAX_BYTES) : base;
 /** The manifest is capped at the server (25 files); a manifest longer than
  *  this is not one the product produced, and is cut rather than trusted. */
 const MAX_FILES = 64;
@@ -359,7 +362,7 @@ export function safeLibraryPath(name, kind) {
   const [dir, file] = parts;
   if (dir !== LIBRARY_DIRS[kind]) return null;
   if (!file || file !== safeKnowledgeName(file)) return null;
-  if (!file.toLowerCase().endsWith(LIBRARY_EXT[kind]) || file.length <= LIBRARY_EXT[kind].length) return null;
+  if (!LIBRARY_EXT[kind].some((ext) => file.toLowerCase().endsWith(ext) && file.length > ext.length)) return null;
   return `${dir}/${file}`;
 }
 
@@ -376,7 +379,11 @@ function libraryItemsOf(manifest) {
     const path = safeLibraryPath(it.name, it.kind);
     if (!path || seen.has(path.toLowerCase())) continue;
     seen.add(path.toLowerCase());
-    out.push({ ...it, path });
+    const previewPath = it.kind === 'design' && it.preview &&
+      it.preview.name === it.name.replace(/\.html$/, '.png') &&
+      safeLibraryPath(it.preview.name.replace(/\.png$/, '.html'), 'design')
+      ? `designs/${it.preview.name.split('/')[1]}` : null;
+    out.push({ ...it, path, previewPath, previewUnknown: it.kind === 'design' && path.endsWith('.html') && it.preview === undefined });
   }
   return out;
 }
@@ -515,7 +522,8 @@ export async function syncKnowledge({ checkoutDir, manifest, fetchFile, maxBytes
 
   for (const f of planned) {
     const path = join(dir, f.local);
-    if (Number(f.bytes) > maxBytes) {
+    const fileMax = knowledgeMaxFor(f.name, maxBytes);
+    if (Number(f.bytes) > fileMax) {
       // Permanent for this rev, and NOT a reason to delete the rest. Any stale
       // local copy under this name goes, because it is not the file the
       // manifest now names.
@@ -526,7 +534,7 @@ export async function syncKnowledge({ checkoutDir, manifest, fetchFile, maxBytes
     if (typeof f.sha256 === 'string' && localSha(path) === f.sha256.toLowerCase()) continue;
     try {
       const buf = await fetchFile(f.id);
-      if (!Buffer.isBuffer(buf) || buf.byteLength > maxBytes) {
+      if (!Buffer.isBuffer(buf) || buf.byteLength > fileMax) {
         result.refused.push(f.local);
         keep.delete(f.local);
         continue;
@@ -605,35 +613,53 @@ async function syncLibrary({ dir, items, fetchFile, maxBytes, keep, result }) {
   for (const it of items) {
     const [sub, file] = it.path.split('/');
     const path = join(dir, sub, file);
+    const itemMax = knowledgeMaxFor(it.path, maxBytes);
     wanted[sub].add(file);
-    if (Number(it.bytes) > maxBytes) {
+    if (it.previewPath) wanted[sub].add(it.previewPath.split('/')[1]);
+    if (it.previewUnknown) {
+      const oldPng = file.replace(/\.html$/, '.png');
+      if (localSha(join(dir, sub, oldPng)) !== null) wanted[sub].add(oldPng);
+    }
+    if (Number(it.bytes) > itemMax) {
       result.refused.push(it.path);
       wanted[sub].delete(file);
       continue;
     }
     if (typeof it.sha256 === 'string' && localSha(path) === it.sha256.toLowerCase()) {
       onDisk.push(it);
-      continue;
+    } else {
+      try {
+        const buf = await fetchFile(it.id, { library: true });
+        if (!Buffer.isBuffer(buf) || buf.byteLength > itemMax) {
+          result.refused.push(it.path);
+          wanted[sub].delete(file);
+          continue;
+        }
+        if (typeof it.sha256 === 'string' && sha256Of(buf) !== it.sha256.toLowerCase()) {
+          throw new Error('sha256 mismatch');
+        }
+        writeAtomic(path, buf);
+        result.wrote.push(it.path);
+        onDisk.push(it);
+      } catch {
+        result.ok = false;
+        result.failed.push(it.path);
+        if (localSha(path) !== null) onDisk.push(it);
+      }
     }
-    try {
-      const buf = await fetchFile(it.id, { library: true });
-      if (!Buffer.isBuffer(buf) || buf.byteLength > maxBytes) {
-        result.refused.push(it.path);
-        wanted[sub].delete(file);
-        continue;
+    if (it.previewPath && it.preview?.sha256) {
+      const previewFile = join(dir, ...it.previewPath.split('/'));
+      if (localSha(previewFile) !== it.preview.sha256.toLowerCase()) {
+        try {
+          const buf = await fetchFile(it.id, { library: true, preview: true });
+          if (!Buffer.isBuffer(buf) || buf.byteLength > 2 * 1024 * 1024 || sha256Of(buf) !== it.preview.sha256.toLowerCase()) throw new Error('preview mismatch');
+          writeAtomic(previewFile, buf);
+          result.wrote.push(it.previewPath);
+        } catch {
+          result.ok = false;
+          result.failed.push(it.previewPath);
+        }
       }
-      if (typeof it.sha256 === 'string' && sha256Of(buf) !== it.sha256.toLowerCase()) {
-        throw new Error('sha256 mismatch');
-      }
-      writeAtomic(path, buf);
-      result.wrote.push(it.path);
-      onDisk.push(it);
-    } catch {
-      result.ok = false;
-      result.failed.push(it.path);
-      // A stale copy is better than none until the retry lands — and it stays
-      // in the catalog only if it is actually there.
-      if (localSha(path) !== null) onDisk.push(it);
     }
   }
   // Each subdirectory holds exactly what the manifest names.
@@ -726,7 +752,7 @@ function libraryStale(checkoutDir, manifest, { synced, refused }) {
   const items = libraryItemsOf(manifest);
   if (items === null) return false;
   if (!synced) return true;
-  const expected = items.filter((it) => !(Number(it.bytes) > KNOWLEDGE_FILE_MAX_BYTES) && !refused.has(it.path));
+  const expected = items.filter((it) => !(Number(it.bytes) > knowledgeMaxFor(it.path, KNOWLEDGE_FILE_MAX_BYTES)) && !refused.has(it.path));
   if (expected.length === 0) return false;
   const dir = join(checkoutDir, KNOWLEDGE_DIR);
   const isFile = (p) => {
@@ -737,7 +763,8 @@ function libraryStale(checkoutDir, manifest, { synced, refused }) {
     }
   };
   if (!isFile(join(dir, LIBRARY_FILE))) return true;
-  return expected.some((it) => !isFile(join(dir, ...it.path.split('/'))));
+  return expected.some((it) => !isFile(join(dir, ...it.path.split('/'))) ||
+    (it.previewPath && !refused.has(it.previewPath) && !isFile(join(dir, ...it.previewPath.split('/')))));
 }
 
 /**
@@ -856,13 +883,13 @@ export function createKnowledgeSync({
  * URL is derived from the roster URL the way every `/fleet/*` path is, so a
  * self-hosted `FLOWVIANT_FLEET_URL` is honoured.
  */
-export function knowledgeFetcher({ fleetUrl, token, userAgent, maxBytes = KNOWLEDGE_FILE_MAX_BYTES }) {
+export function knowledgeFetcher({ fleetUrl, token, userAgent, maxBytes = KNOWLEDGE_BINARY_MODEL_MAX_BYTES }) {
   const base = String(fleetUrl).replace(/\/agents\/?$/, '/knowledge');
   // A kept library item (0.97.0) is its sibling, `GET /fleet/library/:id` —
   // the same credential, the same shape, the same caps.
   const libraryBase = String(fleetUrl).replace(/\/agents\/?$/, '/library');
-  return async (id, { library = false } = {}) => {
-    const res = await fetch(`${library ? libraryBase : base}/${encodeURIComponent(id)}`, {
+  return async (id, { library = false, preview = false } = {}) => {
+    const res = await fetch(`${library ? libraryBase : base}/${encodeURIComponent(id)}${preview ? '/preview' : ''}`, {
       headers: { Authorization: `Bearer ${token}`, 'User-Agent': userAgent },
       signal: AbortSignal.timeout(60_000),
     });

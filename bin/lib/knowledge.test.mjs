@@ -453,6 +453,64 @@ const item = (n, over = {}) => ({
   ...over,
 });
 
+test('a measured preview syncs beside HTML and an absent preview is not fetched', async () => {
+  const dir = checkout();
+  const png = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 1]);
+  const calls = [];
+  const fetchFile = async (fid, opts) => {
+    calls.push(opts?.preview === true ? 'preview' : 'html');
+    return opts?.preview ? png : Buffer.from('<1>');
+  };
+  const preview = { name: 'designs/landing-v1.png', bytes: png.length, sha256: sha(png) };
+  const manifest = { rev: 1, instructions: null, files: [], library: { items: [item(1, { preview })] } };
+  const sync = createKnowledgeSync({ checkoutDir: dir, fetchFile });
+  assert.equal((await sync.onRoster(manifest)).ok, true);
+  assert.deepEqual(readFileSync(join(lib(dir), preview.name)), png);
+  assert.deepEqual(calls, ['html', 'preview']);
+  assert.equal(await sync.onRoster(manifest), null);
+  rmSync(join(lib(dir), preview.name));
+  assert.equal((await sync.onRoster(manifest)).ok, true);
+  assert.deepEqual(calls, ['html', 'preview', 'preview']);
+  const unknown = { ...manifest, rev: 2, library: { items: [item(1)] } };
+  assert.equal((await sync.onRoster(unknown)).ok, true);
+  assert.deepEqual(readFileSync(join(lib(dir), preview.name)), png);
+  const measuredEmpty = { ...manifest, rev: 3, library: { items: [item(1, { preview: null })] } };
+  assert.equal((await sync.onRoster(measuredEmpty)).ok, true);
+  assert.equal(existsSync(join(lib(dir), preview.name)), false);
+});
+
+test('kept model files retain their extensions and sync under designs', async () => {
+  const dir = checkout();
+  const names = ['mesh.gltf', 'mesh.obj', 'mesh.glb', 'mesh.bin'];
+  const items = names.map((name, n) => item(n + 1, {
+    name: `designs/landing-${name}`,
+    bytes: 4,
+    sha256: sha('mesh'),
+  }));
+  const r = await syncKnowledge({ checkoutDir: dir,
+    manifest: { rev: 1, instructions: null, files: [], library: { items } },
+    fetchFile: async () => Buffer.from('mesh'),
+  });
+  assert.equal(r.ok, true);
+  for (const it of items) assert.equal(readFileSync(join(lib(dir), it.name), 'utf8'), 'mesh');
+  assert.equal(safeLibraryPath('designs/landing-mesh.glb', 'design'), 'designs/landing-mesh.glb');
+  assert.equal(safeLibraryPath('research/landing-mesh.glb', 'research'), null);
+});
+
+test('binary kept models clear 10 MB while text model files keep the old cap', async () => {
+  const dir = checkout();
+  const mesh = Buffer.alloc(10 * 1024 * 1024 + 1, 7);
+  const glb = item(1, { name: 'designs/large.glb', bytes: mesh.length, sha256: sha(mesh) });
+  const gltf = item(2, { name: 'designs/large.gltf', bytes: mesh.length, sha256: sha(mesh) });
+  const r = await syncKnowledge({ checkoutDir: dir,
+    manifest: { rev: 1, instructions: null, files: [], library: { items: [glb, gltf] } },
+    fetchFile: async () => mesh,
+  });
+  assert.equal(r.ok, true);
+  assert.equal(readFileSync(join(lib(dir), glb.name)).length, mesh.length);
+  assert.ok(r.refused.includes(gltf.name));
+});
+
 test('library items land in their subdirectory and LIBRARY.md catalogues them, one line each', async () => {
   const dir = checkout();
   const srv = fakeServer({ [id(1)]: '<1>', [id(2)]: '<2>', [id(3)]: '# r' });
