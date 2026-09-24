@@ -132,7 +132,7 @@ export const FLOWVIANT_OWN_PATHS = [
 export const LIBRARY_FILE = 'LIBRARY.md';
 /** The two subdirectories a kept item may live in, by kind. */
 export const LIBRARY_DIRS = { design: 'designs', research: 'research' };
-const LIBRARY_EXT = { design: '.html', research: '.md' };
+const LIBRARY_EXT = { design: ['.html', '.gltf', '.obj', '.glb', '.bin'], research: ['.md'] };
 /** The server caps a library at 200 items; a longer manifest is cut. */
 const MAX_LIBRARY_ITEMS = 256;
 
@@ -362,7 +362,7 @@ export function safeLibraryPath(name, kind) {
   const [dir, file] = parts;
   if (dir !== LIBRARY_DIRS[kind]) return null;
   if (!file || file !== safeKnowledgeName(file)) return null;
-  if (!file.toLowerCase().endsWith(LIBRARY_EXT[kind]) || file.length <= LIBRARY_EXT[kind].length) return null;
+  if (!LIBRARY_EXT[kind].some((ext) => file.toLowerCase().endsWith(ext) && file.length > ext.length)) return null;
   return `${dir}/${file}`;
 }
 
@@ -383,7 +383,7 @@ function libraryItemsOf(manifest) {
       it.preview.name === it.name.replace(/\.html$/, '.png') &&
       safeLibraryPath(it.preview.name.replace(/\.png$/, '.html'), 'design')
       ? `designs/${it.preview.name.split('/')[1]}` : null;
-    out.push({ ...it, path, previewPath, previewUnknown: it.kind === 'design' && it.preview === undefined });
+    out.push({ ...it, path, previewPath, previewUnknown: it.kind === 'design' && path.endsWith('.html') && it.preview === undefined });
   }
   return out;
 }
@@ -613,13 +613,14 @@ async function syncLibrary({ dir, items, fetchFile, maxBytes, keep, result }) {
   for (const it of items) {
     const [sub, file] = it.path.split('/');
     const path = join(dir, sub, file);
+    const itemMax = knowledgeMaxFor(it.path, maxBytes);
     wanted[sub].add(file);
     if (it.previewPath) wanted[sub].add(it.previewPath.split('/')[1]);
     if (it.previewUnknown) {
       const oldPng = file.replace(/\.html$/, '.png');
       if (localSha(join(dir, sub, oldPng)) !== null) wanted[sub].add(oldPng);
     }
-    if (Number(it.bytes) > maxBytes) {
+    if (Number(it.bytes) > itemMax) {
       result.refused.push(it.path);
       wanted[sub].delete(file);
       continue;
@@ -629,7 +630,7 @@ async function syncLibrary({ dir, items, fetchFile, maxBytes, keep, result }) {
     } else {
       try {
         const buf = await fetchFile(it.id, { library: true });
-        if (!Buffer.isBuffer(buf) || buf.byteLength > maxBytes) {
+        if (!Buffer.isBuffer(buf) || buf.byteLength > itemMax) {
           result.refused.push(it.path);
           wanted[sub].delete(file);
           continue;
@@ -751,7 +752,7 @@ function libraryStale(checkoutDir, manifest, { synced, refused }) {
   const items = libraryItemsOf(manifest);
   if (items === null) return false;
   if (!synced) return true;
-  const expected = items.filter((it) => !(Number(it.bytes) > KNOWLEDGE_FILE_MAX_BYTES) && !refused.has(it.path));
+  const expected = items.filter((it) => !(Number(it.bytes) > knowledgeMaxFor(it.path, KNOWLEDGE_FILE_MAX_BYTES)) && !refused.has(it.path));
   if (expected.length === 0) return false;
   const dir = join(checkoutDir, KNOWLEDGE_DIR);
   const isFile = (p) => {
