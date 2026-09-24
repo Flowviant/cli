@@ -11,14 +11,18 @@ import { cpus, hostname, totalmem } from 'node:os';
 // '0.28.0' across every release through 0.28.6, so the startup banner, the
 // User-Agent the server version-gates on, and the self-update check all reported
 // a stale version (and the "update available" nag never cleared).
-export const VERSION = (() => {
-  try {
-    const pkgPath = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'package.json');
-    return JSON.parse(readFileSync(pkgPath, 'utf8')).version || '0.0.0';
-  } catch {
-    return '0.0.0';
-  }
-})();
+// The compile script substitutes this constant into the binary. npm installs
+// still read their own package.json exactly as before (including on Node 20).
+export const VERSION = typeof __FLOWVIANT_BUILD_VERSION__ === 'string'
+  ? __FLOWVIANT_BUILD_VERSION__
+  : (() => {
+      try {
+        const pkgPath = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'package.json');
+        return JSON.parse(readFileSync(pkgPath, 'utf8')).version || '0.0.0';
+      } catch {
+        return '0.0.0';
+      }
+    })();
 
 // The model EVERY daemon Claude turn runs on — pinned so autonomous work never
 // inherits your interactive `~/.claude/settings.json` default. That matters: a
