@@ -17,6 +17,8 @@
  *    does not become a file nobody can read.
  */
 
+import { execFileSync } from 'node:child_process';
+import { platform, uptime } from 'node:os';
 import {
   closeSync,
   mkdirSync,
@@ -92,6 +94,69 @@ export function writeRegistry(dir, path, list) {
     renameSync(tmp, path);
   } catch {
     /* best-effort */
+  }
+}
+
+/**
+ * WHICH BOOT THIS IS — so a pid or process-group id read back off disk is only
+ * ever believed in the boot that wrote it.
+ *
+ * A registry outlives a reboot and pids do not: after one, the number a file
+ * remembers belongs to whatever the kernel handed it to next — another user's
+ * service, the operator's shell — and signal-0 says "alive" about a stranger.
+ * Linux names the boot outright (`boot_id`); elsewhere the boot INSTANT stands
+ * in, derived from the uptime and compared with slack, because two reads a
+ * second apart disagree by the rounding.
+ */
+const BOOT_SLACK_S = 120;
+export function bootMark() {
+  try {
+    const id = readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
+    if (id) return id;
+  } catch {
+    /* not Linux, or /proc is not mounted */
+  }
+  return `bt:${Math.round(Date.now() / 1000 - uptime())}`;
+}
+/** Was `mark` written during this boot? An absent mark is NOT this boot —
+ *  an entry that cannot say when it was written cannot be trusted across one. */
+export function sameBoot(mark, now = bootMark()) {
+  if (typeof mark !== 'string' || !mark) return false;
+  if (mark.startsWith('bt:') && now.startsWith('bt:'))
+    return Math.abs(Number(mark.slice(3)) - Number(now.slice(3))) <= BOOT_SLACK_S;
+  return mark === now;
+}
+
+/**
+ * WHEN A PROCESS STARTED, as an opaque token — so a lock that remembers a pid
+ * can tell the process it meant from one that inherited the number.
+ *
+ * Linux: field 22 of `/proc/<pid>/stat` (start time in clock ticks since boot),
+ * read after the LAST `)` because the comm field may itself contain one.
+ * macOS: `ps -o lstart=`. Null when it cannot be read, which callers treat as
+ * "cannot tell" — never as a mismatch.
+ */
+export function processStartTime(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const rest = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+    // `rest[0]` is field 3 (state), so field 22 is rest[19].
+    const st = rest[19];
+    return st && /^\d+$/.test(st) ? `${bootMark()}:${st}` : null;
+  } catch {
+    /* not Linux, or the pid is gone */
+  }
+  if (platform() !== 'darwin') return null;
+  try {
+    const out = execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 5_000,
+    }).trim();
+    return out || null;
+  } catch {
+    return null;
   }
 }
 

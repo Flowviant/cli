@@ -1,11 +1,139 @@
 /** Git worktree helpers (fleet & static-fleet modes). */
 
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { appendFileSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 
 export function git(args, cwd) {
   return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+}
+
+/**
+ * THE SSH COMMAND A NETWORK GIT CALL RUNS UNDER when the operator has not named
+ * one. `BatchMode` turns a passphrase or host-key prompt on /dev/tty into an
+ * immediate failure; the keepalive pair ends a half-open connection (a laptop
+ * that slept, a Wi-Fi change) in ~30s instead of when the kernel gives up hours
+ * later. An agent key still works — BatchMode disables prompts, not keys.
+ */
+export const NET_SSH_COMMAND =
+  'ssh -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=15 -o ServerAliveCountMax=2';
+
+/** The default bound on one network git call. */
+export const GIT_NET_TIMEOUT_MS = 60_000;
+
+/**
+ * The environment a NETWORK git call runs under — never interactive.
+ *
+ * `GIT_TERMINAL_PROMPT=0` makes git fail instead of opening /dev/tty for a
+ * username (an HTTPS remote whose credential cache expired), and
+ * `GCM_INTERACTIVE=never` says the same to Git Credential Manager. The SSH
+ * command is set only when the operator has not chosen one — `GIT_SSH_COMMAND`,
+ * `GIT_SSH` or `core.sshCommand` — because the env var OUTRANKS the config key,
+ * and overriding somebody's `-i ~/.ssh/deploy_key` would break every fetch to
+ * make it non-interactive. Their own command is still bounded by the timeout.
+ */
+export function gitNetEnv(cwd, env = process.env) {
+  const out = { ...env, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' };
+  if (env.GIT_SSH_COMMAND || env.GIT_SSH) return out;
+  let configured = '';
+  try {
+    configured = execFileSync('git', ['config', '--get', 'core.sshCommand'], {
+      cwd,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 5_000,
+    }).trim();
+  } catch {
+    /* unset (exit 1) or unreadable — ours, then */
+  }
+  if (!configured) out.GIT_SSH_COMMAND = NET_SSH_COMMAND;
+  return out;
+}
+
+/**
+ * A NETWORK git call (fetch, push), TIMED AND NON-INTERACTIVE.
+ *
+ * `git()` above is `execFileSync` with no timeout: right for a local
+ * `rev-parse`, and a daemon-wide freeze for a `fetch` — the call blocks the
+ * whole event loop, so a remote that prompts on /dev/tty or a connection that
+ * went half-open stops every poll, settle, lease renewal and relay on the
+ * machine until it returns. Every call that talks to a remote goes through
+ * here. Returns the untrimmed stdout; throws like `git()` does (a timeout
+ * throws with `code: 'ETIMEDOUT'`).
+ */
+export function gitNet(args, cwd, ms = GIT_NET_TIMEOUT_MS) {
+  return execFileSync('git', args, {
+    cwd,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    timeout: ms,
+    killSignal: 'SIGKILL',
+    env: gitNetEnv(cwd),
+  });
+}
+
+/**
+ * The same call WITHOUT BLOCKING — for the unattended periodic fetch, where
+ * even a bounded freeze every few minutes is a daemon that goes dark for a
+ * remote's bad day. Spawned as its own process group so a timeout takes the
+ * ssh or credential helper under git with it. Resolves stdout; rejects on a
+ * non-zero exit, a spawn error or the timeout.
+ */
+export function gitNetAsync(args, cwd, ms = GIT_NET_TIMEOUT_MS) {
+  return new Promise((resolvePromise, reject) => {
+    let child;
+    try {
+      child = spawn('git', args, {
+        cwd,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: gitNetEnv(cwd),
+        detached: true,
+      });
+    } catch (e) {
+      reject(e);
+      return;
+    }
+    let out = '';
+    let err = '';
+    let settled = false;
+    const finish = (fn, v) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      fn(v);
+    };
+    const timer = setTimeout(() => {
+      try {
+        process.kill(-child.pid, 'SIGKILL');
+      } catch {
+        try {
+          child.kill('SIGKILL');
+        } catch {
+          /* already gone */
+        }
+      }
+      const e = new Error(`git ${args[0]} timed out after ${ms}ms`);
+      e.code = 'ETIMEDOUT';
+      finish(reject, e);
+    }, ms);
+    timer.unref?.();
+    child.stdout.on('data', (d) => {
+      out += d;
+    });
+    child.stderr.on('data', (d) => {
+      err += d;
+    });
+    child.on('error', (e) => finish(reject, e));
+    child.on('close', (code) => {
+      if (code === 0) finish(resolvePromise, out);
+      else {
+        const e = new Error(`git ${args[0]} exited ${code}`);
+        e.stderr = err;
+        e.status = code;
+        finish(reject, e);
+      }
+    });
+  });
 }
 
 /**
@@ -143,9 +271,9 @@ export function baseBranchName(baseRef) {
 
 export function resetWorktree(wt, baseRef) {
   try {
-    git(['fetch', 'origin', '--quiet'], wt);
+    gitNet(['fetch', 'origin', '--quiet'], wt);
   } catch {
-    /* offline / no remote — reset to whatever we have */
+    /* offline / no remote / timed out — reset to whatever we have */
   }
   try {
     git(['checkout', '--detach', baseRef], wt);

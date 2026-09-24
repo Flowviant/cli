@@ -42,6 +42,8 @@ import {
 import {
   git,
   gitRaw,
+  gitNet as gitNetIn,
+  gitNetAsync,
   splitNul,
   baseBranchName,
   isSafePathSegment,
@@ -57,7 +59,14 @@ import {
 import { createLandedObserver } from './landed.mjs';
 import { listenersIn, measureListeners, listenersSupported } from './listeners.mjs';
 import { measureProcesses, liveGroups, processesSupported } from './processes.mjs';
-import { mutateRegistry, processAlive, readRegistry } from './procRegistry.mjs';
+import {
+  bootMark,
+  mutateRegistry,
+  processAlive,
+  processStartTime,
+  readRegistry,
+  sameBoot,
+} from './procRegistry.mjs';
 import { createPlaceLock } from './placeLock.mjs';
 import { parseProposal, parsePrecheck, parseTurnResult } from './agentPlan.mjs';
 import { readStash, stashCard } from './agentCards.mjs';
@@ -86,7 +95,14 @@ import {
   withProjectContext,
 } from './prompts.mjs';
 import { knowledgeDirFor, FLOWVIANT_OWN_PATHS } from './knowledge.mjs';
-import { changedArtifacts, createArtifactReporter, scanArtifacts, snapshotArtifacts } from './artifacts.mjs';
+import {
+  ARTIFACT_DIR,
+  artifactTypeFor,
+  changedArtifacts,
+  createArtifactReporter,
+  scanArtifacts,
+  snapshotArtifacts,
+} from './artifacts.mjs';
 import { myPubB64, scrub as envScrub, secretIn as envSecretIn } from './env.mjs';
 import {
   detectRuntimes,
@@ -112,6 +128,134 @@ import {
 } from './localSessions.mjs';
 import { worktreeDiff } from './worktreeDiff.mjs';
 import { homedir } from 'node:os';
+import { createHash } from 'node:crypto';
+
+/**
+ * CLEAR THE ARTIFACTS DIRECTORY OF ANYTHING THAT IS NOT AN ARTIFACT, BEFORE
+ * THE PROJECT'S CHECK RUNS OVER THE WORKTREE (2026-09-24).
+ *
+ * A design or research turn may write under `.flowviant/artifacts/` and
+ * nowhere else — that posture's whole safety claim is that such a card
+ * changes no repository file. But the check is the repo's own command, run
+ * unattended in the same worktree the moment the queue empties, and a test
+ * runner's DEFAULT discovery reaches into that directory: vitest collected and
+ * ran `.flowviant/artifacts/pwn.test.js` with no include override. So a card
+ * steered by text it read could plant a test and have the machine execute it,
+ * before any person looked — and the directory is git-excluded, so the file
+ * never appears in the diff a reviewer reads.
+ *
+ * What an artifact IS is already a closed list (`ARTIFACT_TYPES`), and the
+ * scan only ever shows TOP-LEVEL regular files: anything else there is
+ * nothing the product will show, so removing it before the check costs
+ * nothing a person could see. Symlinks and subdirectories go whole; a
+ * `.flowviant` that is not a real directory is left alone (that is the
+ * repository's own content, not something a turn wrote). Returns the names
+ * removed, for the log line.
+ */
+export function clearNonArtifacts(wt) {
+  const removed = [];
+  try {
+    const parent = lstatSync(join(wt, '.flowviant'));
+    if (parent.isSymbolicLink() || !parent.isDirectory()) return removed;
+    const dir = join(wt, ARTIFACT_DIR);
+    const st = lstatSync(dir);
+    if (st.isSymbolicLink() || !st.isDirectory()) {
+      rmSync(dir, { force: true, recursive: false });
+      removed.push(ARTIFACT_DIR);
+      return removed;
+    }
+    for (const name of readdirSync(dir)) {
+      const p = join(dir, name);
+      let e;
+      try {
+        e = lstatSync(p);
+      } catch {
+        continue; // vanished between the list and the stat
+      }
+      const keep = e.isFile() && !name.startsWith('.') && artifactTypeFor(name) !== null;
+      if (keep) continue;
+      try {
+        rmSync(p, { recursive: true, force: true });
+        removed.push(name);
+      } catch {
+        /* best-effort — reported by omission */
+      }
+    }
+  } catch {
+    /* no artifacts directory — the ordinary case */
+  }
+  return removed;
+}
+
+/**
+ * THE ENVIRONMENT THE PROJECT'S CHECK RUNS UNDER: the daemon's own, minus the
+ * machine credential — the same rule `cliEnv` (claude.mjs) applies to a turn,
+ * repeated here rather than imported so the check never depends on the CLI
+ * module's spawn helpers. Nothing a check runs needs the credential the daemon
+ * authenticates with; everything else is what the agent's own turn saw when it
+ * ran the same tests.
+ */
+const CHECK_DROPPED_ENV = ['FLOWVIANT_MACHINE_TOKEN', 'FLOWVIANT_FLEET'];
+export function checkEnv(env = process.env) {
+  const out = { ...env };
+  for (const k of CHECK_DROPPED_ENV) delete out[k];
+  return out;
+}
+
+/**
+ * The spawn lock: the pid of the CLI currently live in this worktree. A
+ * restarted daemon must not put a second Claude into a directory the orphan
+ * of its previous life is still editing — two CLIs appending to one held
+ * conversation is exactly the incoherence workChains prevents in-process,
+ * and the lock extends that guarantee across a restart. A dead pid is a
+ * stale lock (removed here); a live one means "come back next poll".
+ *
+ * …AND A PID IS ONLY THE HOLDER WHILE IT IS STILL THE SAME PROCESS.
+ *
+ * The lock outlives a reboot or a daemon killed mid-turn, and pids are
+ * recycled. Two readings treated a stranger as the holder and wedged every
+ * turn and ship in the place until somebody deleted the file by hand: EPERM
+ * was read as "alive, just not ours" — but the lock only ever holds a CLI this
+ * daemon spawned under its own uid, so a pid we may not signal is by
+ * definition not ours, i.e. stale — and a recycled pid of our OWN uid
+ * answered signal 0 like the CLI it replaced. The lock now records the
+ * process's start time beside the pid (`pid:start`); a live pid whose start
+ * time differs is a different process. A lock with no start time (written by
+ * an older daemon) keeps the old signal-0 reading, minus EPERM.
+ */
+export const turnLockedByLivePid = (lockPath) => {
+  if (!lockPath || !existsSync(lockPath)) return false;
+  let pid = 0;
+  let start = null;
+  try {
+    const raw = readFileSync(lockPath, 'utf8').trim();
+    const cut = raw.indexOf(':');
+    pid = Number(cut < 0 ? raw : raw.slice(0, cut));
+    start = cut < 0 ? null : raw.slice(cut + 1) || null;
+  } catch {
+    /* unreadable — treat as stale */
+  }
+  if (Number.isInteger(pid) && pid > 0) {
+    let alive = false;
+    try {
+      process.kill(pid, 0);
+      alive = true; // signal 0 delivered — a process of OUR uid holds the pid
+    } catch {
+      /* ESRCH: gone. EPERM: another uid's process — never our CLI. Stale. */
+    }
+    if (alive) {
+      const now = start ? processStartTime(pid) : null;
+      // Unmeasurable start time is "cannot tell", which keeps the lock.
+      if (!start || !now || now === start) return true;
+    }
+  }
+  try {
+    rmSync(lockPath, { force: true }); // dead holder — clear the stale lock
+  } catch {
+    /* best-effort */
+  }
+  return false;
+};
 
 /**
  * A RESUME THAT FOUND NO CONVERSATION, in the CLI's own words.
@@ -139,9 +283,30 @@ const RESUME_LOST = [
   /thread .{0,80}not found/i,
   /trajectory not found/i,
 ];
-const resumeConversationLost = (text) => {
-  const t = String(text || '');
-  return t.length > 0 && RESUME_LOST.some((re) => re.test(t));
+/**
+ * …BUT ONLY WHEN THE CLI SAID IT, NOT WHEN THE REPLY DID (2026-09-24).
+ *
+ * Under `answerFromResult` a SUCCESSFUL turn's `out` is Claude's reply, and the
+ * patterns above were tested against all of it — so "the session cookie was not
+ * found because SameSite dropped it" threw away a real answer and re-ran the
+ * same message in a fresh, context-free conversation, whose init id then
+ * re-pinned the tab: the first run's edits and commits had already happened,
+ * the second repeated or misread them, and the tab's history was gone for good.
+ * Web debugging talk says "session … not found" all day.
+ *
+ * So the text alone is never the evidence. Claude Code emits `system.init` on
+ * EVERY turn that reached a conversation, and a dead `--resume` id fails before
+ * one is emitted — so for Claude, a lost conversation is the phrase AND no init
+ * event. Codex and agy give no such marker to this caller, so for them the
+ * phrase must BE the reply: a short line, the shape a CLI error takes, never a
+ * paragraph that happens to contain it.
+ */
+export const RESUME_LOST_MAX_CHARS = 400;
+export const resumeConversationLost = (text, { runtime = 'claude', sawInit = false } = {}) => {
+  const t = String(text || '').trim();
+  if (!t || !RESUME_LOST.some((re) => re.test(t))) return false;
+  if (runtime === 'claude') return !sawInit;
+  return t.length <= RESUME_LOST_MAX_CHARS;
 };
 
 /**
@@ -347,14 +512,45 @@ export function createWorkManager({
    * of every turn while the watcher it started keeps running. `liveGroups` is
    * the real prune, on every read, against the kernel.
    */
+  /*
+   * THREE RULES THE FIRST CUT BROKE (2026-09-24), each a way the file named a
+   * group that was not this tab's, or forgot one that was:
+   *
+   *  - ONE FILE PER REPO, not per OS user. Each daemon rewrote the shared file
+   *    with only its own groups, so two daemons on one box (project A in one
+   *    checkout, B in another) erased each other's entries and A's watcher
+   *    was forgotten at A's next restart. The instance lock already makes a
+   *    repo one daemon, so the repo is the right owner. The pre-2026-09-24
+   *    shared file is not read: its entries carry no boot, so no rule below
+   *    could believe them anyway.
+   *  - AN ENTRY IS BELIEVED ONLY IN THE BOOT THAT WROTE IT. After a reboot the
+   *    remembered pgid belongs to whatever the kernel handed it to next — the
+   *    operator's shell, another project's children — and the Running list
+   *    relayed that group's command lines as this tab's and `killTargetOk`
+   *    accepted a Stop on them.
+   *  - ONLY LIVE GROUPS ARE WRITTEN, each with the time it was FIRST seen.
+   *    Every persist used to restamp every entry with `Date.now()`, so the
+   *    registry's 7-day TTL never applied to anything, and dead entries (one per
+   *    agent turn, recorded under a key nothing read) filled the 32-entry cap
+   *    and pushed a tab's live watcher off the end.
+   */
   const GROUPS_DIR = join(homedir(), '.flowviant');
-  const GROUPS_FILE = join(GROUPS_DIR, 'session-groups.json');
-  const GROUPS_LOCK = join(GROUPS_DIR, 'session-groups.lock');
+  const GROUPS_KEY = createHash('sha256').update(String(repoRoot)).digest('hex').slice(0, 16);
+  const GROUPS_FILE = join(GROUPS_DIR, `session-groups-${GROUPS_KEY}.json`);
+  const GROUPS_LOCK = join(GROUPS_DIR, `session-groups-${GROUPS_KEY}.lock`);
+  const groupFirstSeen = new Map(); // pgid -> ms first recorded
+  const BOOT = bootMark();
 
   const persistGroups = () => {
     const flat = [];
-    for (const [sid, set] of sessionGroups)
-      for (const pgid of set) flat.push({ sessionId: sid, pid: pgid, startedAt: Date.now() });
+    for (const [sid, set] of sessionGroups) {
+      for (const pgid of liveGroups(set)) {
+        if (!groupFirstSeen.has(pgid)) groupFirstSeen.set(pgid, Date.now());
+        flat.push({ sessionId: sid, pid: pgid, startedAt: groupFirstSeen.get(pgid), boot: BOOT });
+      }
+    }
+    const kept = new Set(flat.map((e) => e.pid));
+    for (const g of groupFirstSeen.keys()) if (!kept.has(g)) groupFirstSeen.delete(g);
     try {
       mutateRegistry(GROUPS_DIR, GROUPS_FILE, GROUPS_LOCK, () => flat);
     } catch {
@@ -365,13 +561,29 @@ export function createWorkManager({
   try {
     for (const e of readRegistry(GROUPS_FILE)) {
       if (!e?.sessionId || !Number.isInteger(e?.pid)) continue;
+      if (!sameBoot(e.boot, BOOT)) continue; // another boot's pgid names a stranger now
       const set = sessionGroups.get(e.sessionId) ?? new Set();
       set.add(e.pid);
       sessionGroups.set(e.sessionId, set);
+      if (Number(e.startedAt) > 0) groupFirstSeen.set(e.pid, Number(e.startedAt));
     }
   } catch {
     /* no registry yet — the ordinary first run */
   }
+
+  /** Forget the groups of every id the roster no longer names — a closed tab,
+   *  a finished agent. Nothing reports or stops a group for an id that is not
+   *  live, so holding it only grows the map for the life of the process. */
+  const pruneSessionGroups = (activeIds) => {
+    const live = new Set(activeIds);
+    let changed = false;
+    for (const id of [...sessionGroups.keys()]) {
+      if (live.has(id)) continue;
+      sessionGroups.delete(id);
+      changed = true;
+    }
+    if (changed) persistGroups();
+  };
 
   const noteSessionGroup = (sessionId, pgid) => {
     if (!sessionId || !pgid) return;
@@ -386,7 +598,10 @@ export function createWorkManager({
   const sessionProcesses = (sessionId) => {
     if (!processesSupported()) return null;
     const known = sessionGroups.get(sessionId);
-    if (!known || known.size === 0) return [];
+    // The SHAPE `measureProcesses` returns — a bare `[]` here has no `.rows`,
+    // so the report's `processes` key came out undefined and was dropped from
+    // the JSON: "looked and found none" arrived as "never looked".
+    if (!known || known.size === 0) return { rows: [], total: 0 };
     const alive = liveGroups(known);
     // Only touch the disk when the set actually MOVED. This runs on every
     // sweep, for every live tab, forever; an unconditional write would be a
@@ -756,14 +971,7 @@ export function createWorkManager({
    * every turn on the machine, so it is bounded here and `GIT_TERMINAL_PROMPT=0`
    * turns a prompt into an immediate, reportable failure.
    */
-  const gitNet = (args, ms) =>
-    execFileSync('git', args, {
-      cwd: repoRoot,
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'pipe'],
-      timeout: ms,
-      env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
-    });
+  const gitNet = (args, ms) => gitNetIn(args, repoRoot, ms);
   /** The tip of an agent's local branch, or null when this box does not hold it
    *  — which is a perfectly ordinary state (the begun-guard's whole subject) and
    *  means there is nothing to publish, never that a push failed. */
@@ -1156,6 +1364,7 @@ export function createWorkManager({
     // long-running daemon must not accumulate a row per agent that ever ran.
     for (const id of agentPublished.keys()) if (!live.has(id)) agentPublished.delete(id);
     for (const id of agentRemoteAt.keys()) if (!live.has(id)) agentRemoteAt.delete(id);
+    pruneSessionGroups(activeIds);
     sweepingWorktrees = true;
     lastWorktreeSweep = Date.now();
     void (async () => {
@@ -1166,9 +1375,14 @@ export function createWorkManager({
         if (Date.now() - lastWorktreeFetch >= WORKTREE_FETCH_MS) {
           lastWorktreeFetch = Date.now();
           try {
-            git(['fetch', 'origin', '--quiet'], repoRoot);
+            // ASYNC and TIMED: this runs every three minutes with nobody
+            // watching, and a synchronous fetch against a remote that prompts
+            // on /dev/tty or a connection gone half-open froze the whole
+            // daemon — no polls, no settles, no lease renewals — until it
+            // returned. See `gitNetAsync`.
+            await gitNetAsync(['fetch', 'origin', '--quiet'], repoRoot);
           } catch {
-            /* offline, or no remote — the numbers just age */
+            /* offline, no remote, or timed out — the numbers just age */
           }
           // The fetch may have moved the base tip — walk and report what
           // landed. Best-effort like everything in this sweep.
@@ -1896,30 +2110,51 @@ export function createWorkManager({
      *  MERGED/CLOSED PR when no open one exists, and adopting a dead PR turns
      *  every later delivery on a long-lived session branch into a silent
      *  black hole ('opened'/'merged' over work that never moves). */
-    const openPrUrl = () => {
+    /** …and ONLY ONE THAT TARGETS THE PROJECT'S BASE. A PR somebody opened by
+     *  hand into another branch (`staging`, to try it there) was adopted as
+     *  this delivery's PR, and Approve then merged the unreviewed branch INTO
+     *  that branch — the ancestry check afterwards blamed "an older PR". The
+     *  agent merge path has refused this since it shipped; this is the same
+     *  guard, measured the same way: refused only on a MEASURED mismatch, an
+     *  absent field adopts as before. Returns `{ url, base }` or null. */
+    const openPr = () => {
       try {
         const j = JSON.parse(
-          execFileSync('gh', ['pr', 'view', branch, '--json', 'url,state'], {
+          execFileSync('gh', ['pr', 'view', branch, '--json', 'url,state,baseRefName'], {
             cwd: repoRoot,
             stdio: ['ignore', 'pipe', 'pipe'],
             timeout: 30_000,
           }).toString()
         );
-        return j?.state === 'OPEN' && typeof j?.url === 'string' ? j.url.trim() : null;
+        if (j?.state !== 'OPEN' || typeof j?.url !== 'string') return null;
+        return {
+          url: j.url.trim(),
+          base: typeof j?.baseRefName === 'string' ? j.baseRefName : null,
+        };
       } catch {
         return null; // no PR for the branch at all
       }
     };
+    const otherBase = (pr) =>
+      pr && pr.base && pr.base !== baseName
+        ? `the open pull request for ${branch} targets ${pr.base}, not ${baseName} — retarget or close it, then try again`
+        : null;
     if (job.kind !== 'merge') {
       // OPEN: push, then create — or adopt a PR already OPEN for the branch
       // (a re-delivery, or one the driver opened by hand).
       try {
-        git(['push', '-u', 'origin', branch], pushCwd);
+        gitNetIn(['push', '-u', 'origin', branch], pushCwd, 120_000);
       } catch (e) {
         await settlePr({ id, outcome: 'failed', detail: ghFirstLine(e) });
         return;
       }
-      let url = openPrUrl();
+      const existing = openPr();
+      const wrongBase = otherBase(existing);
+      if (wrongBase) {
+        await settlePr({ id, outcome: 'failed', detail: wrongBase });
+        return;
+      }
+      let url = existing?.url ?? null;
       if (!url) {
         try {
           const out = execFileSync(
@@ -1953,8 +2188,17 @@ export function createWorkManager({
     // squash rewrites them off base, which would orphan every receipt AND
     // blind the landed walk's trailer read.
     // No --delete-branch: the local branch may be a live worktree's HEAD.
+    // THE BASE IS RE-ASKED BEFORE THE MERGE, never trusted from the open step:
+    // somebody can retarget a PR between Deliver and Approve, and `gh pr merge
+    // <branch>` merges whichever open PR the branch has, into whatever it
+    // targets now.
+    const wrongBase = otherBase(openPr());
+    if (wrongBase) {
+      await settlePr({ id, outcome: 'failed', detail: wrongBase });
+      return;
+    }
     try {
-      git(['push', 'origin', branch], pushCwd);
+      gitNetIn(['push', 'origin', branch], pushCwd, 120_000);
     } catch (e) {
       await settlePr({ id, outcome: 'failed', detail: ghFirstLine(e) });
       return;
@@ -1997,7 +2241,7 @@ export function createWorkManager({
     for (let attempt = 0; attempt < 2 && !merged; attempt++) {
       if (attempt > 0) await new Promise((r) => setTimeout(r, 2000));
       try {
-        git(['fetch', 'origin', '--quiet'], repoRoot);
+        gitNet(['fetch', 'origin', '--quiet'], 60_000);
       } catch {
         /* offline — the check below answers from what we have */
       }
@@ -2603,38 +2847,6 @@ export function createWorkManager({
     } catch {
       return null;
     }
-  };
-
-  /**
-   * The spawn lock: the pid of the CLI currently live in this worktree. A
-   * restarted daemon must not put a second Claude into a directory the orphan
-   * of its previous life is still editing — two CLIs appending to one held
-   * conversation is exactly the incoherence workChains prevents in-process,
-   * and the lock extends that guarantee across a restart. A dead pid is a
-   * stale lock (removed here); a live one means "come back next poll".
-   */
-  const turnLockedByLivePid = (lockPath) => {
-    if (!lockPath || !existsSync(lockPath)) return false;
-    let pid = 0;
-    try {
-      pid = Number(readFileSync(lockPath, 'utf8').trim());
-    } catch {
-      /* unreadable — treat as stale */
-    }
-    if (Number.isInteger(pid) && pid > 0) {
-      try {
-        process.kill(pid, 0);
-        return true; // signal 0 delivered — the process is alive
-      } catch (e) {
-        if (e.code === 'EPERM') return true; // alive, just not ours to signal
-      }
-    }
-    try {
-      rmSync(lockPath, { force: true }); // dead holder — clear the stale lock
-    } catch {
-      /* best-effort */
-    }
-    return false;
   };
 
   /**
@@ -3591,7 +3803,8 @@ export function createWorkManager({
                 if (ch.pid) noteSessionGroup(job.sessionId, ch.pid);
                 if (lockPath && ch.pid) {
                   try {
-                    writeFileSync(lockPath, String(ch.pid));
+                    const start = processStartTime(ch.pid);
+                    writeFileSync(lockPath, start ? `${ch.pid}:${start}` : String(ch.pid));
                   } catch {
                     /* best-effort */
                   }
@@ -3633,7 +3846,8 @@ export function createWorkManager({
             if (
               !adopting &&
               resume &&
-              (!(out || '').trim() || resumeConversationLost(out))
+              (!(out || '').trim() ||
+                resumeConversationLost(out, { runtime: rt.id, sawInit: Boolean(seenClaudeSession) }))
             ) {
               out = await runTurn({ ...turnArgs, resume: false });
             }
@@ -3904,7 +4118,7 @@ export function createWorkManager({
             return;
           }
           try {
-            git(['fetch', 'origin', '--quiet'], repoRoot);
+            gitNet(['fetch', 'origin', '--quiet'], 60_000);
           } catch {
             /* offline fetch — merge against what we have */
           }
@@ -4407,6 +4621,18 @@ export function createWorkManager({
      *  auto-update from that moment on, silently, until a restart. */
     let planChild = null;
     let planTimer = null;
+    /**
+     * THE PLANNER'S OWN CONVERSATION, so its transcript can be removed.
+     *
+     * `claude -p` in the CHECKOUT writes `~/.claude/projects/<checkout>/<id>.jsonl`,
+     * and the checkout is exactly where the operator runs their own terminal
+     * Claude. Left behind, every Deploy press became the newest ENDED session
+     * there: it displaced the operator's real conversation from the `+` adopt
+     * menu (one row per directory), offered to fork a read-only planner into a
+     * build tab, and was what their own `claude --continue` resumed. The
+     * pre-review and the skills probe delete theirs for the same reason.
+     */
+    let planSession = null;
     /** The cap fired: the CLI was still running when this machine stopped it. */
     let wedged = false;
     // Said BEFORE the lock is asked for, because a reader only waits when a
@@ -4449,6 +4675,10 @@ export function createWorkManager({
           onActivity: (a) => {
             if (a?.label) narrate(String(a.label));
           },
+          onInit: (i) => {
+            if (typeof i.sessionId === 'string' && i.sessionId.trim())
+              planSession = i.sessionId.trim();
+          },
           onSpawn: (ch) => {
             planChild = ch;
             // No id: a Deploy press is not a task, and the snapshot's per-task
@@ -4487,6 +4717,10 @@ export function createWorkManager({
     } finally {
       if (planTimer) clearTimeout(planTimer);
       if (planChild) workChildren.delete(planChild);
+      // On EVERY exit, after the kill and on a delay — the transcript is the
+      // child's file, and removing it while the child is still dying races a
+      // recreate. The pre-review's own shape.
+      if (planSession) setTimeout(() => removeProbeTranscript(repoRoot, planSession), 750).unref?.();
     }
 
     if (wedged) {
@@ -4605,6 +4839,7 @@ export function createWorkManager({
    * re-POST, or expired server-side — the grace below is all that keeps it.
    */
   const agentReported = new Map(); // turnId -> { body, at }
+  const agentRejectedUntil = new Map(); // turnId -> earliest re-POST of a refused body
   const AGENT_REPORT_GRACE_MS = 30 * 60_000;
 
   const postAgentTurn = async (body) => {
@@ -4622,15 +4857,24 @@ export function createWorkManager({
         body: JSON.stringify(body),
       });
       const j = await res.json().catch(() => null);
-      // Landed, or REFUSED: a 4xx is the server saying this settle will never
-      // be accepted (expired, already settled, unknown turn), and re-POSTing a
-      // refusal forever is the wedge wearing a retry's clothes. 408/429 stay
-      // retryable, the same split `postSettle` makes for a tab.
-      if (
-        res.ok ||
-        (res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429)
-      )
+      /**
+       * ONLY A 2xx IS DELIVERED. The server answers an already-settled,
+       * expired or unknown turn with 200 `{ settled: false }` — its only 4xx
+       * are a body it could not parse (deploy skew) and auth, and an edge WAF
+       * rule tripped by a summary that quotes an exploit string is a 403 from
+       * in front of it. Each of those left the turn row PENDING, and dropping
+       * the held body on them meant the next offer found nothing held and ran
+       * the CLI again: a second set of commits and the operator's quota spent,
+       * every poll, for six hours. The tab lane learned this as its 'reject'
+       * class. So a refused body stays HELD — it is the skip-guard — and its
+       * re-POST backs off instead of hammering a body the server just refused.
+       */
+      if (res.ok) {
         agentReported.delete(turnId);
+        agentRejectedUntil.delete(turnId);
+      } else if (res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429) {
+        agentRejectedUntil.set(turnId, Date.now() + REJECT_RETRY_MS);
+      }
       return j?.data ?? null;
     } catch {
       // Unsettled — a network error, so the body STAYS held and the next
@@ -5188,7 +5432,11 @@ export function createWorkManager({
             // …and the registry now counts what the reservation was standing
             // in for.
             releaseSlot();
-            noteSessionGroup(agentId, ch.pid);
+            // Under the PLACE, the id every reader asks with — the worktree
+            // sweep and `killTargetOk` both key on `a-<agentId>`. Recorded under
+            // the bare agent id it was never read, reported `processes: []`
+            // over a running watcher, and left one dead entry per turn.
+            noteSessionGroup(place, ch.pid);
             // Keyed by PLACE, because the retire sweep iterates directory names
             // and a place id IS one. It is what lets a hard stop actually reach
             // the CLI — see `retireWorkSessions`.
@@ -5343,7 +5591,18 @@ export function createWorkManager({
         outcome: res.outcome,
         answer: envScrub(res.answer ?? '').slice(0, 8000),
         ...(commits.length ? { commits } : {}),
-        ...(res.raised?.length ? { raised: res.raised } : {}),
+        // SCRUBBED like the answer beside it: a raised card lands in the
+        // project doc every member reads, and a brief quoting the `.env` the
+        // agent just read ("value sk_live_… is logged in pay.ts") went out
+        // verbatim while the same value in the summary was redacted.
+        ...(res.raised?.length
+          ? {
+              raised: res.raised.map((r) => ({
+                title: envScrub(r.title).slice(0, 300),
+                ...(r.brief ? { brief: envScrub(r.brief).slice(0, 2000) } : {}),
+              })),
+            }
+          : {}),
         ...(usage ? { usage } : {}),
         /**
          * THE AGENT'S RUNNING ACCOUNT OF THIS BRANCH (2026-09-22).
@@ -5454,7 +5713,10 @@ export function createWorkManager({
       const now = Date.now();
       for (const [id, held] of agentReported) {
         if (offered.has(id)) held.at = now;
-        else if (now - held.at > AGENT_REPORT_GRACE_MS) agentReported.delete(id);
+        else if (now - held.at > AGENT_REPORT_GRACE_MS) {
+          agentReported.delete(id);
+          agentRejectedUntil.delete(id);
+        }
       }
     }
     /** One deferral line per tick, however many turns were offered. */
@@ -5463,6 +5725,9 @@ export function createWorkManager({
       const id = String(job?.id || '');
       if (!id || agentTurns.has(id)) continue;
       const held = agentReported.get(id);
+      // A body the server REFUSED waits out its backoff — still held, so the
+      // CLI is never re-run in the meantime.
+      if (held && (agentRejectedUntil.get(id) ?? 0) > Date.now()) continue;
       if (held) {
         // Already RAN here; only the settle is outstanding. Re-POST the held
         // body — never the CLI, which would spend the operator's quota again
@@ -5613,6 +5878,11 @@ export function createWorkManager({
       await postCheck({ agentId, status: 'none', ...(headSha ? { headSha } : {}) });
       return;
     }
+    const cleared = clearNonArtifacts(wt);
+    if (cleared.length)
+      warn(
+        `agent ${agentId}: removed ${cleared.length} non-artifact file(s) from ${ARTIFACT_DIR} before the check — ${cleared.slice(0, 5).join(', ')}`
+      );
     const out = await new Promise((resolve) => {
       let text = '';
       let done = false;
@@ -5627,11 +5897,24 @@ export function createWorkManager({
         // always a shell that spawns the real runner, and signalling the shell
         // alone leaves the runner holding the worktree — and this place's
         // WRITER lock — for as long as it likes.
+        //
+        // AND WITHOUT THE MACHINE CREDENTIAL. The check is the repo's command
+        // run with nobody watching, and it inherited `FLOWVIANT_MACHINE_TOKEN`
+        // — so anything the check executes (a test a turn wrote, a
+        // dependency's postinstall) could read the credential the whole
+        // machine authenticates with. It is `checkEnv()`, the environment the
+        // agent's own turn ran under (`cliEnv`'s rule), NOT `childEnv`'s
+        // allowlist: the agent runs these same tests in its turn, and a check
+        // stripped of `JAVA_HOME`, `DATABASE_URL` or the rest of the operator's
+        // shell would FAIL where the agent's own run passed — a "Check failed"
+        // the product manufactured and then relayed as the project's verdict.
+        // The planted-file path is closed by `clearNonArtifacts` above.
         child = spawn(cmd, {
           cwd: wt,
           shell: true,
           detached: true,
           stdio: ['ignore', 'pipe', 'pipe'],
+          env: checkEnv(),
         });
         /**
          * …AND IT IS TRACKED, so a stop or a takeover takes it with them.
@@ -6249,7 +6532,7 @@ export function createWorkManager({
         return;
       }
       try {
-        git(['fetch', 'origin', '--quiet'], repoRoot);
+        gitNet(['fetch', 'origin', '--quiet'], 60_000);
       } catch {
         /* offline — the merge fails honestly below */
       }
@@ -6374,7 +6657,7 @@ export function createWorkManager({
           ownBranch && isPublishRef(job.publishedRef) ? job.publishedRef : branch;
         try {
           if (head === branch) {
-            git(['push', '-u', 'origin', branch], wt);
+            gitNetIn(['push', '-u', 'origin', branch], wt, 120_000);
           } else {
             // The same lease discipline the publish lane keeps, and TIMED like
             // every other network call on this path: `git()` has no timeout, and
@@ -6479,7 +6762,7 @@ export function createWorkManager({
         for (let attempt = 0; attempt < 2 && !landedOnBase; attempt++) {
           if (attempt > 0) await new Promise((r) => setTimeout(r, 2000));
           try {
-            git(['fetch', 'origin', '--quiet'], repoRoot);
+            gitNet(['fetch', 'origin', '--quiet'], 60_000);
           } catch {
             /* offline — the check below answers from what we have */
           }

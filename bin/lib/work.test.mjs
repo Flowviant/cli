@@ -138,31 +138,38 @@ test('a finished agent turn whose settle POST failed re-POSTs the held body on r
   await until(() => !m.workBusy());
 });
 
-test('a settle the server refuses (4xx) is dropped rather than retried forever', async (t) => {
+/**
+ * A REFUSED SETTLE STAYS HELD (2026-09-24). The server answers an already-
+ * settled, expired or unknown turn with 200 `{ settled: false }`; its only 4xx
+ * are an unparseable body and auth, and a WAF rule in front of it answers 403.
+ * Every one leaves the turn row PENDING, so dropping the body on a 4xx meant
+ * the next offer found nothing held and RAN THE CLI AGAIN — every poll, for
+ * six hours. The body is the skip-guard: it stays, and only its re-POST backs
+ * off.
+ */
+test('a settle the server refuses (4xx) stays held — the CLI is never re-run, and the re-POST backs off', async (t) => {
   const m = manager(t);
   const { calls, state } = stubFetch(t);
-  state.mode = 'down';
+  state.mode = '404';
   const job = { id: 'at-2', agentId: 'ag-2', placeId: 'a-2', kind: 'task' };
   m.processAgentTurnJobs([job]);
-  await until(() => calls.some((c) => c.url.includes('agent-turn-done')));
-  await until(() => m.workBusy());
-  // The server says this settle will never be accepted (expired, already
-  // settled). Holding the body past that is a wedge wearing retry's clothes.
-  // Offer until the re-POST has gone out (a single offer can race the first
-  // attempt's in-flight guard), then STOP offering — which is what the server
-  // does once the row is settled or expired; a turn it kept offering after a
-  // drop would honestly be fresh work.
-  state.mode = '404';
   const doneCalls = () => calls.filter((c) => c.url.includes('agent-turn-done'));
+  await until(() => doneCalls().length >= 1);
+  await tick();
   const heldBody = doneCalls()[0].body;
-  await until(() => {
-    if (doneCalls().length < 2) {
-      m.processAgentTurnJobs([job]);
-      return false;
-    }
-    return true;
-  });
-  assert.deepEqual(doneCalls()[1].body, heldBody, 'the retry must be the stored body');
+  assert.equal(m.workBusy(), true, 'a refused body is still undelivered work');
+  // The server keeps offering the pending turn — now WITH a task, so a re-RUN
+  // would head for a worktree and settle something else. Inside the backoff
+  // nothing goes out at all.
+  const before = calls.length;
+  m.processAgentTurnJobs([{ ...job, task: { id: 'card-1', title: 'x' } }]);
+  await tick(120);
+  assert.equal(calls.length, before, 'no CLI, no second body, no hammering inside the backoff');
+  assert.equal(m.workBusy(), true);
+  // The stand-down flush still carries the STORED body, and a 2xx releases it.
+  state.mode = 'ok';
+  await m.settleAgentTurns('stopping');
+  assert.deepEqual(doneCalls()[doneCalls().length - 1].body, heldBody, 'the stored body, never a new one');
   await until(() => !m.workBusy());
 });
 
@@ -1446,4 +1453,29 @@ test('a card-less send-back on a design agent runs under the design posture', as
   assert.equal(settle('at-k1').answer, 'design and research cards run on Claude on this machine');
   assert.equal(settle('at-k2').answer, 'this machine cannot run no-such-cli');
   await until(() => !m.workBusy());
+});
+
+/**
+ * THREE WIRINGS A ROUND TRIP HERE CANNOT REACH (2026-09-24) — each sits behind
+ * a CLI that actually ran, which this suite deliberately never spawns (see the
+ * account pin above for why). Each failed silently:
+ *  · an agent's process group was recorded under the bare agent id while every
+ *    reader asks with its PLACE, so its watcher reported `processes: []` and a
+ *    dead entry per turn filled the registry;
+ *  · the Deploy-press planner left its transcript in the checkout, where it
+ *    became the newest terminal session the operator's `+` menu and their own
+ *    `claude --continue` saw;
+ *  · raised cards went out unscrubbed beside a scrubbed answer.
+ */
+test('an agent group is recorded under its place, the planner removes its transcript, raised cards are scrubbed', () => {
+  const src = workSource();
+  const turn = fnBody(src, 'runAgentTurn');
+  assert.ok(turn.includes('noteSessionGroup(place, ch.pid)'));
+  assert.ok(!turn.includes('noteSessionGroup(agentId'), 'never the bare agent id');
+  const plan = fnBody(src, 'runAgentPlan');
+  assert.ok(plan.includes('planSession = i.sessionId.trim()'), 'the planner learns its own conversation');
+  assert.ok(plan.includes('removeProbeTranscript(repoRoot, planSession)'), '…and removes it');
+  assert.ok(!turn.includes('{ raised: res.raised }'), 'raised cards never ride verbatim');
+  assert.ok(turn.includes('title: envScrub(r.title).slice(0, 300)'));
+  assert.ok(turn.includes('brief: envScrub(r.brief).slice(0, 2000)'));
 });
