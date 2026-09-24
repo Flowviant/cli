@@ -273,19 +273,44 @@ function ensureDir(checkoutDir) {
   return dir;
 }
 
-export function readKnowledgeMarker(checkoutDir) {
+/**
+ * THE MARKER SAYS WHICH REV WAS WRITTEN, AND WHETHER THE LIBRARY WAS PART OF
+ * IT (2026-09-23): `<rev>` or `<rev>:lib`.
+ *
+ * The rev alone could not tell an upgrade from a sync. A 0.96.0 box wrote the
+ * marker for rev N while ignoring the manifest's `library` key (it did not
+ * know one); updated to 0.97.0 with `knowledge_rev` still N, it read "N",
+ * matched the roster, and never synced the library — then the server handed
+ * `task.references` naming `designs/x-v1.html` and the agent was told to read
+ * a file that was not there. `:lib` records that THIS rev's sync carried a
+ * library key, so the upgrade case is one string compare and re-syncs at
+ * once. An older daemon reading `N:lib` sees NaN and re-syncs once, which is
+ * the harmless direction.
+ */
+function parseMarker(checkoutDir) {
   try {
-    const n = Number(readFileSync(join(checkoutDir, MARKER), 'utf8').trim());
-    return Number.isInteger(n) && n >= 0 ? n : null;
+    const m = /^(\d+)(:lib)?$/.exec(readFileSync(join(checkoutDir, MARKER), 'utf8').trim());
+    if (!m) return null;
+    const n = Number(m[1]);
+    return Number.isSafeInteger(n) ? { rev: n, lib: Boolean(m[2]) } : null;
   } catch {
     return null;
   }
 }
 
-function writeKnowledgeMarker(checkoutDir, rev) {
+export function readKnowledgeMarker(checkoutDir) {
+  return parseMarker(checkoutDir)?.rev ?? null;
+}
+
+/** Did the sync that wrote the marker carry a `library` key? */
+export function knowledgeMarkerHasLibrary(checkoutDir) {
+  return parseMarker(checkoutDir)?.lib ?? false;
+}
+
+function writeKnowledgeMarker(checkoutDir, rev, lib = false) {
   try {
     mkdirSync(join(checkoutDir, '.flowviant'), { recursive: true });
-    writeAtomic(join(checkoutDir, MARKER), `${rev}\n`);
+    writeAtomic(join(checkoutDir, MARKER), `${rev}${lib ? ':lib' : ''}\n`);
   } catch {
     /* a lost marker costs one re-sync after a restart — every file already on
        disk matches by sha and is not downloaded again */
@@ -654,6 +679,39 @@ function libraryMissing(checkoutDir, manifest) {
 }
 
 /**
+ * Does the manifest name LIBRARY items the disk no longer holds — or a library
+ * this box never synced at all? The same-rev skip's second question, beside
+ * `libraryMissing`'s "is the directory there".
+ *
+ * `synced` is the marker's `:lib` (or the driver's memory of it): false means
+ * the rev on the marker was written by a sync that ignored the library, the
+ * 0.96.0-to-0.97.0 upgrade. Otherwise every named item's path AND `LIBRARY.md`
+ * must be regular files — a hand-deleted `designs/`, or one item removed, is a
+ * re-sync, and the files still on disk match by hash and are not fetched
+ * again. Items the manifest itself puts over the cap, and items this driver
+ * already saw refused for this rev, are not expected: a refusal is permanent
+ * for the rev, and expecting it would re-fetch ten megabytes every poll.
+ * An ABSENT `library` key expects nothing (an older server has no say).
+ */
+function libraryStale(checkoutDir, manifest, { synced, refused }) {
+  const items = libraryItemsOf(manifest);
+  if (items === null) return false;
+  if (!synced) return true;
+  const expected = items.filter((it) => !(Number(it.bytes) > KNOWLEDGE_FILE_MAX_BYTES) && !refused.has(it.path));
+  if (expected.length === 0) return false;
+  const dir = join(checkoutDir, KNOWLEDGE_DIR);
+  const isFile = (p) => {
+    try {
+      return lstatSync(p).isFile();
+    } catch {
+      return false;
+    }
+  };
+  if (!isFile(join(dir, LIBRARY_FILE))) return true;
+  return expected.some((it) => !isFile(join(dir, ...it.path.split('/'))));
+}
+
+/**
  * The per-process driver: called with every roster's `knowledge` key.
  *
  * Holds the last-materialised rev in memory (seeded from the marker, so a
@@ -669,6 +727,11 @@ export function createKnowledgeSync({
   now = () => Date.now(),
 }) {
   let rev = readKnowledgeMarker(checkoutDir);
+  /** Whether the sync that wrote `rev` carried a library key — the marker's
+   *  `:lib`, then this process's own memory. */
+  let libSynced = knowledgeMarkerHasLibrary(checkoutDir);
+  /** Library paths refused for size at `rev` — not expected on disk. */
+  let libRefused = new Set();
   let busy = false;
   let failures = 0;
   let retryAt = 0;
@@ -698,7 +761,17 @@ export function createKnowledgeSync({
        * something over a directory that does not exist is re-synced; files
        * already on disk match by hash and are not fetched again.
        */
-      if (knowledge.rev === rev && !libraryMissing(checkoutDir, knowledge)) return null;
+      //
+      // …AND THE SAME REV IS NOT ALWAYS THE SAME LIBRARY: an upgrade from a
+      // daemon that ignored the `library` key, or a hand-deleted `designs/`,
+      // leaves the marker current over files a card's references name. See
+      // `libraryStale`.
+      if (
+        knowledge.rev === rev &&
+        !libraryMissing(checkoutDir, knowledge) &&
+        !libraryStale(checkoutDir, knowledge, { synced: libSynced, refused: libRefused })
+      )
+        return null;
       if (busy) return null;
       if (knowledge.rev === failedRev && now() < retryAt) return null;
       busy = true;
@@ -711,10 +784,12 @@ export function createKnowledgeSync({
         const r = await syncKnowledge({ checkoutDir, manifest: knowledge, fetchFile });
         if (r.ok) {
           rev = knowledge.rev;
+          libSynced = libraryItemsOf(knowledge) !== null;
+          libRefused = new Set(r.refused);
           failures = 0;
           retryAt = 0;
           failedRev = null;
-          writeKnowledgeMarker(checkoutDir, rev);
+          writeKnowledgeMarker(checkoutDir, rev, libSynced);
           if (r.wrote.length || r.removed.length) {
             log(
               `knowledge · synced rev ${rev}` +

@@ -1244,10 +1244,20 @@ export function knownSkills() {
  * not. Bounded (40 entries, names cut at 60) and sorted, the `recordSkills`
  * discipline: a stable param, so an unchanged report writes nothing.
  *
+ * ONLY WHAT IS NOT CONNECTED LEAVES THE BOX (2026-09-23). The first cut
+ * relayed every server, connected ones included — so the operator's whole set
+ * of signed-in services (their mail, their brokerage, their calendar) rode the
+ * poll to the server and into every teammate's read of the Machines page,
+ * which renders only the servers that are NOT connected anyway. A connected
+ * connector is good news and good news is not a line; it is also nobody
+ * else's business. So `connected` is dropped HERE, before the cap, and what is
+ * sent is exactly what the page can say something about.
+ *
  * THREE STATES, the skills split: null = no turn has taught us (the param is
- * not sent), [] = the CLI mounted none of the person's own, a list = the words.
- * Last turn wins, so a connector somebody signs into shows up connected on the
- * next turn's init.
+ * not sent), [] = nothing of the person's own needs anything (every server is
+ * connected, or none is mounted), a list = the ones that do. Last turn wins,
+ * so a connector somebody signs into leaves the list on the next turn's init,
+ * and an all-connected turn sends `[]`, which clears a stale list server-side.
  */
 let mcpServersCache = null;
 
@@ -1262,6 +1272,7 @@ export function recordMcpServers(list) {
     if (!e || typeof e !== 'object' || typeof e.name !== 'string') continue;
     const n = e.name.trim().slice(0, MCP_NAME_MAX).trim();
     if (!n || n === 'flowviant' || seen.has(n)) continue;
+    if (e.status === 'connected') continue; // see the header: never relayed
     seen.set(n, { n, s: MCP_STATUSES.has(e.status) ? e.status : 'other' });
   }
   mcpServersCache = [...seen.values()]

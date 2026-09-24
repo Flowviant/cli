@@ -287,7 +287,10 @@ async function fetchRoster(
   }
   // WHICH MCP SERVERS AND CONNECTORS THE CLI MOUNTED, AND HOW EACH STANDS
   // (0.97.0) — `[{n, s}]`, learned off the same init event as the skills, this
-  // daemon's own `flowviant` server excluded. The same three states: NOT SENT
+  // daemon's own `flowviant` server excluded AND every `connected` one with it:
+  // only what needs something leaves the box (runtimes.mjs, recordMcpServers —
+  // a teammate has no business reading which services the operator signed
+  // into). The same three states: NOT SENT
   // until a turn (or the one probe) has taught us, `[]` sent as the fact it is.
   // The app names every server that is not connected — a connector that needs
   // a sign-in AT THIS BOX above all — under the serving machine's row. A

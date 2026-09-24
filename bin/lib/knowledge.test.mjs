@@ -641,3 +641,80 @@ test('the paragraph names the catalog; a card spec prints its references; the ca
   const cap = SYSTEM_CAPTURE.replace(/\s+/g, ' ');
   assert.ok(cap.includes('call list_library and pass its id as `references`'));
 });
+
+// ── THE SAME REV OVER A LIBRARY THE DISK DOES NOT HOLD (2026-09-23) ────────
+
+test('an upgrade from a daemon that ignored the library re-syncs it though the rev is unchanged', async () => {
+  const dir = checkout();
+  const srv = fakeServer({ [id(1)]: 'a', [id(7)]: '<7>' });
+  const shelf = [{ id: id(1), name: 'a.md', bytes: 1, sha256: sha('a') }];
+  // What a 0.96.0 box left behind: the shelf synced, the marker at rev 5 with
+  // no `:lib`, and no library on disk — it did not know the key existed.
+  await syncKnowledge({ checkoutDir: dir, manifest: { rev: 5, instructions: null, files: shelf }, fetchFile: srv.fetchFile });
+  writeFileSync(join(dir, '.flowviant/knowledge.rev'), '5\n');
+  const sync = createKnowledgeSync({ checkoutDir: dir, fetchFile: srv.fetchFile });
+  assert.equal(sync.rev, 5);
+  // The 0.97.0 roster: SAME rev, now carrying the library.
+  const r = await sync.onRoster({ rev: 5, instructions: null, files: shelf, library: { items: [item(7)] } });
+  assert.ok(r, 'the same rev did not stop the sync');
+  assert.equal(readFileSync(join(lib(dir), 'designs', 'landing-v7.html'), 'utf8'), '<7>');
+  assert.ok(existsSync(join(lib(dir), LIBRARY_FILE)));
+  // The marker now says the library was part of this rev…
+  assert.equal(readFileSync(join(dir, '.flowviant/knowledge.rev'), 'utf8'), '5:lib\n');
+  assert.equal(readKnowledgeMarker(dir), 5, 'and still reads as the rev');
+  // …so the next poll is a no-op, and a restart agrees.
+  assert.equal(await sync.onRoster({ rev: 5, instructions: null, files: shelf, library: { items: [item(7)] } }), null);
+  const again = createKnowledgeSync({ checkoutDir: dir, fetchFile: srv.fetchFile });
+  assert.equal(await again.onRoster({ rev: 5, instructions: null, files: shelf, library: { items: [item(7)] } }), null);
+});
+
+test('rev unchanged + a library named + its file missing → the sync runs and fetches only the missing one', async () => {
+  const dir = checkout();
+  const srv = fakeServer({ [id(1)]: '<1>', [id(2)]: '<2>' });
+  const sync = createKnowledgeSync({ checkoutDir: dir, fetchFile: srv.fetchFile });
+  const manifest = { rev: 9, instructions: null, files: [], library: { items: [item(1), item(2)] } };
+  await sync.onRoster(manifest);
+  assert.deepEqual(srv.calls, [id(1), id(2)]);
+  assert.equal(await sync.onRoster(manifest), null, 'canary: intact, nothing runs');
+  // One item deleted by hand.
+  rmSync(join(lib(dir), 'designs', 'landing-v2.html'));
+  assert.ok(await sync.onRoster(manifest));
+  assert.deepEqual(srv.calls, [id(1), id(2), id(2)], 'only the missing file is fetched again');
+  assert.ok(existsSync(join(lib(dir), 'designs', 'landing-v2.html')));
+  // The whole designs/ directory deleted by hand.
+  rmSync(join(lib(dir), 'designs'), { recursive: true, force: true });
+  assert.ok(await sync.onRoster(manifest));
+  assert.deepEqual(readdirSync(join(lib(dir), 'designs')).sort(), ['landing-v1.html', 'landing-v2.html']);
+  // LIBRARY.md deleted by hand: re-synced, nothing fetched.
+  const before = srv.calls.length;
+  rmSync(join(lib(dir), LIBRARY_FILE));
+  assert.ok(await sync.onRoster(manifest));
+  assert.ok(existsSync(join(lib(dir), LIBRARY_FILE)));
+  assert.equal(srv.calls.length, before);
+});
+
+test('an item refused for size is not EXPECTED on disk — the same rev does not re-fetch it every poll', async () => {
+  const dir = checkout();
+  const srv = fakeServer({ [id(1)]: '<1>' });
+  const sync = createKnowledgeSync({ checkoutDir: dir, fetchFile: srv.fetchFile });
+  const manifest = {
+    rev: 2,
+    instructions: null,
+    files: [],
+    library: { items: [item(1), item(2, { bytes: 11 * 1024 * 1024 })] },
+  };
+  const r = await sync.onRoster(manifest);
+  assert.deepEqual(r.refused, ['designs/landing-v2.html']);
+  assert.equal(await sync.onRoster(manifest), null);
+  assert.deepEqual(srv.calls, [id(1)]);
+});
+
+test('an ABSENT library key expects nothing — an older server over a plain shelf is still a no-op', async () => {
+  const dir = checkout();
+  const srv = fakeServer({ [id(1)]: 'a' });
+  const sync = createKnowledgeSync({ checkoutDir: dir, fetchFile: srv.fetchFile });
+  const manifest = { rev: 1, instructions: null, files: [{ id: id(1), name: 'a.md', bytes: 1, sha256: sha('a') }] };
+  await sync.onRoster(manifest);
+  assert.equal(readFileSync(join(dir, '.flowviant/knowledge.rev'), 'utf8'), '1\n', 'no `:lib` without a library key');
+  assert.equal(await sync.onRoster(manifest), null);
+});

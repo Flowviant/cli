@@ -31,6 +31,7 @@ import {
   SYSTEM_WORK_PLAIN,
   withProjectContext,
 } from './prompts.mjs';
+import { scanEnvForScrub, scrub as envScrub, secretIn as envSecretIn } from './env.mjs';
 
 const place = () => {
   const d = mkdtempSync(join(tmpdir(), 'fv-artifacts-'));
@@ -267,4 +268,70 @@ test('the ARTIFACTS paragraph names the document types, and the CSP wording besi
   // Canary: the policy sentences another pass made exact today are still there.
   assert.match(ARTIFACTS_PARAGRAPH, /nothing else loads from the network/);
   assert.match(ARTIFACTS_PARAGRAPH, /Keep each under 2 MB\./);
+});
+
+
+// ── A BINARY CARRYING A KNOWN SECRET IS WITHHELD (2026-09-23) ──────────────
+
+test('a binary is checked for a known secret\'s bytes and WITHHELD on a hit — never rewritten', () => {
+  const d = place();
+  // A PNG's tEXt chunk is plain bytes — exactly where a value can hide.
+  writeFileSync(
+    join(d, ARTIFACT_DIR, 'chart.png'),
+    Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47]), Buffer.from('tEXtComment\0sk-live-9f8e7d6c5b4a')])
+  );
+  writeFileSync(join(d, ARTIFACT_DIR, 'clean.png'), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0, 1, 2]));
+  put(d, 'page.html', '<p>sk-live-9f8e7d6c5b4a</p>');
+  const secretIn = (buf) => (buf.includes('sk-live-9f8e7d6c5b4a') ? 'STRIPE_KEY' : null);
+  const scrub = (t) => t.replaceAll('sk-live-9f8e7d6c5b4a', '[REDACTED:STRIPE_KEY]');
+  const of = (n) => buildArtifactUpload(scanArtifacts(d).find((e) => e.name === n), { agentId: 'a1' }, scrub, secretIn);
+  const hit = of('chart.png');
+  assert.equal(hit.withheld, 'STRIPE_KEY');
+  assert.equal(hit.bytes, undefined, 'no bytes of any kind — never a redacted copy');
+  assert.deepEqual([...of('clean.png').bytes], [0x89, 0x50, 0x4e, 0x47, 0, 1, 2], 'a clean binary goes as it is');
+  // TEXT is still scrubbed, not withheld: a rewrite cannot corrupt it.
+  assert.equal(of('page.html').bytes.toString('utf8'), '<p>[REDACTED:STRIPE_KEY]</p>');
+});
+
+test('the reporter skips a withheld binary with a warn line naming the file, and sends the rest', async () => {
+  const d = place();
+  writeFileSync(join(d, ARTIFACT_DIR, 'deck.pdf'), Buffer.from('%PDF-1.4\nBT (token sk-live-9f8e7d6c5b4a) Tj ET'));
+  writeFileSync(join(d, ARTIFACT_DIR, 'ok.png'), Buffer.from([0x89, 0x50]));
+  const srv = fakeServer();
+  const lines = [];
+  const r = createArtifactReporter({
+    fleetUrl: 'https://x.test/api/v2/fleet/agents',
+    token: 't',
+    userAgent: 'ua',
+    scrub: (t) => t,
+    secretIn: (buf) => (buf.includes('sk-live-9f8e7d6c5b4a') ? 'STRIPE_KEY' : null),
+    fetchImpl: srv.fetchImpl,
+    log: (l) => lines.push(l),
+  });
+  const n = await r.report({ placeDir: d, before: new Map(), agentId: 'a1', turnId: 't1' });
+  assert.equal(n, 1);
+  assert.deepEqual(srv.bodies.map((b) => b.fields.name), ['ok.png'], 'the PDF never left, not even by name');
+  assert.deepEqual(lines, ["artifact deck.pdf: not uploaded — it contains the value of STRIPE_KEY from this machine's environment"]);
+  assert.equal(r.pendingCount(), 0, 'withheld is not held for a retry');
+});
+
+test('the real scrub list: secretIn finds a checkout .env value inside binary bytes', () => {
+  const repo = mkdtempSync(join(tmpdir(), 'fv-artifacts-env-'));
+  writeFileSync(join(repo, '.env'), 'ARTIFACT_PROBE_TOKEN=ghp_Zq81xVb2Lw7Kd4Pn0Ty6\n');
+  scanEnvForScrub(repo, null);
+  assert.equal(envSecretIn(Buffer.from('PK\u0003\u0004 stored ghp_Zq81xVb2Lw7Kd4Pn0Ty6 entry')), 'ARTIFACT_PROBE_TOKEN');
+  assert.equal(envSecretIn(Buffer.from('nothing to see')), null);
+  // Canary: the same list is what the text scrub uses.
+  assert.equal(envScrub('x ghp_Zq81xVb2Lw7Kd4Pn0Ty6'), 'x [REDACTED:ARTIFACT_PROBE_TOKEN]');
+});
+
+test('the work manager hands the reporter the byte check', () => {
+  const w = readFileSync(new URL('./work.mjs', import.meta.url), 'utf8');
+  const a = w.indexOf('const artifacts = createArtifactReporter({');
+  assert.ok(a > -1, 'anchor');
+  const b = w.indexOf('});', a);
+  assert.ok(b > a, 'terminator');
+  const block = w.slice(a, b);
+  assert.match(block, /scrub: envScrub,/); // canary
+  assert.match(block, /secretIn: envSecretIn,/);
 });

@@ -18,6 +18,24 @@
  */
 export const agentTaskKindOf = (v) => (v === 'design' || v === 'research' ? v : 'code');
 
+/**
+ * …EXCEPT WHERE A TURN IS ABOUT TO SPAWN (2026-09-23). "Unknown degrades to
+ * code" is right for every reader that only PRINTS the kind — the planner's
+ * kickoff, the spec, a contract heading — and wrong for the one that picks a
+ * POSTURE: code is the build turn, permissions skipped, so a kind a newer
+ * server invented for a card that must not touch the code (a fourth kind, a
+ * typo, `Design`) would have run as exactly the turn it exists to prevent. The
+ * agent lane asks this first and refuses in words, relaying the word it was
+ * handed. Absent, null and empty stay code — that is how a code card arrives.
+ *
+ * @returns {string|null} the unrecognised value, or null when the kind is one
+ *   this daemon runs.
+ */
+export const unknownAgentTaskKind = (v) =>
+  v === undefined || v === null || v === '' || v === 'code' || v === 'design' || v === 'research'
+    ? null
+    : String(v).replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 40);
+
 
 
 // Wiki-gen turn: the local Claude READS the repo (cwd) and writes/maintains the
@@ -919,6 +937,14 @@ not only this card. Past tense, plain sentences, no commit shas and no card ids.
  * (claude.mjs) can write ONLY under `.flowviant/artifacts/` — "change no
  * repository file" is enforced, not asked — and the daemon refuses to call the
  * turn delivered if no `.html` was written under it this turn.
+ *
+ * "DIRECTLY IN, NO SUBFOLDERS" (2026-09-23) is the one rule here only the
+ * prompt can carry. The artifact scan keeps top-level files (depth one, by
+ * design — artifacts.mjs), so a mockup written to
+ * `.flowviant/artifacts/landing/index.html` was neither uploaded nor counted
+ * and the turn settled `nothing` saying no mockup was written. The posture
+ * cannot narrow it: `Edit(.flowviant/artifacts/*)` was measured on 2.1.281
+ * to admit a subfolder write exactly as `**` does.
  */
 export const SYSTEM_AGENT_DESIGN = `You are the human's own Claude, working one DESIGN card in a git worktree of
 their repository. Nobody is watching this run. You have the repo and nothing
@@ -934,9 +960,10 @@ WHAT TO DO:
    touches. The mockup must look like THIS product, in its own words, not like
    a template. If a frontend-design skill is available on this machine, use it.
 
-2. Write ONE self-contained HTML file under .flowviant/artifacts/ — a short
-   kebab-case name for what it shows (for example
-   .flowviant/artifacts/landing-redesign.html). Inline CSS (a Google Fonts
+2. Write ONE self-contained HTML file directly in .flowviant/artifacts/ (no
+   subfolders — a file in one is never shown) — a short kebab-case name for
+   what it shows (for example .flowviant/artifacts/landing-redesign.html).
+   Inline CSS (a Google Fonts
    stylesheet may load). Scripts may be inline or loaded from
    cdnjs.cloudflare.com, cdn.jsdelivr.net/npm or unpkg.com, and from nowhere
    else; nothing else may load from the network and nothing can be sent, so
@@ -997,8 +1024,9 @@ WHAT TO DO:
    today, and the web, for how others do it. Prefer primary sources — the
    product itself, its docs, its changelog — over commentary about them.
 
-2. Write ONE Markdown file under .flowviant/artifacts/ — a short kebab-case
-   name for the question (for example .flowviant/artifacts/onboarding-teardown.md).
+2. Write ONE Markdown file directly in .flowviant/artifacts/ (no subfolders —
+   a file in one is never shown) — a short kebab-case name for the question
+   (for example .flowviant/artifacts/onboarding-teardown.md).
    Lead with the answer in a few sentences, then the evidence. CITE WHAT YOU
    READ: a link for every web source, a path for every file in the repo. Say
    plainly what you could not find or verify rather than filling the gap.

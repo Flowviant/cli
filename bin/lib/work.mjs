@@ -77,6 +77,7 @@ import {
   AGENT_PLAN_KICKOFF,
   SYSTEM_AGENT_FOR,
   agentTaskKindOf,
+  unknownAgentTaskKind,
   SYSTEM_PRECHECK,
   AGENT_TASK_KICKOFF,
   AGENT_TASK_SPEC,
@@ -86,7 +87,7 @@ import {
 } from './prompts.mjs';
 import { knowledgeDirFor, FLOWVIANT_OWN_PATHS } from './knowledge.mjs';
 import { changedArtifacts, createArtifactReporter, scanArtifacts, snapshotArtifacts } from './artifacts.mjs';
-import { myPubB64, scrub as envScrub } from './env.mjs';
+import { myPubB64, scrub as envScrub, secretIn as envSecretIn } from './env.mjs';
 import {
   detectRuntimes,
   canRun,
@@ -276,6 +277,9 @@ export function createWorkManager({
     token: FLEET_TOKEN,
     userAgent: USER_AGENT,
     scrub: envScrub,
+    // …and for the binaries it cannot scrub, the same list as a byte check:
+    // a hit is withheld, never uploaded rewritten (artifacts.mjs).
+    secretIn: envSecretIn,
     log: (line) => warn(line),
   });
   /**
@@ -4949,6 +4953,26 @@ export function createWorkManager({
        * floor as the card's own key, no new one), and the card's key stays the
        * fallback for a server that sends only that. Absent on both is code.
        */
+      /**
+       * A KIND THIS DAEMON DOES NOT KNOW IS REFUSED, NEVER BUILT (2026-09-23).
+       * `agentTaskKindOf` reads anything unrecognised as code — right for a
+       * printed label, wrong here, where code means the build posture with
+       * permissions skipped. A server that learned a fourth kind ahead of
+       * this daemon is exactly the case the version floor cannot cover (the
+       * handout does not re-check it), and the answer is an update, said in
+       * the word the server used. `nothing` puts the agent in Stuck with it.
+       */
+      const strangeKind = unknownAgentTaskKind(job.taskKind ?? job.task?.taskKind);
+      if (strangeKind !== null) {
+        await postAgentTurn({
+          turnId,
+          outcome: 'nothing',
+          answer: `this daemon does not know the card kind '${strangeKind}' — update it`,
+          branch,
+          worktree: wt,
+        });
+        return;
+      }
       const taskKind = agentTaskKindOf(job.taskKind ?? job.task?.taskKind);
       const posture = taskKind === 'code' ? 'build' : taskKind;
       if (!canRun(RUNTIMES[rt], posture)) {
@@ -5146,6 +5170,16 @@ export function createWorkManager({
           onUsage: (u) => {
             usage = u;
           },
+          // WHAT THE CLI SAYS IT CAN BE ASKED FOR, AND WHICH CONNECTORS NEED A
+          // LOGIN — the same free fact off the same init event the tab lane
+          // records (2026-09-23). Without it a box that only ever runs agents
+          // taught the app its skills and connectors ONCE, from the startup
+          // probe, and never again: a connector signed into at the box kept
+          // reading "needs authorization" for the life of the process.
+          onInit: (i) => {
+            recordSkills(i.skills);
+            recordMcpServers(i.mcpServers);
+          },
           onSpawn: (ch) => {
             child = ch;
             // The AGENT it serves — what the machine snapshot charges this
@@ -5269,6 +5303,16 @@ export function createWorkManager({
        * is" is a legitimate answer to a question the agent asked after
        * drawing, and the turn did not have to rewrite the page to deliver it.
        *
+       * …AND ON A REDO (2026-09-23): a TASK turn re-running a card this agent
+       * already delivered, which is what a send-back's "Needs work" queues —
+       * the human turn in front of it usually rewrote the mockup already, so
+       * the task turn that follows truthfully says "revised last turn" with
+       * nothing new to write, and the task rule sent it to Stuck with a false
+       * sentence. The server marks such a job `redo: true` (a link delivered
+       * before, or carrying a `needs_work` verdict), and then a standing match
+       * counts, as it does for a human turn. No floor: an older server never
+       * sends the key, and absent keeps the stricter task rule.
+       *
        * Commits are still reported if any exist — the posture prevents them,
        * and a report never lies by omission about what is on the branch.
        */
@@ -5276,7 +5320,8 @@ export function createWorkManager({
         const want = taskKind === 'design' ? /\.html?$/i : /\.md$/i;
         const standing = scanArtifacts(wt);
         const wrote = changedArtifacts(artifactsBefore, standing).some((e) => want.test(e.name));
-        const present = wrote || (job.kind !== 'task' && standing.some((e) => want.test(e.name)));
+        const present =
+          wrote || ((job.kind !== 'task' || job.redo === true) && standing.some((e) => want.test(e.name)));
         if (!present) {
           await postAgentTurn({
             turnId,

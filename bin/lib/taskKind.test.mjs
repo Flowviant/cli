@@ -16,7 +16,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import * as prompts from './prompts.mjs';
 import { parseTurnResult } from './agentPlan.mjs';
-import { DESIGN_PERM, RESEARCH_PERM } from './claude.mjs';
+import { DESIGN_PERM, RESEARCH_PERM, READ_GUARD_SETTINGS, researchPerm } from './claude.mjs';
 import { RUNTIMES, canRun } from './runtimes.mjs';
 
 const src = (f) => readFileSync(new URL(`./${f}`, import.meta.url), 'utf8');
@@ -36,6 +36,18 @@ test('the kind is read one way: absent and unknown are code', () => {
   assert.equal(prompts.agentTaskKindOf('Design'), 'code');
   assert.equal(prompts.agentTaskKindOf('design'), 'design');
   assert.equal(prompts.agentTaskKindOf('research'), 'research');
+});
+
+test('…but a turn is never SPAWNED on a kind this daemon does not know (2026-09-23)', () => {
+  // Absent, null, empty and the three it runs: nothing to refuse.
+  for (const v of [undefined, null, '', 'code', 'design', 'research']) {
+    assert.equal(prompts.unknownAgentTaskKind(v), null, String(v));
+  }
+  // Anything else is relayed back, bounded and stripped of control bytes.
+  assert.equal(prompts.unknownAgentTaskKind('Design'), 'Design');
+  assert.equal(prompts.unknownAgentTaskKind('video'), 'video');
+  assert.equal(prompts.unknownAgentTaskKind('x\ny'), 'xy');
+  assert.equal(prompts.unknownAgentTaskKind('z'.repeat(99)).length, 40);
 });
 
 test('the capture chat reads a kind off the words, and asks when two fit', () => {
@@ -121,14 +133,14 @@ test('all three agent contracts end in JSON the one parser reads', () => {
 
 test('design draws one self-contained page and commits nothing; research cites and commits nothing', () => {
   const d = prompts.SYSTEM_AGENT_DESIGN;
-  assert.match(d, /ONE self-contained HTML file under \.flowviant\/artifacts\//);
+  assert.match(d, /ONE self-contained HTML file directly in \.flowviant\/artifacts\/ \(no\s+subfolders — a file in one is never shown\)/);
   assert.match(d, /cdnjs\.cloudflare\.com, cdn\.jsdelivr\.net\/npm or\s+unpkg\.com/);
   assert.match(d, /CHANGE NO REPOSITORY FILE AND COMMIT NOTHING/);
   assert.match(d, /frontend-design skill/);
   assert.match(d, /real copy|the real copy|the brand, the\s+design tokens/);
   assert.ok(!d.includes('Flowviant-Task'), 'no trailer — there is nothing to commit');
   const r = prompts.SYSTEM_AGENT_RESEARCH;
-  assert.match(r, /ONE Markdown file under \.flowviant\/artifacts\//);
+  assert.match(r, /ONE Markdown file directly in \.flowviant\/artifacts\/ \(no subfolders —\s+a file in one is never shown\)/);
   assert.match(r, /CITE WHAT YOU\s+READ/);
   assert.match(r, /CHANGE NO REPOSITORY FILE AND COMMIT NOTHING/);
   assert.ok(!r.includes('Flowviant-Task'));
@@ -144,7 +156,8 @@ test('the artifacts paragraph no longer says scripts are disabled', () => {
 test('the postures: research reads the web, design does not, and neither writes outside artifacts', () => {
   const scoped = 'Edit(.flowviant/artifacts/**)';
   for (const [name, perm] of [['design', DESIGN_PERM], ['research', RESEARCH_PERM]]) {
-    assert.equal(perm[0], '--allowedTools', `${name}: a curated list, never skip-permissions`);
+    // The read guard rides FIRST, before the variadic list could swallow it.
+    assert.deepEqual(perm.slice(0, 3), ['--settings', READ_GUARD_SETTINGS, '--allowedTools'], `${name}: guarded, then a curated list`);
     assert.ok(perm.includes(scoped), `${name}: the one scoped write`);
     // No UNSCOPED write of any spelling, and no shell that could commit.
     for (const bad of ['Write', 'Edit', '--dangerously-skip-permissions', 'Bash(git:*)', 'Bash(git commit:*)', 'mcp__flowviant']) {
@@ -153,9 +166,50 @@ test('the postures: research reads the web, design does not, and neither writes 
     // The probe's finding, pinned: a `Write(...)` path rule is NOT a scoped
     // write on 2.1.281 — it denied both files — so it must not be the one used.
     assert.ok(!perm.some((x) => x.startsWith('Write(')), `${name}: never the Write(...) spelling`);
+    // `**`, not `*`: the single-level spelling admitted a subfolder write on
+    // 2.1.281 exactly as `**` did, so it would only LOOK narrower.
+    assert.ok(!perm.includes('Edit(.flowviant/artifacts/*)'), `${name}: never the look-alike single level`);
+    // No git reader and no cat/head/wc: each git reader was an `--output`
+    // away from a write, and Read covers the rest.
+    assert.ok(!perm.some((x) => /^Bash\((git|cat|head|wc)\b/.test(x)), `${name}: no git readers, no cat/head/wc`);
   }
-  assert.ok(RESEARCH_PERM.includes('WebSearch') && RESEARCH_PERM.includes('WebFetch'));
+  // DESIGN, exactly: reads the repo broadly, no web.
+  assert.deepEqual(DESIGN_PERM.slice(2), ['--allowedTools', 'Read', 'Grep', 'Glob', 'Bash(ls:*)', scoped]);
   assert.ok(!DESIGN_PERM.some((x) => x.startsWith('Web')), 'a design card draws THIS product');
+  // RESEARCH, exactly: the web, and reading fenced to the worktree — no Grep,
+  // no Bash, `.env*` denied by name (measured load-bearing: without the deny,
+  // `Read(./**)` read `.env`).
+  assert.deepEqual(RESEARCH_PERM.slice(2), [
+    '--allowedTools',
+    'Read(./**)',
+    'Glob(./**)',
+    'WebSearch',
+    'WebFetch',
+    scoped,
+    '--disallowedTools',
+    'Read(./.env*)',
+    'Read(./**/.env*)',
+    // Denied BY NAME: off the allow list, the CLI still ran `git log` and
+    // `ls` on its own read-only classifier (measured).
+    'Bash',
+  ]);
+  for (const bad of ['Read', 'Grep', 'Glob']) assert.ok(!RESEARCH_PERM.includes(bad), `research: no bare ${bad}`);
+  const allowed = RESEARCH_PERM.slice(RESEARCH_PERM.indexOf('--allowedTools'), RESEARCH_PERM.indexOf('--disallowedTools'));
+  assert.ok(!allowed.some((x) => x.startsWith('Bash') || x.startsWith('Grep')), 'research: no Bash, no Grep allowed');
+});
+
+test('research reads the knowledge library by its absolute path, built at spawn', () => {
+  const kd = '/home/op/repo/.flowviant/knowledge';
+  const perm = researchPerm(kd);
+  assert.ok(perm.includes(`Read(/${kd}/**)`), 'the CLI spells an absolute rule with //');
+  assert.ok(perm.includes(`Glob(/${kd}/**)`));
+  assert.ok(perm.includes('Read(./**)'), 'canary: the worktree rule is still there');
+  // A trailing slash is not doubled; a path the rule syntax cannot carry gets
+  // no rule at all (`--add-dir` still admits the directory — measured).
+  assert.ok(researchPerm(`${kd}/`).includes(`Read(/${kd}/**)`));
+  for (const odd of ['relative/dir', '/has(paren)', '/has*star', null, undefined]) {
+    assert.deepEqual(researchPerm(odd), RESEARCH_PERM, String(odd));
+  }
 });
 
 test('runTurn picks the posture by name, ahead of every older branch', () => {
@@ -163,7 +217,7 @@ test('runTurn picks the posture by name, ahead of every older branch', () => {
   const body = slice(c, 'export function runTurn(', 'const args = rt.args({');
   assert.match(body, /posture === 'design' \|\| posture === 'research'\s*\?\s*posture\s*:\s*planPerm \? 'plan'/);
   const perm = slice(c, 'const args = rt.args({', '// Handed to the adapter rather than appended here');
-  assert.match(perm, /profile === 'design'\s*\?\s*DESIGN_PERM\s*:\s*profile === 'research'\s*\?\s*RESEARCH_PERM/);
+  assert.match(perm, /profile === 'design'\s*\?\s*DESIGN_PERM\s*:\s*profile === 'research'\s*\?\s*researchPerm\(knowledgeDir\)/);
   // Canary: the untouched arm is still there, so the slice is the real one.
   assert.match(perm, /planPerm \? PLAN_PERM : readOnly \? CONSULT_PERM : wikiPerm \? WIKI_PERM : PERM/);
 });
@@ -184,6 +238,11 @@ test('the agent turn: contract and posture from the kind, refusal off Claude, ar
   // Canary: this IS the agent lane.
   assert.match(turn, /AGENT_TASK_KICKOFF\(/);
   assert.match(turn, /const taskKind = agentTaskKindOf\(job\.taskKind \?\? job\.task\?\.taskKind\);/);
+  // An unknown kind is refused, in its own word, BEFORE the kind is coerced.
+  const refuse = slice(turn, 'const strangeKind = unknownAgentTaskKind(job.taskKind ?? job.task?.taskKind);', 'const taskKind = agentTaskKindOf(');
+  assert.match(refuse, /if \(strangeKind !== null\) \{\s*await postAgentTurn\(\{\s*turnId,\s*outcome: 'nothing',/);
+  assert.ok(refuse.includes("answer: `this daemon does not know the card kind '${strangeKind}' — update it`,"));
+  assert.match(refuse, /return;\s*\}\s*$/);
   assert.match(turn, /const posture = taskKind === 'code' \? 'build' : taskKind;/);
   assert.match(turn, /if \(!canRun\(RUNTIMES\[rt\], posture\)\)/);
   assert.ok(turn.includes("'design and research cards run on Claude on this machine'"));
@@ -193,7 +252,7 @@ test('the agent turn: contract and posture from the kind, refusal off Claude, ar
   const check = slice(turn, "if (res.outcome === 'delivered' && taskKind !== 'code') {", 'const reply = await postAgentTurn({');
   assert.match(check, /taskKind === 'design' \? \/\\\.html\?\$\/i : \/\\\.md\$\/i/);
   assert.match(check, /changedArtifacts\(artifactsBefore, standing\)/);
-  assert.match(check, /job\.kind !== 'task' && standing\.some/);
+  assert.match(check, /\(job\.kind !== 'task' \|\| job\.redo === true\) && standing\.some/);
   assert.match(check, /outcome: 'nothing'/);
   assert.ok(check.includes("'the turn ended without writing a mockup under .flowviant/artifacts/'"));
   assert.ok(check.includes("'the turn ended without writing a write-up under .flowviant/artifacts/'"));

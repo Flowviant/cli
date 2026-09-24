@@ -37,13 +37,27 @@
  * this is somebody's disk and one place checking is one deploy from zero) are
  * reported BY NAME and never read. Over `ARTIFACT_MAX_BYTES` likewise.
  *
- * ── TEXT IS SCRUBBED ──
+ * ── TEXT IS SCRUBBED; A BINARY CARRYING A SECRET IS WITHHELD ──
  *
  * html, md, svg, json, csv and txt pass through `envScrub` before upload — the
  * turn trace's own scrub, for the trace's own reason: a page the agent wrote
  * can quote a value out of the checkout's `.env`, and an artifact is served to
- * a browser. Binary images are not scrubbed (there is no text to match), and
- * the SERVER computes the sha256 of what it stored; the one sent here is for
+ * a browser.
+ *
+ * The binary types CAN carry text, and this header used to say they could
+ * not. A PNG has tEXt chunks, a PDF has streams that are often stored
+ * uncompressed, a docx/pptx/xlsx is a zip whose entries may be STORED rather
+ * than deflated — and a turn that can write a file can write a secret into
+ * any of them. What they cannot be is REWRITTEN: `envScrub` swapping bytes
+ * inside one corrupts it, and a corrupted binary served as the thing the agent
+ * made is worse than none. So each binary is checked against the same scrub
+ * list as exact byte substrings (`secretIn`, env.mjs) before it is uploaded,
+ * and a hit SKIPS the file with a warn line naming it and the variable — never
+ * a redacted copy, never a by-name row the page would draw as a file it merely
+ * could not show. STATED: a value inside a deflated stream is not a substring
+ * of the file, so this catches what is stored plainly and nothing more.
+ *
+ * The SERVER computes the sha256 of what it stored; the one sent here is for
  * the log.
  *
  * ── DELIVERY ──
@@ -92,9 +106,10 @@ export const ARTIFACT_TYPES = {
   csv: { mime: 'text/csv', text: true },
   txt: { mime: 'text/plain', text: true },
   // DOCUMENTS (0.97.0): a Word file, a deck, a sheet or a PDF — what the
-  // machine's docx/pptx/xlsx/pdf skills write. Binary, so never scrubbed (a
-  // zip or a PDF carries no plain text for `envScrub` to match), and under the
-  // same cap. The app offers the first three as a download and frames the PDF.
+  // machine's docx/pptx/xlsx/pdf skills write. Binary, so never REWRITTEN (a
+  // scrub inside a zip or a PDF corrupts it) but checked for a known secret's
+  // bytes and withheld on a hit — see the header. Under the same cap. The app
+  // offers the first three as a download and frames the PDF.
   docx: { mime: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', text: false },
   pptx: { mime: 'application/vnd.openxmlformats-officedocument.presentationml.presentation', text: false },
   xlsx: { mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', text: false },
@@ -190,7 +205,7 @@ function readNoFollow(path, limit) {
  * re-sent exactly as it was first built (scrubbed once, never re-read from a
  * disk the agent may have changed since).
  */
-export function buildArtifactUpload(entry, { sessionId, agentId, turnId }, scrub = (s) => s) {
+export function buildArtifactUpload(entry, { sessionId, agentId, turnId }, scrub = (s) => s, secretIn = () => null) {
   const type = artifactTypeFor(entry.name);
   const fields = {
     ...(sessionId ? { sessionId } : { agentId }),
@@ -207,7 +222,11 @@ export function buildArtifactUpload(entry, { sessionId, agentId, turnId }, scrub
     return null; // vanished, or a symlink swapped in: nothing to say
   }
   if (!bytes) return { fields: { ...fields, tooLarge: '1' }, bytes: null };
-  if (type.text) {
+  if (!type.text) {
+    // A binary is never rewritten; one carrying a known secret is not sent.
+    const secret = secretIn(bytes);
+    if (secret) return { withheld: secret, fields };
+  } else {
     bytes = Buffer.from(String(scrub(bytes.toString('utf8'))), 'utf8');
     // A redaction marker can be longer than the value it replaced.
     if (bytes.byteLength > ARTIFACT_MAX_BYTES) {
@@ -230,7 +249,7 @@ export function buildArtifactUpload(entry, { sessionId, agentId, turnId }, scrub
  * finished turn and never awaited by the turn (a slow uplink must not hold the
  * next turn behind a readout); `retryPending` rides the settle retry beat.
  */
-export function createArtifactReporter({ fleetUrl, token, userAgent, scrub, fetchImpl, log = () => {} }) {
+export function createArtifactReporter({ fleetUrl, token, userAgent, scrub, secretIn, fetchImpl, log = () => {} }) {
   const url = String(fleetUrl).replace(/\/agents\/?$/, '/artifact');
   const doFetch = fetchImpl ?? ((...a) => fetch(...a));
   const pending = new Map(); // `${owner}:${name}` -> { body, tries }
@@ -292,8 +311,12 @@ export function createArtifactReporter({ fleetUrl, token, userAgent, scrub, fetc
     const changed = changedArtifacts(before, scanArtifacts(placeDir));
     let n = 0;
     for (const entry of changed) {
-      const body = buildArtifactUpload(entry, { sessionId, agentId, turnId }, scrub);
+      const body = buildArtifactUpload(entry, { sessionId, agentId, turnId }, scrub, secretIn);
       if (!body) continue;
+      if (body.withheld) {
+        log(`artifact ${entry.name}: not uploaded — it contains the value of ${body.withheld} from this machine's environment`);
+        continue;
+      }
       const key = `${sessionId ?? agentId}:${entry.name}`;
       pending.delete(key); // this copy supersedes a held older one
       await send(key, body, 0);

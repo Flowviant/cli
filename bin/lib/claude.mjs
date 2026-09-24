@@ -12,6 +12,7 @@
  */
 
 import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { SAFE } from './config.mjs';
 import { runtimeById, humanizeClaudeTool, THINK_MARKER } from './runtimes.mjs';
 
@@ -19,6 +20,46 @@ import { runtimeById, humanizeClaudeTool, THINK_MARKER } from './runtimes.mjs';
 // a dozen call sites import them from claude.mjs, and none of them care where
 // the strings live.
 export * from './prompts.mjs';
+
+/**
+ * THE READ GUARD, ON EVERY CURATED POSTURE (2026-09-23) — see
+ * hooks/readGuard.mjs for what it refuses and the probe that proved it fires.
+ *
+ * A `Bash(git log:*)` allow is a PREFIX: it names the program and says nothing
+ * about the arguments, and `git log --output=<path>` writes any file while
+ * `-c core.fsmonitor=…` / `--ext-diff` run a program. A reviewer landed
+ * `git log -1 --format='tformat:x' --output=pwned.txt` under RESEARCH_PERM with
+ * no denial, and it re-measured the same way here. So every list below that
+ * promises "reads, and nothing else" carries a `PreToolUse` hook through
+ * `--settings`, measured on Claude Code 2.1.281: it fires under
+ * `--allowedTools`, exit 2 blocks the call, and its sentence reaches the model.
+ *
+ * NEVER ON THE BUILD POSTURE: `--dangerously-skip-permissions` is the
+ * operator's own choice for a turn that is meant to write, and a guard there
+ * would be refusing the job. Nor on PLAN_MODE_PERM, which is the CLI's own
+ * posture on the owner's own tab, not a list this file promises anything about.
+ *
+ * The hook runs as `<this node> <readGuard.mjs>` — the daemon's own
+ * `process.execPath`, never a `node` looked up on a PATH the operator may not
+ * have, because a hook that fails to START is a non-blocking error and the
+ * command runs anyway.
+ */
+export const READ_GUARD_PATH = fileURLToPath(new URL('./hooks/readGuard.mjs', import.meta.url));
+const hookQuote = (s) =>
+  process.platform === 'win32' ? `"${s}"` : `'${String(s).replace(/'/g, `'\\''`)}'`;
+export const READ_GUARD_SETTINGS = JSON.stringify({
+  hooks: {
+    PreToolUse: [
+      {
+        matcher: 'Bash',
+        hooks: [{ type: 'command', command: `${hookQuote(process.execPath)} ${hookQuote(READ_GUARD_PATH)}` }],
+      },
+    ],
+  },
+});
+/** Spread FIRST into a curated list: `--allowedTools` is variadic, so the
+ *  `--settings` pair must stand before it or be swallowed as a tool name. */
+const READ_GUARD = ['--settings', READ_GUARD_SETTINGS];
 
 /**
  * PLAN — read the repo, write the plan, never the code.
@@ -37,6 +78,7 @@ export * from './prompts.mjs';
  * touching.
  */
 const PLAN_PERM = [
+  ...READ_GUARD,
   '--allowedTools',
   'mcp__flowviant',
   'Read',
@@ -81,6 +123,7 @@ const PERM = SAFE
 // after every wiki turn, and the vault has its own git history.
 // (Write/Edit can't be path-scoped here; the worktree reset is the backstop.)
 const WIKI_PERM = [
+  ...READ_GUARD,
   '--allowedTools',
   'Read',
   'Grep',
@@ -112,6 +155,7 @@ const WIKI_PERM = [
 // "do not change anything" is only an instruction, and instructions are exactly
 // what an injected question competes with.
 const CONSULT_PERM = [
+  ...READ_GUARD,
   '--allowedTools',
   'Read',
   'Grep',
@@ -130,10 +174,9 @@ const CONSULT_PERM = [
  * THE TWO NON-CODE POSTURES (0.97.0) — a design card and a research card may
  * WRITE, and only under `.flowviant/artifacts/`.
  *
- * Both start from CONSULT_PERM verbatim, for the reason that list gives: the
- * card's words are steered by anyone who can file a card, so "change nothing"
- * as prose is only an instruction, and the permission list is the enforcement.
- * What each adds is the ONE write its contract needs:
+ * The card's words are steered by anyone who can file a card, so "change
+ * nothing" as prose is only an instruction, and the permission list is the
+ * enforcement. What each carries is the ONE write its contract needs:
  *
  *  · `Edit(.flowviant/artifacts/**)` — PROBED on Claude Code 2.1.281 before
  *    relying on it (2026-09-23): with `--allowedTools 'Read'
@@ -144,14 +187,61 @@ const CONSULT_PERM = [
  *    `//abs`-anchored — the same probe was denied BOTH files, so that spelling
  *    is not a scoped write at all, it is no write. Relative to the turn's cwd,
  *    which is the agent's own worktree, which is where the artifact scan looks.
- *  · research alone adds `WebSearch` and `WebFetch`: it is the one kind whose
- *    answer lives partly outside the repository. A design card reads the repo's
- *    own copy and tokens, and a mockup that went looking on the web would be a
- *    mockup of somebody else's product.
+ *    `**` AND NOT `*`, measured the same day: `Edit(.flowviant/artifacts/*)`
+ *    let a Write to `.flowviant/artifacts/sub/b.html` through exactly as `**`
+ *    did, so the single-level spelling is not narrower on this CLI and would
+ *    only read as if it were. The scan keeps top-level files, so the
+ *    contracts say "no subfolders" — the prompt is the only thing that can.
  *
- * NO BASH BEYOND CONSULT'S READERS, and no MCP: the agent turn has neither
- * anyway (see SYSTEM_AGENT's header), and a posture that could run `git
- * commit` could commit the mockup it was told to keep out of git.
+ * THEY ARE NOT THE SAME READER, and the difference is the network:
+ *
+ *  · DESIGN draws THIS product, so it reads the repo broadly — Read, Grep,
+ *    Glob and `ls` — and has no web at all (a mockup that went looking on the
+ *    web would be a mockup of somebody else's product). No git readers and no
+ *    cat/head/wc: Read covers every one of them, and each git reader was an
+ *    `--output` away from a write (see READ_GUARD, which it still carries for
+ *    the `ls` it keeps).
+ *  · RESEARCH has the web — WebSearch and WebFetch — and a turn that can both
+ *    read a secret and fetch a URL can send one. So its reading is FENCED to
+ *    what the card is about: `Read(./**)` (the worktree) plus the project's
+ *    knowledge library by its absolute path, `Glob(./**)` for names, NO Grep
+ *    (an unscoped search of the home directory prints matching lines), NO
+ *    Bash at all, and `.env*` DENIED by name. PROBED on 2.1.281, the whole
+ *    list with `--add-dir <knowledge>`: a file in the cwd read; `/etc/hostname`,
+ *    a sibling directory's file and `~/.flowviant/credentials.json` were each
+ *    refused ("Claude requested permissions to read from …, but you haven't
+ *    granted it yet"); `.env` was refused ("File is in a directory that is
+ *    denied by your permission settings"); the knowledge file read. Two
+ *    controls: WITHOUT the `--disallowedTools` pair, `Read(./**)` read `.env`
+ *    — the deny is load-bearing; and a bare `Glob` listed `~/.flowviant`
+ *    while `Glob(./**)` refused it and still listed the cwd and the added
+ *    directory. The knowledge `Read(//…)` rule is belt: `--add-dir` alone
+ *    admitted the file, and the rule keeps the read allowed should the
+ *    adapter ever stop passing that flag.
+ *    AND `Bash` IS DENIED BY NAME, because leaving it off the allow list is
+ *    not "no Bash": measured the same day, with Bash absent from
+ *    `--allowedTools` the CLI still ran `git log -1 --format=%s` and `ls` on
+ *    its own read-only classifier (it did refuse `git log … --output=…`,
+ *    "This command requires approval" — the reviewer's write needed the
+ *    explicit `Bash(git log:*)` prefix the old list carried). With `Bash` in
+ *    `--disallowedTools` the tool was not there at all.
+ *
+ * NO MCP, and no shell that could commit: the agent turn has no MCP anyway
+ * (see SYSTEM_AGENT's header), and a posture that could run `git commit` could
+ * commit the mockup it was told to keep out of git.
+ *
+ * STATED, not closed: research may still read any file in the worktree and
+ * name it in a WebFetch URL — the repository is what a research card is about,
+ * and a turn that could not read it could not answer. Design may read any
+ * file the Read tool reaches and put it in an artifact the server stores;
+ * text artifacts are scrubbed of the machine's known secret values on the way
+ * out (artifacts.mjs), and binary ones are withheld when they carry one.
+ * Design still runs a plain `git log` on the CLI's own read-only classifier
+ * though no git reader is allowed (measured) — the guard is what refuses its
+ * `--output`. And the Agent tool is offered with no allow rule on this CLI:
+ * a research turn with Bash denied launched a subagent to run one, and the
+ * subagent had no Bash either (measured) — the rules are inherited. Whether
+ * the guard's hook sees a subagent's own calls was not measured here.
  */
 const ARTIFACT_WRITE = 'Edit(.flowviant/artifacts/**)';
 /**
@@ -184,8 +274,47 @@ const ARTIFACT_WRITE = 'Edit(.flowviant/artifacts/**)';
  *    plane whose every call the CLI refuses. See work.mjs.
  */
 export const PLAN_MODE_PERM = ['--permission-mode', 'plan'];
-export const DESIGN_PERM = [...CONSULT_PERM, ARTIFACT_WRITE];
-export const RESEARCH_PERM = [...CONSULT_PERM, 'WebSearch', 'WebFetch', ARTIFACT_WRITE];
+export const DESIGN_PERM = [
+  ...READ_GUARD,
+  '--allowedTools',
+  'Read',
+  'Grep',
+  'Glob',
+  'Bash(ls:*)',
+  ARTIFACT_WRITE,
+];
+
+/** A path a permission rule can name: absolute POSIX, and free of the glob and
+ *  rule-syntax characters that would change what the rule means. Anything else
+ *  gets no rule — `--add-dir` still admits the directory (measured). */
+const ruleSafeAbsolute = (p) =>
+  typeof p === 'string' && p.startsWith('/') && !/[*?[\]{}()\\\n]/.test(p) ? p.replace(/\/+$/, '') : null;
+
+/**
+ * RESEARCH, built at spawn — the knowledge library is the one directory
+ * outside the worktree it may read, and only the spawn knows where that is.
+ * `//` is the CLI's own spelling for an absolute path in a rule.
+ */
+export function researchPerm(knowledgeDir) {
+  const kd = ruleSafeAbsolute(knowledgeDir);
+  return [
+    ...READ_GUARD,
+    '--allowedTools',
+    'Read(./**)',
+    ...(kd ? [`Read(/${kd}/**)`] : []),
+    'Glob(./**)',
+    ...(kd ? [`Glob(/${kd}/**)`] : []),
+    'WebSearch',
+    'WebFetch',
+    ARTIFACT_WRITE,
+    '--disallowedTools',
+    'Read(./.env*)',
+    'Read(./**/.env*)',
+    'Bash',
+  ];
+}
+/** The list with no library — what a project that keeps none runs under. */
+export const RESEARCH_PERM = researchPerm(null);
 
 export const sleep = (s) => new Promise((r) => setTimeout(r, s * 1000));
 
@@ -432,6 +561,19 @@ export function runTurn({ prompt, resume, system, cwd, mcpConfig, mcpArgs, mcpEn
       resolve('');
       return;
     }
+    // …AND SO ARE THE TWO NON-CODE POSTURES, for the same reason and in the
+    // same shape. The agent lane asks `canRun` first and settles `nothing` in
+    // words; this is the layer no caller can skip. A codex or agy adapter
+    // handed `posture: 'design'` never reads `perm` — it builds from `profile`
+    // and runs whatever that falls back to, which for codex is its build
+    // branch, `--sandbox danger-full-access`: a research card's words with the
+    // whole machine to act on. Asked against the runtime's own declared profiles,
+    // so the day an adapter learns to express one this opens by itself.
+    if ((posture === 'design' || posture === 'research') && !(rt.profiles ?? []).includes(posture)) {
+      console.error(`\nerror: a ${posture} card runs on Claude Code only — not '${rt.label}'`);
+      resolve('');
+      return;
+    }
     if (!rt.args) {
       // Reached only if a brief names a runtime this daemon declares but cannot
       // drive. Fail as a turn with no sentinel — the loop already treats that as
@@ -512,7 +654,7 @@ export function runTurn({ prompt, resume, system, cwd, mcpConfig, mcpArgs, mcpEn
         : profile === 'design'
           ? DESIGN_PERM
           : profile === 'research'
-            ? RESEARCH_PERM
+            ? researchPerm(knowledgeDir)
             : planPerm ? PLAN_PERM : readOnly ? CONSULT_PERM : wikiPerm ? WIKI_PERM : PERM,
       // Handed to the adapter rather than appended here, because WHERE these go
       // is a property of the CLI: Codex reads its prompt as a trailing

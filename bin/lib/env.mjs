@@ -725,3 +725,20 @@ export function scrub(text) {
   for (const v of values) out = out.split(v.value).join(`[REDACTED:${v.name}]`);
   return out;
 }
+
+/**
+ * The NAME of the first known secret whose value appears in `bytes` as an
+ * exact byte substring, or null. For the payloads `scrub` cannot touch: a
+ * binary artifact (a PNG's text chunk, a PDF's uncompressed stream, a zip's
+ * stored entry) is not text to rewrite — replacing bytes inside one corrupts
+ * it — so the caller WITHHOLDS a hit rather than redacting it. The same list,
+ * already filtered by `worthRedacting`, so the two can never disagree about
+ * what counts as a secret. It sees only what is stored plainly: a value inside
+ * a deflated stream is not a substring of the file, and that is stated where
+ * it is used (artifacts.mjs).
+ */
+export function secretIn(bytes) {
+  if (!Buffer.isBuffer(bytes) || !bytes.length || !values.length) return null;
+  for (const v of values) if (bytes.includes(v.value, 0, 'utf8')) return v.name;
+  return null;
+}

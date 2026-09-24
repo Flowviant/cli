@@ -88,14 +88,29 @@ test('the probe\'s line reader carries them too', () => {
   assert.equal(parseInitLine(JSON.stringify({ type: 'system', subtype: 'init' })).mcpServers, null);
 });
 
-test('recorded: flowviant excluded, statuses kept, sorted, compact {n, s}', () => {
+test('recorded: flowviant excluded, CONNECTED excluded, statuses kept, sorted, compact {n, s}', () => {
   recordMcpServers(INIT.mcp_servers);
   assert.deepEqual(knownMcpServers(), [
-    { n: 'claude.ai Gmail', s: 'connected' },
     { n: 'claude.ai Google Drive', s: 'needs-auth' },
     { n: 'local-db', s: 'failed' },
   ]);
   assert.ok(!knownMcpServers().some((e) => e.n === 'flowviant'), 'our own server is never relayed');
+});
+
+test('a connected server never leaves the box — the operator\'s signed-in services are nobody\'s read', () => {
+  recordMcpServers([
+    { name: 'claude.ai Gmail', status: 'connected', source: 'claudeai' },
+    { name: 'claude.ai Robinhood', status: 'connected', source: 'claudeai' },
+    { name: 'claude.ai Google Drive', status: 'needs-auth', source: 'claudeai' },
+  ]);
+  assert.deepEqual(knownMcpServers(), [{ n: 'claude.ai Google Drive', s: 'needs-auth' }]);
+  // Signed in at the box: the next init reports it connected, and it LEAVES —
+  // an all-connected turn is `[]`, which clears the stale line server-side.
+  recordMcpServers([
+    { name: 'claude.ai Gmail', status: 'connected' },
+    { name: 'claude.ai Google Drive', status: 'connected' },
+  ]);
+  assert.deepEqual(knownMcpServers(), []);
 });
 
 test('a status off the closed list is relayed as `other`, never dropped', () => {
@@ -112,10 +127,14 @@ test('a status off the closed list is relayed as `other`, never dropped', () => 
 });
 
 test(`capped at ${MAX_MCP_SERVERS} entries and names at ${MCP_NAME_MAX} characters`, () => {
-  const many = Array.from({ length: 70 }, (_, i) => ({ name: `srv-${String(i).padStart(2, '0')}`, status: 'connected' }));
+  const many = Array.from({ length: 70 }, (_, i) => ({ name: `srv-${String(i).padStart(2, '0')}`, status: 'failed' }));
+  // Connected ones are dropped BEFORE the cap, so they never crowd out one
+  // that needs something.
+  many.unshift(...Array.from({ length: 50 }, (_, i) => ({ name: `a-ok-${i}`, status: 'connected' })));
   recordMcpServers([...many, { name: 'z'.repeat(200), status: 'failed' }]);
   const got = knownMcpServers();
   assert.equal(got.length, MAX_MCP_SERVERS);
+  assert.ok(got.every((e) => e.s === 'failed'), 'no connected entry took a slot');
   recordMcpServers([{ name: `  ${'y'.repeat(200)}  `, status: 'failed' }]);
   assert.equal(knownMcpServers()[0].n.length, MCP_NAME_MAX);
 });
@@ -123,10 +142,10 @@ test(`capped at ${MAX_MCP_SERVERS} entries and names at ${MCP_NAME_MAX} characte
 test('[] is a fact and is recorded; a non-array leaves what we knew', () => {
   recordMcpServers([{ name: 'flowviant', status: 'connected' }]);
   assert.deepEqual(knownMcpServers(), [], 'only our own server mounted = none of the person\'s own');
-  recordMcpServers([{ name: 'x', status: 'connected' }]);
+  recordMcpServers([{ name: 'x', status: 'failed' }]);
   recordMcpServers(undefined);
   recordMcpServers('nope');
-  assert.deepEqual(knownMcpServers(), [{ n: 'x', s: 'connected' }]);
+  assert.deepEqual(knownMcpServers(), [{ n: 'x', s: 'failed' }]);
 });
 
 test('every reader of an init event records the servers beside the skills', () => {
@@ -137,6 +156,12 @@ test('every reader of an init event records the servers beside the skills', () =
   const w = src('work.mjs');
   const tab = slice(w, 'onInit: (i) => {\n                recordSkills(i.skills);', 'seenClaudeSession = i.sessionId.trim();');
   assert.match(tab, /recordMcpServers\(i\.mcpServers\);/);
+  // The AGENT lane too (2026-09-23): a box that only runs agents otherwise
+  // learned its skills and connectors once, from the startup probe, forever.
+  const agent = slice(w, 'const runAgentTurn = async (job', 'const lastAgentBeat = new Map();');
+  assert.match(agent, /AGENT_TASK_KICKOFF\(/); // canary: this is the agent lane
+  assert.match(agent, /onInit: \(i\) => \{\s*recordSkills\(i\.skills\);\s*recordMcpServers\(i\.mcpServers\);\s*\},/);
+  assert.equal(w.split('recordMcpServers(i.mcpServers);').length - 1, 2, 'the tab lane and the agent lane');
   const f = src('fleet.mjs');
   assert.equal(f.split('recordMcpServers(i.mcpServers);').length - 1, 2, 'both wiki lanes');
   assert.equal(f.split('recordSkills(i.skills);').length - 1, 2, 'canary: the two wiki lanes are the ones');
