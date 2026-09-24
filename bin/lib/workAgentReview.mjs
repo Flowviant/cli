@@ -551,8 +551,10 @@ export function createWorkAgentReview({
         },
         // The CLI's own count for this reading. Set, never accumulated: one
         // turn is one `result` event, and the adding-up is the server's.
+        // Tagged with the CLI, so a Claude pre-review of a Codex agent is
+        // charged as Claude's and not folded into the agent's own figure.
         onUsage: (u) => {
-          usage = u;
+          usage = { ...u, runtime: rt };
         },
         onSpawn: (ch) => {
           child = ch;

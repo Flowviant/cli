@@ -3194,6 +3194,8 @@ export function createWorkManager({
 
   const { processAgentTurnJobs, settleAgentTurns, agentTurns, agentChildren, agentReported } = createWorkAgentTurns({
     REJECT_RETRY_MS,
+    CODEX_THREAD_RE,
+    resumeConversationLost,
     baseRef,
     inPlace,
     baseDir,

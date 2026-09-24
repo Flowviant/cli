@@ -342,11 +342,40 @@ function parseCodexLine(line, cwd) {
       const activity = humanizeCodexItem(item, cwd);
       // Only the agent's MESSAGES are sentinel-bearing text. Reasoning is not:
       // a model that muses "I could output NOTHING here" must not end the turn.
-      const text =
-        (item.item_type ?? item.type) === 'agent_message'
-          ? `${item.text ?? item.message ?? ''}\n`
-          : '';
-      return { activity, text };
+      const isMessage = (item.item_type ?? item.type) === 'agent_message';
+      const text = isMessage ? `${item.text ?? item.message ?? ''}\n` : '';
+      // `answer` is the SAME message, surfaced alone: `text` accumulates every
+      // message plus every error and stderr line, so a caller that needs "what
+      // the agent said LAST" (the agent lane's final JSON object) cannot recover
+      // it from `out`. Claude's stream has this for free under
+      // `answerFromResult`; codex needed it said.
+      return { activity, text, ...(isMessage ? { answer: String(item.text ?? item.message ?? '') } : {}) };
+    }
+    // THE TURN'S OWN TOKEN COUNT (2026-09-24). `codex exec --json` closes a
+    // turn with `turn.completed` carrying `usage` — the codex twin of Claude's
+    // `result.usage`, and until now dropped on the floor, so a codex agent
+    // reported no spend at all. Mapped onto the daemon's four counters:
+    // OpenAI's `input_tokens` INCLUDES the cached part, Claude's excludes it,
+    // so the cached share is subtracted out rather than counted twice. Codex
+    // has no cache-creation figure; zero is what it reported, not a guess.
+    // Output already includes reasoning tokens on OpenAI's side.
+    case 'turn.completed': {
+      const u = ev.usage;
+      if (!u || typeof u !== 'object') return null;
+      const n = (v) => (Number.isFinite(Number(v)) && Number(v) > 0 ? Math.floor(Number(v)) : 0);
+      const cached = n(u.cached_input_tokens);
+      return {
+        activity: null,
+        text: '',
+        // `usageFromResult`'s shape (claude.mjs), so every consumer of
+        // `onUsage` reads one vocabulary whichever CLI counted it.
+        usage: {
+          input: Math.max(0, n(u.input_tokens) - cached),
+          output: n(u.output_tokens),
+          cacheCreate: 0,
+          cacheRead: cached,
+        },
+      };
     }
     case 'turn.failed': {
       // An error is prose too, and the sentence that explains a failed turn is
@@ -367,7 +396,12 @@ function parseCodexLine(line, cwd) {
           label: oneLine(ev.error?.message ?? 'turn failed'),
           ...(msg.trim() ? { full: msg } : {}),
         },
-        text: '',
+        // THE FAILURE'S OWN WORDS REACH `text` (2026-09-24), the rule the bare
+        // `error` arm below already keeps. This returned '' — so a codex turn
+        // that failed on a usage limit handed the limit matcher nothing, the
+        // agent landed in Stuck as "produced no output", and every other codex
+        // agent kept spending into the same wall.
+        text: msg.trim() ? `${msg}\n` : '',
       };
     }
     // A bare `error` event — the shape an auth failure arrives in ("401

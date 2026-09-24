@@ -622,7 +622,7 @@ export function cliEnv(mcpEnv) {
 // returned string for sentinel detection, and each activity is handed to
 // `onActivity` so the caller can forward progress. Build-agent turns leave it
 // off and keep the raw text passthrough + line sentinels.
-export function runTurn({ prompt, resume, system, cwd, mcpConfig, mcpArgs, mcpEnv, runtime = 'claude', label, onSpawn, streamJson, answerFromResult, onActivity, onToolEvent, onInit, onUsage, onThreadId, wikiPerm, readOnly, planPerm, planMode, posture, vaultDir, knowledgeDir, resultSchemaArgs, model, effort, adoptResumeId, resumeThreadId, resumeConversationId }) {
+export function runTurn({ prompt, resume, system, cwd, mcpConfig, mcpArgs, mcpEnv, runtime = 'claude', label, onSpawn, streamJson, answerFromResult, onActivity, onToolEvent, onInit, onUsage, onThreadId, onAnswer, wikiPerm, readOnly, planPerm, planMode, posture, vaultDir, knowledgeDir, resultSchemaArgs, model, effort, adoptResumeId, resumeThreadId, resumeConversationId }) {
   return new Promise((resolve) => {
     const rt = runtimeById(runtime);
     // PLAN MODE IS CLAUDE'S (0.97.0). The other adapters build their argv
@@ -813,6 +813,13 @@ export function runTurn({ prompt, resume, system, cwd, mcpConfig, mcpArgs, mcpEn
         // thread.started). Purely additive: callers that pass no onThreadId —
         // every dispatch path — see zero behavior change.
         if (ev.threadId) onThreadId?.(ev.threadId);
+        // The runtime's own token count (codex's `turn.completed`) — the same
+        // `onUsage` Claude's result event feeds, so a caller charges a turn
+        // identically whichever CLI ran it.
+        if (ev.usage) onUsage?.(ev.usage);
+        // One agent MESSAGE, alone — see parseCodexLine's `answer`. Last call
+        // wins at the caller, which is what "the final answer" means.
+        if (typeof ev.answer === 'string') onAnswer?.(ev.answer);
         if (ev.text) appendText(ev.text);
         if (ev.activity) {
           emit(`${ev.activity.label}\n`);

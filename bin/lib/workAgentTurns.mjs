@@ -1,6 +1,6 @@
 /** Agent turns, trace delivery, admission, and held settlement reports. */
 import { limitLine } from './workAgentReview.mjs';
-import { existsSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { FLEET_URL, FLEET_TOKEN, USER_AGENT } from './config.mjs';
 import { git, isSafePathSegment } from './git.mjs';
@@ -17,6 +17,8 @@ import { makeTraceRelay } from './trace.mjs';
 
 export function createWorkAgentTurns({
   REJECT_RETRY_MS,
+  CODEX_THREAD_RE,
+  resumeConversationLost,
   baseRef,
   inPlace,
   baseDir,
@@ -470,17 +472,40 @@ export function createWorkAgentTurns({
       // right here — the ambiguity that forced per-tab session pinning in the
       // Workbench (many tabs, one place) cannot arise. The marker is what
       // distinguishes the first turn from every later one across restarts.
+      //
+      // IT MEANS "CLAUDE HAS SPOKEN HERE", and since 2026-09-24 only a Claude
+      // turn writes it: an agent can be switched between CLIs, and a marker a
+      // codex turn left behind would send the first Claude turn to
+      // `--continue` a directory holding no Claude conversation at all.
       const ranMarker = sessionMetaPath(wt, 'flowviant-agent-ran');
       /**
-       * RESUME IS CLAUDE-ONLY, and that is a correctness rule rather than a
-       * preference. Claude's `--continue` is CWD-keyed and one agent is one
-       * directory, so it resumes exactly this agent. Codex's `resume --last` is
-       * MACHINE-GLOBAL: it would cross-resume whichever conversation spoke most
-       * recently anywhere on the box, which is the bug the Workbench fixed in
-       * 0.69.0 by pinning per-tab ids. Until an agent pins its own thread id,
-       * a codex agent starts fresh each turn — a worse turn, not a wrong one.
+       * CODEX RESUMES BY ITS OWN THREAD ID, PINNED PER AGENT (2026-09-24).
+       *
+       * Resume was Claude-only, because codex's `resume --last` is
+       * MACHINE-GLOBAL and would cross-resume whichever conversation spoke
+       * last anywhere on the box. The cost was that every codex card started
+       * a stranger: no memory of the card before it, and — worse — an answer
+       * to the agent's own question arrived at a codex that never asked it.
+       * The Workbench solved the same problem in 0.69.0 by pinning the id
+       * `thread.started` announces; this is that, keyed by the AGENT rather
+       * than a tab. The id is shape-checked before it rides argv.
        */
-      const resume = rt === 'claude' && Boolean(ranMarker && existsSync(ranMarker));
+      const codexThreadMarker =
+        rt === 'codex' ? sessionMetaPath(wt, 'flowviant-agent-codex-thread', agentId) : null;
+      let codexResumeId = null;
+      if (codexThreadMarker && existsSync(codexThreadMarker)) {
+        try {
+          const v = readFileSync(codexThreadMarker, 'utf8').trim();
+          if (CODEX_THREAD_RE.test(v)) codexResumeId = v;
+        } catch {
+          /* unreadable marker — run fresh */
+        }
+      }
+      let seenThreadId = null;
+      const resume =
+        rt === 'codex'
+          ? Boolean(codexResumeId)
+          : rt === 'claude' && Boolean(ranMarker && existsSync(ranMarker));
 
       /**
        * WRITE THE CARD DOWN BEFORE HANDING IT OVER — the material the AI
@@ -566,11 +591,19 @@ export function createWorkAgentTurns({
        * what makes `...(usage ? … : {})` the whole guard.
        */
       let usage = null;
+      /**
+       * THE AGENT'S LAST MESSAGE, ALONE — where the final JSON object lives.
+       * Codex's `out` is every message plus stderr plus error text, and
+       * `parseTurnResult` takes the first object that fits, so an early
+       * message quoting the format could be read as the outcome. Claude never
+       * calls this (its `out` is already the result under `answerFromResult`).
+       */
+      let lastAnswer = null;
       /** The agent's artifact directory as it stood before this turn — the
        *  tab lane's rule, in the agent's own worktree (2026-09-22). */
       const artifactsBefore = beforeArtifacts(wt);
       try {
-        out = await runTurn({
+        const agentTurnArgs = {
           prompt:
             job.kind === 'task' && job.task
               ? AGENT_TASK_KICKOFF({
@@ -603,6 +636,13 @@ export function createWorkAgentTurns({
           cwd: wt,
           runtime: rt,
           resume,
+          resumeThreadId: codexResumeId || undefined,
+          onThreadId: (id) => {
+            seenThreadId = String(id ?? '').trim() || seenThreadId;
+          },
+          onAnswer: (t) => {
+            lastAnswer = t;
+          },
           // Present only when the container named one — see brainFor.
           ...brain,
           streamJson: true,
@@ -644,8 +684,11 @@ export function createWorkAgentTurns({
           // result per turn, so this is a set and not an accumulate — the
           // adding-up happens SERVER-side, behind the settle's idempotent win,
           // because a retried settle must not charge the same turn twice.
+          // …tagged with WHICH CLI counted it (2026-09-24), so the server can
+          // split an agent's spend per CLI rather than labelling a codex
+          // agent's total with whatever the pre-review spent.
           onUsage: (u) => {
-            usage = u;
+            usage = { ...u, runtime: rt };
           },
           // WHAT THE CLI SAYS IT CAN BE ASKED FOR, AND WHICH CONNECTORS NEED A
           // LOGIN — the same free fact off the same init event the tab lane
@@ -675,7 +718,21 @@ export function createWorkAgentTurns({
             // the CLI — see `retireWorkSessions`.
             agentChildren.set(place, ch);
           },
-        });
+        };
+        out = await runTurn(agentTurnArgs);
+        /**
+         * A RESUME THAT CAME BACK EMPTY, OR WITH ONLY THE CLI SAYING THE
+         * CONVERSATION IS GONE, RUNS ONCE MORE FRESH — the tab lane's rule,
+         * for the tab lane's reason: a pinned id the CLI has since pruned
+         * (or a `--continue` over a directory Claude never spoke in, which an
+         * agent switched between CLIs can reach) would otherwise settle
+         * `nothing` on every turn forever. Same worktree, never a reset.
+         */
+        if (resume && (!(out || '').trim() || resumeConversationLost(out))) {
+          seenThreadId = null;
+          lastAnswer = null;
+          out = await runTurn({ ...agentTurnArgs, resume: false, resumeThreadId: undefined });
+        }
       } finally {
         /**
          * THE TAIL, BEFORE THE SETTLE — so the last thing the agent did is on
@@ -691,11 +748,21 @@ export function createWorkAgentTurns({
         await trace.flush(TRACE_FINAL_FLUSH_MS);
         if (child) workChildren.delete(child);
         if (agentChildren.get(place) === child) agentChildren.delete(place);
-        if (ranMarker) {
+        if (ranMarker && rt === 'claude') {
           try {
             writeFileSync(ranMarker, '1');
           } catch {
             /* a missing marker only costs one un-resumed turn */
+          }
+        }
+        // The thread THIS turn spoke under, pinned so the next card, answer
+        // or merge-resolve resumes it. After the turn, like the tab lane: an
+        // id learned mid-turn is only true once the turn that learned it ends.
+        if (codexThreadMarker && seenThreadId && CODEX_THREAD_RE.test(seenThreadId)) {
+          try {
+            writeFileSync(codexThreadMarker, seenThreadId);
+          } catch {
+            /* best-effort — the next turn runs fresh */
           }
         }
         /**
@@ -721,7 +788,7 @@ export function createWorkAgentTurns({
       }
 
       const commits = commitsBetween(wt, before);
-      const res = parseTurnResult(out);
+      const res = (lastAnswer && parseTurnResult(lastAnswer)) || parseTurnResult(out);
       /**
        * A LIMIT IS ONLY A LIMIT WHEN THE TURN PRODUCED NOTHING.
        *
@@ -734,10 +801,12 @@ export function createWorkAgentTurns({
        */
       const limit = res ? null : limitLine(out);
       if (limit) {
-        // EVERY agent parks, because the account is shared: one hitting the
-        // limit means all of them have. The turn itself is reported as
-        // `nothing` — it did not deliver and it did not ask.
-        await postAgentParked(limit);
+        // Every agent ON THIS CLI parks, because that account is shared: one
+        // hitting the limit means all of them have. Named since 2026-09-24 —
+        // a machine can hold a Claude login and a Codex login, and a Codex
+        // limit is no reason to stop the Claude agents. The turn itself is
+        // reported as `nothing` — it did not deliver and it did not ask.
+        await postAgentParked(limit, rt);
         await postAgentTurn({
           turnId,
           outcome: 'nothing',
@@ -917,7 +986,7 @@ export function createWorkAgentTurns({
 
   const lastAgentBeat = new Map(); // agentId -> last activity POST, ms
 
-  const postAgentParked = async (reason) => {
+  const postAgentParked = async (reason, runtime) => {
     try {
       await fetch(AGENT_PARKED_URL, {
         method: 'POST',
@@ -927,7 +996,9 @@ export function createWorkAgentTurns({
           'Content-Type': 'application/json',
         },
         signal: AbortSignal.timeout(15_000),
-        body: JSON.stringify({ reason }),
+        // `runtime` scopes the park to that CLI's agents; a server that does
+        // not know the key parks every agent, which is what it always did.
+        body: JSON.stringify({ reason, ...(runtime ? { runtime } : {}) }),
       });
     } catch {
       /* the next turn will hit the same limit and try again */
