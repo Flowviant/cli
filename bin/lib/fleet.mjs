@@ -92,6 +92,8 @@ import { effectiveMaxTurns, setServerMaxTurns } from './admission.mjs';
 import { scanLocalSessions, ourConversationIds } from './localSessions.mjs';
 import { repoState } from './repoState.mjs';
 import { claudeAuthContext } from './claudeAuth.mjs';
+import { readBaseTools, runnerToolCapabilities, toolReadout } from './projectTools.mjs';
+import { runtimeOfferings } from './runtimeOfferings.mjs';
 
 /** Said once per process — see the catch around `envQueryParams` below. */
 let warnedEnvIdentity = false;
@@ -167,7 +169,8 @@ async function fetchRoster(
    *  rather than re-derived: `repoRootOrDie` is resolved once at startup and
    *  running git on every poll to re-learn a constant would be a syscall for
    *  a readout. */
-  repoRoot = null
+  repoRoot = null,
+  baseRef = null
 ) {
   const url = new URL(FLEET_URL);
   if (haveIds.length) url.searchParams.set('have', haveIds.join(','));
@@ -304,6 +307,18 @@ async function fetchRoster(
     if (mcp !== null) url.searchParams.set('mcp', JSON.stringify(mcp));
   } catch {
     /* best-effort — the poll must never fail on a readout */
+  }
+  if (repoRoot && baseRef) {
+    try {
+      const offerings = detectRuntimes().some((rt) => rt.id === 'codex' && rt.installed)
+        ? runtimeOfferings(repoRoot, baseRef) : {};
+      for (const [param, report] of Object.entries(offerings)) {
+        if (Object.keys(report).length) {
+          const payload = JSON.stringify(report);
+          if (payload.length <= 8_000 && url.toString().length + encodeURIComponent(payload).length <= 14_000) url.searchParams.set(param, payload);
+        }
+      }
+    } catch { /* local readouts never fail the poll */ }
   }
   // THIS BOX'S IDENTITY — `envpub`, and since 2026-09-21 nothing else.
   //
@@ -769,6 +784,36 @@ export async function maybeReportEnv(repoRoot) {
     envReportSent = null;
     return 'retry';
   }
+}
+
+const TOOLS_REPORT_URL = FLEET_URL.replace(/\/agents\/?$/, '/tools-report');
+let toolsReportSent = null;
+let toolsReportUnsupported = false;
+let toolsReportAt = 0;
+/** Repo tool readiness is a per-box daemon report. Never include env values. */
+export async function maybeReportTools(repoRoot, baseRef) {
+  if (Date.now() - toolsReportAt < 60_000) return;
+  toolsReportAt = Date.now();
+  if (toolsReportUnsupported) return;
+  const pubkey = myPubB64();
+  if (!pubkey) return;
+  let payload;
+  try {
+    const snapshot = readBaseTools(repoRoot, baseRef);
+    const installed = detectRuntimes().filter((r) => r.installed);
+    const runner = installed.find((r) => runnerToolCapabilities(r.id).mcp)?.id ?? installed[0]?.id ?? 'none';
+    payload = JSON.stringify({ pubkey, tools: toolReadout(snapshot, runner) });
+  } catch { return; }
+  if (payload === toolsReportSent) return;
+  try {
+    const res = await fetch(TOOLS_REPORT_URL, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${FLEET_TOKEN}`, 'User-Agent': USER_AGENT, 'Content-Type': 'application/json' },
+      signal: AbortSignal.timeout(15_000), body: payload,
+    });
+    if (envReportIsPermanent(res.status)) toolsReportUnsupported = true;
+    toolsReportSent = res.ok ? payload : null;
+  } catch { toolsReportSent = null; }
 }
 
 /**
@@ -2357,7 +2402,8 @@ export async function runFleetDaemon({ afterLock = null } = {}) {
         livePreviewIds(),
         heldSessionIds(),
         admit('churn'),
-        repoRoot
+        repoRoot,
+        getBaseRef()
       );
     } catch (e) {
       if (e.auth) {
@@ -2746,6 +2792,7 @@ export async function runFleetDaemon({ afterLock = null } = {}) {
     // throttled and deduped inside, and silent forever on an older server.
     // This is what replaced the vault's sync tick — see `maybeReportEnv`.
     void maybeReportEnv(repoRoot);
+    void maybeReportTools(repoRoot, getBaseRef());
 
     // Tell the app what this machine is doing with itself. Every reconcile,
     // best-effort, and never awaited — telemetry that can delay a dispatch is

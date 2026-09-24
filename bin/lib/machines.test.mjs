@@ -151,8 +151,8 @@ test('the poll reports the checkout, the pid and the process start', () => {
   assert.ok(region.includes("url.searchParams.set('st', PROCESS_STARTED_AT)"));
   // The checkout is PASSED IN, never re-derived: running git on every poll to
   // re-learn a value resolved once at startup would be a syscall for a readout.
-  assert.ok(/repoRoot = null\s*\n\s*\) \{/.test(src), 'repoRoot is a fetchRoster parameter');
-  assert.ok(src.includes('admit(\'churn\'),\n        repoRoot\n      );'), 'the loop passes it');
+  assert.ok(/repoRoot = null,\s*\n\s*baseRef = null\s*\n\s*\) \{/.test(src), 'repoRoot and baseRef are fetchRoster parameters');
+  assert.ok(src.includes('admit(\'churn\'),\n        repoRoot,\n        getBaseRef()\n      );'), 'the loop passes it');
 });
 
 // ── the listing ─────────────────────────────────────────────────────────────
