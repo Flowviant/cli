@@ -719,6 +719,15 @@ if (!FLEET_TOKEN) {
   }
 }
 
+if (process.argv.includes('--json-events') && dirAt >= 0 && CREDENTIAL?.entry) {
+  const { detectRepoRoot, listStoredProjects, boundElsewhere } = await import('./lib/credentials.mjs');
+  const repo = detectRepoRoot();
+  const entry = CREDENTIAL.entry;
+  if (!repo || entry.repoRoot !== repo || boundElsewhere(listStoredProjects(), repo, entry.projectId).length) {
+    console.error('error: this project is not connected to this repository. Run `flowviant login` for the selected folder.');
+    process.exit(1);
+  }
+}
 const { installDaemonLogging } = await import('./lib/desktopContract.mjs');
 installDaemonLogging(CREDENTIAL?.entry?.projectId, { jsonEvents: process.argv.includes('--json-events') });
 await runFleetDaemon({ afterLock });

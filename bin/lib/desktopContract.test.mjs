@@ -132,6 +132,24 @@ test('login JSONL reports a directory error without beginning device auth', asyn
   assert.deepEqual(JSON.parse(result.stdout), { event: 'error', message: `No git repository found in ${root}.` });
 });
 
+test('desktop start refuses a project bound to a different checkout', async (t) => {
+  const root = temp();
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const repo = join(root, 'repo');
+  mkdirSync(repo);
+  const { spawnSync } = await import('node:child_process');
+  assert.equal(spawnSync('git', ['init', '-q', repo]).status, 0);
+  mkdirSync(join(root, '.flowviant'));
+  writeFileSync(join(root, '.flowviant', 'credentials.json'), JSON.stringify({
+    projectId: 'project-123', fleetToken: 'fva_secret',
+    projects: { 'project-123': { fleetToken: 'fva_secret', repoRoot: '/some/other/repo', name: 'One' } },
+  }));
+  const result = await child(['--project', 'project-123', '--dir', repo, '--json-events'], { HOME: root });
+  assert.equal(result.code, 1);
+  assert.equal(result.stdout, '');
+  assert.match(result.stderr, /not connected to this repository/);
+});
+
 test('a limit stays in this project and clears only on a measured recovery', (t) => {
   const root = temp();
   t.after(() => rmSync(root, { recursive: true, force: true }));
