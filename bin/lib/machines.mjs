@@ -72,7 +72,7 @@
  */
 
 import { USER_AGENT } from './config.mjs';
-import { projectLabel, repoCollisions } from './credentials.mjs';
+import { projectLabel, repoCollisions, safeName } from './credentials.mjs';
 import { credentialRejected } from './authReject.mjs';
 
 /** The boxes read, derived from the roster URL the way the diffstat post is —
@@ -179,7 +179,13 @@ function roleWord(role) {
  *  does not — and the words beside it are all the server's or the box's own. */
 export function renderBox(box, { me = null, latest = null } = {}, now = Date.now()) {
   const mark = box.fresh ? '●' : '○';
-  const name = box.boxName || 'an unnamed machine';
+  // SCRUBBED HERE TOO (2026-09-24, the audit) — a belt against the server's
+  // own display scrub, in defence of a stale stored row or a server this
+  // fix has not reached: the terminal is where an escape sequence in a
+  // box's name or its checkout path actually does harm, so this is the one
+  // place it must never be trusted to have already been cleaned. See
+  // printable.mjs.
+  const name = safeName(box.boxName) ?? 'an unnamed machine';
   // "LAST heard" is the staleness mark, and the row is never hidden for it —
   // the owner's answer to "what about a box that stopped" was exactly this.
   const heard = heardPhrase(box, now);
@@ -191,7 +197,7 @@ export function renderBox(box, { me = null, latest = null } = {}, now = Date.now
   const cells = [
     `${mark} ${name}`,
     roleWord(box.role),
-    box.checkoutPath || '(checkout not reported)',
+    safeName(box.checkoutPath) ?? '(checkout not reported)',
     box.daemonVersion ? `v${box.daemonVersion}` : 'version not reported',
     heard,
   ].filter(Boolean);
@@ -369,7 +375,7 @@ export function otherBoxesLine(boxes, me, now = Date.now()) {
   if (others.length === 0) return null;
   const parts = others.slice(0, 6).map((b) => {
     const role = roleWord(b.role);
-    return `${b.boxName || 'an unnamed machine'} (${role ? `${role} · ` : ''}${heardPhrase(b, now)})`;
+    return `${safeName(b.boxName) ?? 'an unnamed machine'} (${role ? `${role} · ` : ''}${heardPhrase(b, now)})`;
   });
   const more = others.length - parts.length;
   return `other machines on this project: ${parts.join(', ')}${more > 0 ? `, and ${more} more` : ''}`;

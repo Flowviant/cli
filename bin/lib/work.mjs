@@ -57,7 +57,7 @@ import {
   publishErrorText,
 } from './agentPublish.mjs';
 import { createLandedObserver } from './landed.mjs';
-import { listenersIn, measureListeners, listenersSupported } from './listeners.mjs';
+import { measureListeners, listenersSupported, originFor } from './listeners.mjs';
 import { measureProcesses, liveGroups, processesSupported } from './processes.mjs';
 import {
   bootMark,
@@ -126,7 +126,7 @@ import {
   isAgyConversationLive,
   titleForSession,
 } from './localSessions.mjs';
-import { worktreeDiff } from './worktreeDiff.mjs';
+import { worktreeDiff, taskIdsFromMessage } from './worktreeDiff.mjs';
 import { homedir } from 'node:os';
 import { createHash } from 'node:crypto';
 
@@ -673,6 +673,65 @@ export function createWorkManager({
       return 'retry';
     }
   };
+
+  /** Retry-After, in ms — seconds or an HTTP-date — capped so one bad or
+   *  hostile header cannot stall a caller for an hour. Falls back to the
+   *  caller's own backoff when the header is absent or unparseable. */
+  const retryAfterMs = (res, fallbackMs) => {
+    const h = res?.headers?.get?.('retry-after');
+    if (h == null) return fallbackMs;
+    const secs = Number(h);
+    if (Number.isFinite(secs)) return Math.max(0, Math.min(secs * 1000, 60_000));
+    const at = Date.parse(h);
+    return Number.isFinite(at) ? Math.max(0, Math.min(at - Date.now(), 60_000)) : fallbackMs;
+  };
+
+  /**
+   * A best-effort settle POST, AWAITED INLINE by a caller with no per-poll
+   * queue of its own to retry from — unlike `postSettle` above, whose callers
+   * requeue a 'retry'/'reject' outcome themselves. Bounded attempts: 408/429
+   * retry honouring Retry-After, 5xx retries on a short fixed backoff, and
+   * any OTHER 4xx is the server's considered answer — retrying it would just
+   * spend the same refusal again, so it counts as delivered, the existing
+   * trace convention. A network error retries the same way and is then
+   * swallowed: unsettled, and the server expires the job so the asker is
+   * told, never spun.
+   */
+  const postBestEffort = async (url, body, { attempts = 4, timeoutMs = 30_000 } = {}) => {
+    for (let i = 0; i < attempts; i += 1) {
+      let res;
+      try {
+        res = await fetch(url, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${FLEET_TOKEN}`,
+            'User-Agent': USER_AGENT,
+            'Content-Type': 'application/json',
+          },
+          signal: AbortSignal.timeout(timeoutMs),
+          body: JSON.stringify(body),
+        });
+      } catch {
+        if (i === attempts - 1) return false;
+        await new Promise((r) => setTimeout(r, 2_000 * (i + 1)));
+        continue;
+      }
+      if (res.ok) return true;
+      if (res.status === 408 || res.status === 429) {
+        if (i === attempts - 1) return false;
+        await new Promise((r) => setTimeout(r, retryAfterMs(res, 2_000 * (i + 1))));
+        continue;
+      }
+      if (res.status >= 500) {
+        if (i === attempts - 1) return false;
+        await new Promise((r) => setTimeout(r, 2_000 * (i + 1)));
+        continue;
+      }
+      return true; // any other 4xx — the server's considered answer
+    }
+    return false;
+  };
+
   /** How long a REJECTED report sits out before re-offering its body — long
    *  enough that a deploy-skew 400 costs a handful of POSTs a day, short
    *  enough that a server fix picks the report up the same morning. */
@@ -1503,12 +1562,16 @@ export function createWorkManager({
   // owns and nobody can tear down, because only the lease holder can settle the
   // row. `processDiffJobs` gets away without this because running `git show`
   // twice costs nothing.
-  const livePreviews = new Map(); // sessionId -> { port, url, stop }
+  const livePreviews = new Map(); // sessionId -> { port, shareId, url, stop }
   const previewClaiming = new Set(); // sessionIds mid-claim on this tick
 
+  // Returns the parsed JSON (or null on any failure) rather than discarding
+  // it — an OPEN settle's caller needs to see `data.settled === false`, the
+  // sharper share-id check on the server's side of a re-share racing the
+  // open's own round trip (see the openTunnel call site below).
   const postPreview = async (body) => {
     try {
-      await fetch(PREVIEW_DONE_URL, {
+      const res = await fetch(PREVIEW_DONE_URL, {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${FLEET_TOKEN}`,
@@ -1518,12 +1581,19 @@ export function createWorkManager({
         signal: AbortSignal.timeout(30_000),
         body: JSON.stringify({ ...body, instance: DAEMON_INSTANCE }),
       });
+      return await res.json().catch(() => null);
     } catch {
       /* the row stops being confirmed and reads as ended — which is true */
+      return null;
     }
   };
 
-  const claimPreview = async (sessionId) => {
+  // `shareId` is the share the daemon was OFFERED, echoed off the job. A
+  // re-share inside the claim's round trip rotates the id server-side, so a
+  // claim naming the old one matches nothing and this daemon opens no tunnel
+  // for a request that no longer exists. Absent-safe: an older server that
+  // does not read the field just claims on the place alone, the old rule.
+  const claimPreview = async (sessionId, shareId) => {
     try {
       const res = await fetch(PREVIEW_CLAIM_URL, {
         method: 'POST',
@@ -1533,7 +1603,7 @@ export function createWorkManager({
           'Content-Type': 'application/json',
         },
         signal: AbortSignal.timeout(15_000),
-        body: JSON.stringify({ sessionId, instance: DAEMON_INSTANCE }),
+        body: JSON.stringify({ sessionId, instance: DAEMON_INSTANCE, ...(shareId ? { shareId } : {}) }),
       });
       const j = await res.json().catch(() => null);
       return j?.data?.claimed === true;
@@ -1609,23 +1679,34 @@ export function createWorkManager({
       // early-returns on a live row of the same port, so a new secret only ever
       // arrives with a genuinely new row, by which time this map has been
       // cleared. Anyone adding rotation must widen the key first.
-      if (livePreviews.get(sessionId)?.port === port) continue;
+      //
+      // WIDENED for shareId: a live entry that has no shareId of its own (an
+      // older server, or one opened before shareId rode the wire) or this
+      // job's own shareId that is blank still matches on port alone, the old
+      // rule — but a live entry whose shareId is SET and DIFFERS from this
+      // job's is a re-share of the same port under a NEW request, and must
+      // not be skipped as "already serving exactly this".
+      const curLive = livePreviews.get(sessionId);
+      if (curLive?.port === port && (!shareId || !curLive.shareId || curLive.shareId === shareId))
+        continue;
       if (previewClaiming.has(sessionId)) continue;
       previewClaiming.add(sessionId);
 
       void (async () => {
         try {
-          if (!(await claimPreview(sessionId))) return; // somebody else has it
+          if (!(await claimPreview(sessionId, shareId))) return; // somebody else has it
           const wt = placeDir(sessionId);
           // RE-VALIDATE the attribution here, not just the liveness. The server
           // checked this port against a report up to a minute old; more
-          // importantly, checking `listenersIn` again is what keeps the answer
-          // to "whose port is this" on the machine that can actually see it.
-          const measured = listenersIn(wt).some((l) => l.port === port);
+          // importantly, checking `originFor` again is what keeps the answer
+          // to "whose port is this" on the machine that can actually see it —
+          // the same rule the gate itself dials by (below).
+          const measured = !originFor(wt, port).error;
           if (!measured) {
             await postPreview({
               sessionId,
               error: `nothing is listening on port ${port} in this worktree.`,
+              ...(shareId ? { shareId } : {}),
             });
             return;
           }
@@ -1642,25 +1723,40 @@ export function createWorkManager({
           const t = await openTunnel({
             port,
             log: (m) => note(`preview ${sessionId.slice(0, 8)}: ${m}`),
+            // The worktree the port was attributed to — the gate then dials
+            // the address the ATTRIBUTED socket holds (`originFor`, ::1 for a
+            // v6-loopback dev server) and refuses when an outside process
+            // holds the same address, rather than assuming 127.0.0.1.
+            worktree: wt,
             // The origin died under a live tunnel. cloudflared happily outlives
             // a dead dev server and the gate answers a dead origin with 502, so
             // without this the app would print "live" over a 502.
             onDead: () => {
               livePreviews.delete(sessionId);
-              void postPreview({ sessionId, ended: true, endedReason: 'origin_gone' });
+              void postPreview({
+                sessionId,
+                ended: true,
+                endedReason: 'origin_gone',
+                ...(shareId ? { shareId } : {}),
+              });
             },
             // ATTRIBUTION rides the probe, not just the open: a freed default
             // port (5173…) rebound by any other process on the box would keep
             // a bare TCP probe green, and the share's URL+password would serve
             // a worktree nobody consented to publish.
-            stillServing: async () => listenersIn(wt).some((l) => l.port === port),
+            stillServing: async () => !originFor(wt, port).error,
             ...(gateOk ? { grantSecret: secret, shareId, authorizeUrl } : {}),
             // The gate closed itself after repeated failed passwords. Stored,
             // so the incident is visible — and the entry is dropped so the
             // owner can re-share the port without restarting the daemon.
             onAbuse: () => {
               livePreviews.delete(sessionId);
-              void postPreview({ sessionId, ended: true, endedReason: 'abuse' });
+              void postPreview({
+                sessionId,
+                ended: true,
+                endedReason: 'abuse',
+                ...(shareId ? { shareId } : {}),
+              });
             },
             // cloudflared died AFTER publishing (quick tunnels get dropped).
             // Without this the daemon kept heartbeating a hostname that 530s.
@@ -1669,23 +1765,41 @@ export function createWorkManager({
               void postPreview({
                 sessionId,
                 error: 'the tunnel dropped — share it again to reopen.',
+                ...(shareId ? { shareId } : {}),
               });
             },
           });
           if (t.error) {
-            await postPreview({ sessionId, error: t.error });
+            await postPreview({ sessionId, error: t.error, ...(shareId ? { shareId } : {}) });
             return;
           }
-          livePreviews.set(sessionId, { port, url: t.url, stop: t.stop });
+          livePreviews.set(sessionId, { port, shareId, url: t.url, stop: t.stop });
           // The gate we ACTUALLY installed, so the app never asserts a door
           // nobody observed. An older server ignores the field.
-          await postPreview({
+          const settled = await postPreview({
             sessionId,
             url: t.url,
             user: t.user,
             password: t.password,
             gate: t.gateMode,
+            ...(shareId ? { shareId } : {}),
           });
+          // A re-share (or a Stop) can land inside this open's own round
+          // trip and rotate the share id server-side — the settle is then
+          // refused for naming a request that no longer exists, and nobody
+          // holds a live row for the tunnel we just opened. Tear it down
+          // rather than leave a public hostname serving with no door back to
+          // it, and only if this call is still the entry's own (a newer open
+          // for the same session must not be undone by a late-arriving
+          // settle for an older one).
+          if (settled?.data?.settled === false) {
+            if (livePreviews.get(sessionId)?.stop === t.stop) livePreviews.delete(sessionId);
+            try {
+              t.stop();
+            } catch {
+              /* best-effort */
+            }
+          }
         } finally {
           previewClaiming.delete(sessionId);
         }
@@ -2358,14 +2472,36 @@ export function createWorkManager({
    */
   const UPLOAD_DIR = '.flowviant/uploads';
   const ATTACHMENT_MAX_BYTES = 10 * 1024 * 1024;
+  // `safeFileName`, verbatim (apps/api/src/routes/sessionsAttachments.routes.ts):
+  // THE EXTENSION SURVIVES A CUT (2026-09-24). A bare `slice(0, 80)` used to
+  // truncate an over-long name mid-extension; an over-long stem is now cut
+  // and an 8-hex FNV-1a hash of the WHOLE sanitised name is appended before
+  // the extension — stable, at most 80 characters, and idempotent over its
+  // own output, so re-applying it to what the server already sanitized is a
+  // no-op and the two sides never disagree about the cut.
+  const safeUploadFnv1a8 = (s) => {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 0x01000193);
+    }
+    return (h >>> 0).toString(16).padStart(8, '0');
+  };
+  const SAFE_UPLOAD_EXT_RE = /^[A-Za-z0-9]{1,10}$/;
   const safeUploadName = (raw) => {
-    const base = String(raw ?? '')
+    const clean = String(raw ?? '')
       .split(/[\\/]/)
       .pop()
       .replace(/[^A-Za-z0-9._-]/g, '_')
-      .replace(/^[.-]+/, '')
-      .slice(0, 80);
-    return base || 'attachment';
+      .replace(/^[.-]+/, '');
+    if (!clean) return 'attachment';
+    if (clean.length <= 80) return clean;
+    const dot = clean.lastIndexOf('.');
+    const ext = dot > 0 && SAFE_UPLOAD_EXT_RE.test(clean.slice(dot + 1)) ? clean.slice(dot + 1) : '';
+    const stem = ext ? clean.slice(0, dot) : clean;
+    const tag = `-${safeUploadFnv1a8(clean)}`;
+    const room = 80 - tag.length - (ext ? ext.length + 1 : 0);
+    return `${stem.slice(0, room)}${tag}${ext ? `.${ext}` : ''}`;
   };
   /** @returns relative paths written, in the order the human attached them. */
   const fetchAttachments = async (wt, attachments) => {
@@ -4375,32 +4511,25 @@ export function createWorkManager({
   // proposes on the board, and ACCEPTING is what spawns anything. Nothing here
   // creates a worktree, a branch or a card.
   //
-  // READ-ONLY IN THE CHECKOUT. `readOnly: true` selects CONSULT_PERM (Read,
-  // Grep, Glob and a few `git` reads — no Write, no Edit, no mkdir, no rm) and
-  // NO MCP is passed at all, so this turn has no control plane to reach even if
-  // the repository it reads tries to steer it. The proposal comes back as the
-  // turn's final message rather than through a tool, which is exactly what lets
-  // that permission set be this narrow.
+  // READ-ONLY IN THE CHECKOUT. `readOnly: true` selects `consultPermFor` (the
+  // fenced Read/Glob rules plus a few path-validated `git`/`ls`/`cat` reads —
+  // no Write, no Edit, no mkdir, no rm) and NO MCP is passed at all, so this
+  // turn has no control plane to reach even if the repository it reads tries
+  // to steer it. The proposal comes back as the turn's final message rather
+  // than through a tool, which is exactly what lets that permission set be
+  // this narrow.
   //
   // It takes the checkout's place lock as a READER, beside the operator's own
   // tabs. It writes nothing, so a writer lock would only starve real work.
   const planning = new Set(); // press ids in flight on this tick
 
   const postAgentPlan = async (body) => {
-    try {
-      await fetch(AGENT_PLAN_DONE_URL, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${FLEET_TOKEN}`,
-          'User-Agent': USER_AGENT,
-          'Content-Type': 'application/json',
-        },
-        signal: AbortSignal.timeout(30_000),
-        body: JSON.stringify({ ...body, instance: DAEMON_INSTANCE }),
-      });
-    } catch {
-      /* unsettled, and the server expires it — the asker is told, never spun */
-    }
+    // Bounded retry on 408/429/5xx, an other-4xx counted as delivered — see
+    // postBestEffort's own docblock. Previously this swallowed every
+    // response including ordinary 5xx and rate limits, so a transient
+    // failure looked identical to a hostile refusal: nothing retried, and
+    // the proposal sat unsettled until the server's own expiry.
+    await postBestEffort(AGENT_PLAN_DONE_URL, { ...body, instance: DAEMON_INSTANCE });
   };
 
   /**
@@ -4453,12 +4582,21 @@ export function createWorkManager({
    * operator's account is charged for a live session.
    *
    * FIFTEEN because the server fails a claimed press at THIRTY (its
-   * `PLAN_JOB_TTL_MS`, measured from `claimedAt`): half of that leaves this
-   * side — the only side that knows the CLI is still running — time to stop it
-   * and have its settle land, instead of the press expiring into a sentence
-   * that blames a machine which never spoke. Nothing legitimate is cut off
-   * either way: this turn reads a card selection and writes nothing, and the
-   * shape of it is minutes.
+   * `PLAN_JOB_TTL_MS`) past thirty minutes with no renewal: half of that
+   * leaves this side — the only side that knows the CLI is still running —
+   * time to stop it and have its settle land, instead of the press expiring
+   * into a sentence that blames a machine which never spoke. Nothing
+   * legitimate is cut off either way: this turn reads a card selection and
+   * writes nothing, and the shape of it is minutes.
+   *
+   * `claimedAt` IS NO LONGER A ONE-SHOT STAMP (2026-09-24): the narration
+   * relay below (`postAgentPlanActivity`, `/fleet/agent-plan-activity`)
+   * renews it server-side as its own heartbeat, so a genuinely WORKING plan
+   * turn keeps its claim alive well past thirty minutes on its own. This
+   * timer exists for the one case narration cannot cover — a WEDGED CLI (a
+   * login prompt nobody answers, a stalled socket) emits nothing, renews
+   * nothing, and is exactly the silence the server's thirty-minute clock was
+   * always measuring.
    */
   const PLAN_TURN_TIMEOUT_MS = 15 * 60_000;
 
@@ -5757,10 +5895,14 @@ export function createWorkManager({
        * four of them a tick with nothing looking at memory is how the daemon
        * froze somebody's computer.
        *
-       * Deferring costs the job nothing: it is unleased, the server re-offers
-       * it on the next poll, and no attempt is consumed. Settling it would be
-       * the opposite — it would send the agent to Stuck over a turn this
-       * machine never ran.
+       * Deferring costs the job nothing. The handout DOES claim a lease (and
+       * every poll's `renewAgentLeases` keeps it fresh), but the server judges
+       * "begun" as activity PLUS a fresh lease — and nothing has run here, so
+       * there is no activity to have relayed. A lease with no activity behind
+       * it is exactly what lets the server end or re-queue this turn
+       * correctly on its own expiry, with no attempt consumed by deferring.
+       * Settling it here would be the opposite — it would send the agent to
+       * Stuck over a turn this machine never ran.
        *
        * Checked here rather than inside `runAgentTurn` so a HELD BODY above
        * still re-POSTs: that path spawns nothing, and holding a finished
@@ -5855,20 +5997,10 @@ export function createWorkManager({
   };
 
   const postCheck = async (body) => {
-    try {
-      await fetch(AGENT_CHECK_DONE_URL, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${FLEET_TOKEN}`,
-          'User-Agent': USER_AGENT,
-          'Content-Type': 'application/json',
-        },
-        signal: AbortSignal.timeout(30_000),
-        body: JSON.stringify(body),
-      });
-    } catch {
-      /* the row simply keeps its previous answer, which is null the first time */
-    }
+    // Same bounded retry as postAgentPlan — see postBestEffort. On the
+    // final failure the row simply keeps its previous answer, which is
+    // null the first time.
+    await postBestEffort(AGENT_CHECK_DONE_URL, body);
   };
 
   const runCheck = async (agentId, wt) => {
@@ -6022,9 +6154,10 @@ export function createWorkManager({
   // arguing itself into a design defends that design, and asked whether its work
   // meets the card it answers from the very context that produced the work. The
   // reviewer stands IN the agent's worktree because it needs the code and the
-  // diff, under `readOnly` (CONSULT_PERM — Read, Grep, Glob and a few git reads)
-  // with NO MCP passed at all, so there is no control plane on this turn even if
-  // the repository it reads tries to steer it.
+  // diff, under `readOnly` (`consultPermFor` — the fenced Read/Glob rules plus
+  // a few path-validated git reads) with NO MCP passed at all, so there is no
+  // control plane on this turn even if the repository it reads tries to steer
+  // it.
   //
   // IT LABELS AND NEVER BLOCKS — the check's own law, one function up. Approve,
   // the per-card verdicts and the ship quiz do not know this exists. Every exit
@@ -6118,10 +6251,14 @@ export function createWorkManager({
       return { text: '', taskIds: [] };
     }
     if (typeof out !== 'string') return { text: '', taskIds: [] };
-    const taskIds = new Set();
-    for (const m of out.matchAll(/^\s*Flowviant-Task:\s*(\S+)\s*$/gm)) {
-      taskIds.add(m[1].slice(0, 64));
-    }
+    // LINEAR, never backtracking (audit 2026-09-24) — this was
+    // `out.matchAll(/^\s*Flowviant-Task:\s*(\S+)\s*$/gm)`, whose `\s*$` is
+    // quadratic against a long trailing run of whitespace on one line
+    // (measured ~1s at 40KB), and a branch's own commit log is exactly the
+    // kind of text an agent's commits can grow past that. `taskIdsFromMessage`
+    // is the same line-split, length-capped reader every other trailer scan
+    // in this codebase uses.
+    const taskIds = taskIdsFromMessage(out);
     const text = out
       .split('\n')
       .filter((l) => l.trim())

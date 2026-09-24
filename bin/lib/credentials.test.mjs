@@ -105,6 +105,11 @@ test('a project name carrying terminal control sequences is printed and stored w
   // Nothing left is no name, so the id speaks instead of an empty label.
   assert.equal(safeName('\x1b\x07'), null);
   assert.equal(projectLabel({ name: '\x1b\x07', projectId: 'p1234567890' }), 'project p1234567…');
+  // …AND THE BIDI/FORMAT CONTROLS A C0/C1-ONLY SCRUB MISSES (2026-09-24, the
+  // audit's A3 CROSS 8a): `printable()` extended safeName's own class rather
+  // than being re-derived beside it — a name carrying a right-to-left
+  // override can visually reorder itself on a bidi-aware terminal.
+  assert.equal(safeName('evil‮txt.crt⁦'), 'eviltxt.crt');
 
   // …and the STORE never keeps the raw form, whichever writer it arrives by.
   const { mkdtempSync, readFileSync } = await import('node:fs');

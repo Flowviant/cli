@@ -219,11 +219,43 @@ export function parseProposal(text, scrub = envScrub) {
   }
   if (agents.length === 0) return null;
   return {
-    agents,
+    agents: uniqueTempIds(agents),
     ...(typeof parsed.note === 'string' && parsed.note.trim()
       ? { note: String(scrub(parsed.note)).slice(0, MAX_NOTE) }
       : {}),
   };
+}
+
+/**
+ * A DAEMON BELT ON THE SAME COLLISION THE SERVER ALREADY REFUSES TO SHIP
+ * (2026-09-24, the audit's A4a CROSS 5).
+ *
+ * Two groups can share one tempId two ways: the model repeats itself, or one
+ * group NAMES none and defaults to the positional `a${i+1}` a differently-
+ * ordered group already claimed. The web keys `draftByTask` / `proposedCards`
+ * by tempId (boardLanes.ts), so two containers sharing one id is not cosmetic —
+ * per-group Start/Decline on either one then deletes BOTH, because
+ * `planAfterGroup` filters `.agents` by tempId and both match.
+ *
+ * Kept a byte-for-byte copy of the server's own rule
+ * (`agentPlan.ts`'s `uniqueTempIds`, the boundary every daemon version passes
+ * through) rather than re-derived, so the two ends cannot disagree about which
+ * of two colliding agents keeps the id the model wrote. FIRST occurrence wins
+ * unchanged; each later collision is suffixed `-2`, `-3`, … off the ORIGINAL
+ * id (not the previous suffix), staying inside the 64-char bound the schema
+ * already enforces upstream.
+ *
+ * This is a BELT, not the fix: an older daemon proposing the same collision is
+ * still covered by the server's identical transform at its own boundary.
+ */
+function uniqueTempIds(list) {
+  const used = new Set();
+  return list.map((g) => {
+    let id = g.tempId;
+    for (let n = 2; used.has(id); n++) id = `${g.tempId.slice(0, 58)}-${n}`;
+    used.add(id);
+    return id === g.tempId ? g : { ...g, tempId: id };
+  });
 }
 
 /**

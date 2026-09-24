@@ -194,6 +194,106 @@ test('a press the board can no longer serve is settled, and narrates NOTHING', a
   await until(() => !m.workBusy());
 });
 
+test('postAgentPlan retries a 429 honouring Retry-After instead of dropping the settle', async (t) => {
+  const m = manager(t);
+  const real = globalThis.fetch;
+  const calls = [];
+  let doneAttempts = 0;
+  globalThis.fetch = async (url, opts = {}) => {
+    const u = String(url);
+    calls.push({ url: u, body: typeof opts.body === 'string' ? JSON.parse(opts.body) : null });
+    if (u.includes('agent-plan-claim'))
+      return { ok: true, status: 200, json: async () => ({ data: { claimed: true } }) };
+    if (u.includes('agent-plan-done')) {
+      doneAttempts += 1;
+      if (doneAttempts === 1)
+        return {
+          ok: false,
+          status: 429,
+          // Retry-After: 0 — a real header would carry a real delay, but the
+          // point under test is that the header is HONOURED at all, and a
+          // slow test proves nothing a fast one does not.
+          headers: { get: (k) => (String(k).toLowerCase() === 'retry-after' ? '0' : null) },
+          json: async () => ({}),
+        };
+      return { ok: true, status: 200, json: async () => ({}) };
+    }
+    return { ok: true, status: 200, json: async () => ({}) };
+  };
+  t.after(() => {
+    globalThis.fetch = real;
+  });
+
+  m.processAgentPlanJobs([{ id: 'p-1', tasks: [] }]);
+  await until(() => calls.filter((c) => c.url.includes('agent-plan-done')).length >= 2);
+  assert.equal(
+    calls.filter((c) => c.url.includes('agent-plan-done')).length,
+    2,
+    'a 429 is retried rather than treated as the server having answered'
+  );
+  await until(() => !m.workBusy());
+});
+
+test('postAgentPlan treats any OTHER 4xx as delivered — no retry, no hammering', async (t) => {
+  const m = manager(t);
+  const real = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    calls.push({ url: u });
+    if (u.includes('agent-plan-claim'))
+      return { ok: true, status: 200, json: async () => ({ data: { claimed: true } }) };
+    if (u.includes('agent-plan-done')) return { ok: false, status: 400, json: async () => ({}) };
+    return { ok: true, status: 200, json: async () => ({}) };
+  };
+  t.after(() => {
+    globalThis.fetch = real;
+  });
+
+  m.processAgentPlanJobs([{ id: 'p-1', tasks: [] }]);
+  await until(() => calls.some((c) => c.url.includes('agent-plan-done')));
+  await tick(200);
+  assert.equal(
+    calls.filter((c) => c.url.includes('agent-plan-done')).length,
+    1,
+    'a considered refusal is the server’s answer, not something to retry into a hammer'
+  );
+  await until(() => !m.workBusy());
+});
+
+test('safeUploadName keeps the extension through a cut, the server’s safeFileName shape', () => {
+  // CODE ONLY: `safeUploadName` has no seam of its own to call through the
+  // manager's returned API (it is reached only via a full session turn with
+  // a real attachment). The shape under test — stem cut, an 8-hex hash tag,
+  // extension preserved — is identical to the behaviourally-tested versions
+  // in knowledge.test.mjs and artifacts.test.mjs; this pins that it was not
+  // quietly reverted to the old bare `slice(0, 80)`.
+  const src = workSource();
+  const fn = fnBody(src, 'safeUploadName');
+  assert.ok(!/\.slice\(0,\s*80\)/.test(fn), 'no bare 80-char slice — that is what cut extensions off');
+  assert.match(fn, /lastIndexOf\('\.'\)/, 'the dot is found so the extension can survive the cut');
+  assert.match(fn, /safeUploadFnv1a8\(clean\)/, 'the hash rides the WHOLE sanitised name');
+  const hash = fnBody(src, 'safeUploadFnv1a8');
+  assert.match(hash, /0x811c9dc5/, 'FNV-1a, the server’s own hash, not a different scheme');
+  assert.match(hash, /\.toString\(16\)\.padStart\(8, '0'\)/, '8 hex digits, matching the server’s fnv1a8');
+});
+
+test('a preview claim and its attribution refusal both echo the job’s shareId', async (t) => {
+  const m = manager(t);
+  const { calls } = stubFetch(t);
+  // No real listener on this port in this worktree, so the attribution check
+  // (originFor) fails honestly — the point under test is the wire shape, not
+  // opening a real tunnel.
+  m.processPreviewJobs([{ sessionId: 'sess-1', port: 47823, shareId: 'share-abc123' }]);
+  await until(() => calls.some((c) => c.url.includes('preview-done')));
+  const claim = calls.find((c) => c.url.includes('preview-claim'));
+  assert.ok(claim, 'the claim went out');
+  assert.equal(claim.body.shareId, 'share-abc123', 'the claim echoes the job’s shareId');
+  const done = calls.find((c) => c.url.includes('preview-done'));
+  assert.match(done.body.error, /nothing is listening/);
+  assert.equal(done.body.shareId, 'share-abc123', 'the refusal echoes it too');
+});
+
 /**
  * CODE ONLY. The comments in `work.mjs` quote the shapes they replaced, and
  * matching over raw source fails on its own documentation — a false alarm
@@ -1143,7 +1243,7 @@ test('the reviewer is a STRANGER: fresh conversation, read-only, no MCP', () => 
   // The whole design in one absence. A resumed turn would be the agent grading
   // its own homework out of the context that produced the work.
   assert.ok(!/\bresume\b\s*[:,]/.test(pre), 'no resume — a second reader has no conversation');
-  assert.ok(pre.includes('readOnly: true'), 'CONSULT_PERM: no Write, no Edit, no mkdir, no rm');
+  assert.ok(pre.includes('readOnly: true'), 'consultPermFor: no Write, no Edit, no mkdir, no rm');
   assert.ok(!pre.includes('mcpArgs'), 'no control plane on this turn at all');
   assert.ok(!pre.includes('mcpConfig'));
   assert.ok(pre.includes('system: SYSTEM_PRECHECK'));
@@ -1320,7 +1420,12 @@ test('the card spec is stashed as the agent is given it, from ONE builder', () =
 test('a box that holds only half the specs says so, from the branch\'s own trailers', () => {
   const src = workSource();
   const log = fnBody(src, 'branchLog');
-  assert.ok(log.includes('Flowviant-Task:'), 'the ids come off the commits, not from a guess');
+  // The trailer scan itself lives in taskIdsFromMessage (worktreeDiff.mjs,
+  // pinned against 'Flowviant-Task:' there) — a LINEAR reader, replacing a
+  // regex whose `\s*$` was quadratic against a long run of whitespace on one
+  // line (audit 2026-09-24). branchLog calls it over the real commit log
+  // text rather than fabricating ids.
+  assert.ok(log.includes('taskIdsFromMessage(out)'), 'the ids come off the commits, not from a guess');
   assert.ok(/catch \{[\s\S]{0,120}return \{ text: '', taskIds: \[\] \};/.test(log),
     'an unreadable range costs the context, never the beat');
   const pre = fnBody(src, 'runPrecheck');

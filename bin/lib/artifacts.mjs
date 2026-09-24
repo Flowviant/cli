@@ -200,6 +200,39 @@ function readNoFollow(path, limit) {
   }
 }
 
+/** FNV-1a, 32-bit, as 8 hex — verbatim against the server's `fnv1a8`
+ *  (apps/api/src/routes/sessionsAttachments.routes.ts). */
+function artifactFnv1a8(s) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(16).padStart(8, '0');
+}
+const ARTIFACT_SAFE_EXT_RE = /^[A-Za-z0-9]{1,10}$/;
+/**
+ * `safeFileName`, verbatim in effect (apps/api/src/routes/sessionsAttachments.
+ * routes.ts): keeps the extension through a cut. `entry.name` is already a
+ * real, depth-one, separator-free basename off this disk, so this only ever
+ * differs from it on an over-long name — but that is exactly the case the
+ * server's own `safeFileName(rawName)` would otherwise re-cut DIFFERENTLY
+ * from whatever this reported, since a bare truncation and an
+ * extension-preserving one disagree past 80 characters. Applying the same
+ * rule here means the server's re-application is a no-op and the name a
+ * design or research delivery is judged by is the one this machine reported.
+ */
+function safeArtifactName(raw) {
+  const clean = String(raw ?? '').replace(/[^A-Za-z0-9._-]/g, '_');
+  if (clean.length <= 80) return clean || 'artifact';
+  const dot = clean.lastIndexOf('.');
+  const ext = dot > 0 && ARTIFACT_SAFE_EXT_RE.test(clean.slice(dot + 1)) ? clean.slice(dot + 1) : '';
+  const stem = ext ? clean.slice(0, dot) : clean;
+  const tag = `-${artifactFnv1a8(clean)}`;
+  const room = 80 - tag.length - (ext ? ext.length + 1 : 0);
+  return `${stem.slice(0, room)}${tag}${ext ? `.${ext}` : ''}`;
+}
+
 /**
  * ONE UPLOAD BODY, as data — fields plus optional bytes — so a held body is
  * re-sent exactly as it was first built (scrubbed once, never re-read from a
@@ -210,7 +243,7 @@ export function buildArtifactUpload(entry, { sessionId, agentId, turnId }, scrub
   const fields = {
     ...(sessionId ? { sessionId } : { agentId }),
     ...(turnId ? { turnId } : {}),
-    name: entry.name,
+    name: safeArtifactName(entry.name),
     bytes: String(entry.size),
   };
   if (!type) return { fields, bytes: null }; // reported by name only

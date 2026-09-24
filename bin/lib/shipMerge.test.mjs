@@ -155,7 +155,9 @@ test('a losing retry throws rather than reporting a ship that did not happen', (
       }
       return g(args, cwd);
     };
-    assert.throws(() => run(w, { tip, branch: 'feat', git: hostile }));
+    // Push is now a gitNet call (D2: timed, non-interactive), so the
+    // interception moves from the injected `git` to the injected `gitNet`.
+    assert.throws(() => run(w, { tip, branch: 'feat', gitNet: hostile }));
     // And it still cleaned up after itself.
     assert.equal(existsSync(join(w.root, 'throwaway')), false);
   } finally {

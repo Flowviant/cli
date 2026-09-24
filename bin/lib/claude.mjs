@@ -359,10 +359,26 @@ export const sleep = (s) => new Promise((r) => setTimeout(r, s * 1000));
 // matching falsely fired when an agent merely *mentioned* the word in prose
 // (e.g. "I won't fabricate a BLOCKED:<id> line"), trapping the worker in a fake
 // blocked loop. Anchor to a full line instead.
-export const sawSentinel = (out, name) => new RegExp(`^\\s*${name}\\s*$`, 'm').test(out);
+//
+// LINE-SPLIT, NEVER A `^...$` REGEX WITH A `\s*` ON BOTH ENDS (audit
+// 2026-09-24). `new RegExp('^\\s*NAME\\s*$', 'm')` and
+// `/^\s*BLOCKED:(\S+)\s*$/m` are QUADRATIC against a long run of
+// whitespace on one line — the same shape `taskIdsFromMessage` already had
+// to fix, measured ~0.5s at 40KB here — and a CLI's own stdout is exactly
+// the kind of text a stray control sequence or a pasted blob can grow past
+// that. A length cap first, then plain string work, same as there.
+const SENTINEL_MAX_LINE = 2000;
+export const sawSentinel = (out, name) =>
+  String(out ?? '')
+    .split('\n')
+    .some((l) => l.length < SENTINEL_MAX_LINE && l.trim() === name);
 export const blockedId = (out) => {
-  const m = out.match(/^\s*BLOCKED:(\S+)\s*$/m);
-  return m ? m[1] : null;
+  for (const l of String(out ?? '').split('\n')) {
+    if (l.length > SENTINEL_MAX_LINE) continue;
+    const t = l.trim();
+    if (t.startsWith('BLOCKED:') && /^BLOCKED:\S+$/.test(t)) return t.slice(8);
+  }
+  return null;
 };
 
 /**

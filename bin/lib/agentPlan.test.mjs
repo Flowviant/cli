@@ -79,6 +79,28 @@ test('names an agent even when the planner did not', () => {
   assert.equal(out.agents[0].name, '');
 });
 
+// A4a CROSS 5 (the audit): a second group with no tempId defaults to the same
+// positional 'a2' the first group already named explicitly. Two containers
+// sharing one tempId is not cosmetic — the web keys draftByTask/proposedCards
+// by it, so per-group Start/Decline on either one deletes both. First
+// occurrence keeps its id; the collision is suffixed, mirroring the server's
+// own uniqueTempIds at the same boundary.
+test('dedupes a colliding tempId — first occurrence wins, the collision is suffixed', () => {
+  const out = parseProposal(
+    JSON.stringify({
+      agents: [
+        { tempId: 'a2', name: 'auth', taskIds: ['x'] },
+        { name: 'billing', taskIds: ['y'] },
+      ],
+    })
+  );
+  assert.equal(out.agents.length, 2);
+  assert.equal(out.agents[0].tempId, 'a2');
+  assert.equal(out.agents[0].name, 'auth');
+  assert.equal(out.agents[1].tempId, 'a2-2');
+  assert.equal(out.agents[1].name, 'billing');
+});
+
 // This is model output about untrusted card content, and it becomes a row.
 test('caps every string it carries', () => {
   const out = parseProposal(

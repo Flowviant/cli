@@ -1,4 +1,4 @@
-import { baseBranchName } from './git.mjs';
+import { baseBranchName, gitNet as gitNetDefault } from './git.mjs';
 
 /**
  * CARRY A SHIPPED TIP OUT ONTO BASE AND PUSH IT.
@@ -28,6 +28,10 @@ export function mergeOutward({
   baseRef,
   workingTree,
   warn,
+  // NETWORK calls only (push, fetch) — timed and non-interactive, so a
+  // stale credential or a half-open connection cannot freeze the ship
+  // path's writer lock. Injectable for tests; defaults to the real one.
+  gitNet = gitNetDefault,
 }) {
   const dropTmp = () => {
     try {
@@ -43,7 +47,7 @@ export function mergeOutward({
       ['merge', '--no-ff', tip, '-m', `ship(${label}): ${count} commit${count === 1 ? '' : 's'}`],
       tmpDir
     );
-    git(['push', 'origin', `HEAD:${baseBranchName(baseRef())}`], tmpDir);
+    gitNet(['push', 'origin', `HEAD:${baseBranchName(baseRef())}`], tmpDir, 120_000);
   };
   try {
     try {
@@ -74,7 +78,7 @@ export function mergeOutward({
       if (!isRaceRejection(e)) throw e;
       warn?.('ship: base moved under us — refetching and merging again');
       try {
-        git(['fetch', 'origin', '--quiet'], repoRoot);
+        gitNet(['fetch', 'origin', '--quiet'], repoRoot, 60_000);
       } catch {
         /* offline — the retry fails honestly on the same push */
       }
@@ -102,7 +106,7 @@ export function mergeOutward({
      */
     if (workingTree && branch && branch === baseBranchName(baseRef())) {
       try {
-        git(['fetch', 'origin', '--quiet'], repoRoot);
+        gitNet(['fetch', 'origin', '--quiet'], repoRoot, 60_000);
         git(['merge', '--ff-only', baseRef()], workingTree);
       } catch {
         /* a readout, not the ship — the merge already landed, and the next

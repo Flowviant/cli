@@ -152,19 +152,48 @@ export const KNOWLEDGE_FILE_MAX_BYTES = 10 * 1024 * 1024;
  *  this is not one the product produced, and is cut rather than trusted. */
 const MAX_FILES = 64;
 
+/** FNV-1a, 32-bit, as 8 hex — deterministic, so the same long name always maps
+ *  to the same stored name. Verbatim against the server's `fnv1a8`
+ *  (apps/api/src/routes/sessionsAttachments.routes.ts). */
+function fnv1a8(s) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(16).padStart(8, '0');
+}
+/** What counts as an extension worth keeping through a cut. */
+const SAFE_EXT_RE = /^[A-Za-z0-9]{1,10}$/;
+const SAFE_NAME_MAX = 80;
+
 /**
- * `safeUploadName`, verbatim in effect (work.mjs): keeps the extension, drops
- * every path separator, never starts with a dot or a dash. Re-applied here
- * although the server did it, because this string becomes a path on this box.
+ * `safeFileName`, verbatim (apps/api/src/routes/sessionsAttachments.routes.ts):
+ * drops every path separator, never starts with a dot or a dash, and — since
+ * 2026-09-24 — THE EXTENSION SURVIVES A CUT. A bare `slice(0, 80)` truncated
+ * an over-long name mid-extension (an 84-character `….html` mockup stored as
+ * `….` with an unrecognised type and its bytes discarded), so a long name's
+ * stem is now cut and an 8-hex FNV-1a hash of the WHOLE sanitised name is
+ * appended before the extension: stable across calls, at most 80 characters,
+ * idempotent over its own output, and — the reason it is re-applied here
+ * rather than trusted to the server's own pass — byte-identical to what
+ * `safeFileName` computes there, so a knowledge file synced under this name
+ * and one requested by name later never disagree over the cut.
  */
 export function safeKnowledgeName(raw) {
-  const base = String(raw ?? '')
+  const clean = String(raw ?? '')
     .split(/[\\/]/)
     .pop()
     .replace(/[^A-Za-z0-9._-]/g, '_')
-    .replace(/^[.-]+/, '')
-    .slice(0, 80);
-  return base || 'file';
+    .replace(/^[.-]+/, '');
+  if (!clean) return 'file';
+  if (clean.length <= SAFE_NAME_MAX) return clean;
+  const dot = clean.lastIndexOf('.');
+  const ext = dot > 0 && SAFE_EXT_RE.test(clean.slice(dot + 1)) ? clean.slice(dot + 1) : '';
+  const stem = ext ? clean.slice(0, dot) : clean;
+  const tag = `-${fnv1a8(clean)}`;
+  const room = SAFE_NAME_MAX - tag.length - (ext ? ext.length + 1 : 0);
+  return `${stem.slice(0, room)}${tag}${ext ? `.${ext}` : ''}`;
 }
 
 /**

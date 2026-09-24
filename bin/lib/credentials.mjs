@@ -48,6 +48,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { printable } from './printable.mjs';
 
 const CRED_DIR = join(homedir(), '.flowviant');
 const CRED_FILE = join(CRED_DIR, 'credentials.json');
@@ -144,14 +145,16 @@ export function projectLabel(e) {
  * terminal that connects a machine to the project — `login`, the banner, the
  * picker, `projects`, `machines` — and a name carrying an escape sequence can
  * rewrite the clipboard (OSC 52 in kitty, WezTerm, Windows Terminal) or hide
- * lines of the very listing whose job is to say which project is which. C0,
- * DEL and C1 controls are dropped (the server's own `parseBoxName` makes the
- * same cut for hostnames), and what is left is trimmed; nothing left is null,
- * so the caller's id fallback speaks instead of an empty label.
+ * lines of the very listing whose job is to say which project is which. The
+ * scrub is `printable()` (C0, DEL, C1 — the server's own `parseBoxName` makes
+ * the same cut for hostnames — plus the bidi/format controls that reorder a
+ * line, added 2026-09-24 rather than re-derived: see printable.mjs), and what
+ * is left is trimmed; nothing left is null, so the caller's id fallback
+ * speaks instead of an empty label.
  */
 export function safeName(name) {
   if (typeof name !== 'string') return null;
-  const clean = name.replace(/[\u0000-\u001f\u007f-\u009f]/g, '').trim();
+  const clean = printable(name).trim();
   return clean || null;
 }
 

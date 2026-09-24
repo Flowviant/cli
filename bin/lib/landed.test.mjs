@@ -2,13 +2,17 @@
  * The landed observer's walk: what it reports, what it refuses to invent.
  *
  * A REAL REPO and a captured fetch, because the properties under test are
- * git's and the wire's together: git preserves the 0x1e/0x1f delimiter bytes
- * inside a commit body (so a crafted message can imitate the log format's own
- * records — an arbitrary sha plus task ids the server would close cards on),
- * a catch-up range's `%B` bodies outgrow execFileSync's 1MiB default, and the
- * reseed catch must fire for a range the repo cannot answer while every other
- * failure retries. A mocked git would assert our beliefs instead of testing
- * them.
+ * git's and the wire's together: the walk reads each commit BY ITS OWN SHA
+ * (`commitRecord`, one `git show` per commit) rather than as one delimited
+ * multi-record log, so a message embedding the 0x1e/0x1f bytes a batched log
+ * used to split on cannot fabricate a second record for a sha the range
+ * never held — the first test below is the regression case for that, kept
+ * even though the per-sha read makes the old multi-record forgery
+ * structurally unreachable rather than merely detected. A catch-up range's
+ * commit bodies can still outgrow `gitRaw`'s 1MiB default per commit (one
+ * skipped, not an aborted batch), and the reseed catch must fire for a range
+ * the repo cannot answer while every other failure retries. A mocked git
+ * would assert our beliefs instead of testing them.
  *
  * Run: node --test bin/lib/landed.test.mjs
  */
@@ -90,10 +94,14 @@ test('first sight seeds, and a crafted body cannot fabricate a record', async (t
 
   const sha1 = commit(dir, 'one.txt', 'first\n\nFlowviant-Task: card-1');
   const fake = 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef';
-  // The delimiter bytes the walk splits on, embedded in the BODY — git
-  // preserves them, so without the rev-list membership check this fabricates
-  // a record for a sha the range never held, naming a card nobody's commit
-  // named, and /fleet/base-landed would close on it.
+  // The delimiter bytes a BATCHED log used to split multiple records on,
+  // embedded in this commit's own BODY — git preserves them, so a naive
+  // multi-record parse of that log could be tricked into fabricating a
+  // second record for a sha the range never held, naming a card nobody's
+  // commit named, that /fleet/base-landed would close on. The per-sha read
+  // (`commitRecord`, one `git show` per commit) has no multi-record blob to
+  // split, so this can only ever land as literal text inside sha2's OWN
+  // subject/body — never a second record.
   const sha2 = commit(dir, 'two.txt', `second\n\x1e${fake}\x1fforged subject\x1fFlowviant-Task: victim-card`);
 
   await obs.observe();

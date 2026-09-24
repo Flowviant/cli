@@ -160,6 +160,25 @@ test('an unnamed holder gets the nameless fallback and still announces once', ()
   assert.ok(!said[0].includes('heard'), 'an unmeasured duration drops the clause whole');
 });
 
+// A3 CROSS 8a (the audit): `holder.name` and `took.from` are the OTHER box's
+// own reported name, relayed through the server onto every poll — the same
+// class of string `parseBoxName` scrubs server-side, printed here as a belt.
+test('a standby name carrying an escape sequence or a bidi override is scrubbed before it is said', () => {
+  const { w, said } = watch();
+  w.observe({ mine: false, name: 'evil‮txt.crt⁦', heardAgo: 5_000 });
+  assert.equal(said.length, 1);
+  assert.ok(!/[‮⁦]/.test(said[0]));
+  assert.match(said[0], /machine is eviltxt\.crt \(heard 5s ago\)/);
+});
+
+test('a take-over sentence scrubs the displaced box it names', () => {
+  const { w, said } = watch();
+  assert.equal(w.observe({ mine: true, took: { from: 'mac\u009bmini', turns: 2 } }), 'mine');
+  assert.equal(said.length, 1);
+  assert.ok(!/\u009b/.test(said[0]));
+  assert.match(said[0], /took this project's machine from macmini/);
+});
+
 test('the handover is announced only to a box that was standing by', () => {
   const { w, said } = watch();
   // An ordinary daemon that has always been the machine prints nothing new.
@@ -328,6 +347,41 @@ test('kind defaults to moved, so the displaced call site is unchanged', async ()
   assert.equal(sentence, displacedTurnSentence('mac-mini'));
   // And an unrecognised kind is MOVED too rather than a third silent state.
   assert.notEqual(removedTurnSentence(), displacedTurnSentence('mac-mini'));
+});
+
+// A3 CROSS 8a (the audit): `by` (the box that took over) and `project` are
+// both server-relayed strings written straight to this box's own console via
+// `log.warn`, and to the settle sentence every displaced turn is closed with.
+test('the displaced/removed console line and turn sentence scrub an escape sequence or a bidi override', async () => {
+  const warned = [];
+  let sentence = null;
+  await standDownDisplaced({
+    by: 'evil‮txt.crt⁦',
+    settleAgentTurns: async (s) => {
+      sentence = s;
+    },
+    flushReports: async () => {},
+    teardown: () => {},
+    exit: () => {},
+    log: { warn: (m) => warned.push(m), note: () => {} },
+  });
+  assert.ok(!/[‮⁦]/.test(warned[0]));
+  assert.equal(warned[0], 'this project\'s machine moved to eviltxt.crt — standing down.');
+  assert.equal(sentence, displacedTurnSentence('evil‮txt.crt⁦'));
+  assert.ok(!/[‮⁦]/.test(sentence));
+
+  const removedWarned = [];
+  await standDownDisplaced({
+    kind: 'removed',
+    project: 'BRIF\u009b AI',
+    settleAgentTurns: async () => {},
+    flushReports: async () => {},
+    teardown: () => {},
+    exit: () => {},
+    log: { warn: (m) => removedWarned.push(m), note: () => {} },
+  });
+  assert.ok(!/\u009b/.test(removedWarned[0]));
+  assert.equal(removedWarned[0], 'removed from BRIF AI in the app — stopping.');
 });
 
 // ── where it sits in the loop ────────────────────────────────────────────────

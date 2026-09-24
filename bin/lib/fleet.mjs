@@ -42,6 +42,7 @@ import { credentialRejected } from './authReject.mjs';
 import { handleVersionSignal } from './update.mjs';
 import {
   git,
+  gitNetAsync,
   resetWorktree,
   repoRootOrDie,
   detectBaseRef,
@@ -900,10 +901,9 @@ export function createHolderWatch({ say = () => {} } = {}) {
         const took = holder.took;
         if (took && typeof took === 'object' && !Array.isArray(took)) {
           standbyKey = null;
-          const from =
-            typeof took.from === 'string' && took.from.trim()
-              ? took.from.trim().slice(0, 64)
-              : 'another machine';
+          // scrubbed before it reaches a terminal (2026-09-24, the audit) —
+          // see printable.mjs.
+          const from = safeName(took.from)?.slice(0, 64) ?? 'another machine';
           const turns = Number.isInteger(took.turns) && took.turns > 0 ? took.turns : null;
           say(
             `took this project's machine from ${from}` +
@@ -922,10 +922,9 @@ export function createHolderWatch({ say = () => {} } = {}) {
       // The NAME is all the response carries about the other box, so it is also
       // the only thing "a distinct holder" can be keyed on. An unnamed holder
       // keys on the empty string, which is stable — one announcement, not one
-      // per poll.
-      const name = typeof holder.name === 'string' && holder.name.trim()
-        ? holder.name.trim().slice(0, 64)
-        : null;
+      // per poll. Scrubbed before it reaches a terminal (2026-09-24, the
+      // audit) — see printable.mjs.
+      const name = safeName(holder.name)?.slice(0, 64) ?? null;
       const key = name ?? '';
       if (key !== standbyKey) {
         standbyKey = key;
@@ -989,9 +988,10 @@ export function createHolderWatch({ say = () => {} } = {}) {
 
 /** The sentence an in-flight agent turn is settled with when the machine moves
  *  out from under it. MEASURED, not inferred: the server named the box that
- *  took over, and an unnamed one says so rather than guessing. */
+ *  took over, and an unnamed one says so rather than guessing. Scrubbed
+ *  before it is relayed anywhere (2026-09-24, the audit) — see printable.mjs. */
 export function displacedTurnSentence(by) {
-  const name = typeof by === 'string' && by.trim() ? by.trim().slice(0, 64) : 'another machine';
+  const name = safeName(by)?.slice(0, 64) ?? 'another machine';
   return `The project's machine moved to ${name} while this turn was running.`;
 }
 
@@ -1057,7 +1057,9 @@ export async function standDownDisplaced({
         t.unref?.();
       }),
     ]);
-  const name = typeof by === 'string' && by.trim() ? by.trim().slice(0, 64) : null;
+  // Scrubbed before it reaches this box's own console (2026-09-24, the
+  // audit) — see printable.mjs.
+  const name = safeName(by)?.slice(0, 64) ?? null;
   /**
    * TWO KINDS, ONE CHOREOGRAPHY (2026-09-21).
    *
@@ -1073,8 +1075,7 @@ export async function standDownDisplaced({
    * drift and neither call site can invent a third.
    */
   const removed = kind === 'removed';
-  const projectName =
-    typeof project === 'string' && project.trim() ? project.trim().slice(0, 64) : 'this project';
+  const projectName = safeName(project)?.slice(0, 64) ?? 'this project';
   log.warn(
     removed
       ? `removed from ${projectName} in the app — stopping.`
@@ -1755,10 +1756,11 @@ export async function runFleetDaemon({ afterLock = null } = {}) {
           } else if (job.branch && isValidBranch(job.branch, repoRoot, baseRef)) {
             try {
               // Explicit refspec form so a leading '-' can't be a git flag.
-              execFileSync('git', ['push', 'origin', `:refs/heads/${job.branch}`], {
-                cwd: repoRoot,
-                stdio: ['ignore', 'pipe', 'pipe'],
-              });
+              // NETWORK call, so timed and non-interactive (2026-09-24, the
+              // audit): a bare execFileSync here had no timeout and could
+              // prompt on /dev/tty, freezing every poll and lease on the
+              // machine behind this cleanup's own async loop.
+              await gitNetAsync(['push', 'origin', `:refs/heads/${job.branch}`], repoRoot);
             } catch {
               /* branch already gone — fine */
             }

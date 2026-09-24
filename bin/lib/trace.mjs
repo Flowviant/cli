@@ -38,10 +38,15 @@
  * second attempt then opened at `seq: 0` against a mark of three hundred, so
  * every batch it sent was trimmed to nothing and the surface showed the
  * ABANDONED attempt's steps with the new one's tail welded on, no seam, no
- * `dropped` to say so. `run` is a nonce per relay: the server rebases an
- * unfamiliar one onto its current mark, so a second attempt appends AFTER the
- * first instead of being deleted by it, and a retry inside one run still trims
- * exactly as before.
+ * `dropped` to say so. `run` is a nonce per relay: EACH RUN KEEPS ITS OWN
+ * HIGH-WATER MARK IN ITS OWN SEQ SPACE (2026-09-24) — an unfamiliar one starts
+ * its own mark at the server's shared `hw` rather than being rebased onto it,
+ * so a second attempt appends AFTER the first instead of being deleted by it,
+ * and a retry inside one run still trims exactly as before. The first cut
+ * rebased an unfamiliar run onto the one shared mark, so a takeover's old box,
+ * still flushing its last seconds, spliced its late steps between the new
+ * run's — a superseded run's late steps are COUNTED against the shared mark
+ * now (the trace is not lost) and never SPLICED between the live run's.
  *
  * SCRUB EVERY STRING. This is the CLI's own stdout — a command echoing an env
  * var, a read of a config file — riding the same uplink the answer does. Prose

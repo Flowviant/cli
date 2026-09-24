@@ -492,9 +492,10 @@ const kickoff = ({ message, askedByName, head, tail }) => {
  * A CAPTURE TAB (server: work_session.kind='capture', flagged on the job as
  * `capture: true`) — the board's "New task" conversation. Its whole job is
  * turning what the person says into STAGED cards a human lands; it edits
- * nothing, and the permission profile enforces that (PLAN_PERM: read-only +
- * MCP — the same fence the scratch planner runs behind). This prompt is the
- * QUALITY half; the token scope and the permission list are the safety.
+ * nothing, and the permission profile enforces that (`planPermFor`:
+ * read-only + MCP — the same fence the scratch planner runs behind). This
+ * prompt is the QUALITY half; the token scope and the permission list are
+ * the safety.
  *
  * THE CHAT ASKS IN CHIPS, AND SAYS WHAT IT ASSUMED (2026-09-23, 0.97.0). Rule
  * 5 used to be one sentence — "clarify before staging" — and the owner asked
@@ -684,11 +685,11 @@ export const REGROUND_KICKOFF = ({ sha, title, files, vaultDir, predictedPages =
  * no code, edits no files and starts nothing: a person reads what it proposes,
  * edits it on the board, and accepting is what spawns anything.
  *
- * It runs READ-ONLY IN THE CHECKOUT under CONSULT_PERM — no Write, no Edit, no
- * mkdir, no rm, and no MCP at all. The proposal comes back as its final
- * message, not through a tool, which is what lets that permission set be this
- * narrow. A planner authors a decision, and there is no file on this machine it
- * has any business touching.
+ * It runs READ-ONLY IN THE CHECKOUT under `consultPermFor` — no Write, no
+ * Edit, no mkdir, no rm, and no MCP at all. The proposal comes back as its
+ * final message, not through a tool, which is what lets that permission set
+ * be this narrow. A planner authors a decision, and there is no file on this
+ * machine it has any business touching.
  *
  * The two facts it is asked to weigh are the only two that are actually
  * knowable here: what the cards SAY, and what each live agent has already

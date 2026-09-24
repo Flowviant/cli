@@ -256,6 +256,31 @@ test('an unreported checkout or version says so — never blank, never guessed',
   assert.match(line, /version not reported/);
 });
 
+// A3 CROSS 8a (the audit): a box's name and checkout path are SERVER-relayed
+// (another box's own poll, upserted into a row this box's `machines` just
+// read back), so a C1 escape or a bidi override in either reaches this
+// terminal exactly the way a hostname or a project name does.
+test('a box name or checkout path carrying an escape sequence or a bidi override is scrubbed before it reaches the terminal', () => {
+  const line = renderBox(
+    box({ boxName: 'evil‮txt.crt⁦', checkoutPath: '/home/x\u009d52;c;ZXZpbA==\u009c' })
+  );
+  assert.ok(!/[\u0000-\u001f\u007f-\u009f‎‏‪-‮⁦-⁩]/.test(line));
+  assert.match(line, /eviltxt\.crt/);
+  assert.match(line, /\/home\/x52;c;ZXZpbA==/);
+  // A name that scrubs down to nothing still gets the honest fallback, not a
+  // blank cell.
+  assert.match(renderBox(box({ boxName: '‮⁦' })), /an unnamed machine/);
+});
+
+test('otherBoxesLine scrubs a box name the same way', () => {
+  const line = otherBoxesLine(
+    [box({ boxId: 'B2', boxName: 'wayleempc‮', role: 'inactive' })],
+    'B1'
+  );
+  assert.ok(!/‮/.test(line));
+  assert.match(line, /wayleempc/);
+});
+
 test('the project id is on EVERY row — it is what tells two same-named projects apart', () => {
   const a = entry({ projectId: 'fd716bf3-aaaa', name: 'BRIF AI', savedAt: '2026-08-01T12:00:00.000Z' });
   const b = entry({ projectId: 'fdcec6a0-bbbb', name: 'BRIF AI', savedAt: '2026-09-16T12:00:00.000Z' });

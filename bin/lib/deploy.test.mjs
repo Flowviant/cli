@@ -12,7 +12,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { openDeployCheckout, runDeploy } from './deploy.mjs';
+import { openDeployCheckout, reportDeployConfig, runDeploy } from './deploy.mjs';
 
 const sh = (args, cwd) =>
   execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
@@ -26,13 +26,19 @@ function scene() {
   for (const [k, v] of [['user.email', 't@t'], ['user.name', 't'], ['commit.gpgsign', 'false']]) sh(['config', k, v], seed);
   mkdirSync(join(seed, '.flowviant'));
   const out = join(root, 'deployed.txt');
+  const cmd = `cat app.txt > ${JSON.stringify(out)} && (test -e node_modules/dep/marker && echo deps >> ${JSON.stringify(out)} || true) && (cat .env.production >> ${JSON.stringify(out)} 2>/dev/null || true)`;
   writeFileSync(
     join(seed, '.flowviant', 'deploy.json'),
     JSON.stringify({
       targets: [
         {
           id: 'web',
-          command: `cat app.txt > ${JSON.stringify(out)} && (test -e node_modules/dep/marker && echo deps >> ${JSON.stringify(out)} || true) && (cat .env.production >> ${JSON.stringify(out)} 2>/dev/null || true)`,
+          command: cmd,
+          // The env-isolation guard (audit 2026-09-24) refuses a non-prod
+          // trigger with no per-env override, so the scenes below that
+          // deploy env:'dev' need one that resolves to the same command —
+          // this target is meant to be genuinely reachable at that env.
+          commands: { dev: cmd },
         },
       ],
     })
@@ -155,4 +161,149 @@ test("a WORKSPACE package resolves to base's copy, never the checkout's working 
   assert.equal(readFileSync(join(repo, 'packages', 'shared', 'index.js'), 'utf8'), 'WIP-shared\n');
   assert.ok(existsSync(join(repo, 'node_modules', 'dep', 'marker')));
   assert.ok(lstatSync(join(repo, 'node_modules', '@x', 'shared')).isSymbolicLink());
+});
+
+// A8 CROSS 4 (the audit): the server already refuses this at TRIGGER time
+// against its own mirror of the file; this is the daemon re-asking the same
+// question against the file it is actually about to build and run, which
+// closes the window between the two.
+function addBareTarget(root) {
+  const seed = join(root, 'seed');
+  const cfg = JSON.parse(readFileSync(join(seed, '.flowviant', 'deploy.json'), 'utf8'));
+  // Only the base `command` — no per-env override at all — is exactly the
+  // shape `commands?.[env] || command` would fall back to production for.
+  cfg.targets.push({ id: 'bare', command: 'echo THIS IS PROD' });
+  writeFileSync(join(seed, '.flowviant', 'deploy.json'), JSON.stringify(cfg));
+  sh(['add', '-A'], seed);
+  sh(['commit', '-m', 'add a target with no per-env commands'], seed);
+  sh(['push', 'origin', 'main'], seed);
+}
+
+test('a non-prod deploy with no per-env override refuses rather than falling back to the prod command', async () => {
+  const { root, repo, worktreeDir } = scene();
+  addBareTarget(root);
+  const res = await runDeploy(
+    { id: 'job-env-1', kind: 'deploy', targetId: 'bare', env: 'dev' },
+    { repoRoot: repo, baseRef: 'origin/main', worktreeDir }
+  );
+  assert.equal(res.ok, false);
+  assert.match(res.message, /declares no dev command/);
+  assert.match(res.message, /refusing to fall back to the prod command/);
+});
+
+test('a non-prod rollback with no rollback:<env> override refuses rather than running the bare default (which targets prod)', async () => {
+  const { root, repo, worktreeDir } = scene();
+  addBareTarget(root);
+  const res = await runDeploy(
+    { id: 'job-env-2', kind: 'rollback', targetId: 'bare', env: 'preview' },
+    { repoRoot: repo, baseRef: 'origin/main', worktreeDir }
+  );
+  assert.equal(res.ok, false);
+  assert.match(res.message, /declares no preview command/);
+  assert.match(res.message, /refusing to fall back to the prod command/);
+});
+
+test('prod is exempt from the env-isolation guard on both deploy and rollback', async () => {
+  const { root, repo, worktreeDir } = scene();
+  addBareTarget(root);
+  const deploy = await runDeploy(
+    { id: 'job-env-3', kind: 'deploy', targetId: 'bare', env: 'prod' },
+    { repoRoot: repo, baseRef: 'origin/main', worktreeDir }
+  );
+  assert.equal(deploy.ok, true, deploy.message);
+  const rollback = await runDeploy(
+    { id: 'job-env-4', kind: 'rollback', targetId: 'bare', env: 'prod' },
+    { repoRoot: repo, baseRef: 'origin/main', worktreeDir }
+  );
+  // No real `npx wrangler` here, so this fails on execution rather than on
+  // the guard — the point is that it got PAST the guard.
+  assert.doesNotMatch(rollback.message, /refusing to fall back/);
+});
+
+test('a target WITH its own per-env override still runs it (the guard only refuses the silent fallback)', async () => {
+  const { repo, out, worktreeDir } = scene();
+  const res = await runDeploy(
+    { id: 'job-env-5', kind: 'deploy', targetId: 'web', env: 'dev' },
+    { repoRoot: repo, baseRef: 'origin/main', worktreeDir }
+  );
+  assert.equal(res.ok, true, res.message);
+  assert.match(readFileSync(out, 'utf8'), /^v1-on-main$/m);
+});
+
+test('reportDeployConfig normalizes a numeric-string healthStatus and omits empty label/healthcheck/build', async () => {
+  const { root, repo } = scene();
+  const seed = join(root, 'seed');
+  writeFileSync(
+    join(seed, '.flowviant', 'deploy.json'),
+    JSON.stringify({
+      targets: [
+        { id: 'web', command: 'wrangler deploy', label: '', build: null, healthcheck: '', healthStatus: '200' },
+      ],
+    })
+  );
+  sh(['add', '-A'], seed);
+  sh(['commit', '-m', 'lenient target'], seed);
+  sh(['push', 'origin', 'main'], seed);
+  // readDeployConfig reads the LOCAL origin/main ref (no fetch of its own,
+  // unlike openDeployCheckout) — the checkout has to be told the new commit
+  // exists before reportDeployConfig can see it.
+  sh(['fetch', 'origin'], repo);
+
+  const posted = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url, opts = {}) => {
+    posted.push(JSON.parse(opts.body));
+    return { ok: true, json: async () => ({ success: true, data: { targets: 1 } }) };
+  };
+  try {
+    await reportDeployConfig(repo, 'origin/main');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  assert.equal(posted.length, 1);
+  const target = posted[0].targets.find((t) => t.id === 'web');
+  assert.equal(target.healthStatus, 200);
+  assert.equal('label' in target, false);
+  assert.equal('build' in target, false);
+  assert.equal('healthcheck' in target, false);
+});
+
+test('reportDeployConfig warns once per changed config on a rejected target, and still remembers the report so it does not re-post the same file', async () => {
+  const { root, repo } = scene();
+  const seed = join(root, 'seed');
+  writeFileSync(
+    join(seed, '.flowviant', 'deploy.json'),
+    JSON.stringify({ targets: [{ id: 'bad', command: 'echo hi', healthStatus: 'not-a-number' }] })
+  );
+  sh(['add', '-A'], seed);
+  sh(['commit', '-m', 'rejectable target'], seed);
+  sh(['push', 'origin', 'main'], seed);
+  sh(['fetch', 'origin'], repo);
+
+  const posted = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url, opts = {}) => {
+    posted.push(JSON.parse(opts.body));
+    return {
+      ok: true,
+      json: async () => ({
+        success: true,
+        data: { targets: 1, rejected: [{ id: 'bad', reason: 'healthStatus: expected a number' }] },
+      }),
+    };
+  };
+  const logged = [];
+  const realLog = console.log;
+  console.log = (...args) => logged.push(args.join(' '));
+  try {
+    await reportDeployConfig(repo, 'origin/main');
+    await reportDeployConfig(repo, 'origin/main'); // the same file — must not re-post or re-warn
+  } finally {
+    globalThis.fetch = realFetch;
+    console.log = realLog;
+  }
+  assert.equal(posted.length, 1);
+  assert.equal(posted[0].targets[0].id, 'bad');
+  const warnings = logged.filter((l) => l.includes('"bad"') && l.includes('healthStatus'));
+  assert.equal(warnings.length, 1);
 });

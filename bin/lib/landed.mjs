@@ -29,7 +29,7 @@ import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { git, baseBranchName } from './git.mjs';
-import { stripDelims, taskIdsFromMessage } from './worktreeDiff.mjs';
+import { commitRecord, stripDelims, taskIdsFromMessage } from './worktreeDiff.mjs';
 import { warn } from './ui.mjs';
 import { FLEET_URL, FLEET_TOKEN, USER_AGENT } from './config.mjs';
 
@@ -95,41 +95,39 @@ export function createLandedObserver({ repoRoot, baseRef }) {
    *  merge commit describes a range rather than doing work, and its
    *  constituents are walked as themselves.
    *
-   *  THE SHA LIST COMES FROM REV-LIST, NEVER FROM THE FORMATTED LOG. Git
-   *  preserves the 0x1e/0x1f delimiter bytes inside a commit BODY (verified
-   *  empirically), so a crafted message can fabricate whole records — an
-   *  arbitrary sha plus Flowviant-Task ids that /fleet/base-landed would close
-   *  cards on. rev-list prints nothing an author controls, so its output is
-   *  the set of commits that exist: a parsed record whose sha is not in the
-   *  batch is a forgery and is dropped, a repeated sha is the same forgery
-   *  wearing a real commit's name, and the delimiter bytes are stripped from
-   *  every surviving field.
+   *  THE SHA LIST COMES FROM REV-LIST, NEVER FROM THE FORMATTED LOG, and each
+   *  commit is then read BY ITS OWN SHA (`commitRecord`, one `git show` per
+   *  commit) rather than as one delimited multi-record log. A batched log
+   *  used to print every commit's `%H%x1f%s%x1f%B%x1e` back to back and split
+   *  the blob on those same delimiter bytes — bytes git preserves verbatim
+   *  inside a commit BODY (verified empirically), so a crafted message could
+   *  embed its own fake `%x1e`/`%x1f%1f` run and fabricate an extra "record"
+   *  naming an arbitrary sha and Flowviant-Task ids that /fleet/base-landed
+   *  would close cards on. Reading one sha at a time removes the multi-record
+   *  parse entirely — there is no blob to split, so there is nothing for an
+   *  embedded delimiter to forge a SECOND record out of. `stripDelims` still
+   *  scrubs whatever lands in the subject/body of the commit it actually
+   *  belongs to, the same defence-in-depth `branchCommits` above keeps.
    *
-   *  BOUNDING THE BODY FETCH TO THE BATCH is what makes the header's batching
-   *  contract true at any range size: `%B` over the whole range grows without
-   *  bound, so the formatted log runs over exactly the shas being reported
-   *  this beat (`--no-walk=unsorted` shows precisely the commits named, in
-   *  argv order — measured). */
+   *  ONE UNREADABLE COMMIT IS SKIPPED, NOT AN ABORT OF THE WHOLE BATCH:
+   *  `commitRecord` runs through `gitRaw`, whose `maxBuffer` is git.mjs's
+   *  plain default (1MiB) rather than this module's widened `gitWide` — a
+   *  single commit whose message alone exceeds that returns null and is
+   *  dropped, while every other commit in the batch still reports. */
   const walk = (from, to) => {
     const shas = gitWide(['rev-list', '--reverse', '--no-merges', `${from}..${to}`])
       .split('\n')
       .filter((s) => SHA_RE.test(s));
     const batch = shas.slice(0, MAX_COMMITS);
     const tipAfter = shas.length > MAX_COMMITS ? batch[batch.length - 1] : null;
-    if (batch.length === 0) return { commits: [], tipAfter };
-    const real = new Set(batch);
-    const raw = gitWide(['log', '--no-walk=unsorted', '--format=%H%x1f%s%x1f%B%x1e', ...batch]);
     const out = [];
-    for (const rec of raw.split('\x1e')) {
-      const line = rec.replace(/^\n+/, '');
-      if (!line.trim()) continue;
-      const [sha, subject, ...bodyParts] = line.split('\x1f');
-      if (!real.has(sha)) continue;
-      real.delete(sha);
+    for (const sha of batch) {
+      const rec = commitRecord(sha, repoRoot);
+      if (!rec) continue;
       out.push({
         sha,
-        subject: stripDelims(subject).slice(0, 200),
-        taskIds: taskIdsFromMessage(stripDelims(bodyParts.join('\n'))).slice(0, 8),
+        subject: stripDelims(rec.subject).slice(0, 200),
+        taskIds: taskIdsFromMessage(stripDelims(rec.body)).slice(0, 8),
       });
     }
     return { commits: out, tipAfter };

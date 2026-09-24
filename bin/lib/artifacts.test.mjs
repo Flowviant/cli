@@ -172,6 +172,29 @@ test('an off-list type and an oversized file are reported by NAME, never read', 
   assert.equal(big.fields.tooLarge, '1');
 });
 
+test('an over-long name is reported with the extension surviving the cut, byte-identical to the server’s safeFileName (audit 2026-09-24)', () => {
+  // A bare `slice(0, 80)` used to cut mid-extension — a 90-character mockup
+  // name stored as `…` with an unrecognised type, its bytes discarded. The
+  // wire `name` field is now pre-sanitized the same extension-preserving
+  // way the server's own `safeFileName` re-derives it, so the server's pass
+  // is a no-op and the two never disagree about the cut.
+  const d = place();
+  const stem = 'x'.repeat(90);
+  put(d, `${stem}.html`, '<p>a mockup</p>');
+  const entry = scanArtifacts(d).find((e) => e.name === `${stem}.html`);
+  const up = buildArtifactUpload(entry, { agentId: 'a1' });
+  assert.ok(up.fields.name.length <= 80, 'stays at or under the 80-char ceiling');
+  assert.ok(up.fields.name.endsWith('.html'), 'the extension survives the cut');
+  assert.equal(
+    up.fields.name,
+    'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-994582ac.html'
+  );
+  // Type detection and the actual bytes still ride the REAL file, unaffected
+  // by the reported name's cut.
+  assert.equal(up.fields.mime, 'text/html');
+  assert.equal(up.bytes.toString('utf8'), '<p>a mockup</p>');
+});
+
 test('uploads what the turn changed to /fleet/artifact, owned by the session', async () => {
   const d = place();
   const before = snapshotArtifacts(d);

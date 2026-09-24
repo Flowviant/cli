@@ -1462,9 +1462,14 @@ export function probeSkillsOnce(cwd) {
   timer.unref?.();
   child.on('error', () => finish(null));
   child.on('exit', () => finish(null));
+  // UTF-8 mode on the STREAM, not a per-chunk `.toString()` — a multi-byte
+  // character straddling a chunk boundary decodes to mojibake (or a stray
+  // replacement byte) when each chunk is decoded on its own; the stream's
+  // own decoder holds the partial sequence over to the next chunk instead.
+  child.stdout.setEncoding('utf8');
   child.stdout.on('data', (d) => {
     if (settled) return;
-    buf += d.toString();
+    buf += d;
     let nl;
     while (!settled && (nl = buf.indexOf('\n')) >= 0) {
       const line = buf.slice(0, nl);

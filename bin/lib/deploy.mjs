@@ -171,24 +171,60 @@ export async function reportDeployConfig(repoRoot, baseRef) {
     o && typeof o === 'object'
       ? Object.fromEntries(Object.entries(o).map(([k, v]) => [k, scrub(String(v ?? ''))]))
       : o;
-  const meta = targets.map((t) => ({
-    id: t.id,
-    label: t.label,
-    provider: t.provider || 'cloudflare',
-    command: scrub(String(t.command ?? '')),
-    build: t.build ? scrub(String(t.build)) : t.build,
-    commands: scrubCmds(t.commands),
-    healthcheck: t.healthcheck,
-    healthStatus: t.healthStatus,
-    pushSecrets: t.pushSecrets,
-    // Deploy-on-merge: the env this target auto-deploys to when commits land
-    // on base. MUST ride this map — a field forgotten here never reaches the
-    // server, and the server is what turns a landed report into the job.
-    ...(typeof t.onMerge === 'string' ? { onMerge: t.onMerge } : {}),
-  }));
+  /**
+   * NORMALIZE BEFORE POSTING (2026-09-24, the audit). `.flowviant/deploy.json`
+   * is a hand-written file; the shared schema treats `healthStatus` /
+   * `healthcheck` / `build` / `label` as display metadata and drops what it
+   * cannot read rather than refusing the whole target — but this file used to
+   * send them through unmodified, so a `"healthStatus": "200"` (which
+   * `verifyHealth` below already coerces with `Number()`) or a `null` label
+   * used to reach the wire looking present-but-unreadable. Send exactly what
+   * the mirror is going to keep instead of what the file happened to spell:
+   * a numeric `healthStatus` when the value is numeric or a numeric string,
+   * and no key at all for `label` / `healthcheck` / `build` when the file's
+   * value is not a non-empty string.
+   */
+  const numOrOmit = (v) => {
+    if (typeof v === 'number' && Number.isFinite(v)) return v;
+    if (typeof v === 'string' && /^\s*\d+\s*$/.test(v)) return Number(v);
+    return undefined;
+  };
+  const strOrOmit = (v) => (typeof v === 'string' && v.trim() ? v : undefined);
+  const meta = targets.map((t) => {
+    const label = strOrOmit(t.label);
+    const build = strOrOmit(t.build);
+    const healthcheck = strOrOmit(t.healthcheck);
+    const healthStatus = numOrOmit(t.healthStatus);
+    return {
+      id: t.id,
+      ...(label !== undefined ? { label } : {}),
+      provider: t.provider || 'cloudflare',
+      command: scrub(String(t.command ?? '')),
+      ...(build !== undefined ? { build: scrub(build) } : {}),
+      commands: scrubCmds(t.commands),
+      ...(healthcheck !== undefined ? { healthcheck } : {}),
+      ...(healthStatus !== undefined ? { healthStatus } : {}),
+      pushSecrets: t.pushSecrets,
+      // Deploy-on-merge: the env this target auto-deploys to when commits land
+      // on base. MUST ride this map — a field forgotten here never reaches the
+      // server, and the server is what turns a landed report into the job.
+      ...(typeof t.onMerge === 'string' ? { onMerge: t.onMerge } : {}),
+    };
+  });
   try {
-    await post('deploy-config', { pubkey: myPubB64(), targets: meta });
+    const data = await post('deploy-config', { pubkey: myPubB64(), targets: meta });
+    // Set on any 2xx, rejected targets included — the route now accepts a
+    // report per-target rather than failing the whole thing, so a target it
+    // could not read is not a reason to re-post this same file forever.
     lastConfigJson = json;
+    // THE SERVER NAMES WHAT IT COULD NOT READ. Warned once per CHANGED config —
+    // this function only reaches here when the file did — never once per poll.
+    const rejected = Array.isArray(data?.rejected) ? data.rejected : [];
+    for (const r of rejected) {
+      warn(
+        `deploy: .flowviant/deploy.json target "${r?.id ?? '?'}" was not accepted — ${r?.reason ?? 'invalid'}`
+      );
+    }
   } catch (e) {
     warn(`deploy: could not report config — ${e.message}`);
   }
@@ -643,6 +679,32 @@ async function runDeployIn(job, target, cwd) {
   // daemon in, rather than values Flowviant decrypted onto the box.
   const env = childEnv({ cwd, deploy: true }); // infra creds; never a file
   const logs = [];
+  /**
+   * THE ENV-ISOLATION GUARD, RE-APPLIED HERE (2026-09-24, the audit).
+   *
+   * The server already refuses a non-prod trigger whose target declares no
+   * per-env override — `createDeployJob`'s own comment names the same
+   * fallback this file resolves, `commands?.[env] || command`, as the reason:
+   * the base `command` (and the bare `npx wrangler rollback` default) is the
+   * PROD command, so a dev/preview trigger with no override would silently
+   * run production. But that check reads the SERVER'S MIRROR
+   * (`reportDeployConfig`'s last post), and this function reads the file OFF
+   * THE COMMIT it is about to build and run — a window the trigger-time check
+   * cannot close: the file on base changed after the last report, or this
+   * daemon has not reported yet. So the same rule is asked again here,
+   * against the only copy that is about to matter, and prod is the one env
+   * this never touches.
+   */
+  if (job.env !== 'prod') {
+    const key = job.kind === 'rollback' ? `rollback:${job.env}` : job.env;
+    if (!target.commands?.[key]) {
+      return {
+        ok: false,
+        message: `target declares no ${job.env} command — refusing to fall back to the prod command`,
+        logs,
+      };
+    }
+  }
   // Rollback is a single wrangler command; deploy is build → secrets → deploy.
   if (job.kind === 'rollback') {
     const cmd = target.commands?.[`rollback:${job.env}`] || `npx wrangler rollback`;

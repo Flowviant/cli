@@ -173,6 +173,30 @@ test('two files with one name get a numeric suffix, and INSTRUCTIONS.md is reser
   assert.equal(safeKnowledgeName(''), 'file');
 });
 
+test('safeKnowledgeName keeps the extension through a cut, byte-identical to the server’s safeFileName (audit 2026-09-24)', () => {
+  // A bare `slice(0, 80)` used to cut mid-extension — an 84-character
+  // `….html` mockup stored as `….` with an unrecognised type, its bytes
+  // discarded. The cut now falls in the STEM and the extension survives.
+  const long = `${'x'.repeat(90)}.html`;
+  const out = safeKnowledgeName(long);
+  assert.ok(out.length <= 80, 'stays at or under the 80-char ceiling');
+  assert.ok(out.endsWith('.html'), 'the extension survives the cut');
+  // Verbatim against the server's algorithm (apps/api/src/routes/
+  // sessionsAttachments.routes.ts safeFileName): stem cut, an 8-hex FNV-1a
+  // of the WHOLE sanitised name, then the extension.
+  assert.equal(
+    out,
+    'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-994582ac.html'
+  );
+  // Idempotent over its own output — a knowledge file already synced under
+  // its cut name must not be re-cut into a THIRD name on the next sync.
+  assert.equal(safeKnowledgeName(out), out);
+  // A name with no recognisable extension (too long, or not alnum) just
+  // gets the hash tag appended to the cut stem — no dangling dot.
+  const noExt = safeKnowledgeName('y'.repeat(200));
+  assert.ok(noExt.length <= 80 && !noExt.includes('.'));
+});
+
 test('a colliding pair both land on disk, neither overwriting the other', async () => {
   const dir = checkout();
   const srv = fakeServer({ [id(1)]: 'first', [id(2)]: 'second' });
