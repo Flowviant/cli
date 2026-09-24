@@ -10,7 +10,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseProposal } from './agentPlan.mjs';
+import { parseProposal, parseTurnResult } from './agentPlan.mjs';
 import { SYSTEM_PLAN } from './prompts.mjs';
 
 const plan = { agents: [{ tempId: 'a1', name: 'auth', taskIds: ['t1', 't2'] }] };
@@ -467,4 +467,93 @@ test('caps a note at the length the prompt asked for', async () => {
     JSON.stringify({ cards: [{ taskId: 'c1', verdict: 'concerns', note: 'y'.repeat(2000) }] })
   );
   assert.equal(out.cards[0].note.length, 400);
+});
+
+// ── the 2026-09-24 audit ────────────────────────────────────────────────────
+
+/** A stand-in scrubber: one known secret, redacted only when seen WHOLE — the
+ *  exact-value behaviour `envScrub` has, so a cut before it shows up. */
+const SECRET = ['sk', 'live', '4f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c'].join('_');
+const fakeScrub = (s) => String(s).split(SECRET).join('[REDACTED:STRIPE]');
+
+test('a raised card, a summary and a progress line are scrubbed before they reach the server', () => {
+  const res = parseTurnResult(
+    JSON.stringify({
+      status: 'delivered',
+      summary: `fixed it; key was ${SECRET}`,
+      progress: `rotated ${SECRET}`,
+      raised: [{ title: `Stripe key ${SECRET} expired`, brief: `tests fail with STRIPE_SECRET_KEY=${SECRET}` }],
+    }),
+    fakeScrub
+  );
+  const wire = JSON.stringify(res);
+  assert.ok(!wire.includes(SECRET), 'no field may carry the value');
+  assert.match(res.raised[0].brief, /\[REDACTED:STRIPE\]/);
+  assert.match(res.raised[0].title, /\[REDACTED:STRIPE\]/);
+  const q = parseTurnResult(JSON.stringify({ status: 'blocked', question: `use ${SECRET}?` }), fakeScrub);
+  assert.ok(!q.answer.includes(SECRET));
+});
+
+test('a secret straddling the 8000 cap is scrubbed whole, not cut first', () => {
+  const summary = 'x'.repeat(7985) + SECRET + ' tail';
+  const res = parseTurnResult(JSON.stringify({ status: 'delivered', summary }), fakeScrub);
+  assert.ok(res.answer.length <= 8000);
+  assert.ok(!res.answer.includes(SECRET.slice(0, 15)), 'not even the prefix survives the cut');
+  assert.match(res.answer, /\[REDACTED:STRIP/);
+});
+
+test("a planner's note and agent names are scrubbed before they are capped", () => {
+  const p = parseProposal(
+    JSON.stringify({ note: `the .env has ${SECRET}`, agents: [{ name: `billing ${SECRET}`, taskIds: ['t1'] }] }),
+    fakeScrub
+  );
+  assert.ok(!JSON.stringify(p).includes(SECRET));
+  assert.match(p.note, /\[REDACTED:STRIPE\]/);
+});
+
+test('the default scrubber is the real one: a Flowviant credential never rides a raised card', () => {
+  const token = 'fva_' + 'Zx9_-'.repeat(8);
+  const res = parseTurnResult(JSON.stringify({ status: 'delivered', summary: 's', raised: [{ title: `leaked ${token}` }] }));
+  assert.ok(!res.raised[0].title.includes(token));
+  const p = parseProposal(JSON.stringify({ note: `n ${token}`, agents: [{ name: 'a', taskIds: ['t1'] }] }));
+  assert.ok(!p.note.includes(token));
+});
+
+test('brace floods are read in bounded time and a real answer after prose still parses', () => {
+  for (const flood of ['{'.repeat(80000), '{'.repeat(40000) + '}'.repeat(40000), '{"'.repeat(40000)]) {
+    const t0 = Date.now();
+    assert.equal(parseTurnResult(flood), null);
+    assert.equal(parseProposal(flood), null);
+    assert.ok(Date.now() - t0 < 2000, `a ${flood.length}-char flood must not stall the daemon`);
+  }
+  // Exactness kept: prose with a brace, a quote and a nested object before the
+  // real one, which must still be found.
+  const text = 'I looked at {the auth module} and 5" of "config {x}" first.\n' +
+    JSON.stringify({ status: 'delivered', summary: 'ok {with braces}', raised: [{ title: 'a', brief: '{b}' }] });
+  const res = parseTurnResult(text, (s) => s);
+  assert.equal(res.outcome, 'delivered');
+  assert.equal(res.answer, 'ok {with braces}');
+  assert.equal(res.raised[0].brief, '{b}');
+  // …and the answer is still found after a long preamble past the scan window's
+  // start, because the contract puts the object LAST.
+  const long = 'z'.repeat(400 * 1024) + JSON.stringify({ status: 'blocked', question: 'which?' });
+  assert.equal(parseTurnResult(long, (s) => s).answer, 'which?');
+});
+
+test('the parse budget never costs the top-level answer: a real answer after many JSON objects still parses', () => {
+  const ans = JSON.stringify({ status: 'delivered', summary: 'did it' });
+  // 250 JSON lines of a quoted fixture before the answer — more spans than the
+  // nested budget, every one of them top-level.
+  const fixture = Array.from({ length: 250 }, (_, i) => JSON.stringify({ id: i, name: `x${i}` })).join('\n');
+  assert.equal(parseTurnResult(`checked:\n${fixture}\n\n${ans}`, (s) => s)?.answer, 'did it');
+  // One large document with 300 nested objects before the answer.
+  const doc = JSON.stringify({ a: Array.from({ length: 300 }, (_, i) => ({ k: i })) });
+  assert.equal(parseTurnResult(`${doc}\n${ans}`, (s) => s)?.answer, 'did it');
+  // A deeply nested document whose nested spans alone exceed the char budget.
+  let nest = '1';
+  for (let d = 0; d < 200; d++) nest = `{"n":${nest},"pad":"${'x'.repeat(200)}"}`;
+  assert.equal(parseTurnResult(`${nest}\n${ans}`, (s) => s)?.answer, 'did it');
+  // …and the same holds for a proposal.
+  const p = parseProposal(`${fixture}\n${JSON.stringify({ agents: [{ name: 'a', taskIds: ['t1'] }] })}`, (s) => s);
+  assert.equal(p?.agents?.[0]?.name, 'a');
 });

@@ -25,6 +25,10 @@
  * Run: node --test bin/lib/agentPlan.test.mjs
  */
 
+// THE UPLINK SCRUBBER, as the DEFAULT for the two readers whose every string
+// goes to the server (2026-09-24, the audit). See `parseTurnResult`.
+import { scrub as envScrub } from './env.mjs';
+
 /** The biggest a single proposal may be. Bounds on a machine, not a policy:
  *  the server caps these again at its own boundary. */
 const MAX_AGENTS = 20;
@@ -53,14 +57,60 @@ const MAX_NOTE = 1000;
  * about escapes and nobody notices, because the disagreement only shows up on a
  * card title with a quote in it.
  */
-function candidateObjects(raw) {
-  const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/);
+/**
+ * BOUNDED, BECAUSE THE TEXT IS A MODEL'S (2026-09-24, the audit).
+ *
+ * The scan used to walk from EVERY `{` to the end of the text, and parse every
+ * balanced span it found — quadratic on both counts. A final message of eighty
+ * thousand `{` (a quoted fixture, brace padding, a turn steered into writing
+ * one) took nine seconds of synchronous CPU, and while it ran nothing else on
+ * the machine moved: no poll, no lease renewal, no other lane. Three bounds,
+ * none of which a real answer comes near:
+ *
+ *  · only the LAST `MAX_SCAN_CHARS` are scanned — every contract here puts the
+ *    object LAST, and the fenced block is still looked for in the whole text;
+ *  · each `{`'s closing brace is found ONCE (see `closers`), so the scan is a
+ *    single right-to-left pass instead of one walk per brace;
+ *  · only spans that can open an object (`{` then a key or `}`) are handed to
+ *    JSON.parse. Every TOP-LEVEL span is parsed — top-level spans are
+ *    disjoint, so together they are at most the scanned window — and the
+ *    NESTED ones (a span inside an earlier candidate) share a budget of
+ *    `MAX_NESTED_PARSES` spans and `MAX_NESTED_CHARS` characters, so a run of
+ *    nested braces that parse is not re-parsed thousands of times.
+ *
+ * THE BUDGET NEVER REACHES A TOP-LEVEL SPAN, and the review found why it must
+ * not: the first cut counted every span from the left against one budget, so
+ * an answer that followed 250 JSON lines of a quoted fixture (or one large
+ * nested document) was never parsed at all — the turn read as `nothing` and a
+ * delivered agent went to Stuck. The contract puts the answer LAST and at the
+ * top level, which is the one span a budget must never cost.
+ */
+const MAX_SCAN_CHARS = 256 * 1024;
+const MAX_NESTED_PARSES = 200;
+const MAX_NESTED_CHARS = 4 * 1024 * 1024;
+
+function candidateObjects(text) {
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+  const raw = text.length > MAX_SCAN_CHARS ? text.slice(text.length - MAX_SCAN_CHARS) : text;
   const bodies = [];
   if (fenced) bodies.push(fenced[1]);
+  const close = closers(raw);
+  let topEnd = -1;
+  let nestedParses = 0;
+  let nestedChars = 0;
   for (let i = 0; i < raw.length; i++) {
     if (raw[i] !== '{') continue;
-    const end = balanced(raw, i);
-    if (end > i) bodies.push(raw.slice(i, end + 1));
+    const end = close.get(i);
+    if (!(end > i) || !/^\{\s*["}]/.test(raw.slice(i, i + 64))) continue;
+    if (i > topEnd) {
+      topEnd = end;
+    } else {
+      const len = end - i + 1;
+      if (nestedParses >= MAX_NESTED_PARSES || nestedChars + len > MAX_NESTED_CHARS) continue;
+      nestedParses++;
+      nestedChars += len;
+    }
+    bodies.push(raw.slice(i, end + 1));
   }
   const out = [];
   for (const body of bodies) {
@@ -75,32 +125,51 @@ function candidateObjects(raw) {
   return out;
 }
 
+/**
+ * For every `{`, the index of the `}` that closes it when read as the START of
+ * an object (outside any string), or -1 — the answer `balanced` gives, for all
+ * of them in one pass.
+ *
+ * Right to left, so every `{` AFTER the one being closed already has its
+ * answer. A walk that meets such a `{` outside a string jumps straight to that
+ * brace's closer — the string state from there on is the same for both walks,
+ * so the nested object ends where it ends — and if that brace never closes,
+ * neither does this one. What is left for each walk is its own top level.
+ */
+function closers(s) {
+  const close = new Map();
+  for (let i = s.lastIndexOf('{'); i >= 0; i = i > 0 ? s.lastIndexOf('{', i - 1) : -1) {
+    let inStr = false;
+    let esc = false;
+    let end = -1;
+    for (let k = i + 1; k < s.length; k++) {
+      const ch = s[k];
+      if (inStr) {
+        if (esc) esc = false;
+        else if (ch === '\\') esc = true;
+        else if (ch === '"') inStr = false;
+        continue;
+      }
+      if (ch === '"') inStr = true;
+      else if (ch === '{') {
+        const inner = close.get(k);
+        if (inner === undefined || inner < 0) break;
+        k = inner;
+      } else if (ch === '}') {
+        end = k;
+        break;
+      }
+    }
+    close.set(i, end);
+  }
+  return close;
+}
+
 function extract(raw) {
   return candidateObjects(raw).find((v) => Array.isArray(v.agents)) ?? null;
 }
 
-/** The index of the `}` that closes the `{` at `from`, or -1. Skips string
- *  literals so a brace inside a card title cannot end the object early. */
-function balanced(s, from) {
-  let depth = 0;
-  let inStr = false;
-  let esc = false;
-  for (let i = from; i < s.length; i++) {
-    const ch = s[i];
-    if (inStr) {
-      if (esc) esc = false;
-      else if (ch === '\\') esc = true;
-      else if (ch === '"') inStr = false;
-      continue;
-    }
-    if (ch === '"') inStr = true;
-    else if (ch === '{') depth++;
-    else if (ch === '}' && --depth === 0) return i;
-  }
-  return -1;
-}
-
-export function parseProposal(text) {
+export function parseProposal(text, scrub = envScrub) {
   const raw = String(text ?? '');
   const parsed = extract(raw);
   if (!parsed) return null;
@@ -117,7 +186,7 @@ export function parseProposal(text) {
     if (taskIds.length === 0) continue;
     agents.push({
       tempId: String(g.tempId || `a${i + 1}`).slice(0, 64),
-      name: String(g.name ?? '').slice(0, MAX_NAME),
+      name: String(scrub(String(g.name ?? ''))).slice(0, MAX_NAME),
       taskIds,
       ...(Number.isFinite(g.pointsBudget) && g.pointsBudget > 0
         ? { pointsBudget: Math.min(Math.round(g.pointsBudget), 100_000) }
@@ -152,7 +221,7 @@ export function parseProposal(text) {
   return {
     agents,
     ...(typeof parsed.note === 'string' && parsed.note.trim()
-      ? { note: parsed.note.slice(0, MAX_NOTE) }
+      ? { note: String(scrub(parsed.note)).slice(0, MAX_NOTE) }
       : {}),
   };
 }
@@ -181,9 +250,9 @@ export function parseProposal(text) {
  * a machine to have clamped.
  */
 const MAX_PROGRESS = 8000;
-const progressOf = (v) => {
+const progressOf = (v, scrub) => {
   const t = typeof v.progress === 'string' ? v.progress.trim() : '';
-  return t ? { progress: t.slice(0, MAX_PROGRESS) } : {};
+  return t ? { progress: String(scrub(t)).slice(0, MAX_PROGRESS) } : {};
 };
 
 /**
@@ -222,7 +291,28 @@ const progressOf = (v) => {
  * caller omits the field rather than sending an empty string, so the server
  * keeps the last account that was true instead of blanking the head.
  */
-export function parseTurnResult(text) {
+/*
+ * ── EVERY STRING IS SCRUBBED HERE, BEFORE ITS CAP (2026-09-24, the audit) ──
+ *
+ * `raised` cards and a proposal's `note` and names reached the server with no
+ * scrub at all — the caller redacted `answer` and `progress` and nothing
+ * else — so a build turn that quoted `STRIPE_SECRET_KEY=sk_live_…` in a
+ * raised card's brief filed it, verbatim, as an Open card every member reads
+ * and later agents are prompted with; and a planner note quoting one became a
+ * notification body. And `answer` was cut at 8000 HERE, before the caller's
+ * scrub, which is the straddling-cut bug `progress` and the precheck already
+ * record: `scrub` matches whole values, so a credential across the cut kept
+ * its prefix. So the scrub rides in, as `parsePrecheck`'s does, and runs over
+ * each whole field first.
+ *
+ * DEFAULTED TO THE REAL SCRUBBER, unlike the precheck's identity default: the
+ * production callers pass nothing, and a redaction that depends on each caller
+ * remembering is the one that is missing the day it matters. Scrubbing twice
+ * (the caller still scrubs `answer`) is harmless — a redaction marker contains
+ * no secret to match.
+ */
+export function parseTurnResult(text, scrub = envScrub) {
+  const clean = (s, cap) => String(scrub(s)).slice(0, cap);
   for (const v of candidateObjects(String(text ?? ''))) {
     if (v.status === 'blocked') {
       const question = typeof v.question === 'string' ? v.question.trim() : '';
@@ -230,21 +320,21 @@ export function parseTurnResult(text) {
       // parks an agent with nothing to reply to. Treated as `nothing`, which
       // at least says truthfully that the machine went quiet.
       if (!question) continue;
-      return { outcome: 'question', answer: question.slice(0, 8000), ...progressOf(v) };
+      return { outcome: 'question', answer: clean(question, 8000), ...progressOf(v, scrub) };
     }
     if (v.status === 'delivered') {
       return {
         outcome: 'delivered',
-        answer: (typeof v.summary === 'string' ? v.summary : '').slice(0, 8000),
-        ...progressOf(v),
+        answer: typeof v.summary === 'string' ? clean(v.summary, 8000) : '',
+        ...progressOf(v, scrub),
         raised: Array.isArray(v.raised)
           ? v.raised
               .filter((r) => r && typeof r.title === 'string' && r.title.trim())
               .slice(0, 10)
               .map((r) => ({
-                title: r.title.trim().slice(0, 300),
+                title: clean(r.title.trim(), 300),
                 ...(typeof r.brief === 'string' && r.brief.trim()
-                  ? { brief: r.brief.trim().slice(0, 2000) }
+                  ? { brief: clean(r.brief.trim(), 2000) }
                   : {}),
               }))
           : [],

@@ -69,8 +69,19 @@
  * caller.
  */
 
-import { readdirSync, readFileSync, writeFileSync, mkdirSync, lstatSync } from 'node:fs';
-import { createHash } from 'node:crypto';
+import {
+  readdirSync,
+  readFileSync,
+  mkdirSync,
+  lstatSync,
+  openSync,
+  writeSync,
+  fsyncSync,
+  closeSync,
+  linkSync,
+  unlinkSync,
+} from 'node:fs';
+import { createHash, randomBytes } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join, dirname } from 'node:path';
 // STILL SUMO, and deliberately not narrowed to the standard build in the same
@@ -170,7 +181,17 @@ function characterClasses(value) {
 }
 function worthRedacting(value) {
   if (typeof value !== 'string' || value.length < SCRUB_MIN_LENGTH) return false;
-  if (SCRUB_PLAIN_RE.test(value)) return false;
+  // THE PLAIN-IDENTIFIER EXEMPTION DOES NOT COVER A CASE-AND-DIGIT MIX
+  // (2026-09-24, the audit). It was checked first and alone, so a generated
+  // password — `Tq8vZ2mKp4Lx9RbN`, the `pwgen -s 16` shape, or a twelve-
+  // character `Hx93kPq2Lm7w` — starts with a letter, fits sixteen characters of
+  // [A-Za-z0-9] and was left in plain text everywhere this daemon posts, against
+  // this block's own promise that "a case mix" is redacted. A word, a hostname,
+  // a region or a version string does not draw on upper, lower AND digits at
+  // once; a minted secret almost always does.
+  if (SCRUB_PLAIN_RE.test(value) && !(/[a-z]/.test(value) && /[A-Z]/.test(value) && /[0-9]/.test(value))) {
+    return false;
+  }
   if (value.length < 12 && characterClasses(value) < 3) return false;
   return true;
 }
@@ -277,17 +298,85 @@ export async function ensureKeypair() {
     };
     return keypair;
   }
-  keypair = sodium.crypto_box_keypair();
-  mkdirSync(dirname(KEYPAIR_PATH), { recursive: true });
-  writeFileSync(
+  const minted = sodium.crypto_box_keypair();
+  const winner = mintKeypairFile(
     KEYPAIR_PATH,
     JSON.stringify({
-      pub: sodium.to_base64(keypair.publicKey, B64()),
-      priv: sodium.to_base64(keypair.privateKey, B64()),
-    }),
-    { mode: 0o600 }
+      pub: sodium.to_base64(minted.publicKey, B64()),
+      priv: sodium.to_base64(minted.privateKey, B64()),
+    })
   );
+  keypair = {
+    publicKey: sodium.from_base64(winner.pub, B64()),
+    privateKey: sodium.from_base64(winner.priv, B64()),
+  };
   return keypair;
+}
+
+/**
+ * WRITE THE BOX'S IDENTITY ONCE, ATOMICALLY, AND LET THE FIRST WRITER WIN
+ * (2026-09-24, the audit). Returns the `{ pub, priv }` that is ON DISK after
+ * the call — ours, or the one a concurrent first start got there with.
+ *
+ * It was a plain `writeFileSync` reached by every process that saw ENOENT, so
+ * two daemons starting together on a fresh box (two projects, two units at
+ * boot) each minted a key and the LAST writer won: the first kept a key in
+ * memory the disk no longer held and arrived, after its next re-exec, as a
+ * different box. And a crash inside the write left a torn file that every later
+ * start refuses to read — the only-ENOENT-mints rule doing its job over a file
+ * nothing can fix.
+ *
+ * So the key goes to a private temp file, is fsync'd, and is LINKED into place:
+ * `link` fails with EEXIST instead of replacing, so exactly one identity is ever
+ * published and every loser reads the winner's. The file at the real path is
+ * either absent or complete — never half of one.
+ */
+export function mintKeypairFile(path, body) {
+  mkdirSync(dirname(path), { recursive: true });
+  const tmp = `${path}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
+  try {
+    const fd = openSync(tmp, 'wx', 0o600);
+    try {
+      writeSync(fd, body);
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    try {
+      linkSync(tmp, path);
+      return JSON.parse(body);
+    } catch (e) {
+      if (e?.code === 'EEXIST') {
+        // Somebody else published first. Theirs is the identity; ours is dropped.
+        return JSON.parse(readFileSync(path, 'utf8'));
+      }
+      // A filesystem with no hard links (some network and FUSE mounts answer
+      // EPERM/ENOTSUP) must not cost the box its identity — the plain write
+      // this replaced worked there. Fall back to an EXCLUSIVE create: still
+      // first-writer-wins, only without the torn-write guarantee.
+      if (!['EPERM', 'ENOTSUP', 'EOPNOTSUPP', 'ENOSYS', 'EXDEV'].includes(e?.code)) throw e;
+      let fd2;
+      try {
+        fd2 = openSync(path, 'wx', 0o600);
+      } catch (e2) {
+        if (e2?.code !== 'EEXIST') throw e2;
+        return JSON.parse(readFileSync(path, 'utf8'));
+      }
+      try {
+        writeSync(fd2, body);
+        fsyncSync(fd2);
+      } finally {
+        closeSync(fd2);
+      }
+      return JSON.parse(body);
+    }
+  } finally {
+    try {
+      unlinkSync(tmp);
+    } catch {
+      /* already gone */
+    }
+  }
 }
 
 export function myPubB64() {
@@ -720,11 +809,34 @@ export function scanEnvForScrub(repoRoot, salt = PROJECT_ID) {
  *  ordinary word, a short flag and anything under the length floor are simply
  *  not in it. */
 export function scrub(text) {
-  if (typeof text !== 'string' || !text || !values.length) return text;
+  if (typeof text !== 'string' || !text) return text;
   let out = text;
   for (const v of values) out = out.split(v.value).join(`[REDACTED:${v.name}]`);
-  return out;
+  return out.replace(FLOWVIANT_TOKEN_RE, `[REDACTED:${FLOWVIANT_TOKEN_NAME}]`);
 }
+
+/**
+ * EVERY FLOWVIANT CREDENTIAL, CAUGHT BY SHAPE (2026-09-24, the audit).
+ *
+ * The value lists above are the CHECKOUT'S secrets and the process
+ * environment's, and neither holds the one secret that costs the project
+ * itself: the MACHINE CREDENTIAL. It sits in `~/.flowviant/credentials.json` —
+ * for EVERY project connected on this box, 0600 and readable by every turn,
+ * since a turn runs as this uid — and the server mints more of the same shape
+ * per turn (the work and capture tokens a tab's MCP server carries). A turn
+ * that read the store and wrote it into an artifact, a trace or an answer
+ * shipped it verbatim, because `scrub` had no value to match; and a design
+ * artifact runs scripts in a frame that may navigate itself, so the page that
+ * held it could carry it anywhere.
+ *
+ * Every one of them is `fva_` + 40 characters of nanoid (the server's
+ * `AGENT_TOKEN_PREFIX`), so a SHAPE catches them all, including ones this
+ * process never saw, with no store read and nothing to keep in sync. Twenty is
+ * the floor so the 12-character prefix the app shows for identification
+ * (`fva_` + 8) still reads as itself.
+ */
+const FLOWVIANT_TOKEN_RE = /fva_[A-Za-z0-9_-]{20,}/g;
+const FLOWVIANT_TOKEN_NAME = 'FLOWVIANT_TOKEN';
 
 /**
  * The NAME of the first known secret whose value appears in `bytes` as an
@@ -738,7 +850,12 @@ export function scrub(text) {
  * it is used (artifacts.mjs).
  */
 export function secretIn(bytes) {
-  if (!Buffer.isBuffer(bytes) || !bytes.length || !values.length) return null;
+  if (!Buffer.isBuffer(bytes) || !bytes.length) return null;
   for (const v of values) if (bytes.includes(v.value, 0, 'utf8')) return v.name;
+  // The token SHAPE too (see `scrub`). `latin1` maps every byte to one
+  // character, so the ASCII pattern matches exactly where the bytes do.
+  if (bytes.includes('fva_') && new RegExp(FLOWVIANT_TOKEN_RE.source).test(bytes.toString('latin1'))) {
+    return FLOWVIANT_TOKEN_NAME;
+  }
   return null;
 }

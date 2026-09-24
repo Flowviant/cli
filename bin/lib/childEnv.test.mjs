@@ -152,7 +152,9 @@ test('the deploy path actually calls it — a helper nobody uses fixes nothing',
     .split('\n')
     .filter((l) => !/^\s*(\/\/|\*)/.test(l))
     .join('\n');
-  const i = src.indexOf('async function runDeploy');
+  // `runDeployIn` is where the commands run since the deploy moved into a
+  // throwaway base worktree (audit 2026-09-24); `runDeploy` only cuts it.
+  const i = src.indexOf('async function runDeployIn(');
   assert.ok(i > -1);
   const end = src.indexOf('\nasync function', i + 10);
   // BOTH ANCHORS BEFORE THE SLICE. An `indexOf` that returns −1 slices to the
@@ -206,11 +208,13 @@ test('processEnvSecrets covers every DEPLOY_KEEP name that is actually set', () 
     }
     // A name nobody put on either list is not this daemon's secret to hide.
     assert.ok(!byName.has('SOME_OTHER_VENDOR_TOKEN'));
-    // The machine credential is not in it either. It is never passed to a
-    // child, so there is no deploy log that can contain it, and listing it
-    // here would suggest otherwise.
-    assert.ok(!byName.has('FLOWVIANT_FLEET'));
-    assert.ok(!found.some((v) => v.value === 'fleet-secret-value'));
+    // The machine credential IS redactable (2026-09-24, the audit — this line
+    // used to assert the opposite, "it is never passed to a child"). It is
+    // never passed to a DEPLOY child, but a CLI turn inherited it and could
+    // echo it into a trace; redacting a value we never pass costs nothing.
+    assert.equal(byName.get('FLOWVIANT_FLEET'), 'fleet-secret-value');
+    // …and redacting it still does not ADMIT it anywhere.
+    assert.equal(childEnv({ cwd: '/w', deploy: true }).FLOWVIANT_FLEET, undefined);
   } finally {
     for (const k of DEPLOY_KEEP_NAMES) delete process.env[k];
     delete process.env.SOME_OTHER_VENDOR_TOKEN;
@@ -243,6 +247,21 @@ test('the old wrangler spellings are redactable but never admitted', () => {
   } finally {
     delete process.env.CF_API_TOKEN;
     delete process.env.CF_ACCOUNT_ID;
+  }
+});
+
+test("the daemon's own credentials are redactable and never admitted", () => {
+  const names = ['FLOWVIANT_MACHINE_TOKEN', 'ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN', 'OPENAI_API_KEY'];
+  for (const k of names) process.env[k] = `value-of-${k}`;
+  try {
+    const byName = new Map(processEnvSecrets().map((v) => [v.name, v.value]));
+    const env = childEnv({ cwd: '/w', deploy: true });
+    for (const k of names) {
+      assert.equal(byName.get(k), `value-of-${k}`, `${k} must be redactable`);
+      assert.equal(env[k], undefined, `${k} must never reach a deploy child`);
+    }
+  } finally {
+    for (const k of names) delete process.env[k];
   }
 });
 

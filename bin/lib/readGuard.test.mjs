@@ -89,6 +89,35 @@ test('shell composition is refused — one plain command per call', () => {
   }
 });
 
+/**
+ * A FLAG ASSEMBLED BY THE SHELL AFTER THE GUARD READ THE WORD (2026-09-24, the
+ * audit). `git log -1 --outp{u,u}t=pwned.txt` brace-expands to `--output=…`
+ * and wrote the file while the guard returned null; `-{c,c}` is `-c`; a glob
+ * like `-?` is `-c` the moment a file of that name exists. The behavioural half
+ * below proves the shell really does assemble them, so the refusals are
+ * refusing something real rather than a spelling nobody's shell honours.
+ */
+test('brace, glob and subshell syntax cannot assemble a banned flag', () => {
+  for (const cmd of [
+    "git log -1 --format='tformat:x' --outp{u,u}t=pwned.txt",
+    'git log -1 --o{neline,utput=pwned.txt}',
+    'git -{c,c} core.fsmonitor=/tmp/x.sh log',
+    'git -? core.fsmonitor=./x.sh log',
+    'git log --out*=pwned.txt',
+    'git log --outp[u]t=pwned.txt',
+    'ls *(e:touch x:)',
+    'ls (x)',
+  ]) {
+    assert.ok(readGuardRefusal(cmd), cmd);
+  }
+});
+
+test('canary: the shell really does turn those spellings into the banned flag', () => {
+  const r = spawnSync('bash', ['-c', 'printf "%s\\n" --outp{u,u}t=x -{c,c}'], { encoding: 'utf8' });
+  if (r.error) return; // no bash on this box — the refusals above still stand
+  assert.deepEqual(r.stdout.trim().split('\n'), ['--output=x', '--output=x', '-c', '-c']);
+});
+
 test('environment assignments are refused', () => {
   for (const cmd of ['GIT_DIR=/tmp/evil git log', 'GIT_EXTERNAL_DIFF=/tmp/x git diff', 'PAGER=/tmp/x git log', 'git log GIT_TRACE=1']) {
     assert.match(readGuardRefusal(cmd), /environment assignment/, cmd);

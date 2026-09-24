@@ -61,10 +61,66 @@ export const READ_GUARD_SETTINGS = JSON.stringify({
  *  `--settings` pair must stand before it or be swallowed as a tool name. */
 const READ_GUARD = ['--settings', READ_GUARD_SETTINGS];
 
+/** A path a permission rule can name: absolute POSIX, and free of the glob and
+ *  rule-syntax characters that would change what the rule means. Anything else
+ *  gets no rule — `--add-dir` still admits the directory (measured). */
+const ruleSafeAbsolute = (p) =>
+  typeof p === 'string' && p.startsWith('/') && !/[*?[\]{}()\\\n]/.test(p) ? p.replace(/\/+$/, '') : null;
+
+/**
+ * THE READ FENCE — the worktree, plus the knowledge library by its absolute
+ * path, and nothing else on the box (2026-09-24, the audit).
+ *
+ * Every curated posture used to allow bare `Read`, `Grep` and `Glob`, and a
+ * bare allow is not "read the repo": measured on Claude Code 2.1.281, bare
+ * `Read` read a file outside the working directory and bare `Grep` searched
+ * one. So a design, consult or capture turn — each steered by words anyone who
+ * can file a card can write — could read `~/.flowviant/credentials.json`, which
+ * holds the MACHINE CREDENTIAL of every project connected on this box, and put
+ * it in an artifact, a plan note or a transcript that leaves the machine. That
+ * is a cross-project leak from a posture this file calls read-only.
+ *
+ * The fence is research's, measured the same day in the design shape:
+ * `Read(./**)` and `Glob(./**)` read the worktree; the knowledge library reads
+ * through `--add-dir` plus its own `//` rule; a file outside both was refused
+ * ("Claude requested permissions to read from …, but you haven't granted it
+ * yet"). GREP CARRIES NO ALLOW RULE AT ALL, on purpose: with none, Grep in the
+ * working directory (and in the added knowledge directory) ran, and Grep of a
+ * path outside them was refused. The Bash readers these postures keep are
+ * path-validated by the CLI on its own (see CONSULT_BASH).
+ */
+function fencedReads(knowledgeDir) {
+  const kd = ruleSafeAbsolute(knowledgeDir);
+  return [
+    'Read(./**)',
+    ...(kd ? [`Read(/${kd}/**)`] : []),
+    'Glob(./**)',
+    ...(kd ? [`Glob(/${kd}/**)`] : []),
+  ];
+}
+
+/** The shell readers CONSULT and PLAN keep. Each one is PATH-VALIDATED by the
+ *  CLI itself — measured on 2.1.281 (2026-09-24): with `Bash(cat:*)`,
+ *  `Bash(head:*)` and `Bash(ls:*)` allowed, `cat`/`ls`/`head` on a file outside
+ *  the working directories were each refused ("Claude Code may only
+ *  concatenate files from the allowed working directories") — so it is the
+ *  Read/Grep/Glob TOOLS, not these, that needed the fence above. */
+const CONSULT_BASH = [
+  'Bash(ls:*)',
+  'Bash(wc:*)',
+  'Bash(head:*)',
+  'Bash(cat:*)',
+  'Bash(git log:*)',
+  'Bash(git show:*)',
+  'Bash(git diff:*)',
+  'Bash(git rev-parse:*)',
+];
+
 /**
  * PLAN — read the repo, write the plan, never the code.
  *
- * The read half is CONSULT_PERM verbatim: this turn's prompt is steered by
+ * The read half is `consultPermFor`'s verbatim (the read fence and the
+ * path-validated shell readers): this turn's prompt is steered by
  * anything a project editor can type, so the same threat applies and the same
  * allowlist answers it. What is added is the control plane and NOTHING else —
  * `mcp__flowviant` is the plan principal's token, whose entire tool set is the
@@ -77,22 +133,15 @@ const READ_GUARD = ['--settings', READ_GUARD_SETTINGS];
  * through an API, and there is no file on this machine it has any business
  * touching.
  */
-const PLAN_PERM = [
-  ...READ_GUARD,
-  '--allowedTools',
-  'mcp__flowviant',
-  'Read',
-  'Grep',
-  'Glob',
-  'Bash(ls:*)',
-  'Bash(wc:*)',
-  'Bash(head:*)',
-  'Bash(cat:*)',
-  'Bash(git log:*)',
-  'Bash(git show:*)',
-  'Bash(git diff:*)',
-  'Bash(git rev-parse:*)',
-];
+export function planPermFor(knowledgeDir) {
+  return [
+    ...READ_GUARD,
+    '--allowedTools',
+    'mcp__flowviant',
+    ...fencedReads(knowledgeDir),
+    ...CONSULT_BASH,
+  ];
+}
 
 // Unattended (default) skips prompts so the agent never stalls with no terminal;
 // FLOWVIANT_SAFE=1 restricts to a curated toolset instead.
@@ -154,21 +203,9 @@ const WIKI_PERM = [
 // someone else's machine. The permission list is the enforcement; the prompt's
 // "do not change anything" is only an instruction, and instructions are exactly
 // what an injected question competes with.
-const CONSULT_PERM = [
-  ...READ_GUARD,
-  '--allowedTools',
-  'Read',
-  'Grep',
-  'Glob',
-  'Bash(ls:*)',
-  'Bash(wc:*)',
-  'Bash(head:*)',
-  'Bash(cat:*)',
-  'Bash(git log:*)',
-  'Bash(git show:*)',
-  'Bash(git diff:*)',
-  'Bash(git rev-parse:*)',
-];
+export function consultPermFor(knowledgeDir) {
+  return [...READ_GUARD, '--allowedTools', ...fencedReads(knowledgeDir), ...CONSULT_BASH];
+}
 
 /**
  * THE TWO NON-CODE POSTURES (0.97.0) — a design card and a research card may
@@ -195,8 +232,10 @@ const CONSULT_PERM = [
  *
  * THEY ARE NOT THE SAME READER, and the difference is the network:
  *
- *  · DESIGN draws THIS product, so it reads the repo broadly — Read, Grep,
- *    Glob and `ls` — and has no web at all (a mockup that went looking on the
+ *  · DESIGN draws THIS product, so it reads the repo — the worktree and the
+ *    knowledge library through the read fence (`fencedReads`, 2026-09-24:
+ *    it was bare Read/Grep/Glob, which reach the whole box), Grep with no
+ *    allow rule, `ls`, and `.env*` denied by name — and has no web at all (a mockup that went looking on the
  *    web would be a mockup of somebody else's product). No git readers and no
  *    cat/head/wc: Read covers every one of them, and each git reader was an
  *    `--output` away from a write (see READ_GUARD, which it still carries for
@@ -233,9 +272,10 @@ const CONSULT_PERM = [
  * STATED, not closed: research may still read any file in the worktree and
  * name it in a WebFetch URL — the repository is what a research card is about,
  * and a turn that could not read it could not answer. Design may read any
- * file the Read tool reaches and put it in an artifact the server stores;
- * text artifacts are scrubbed of the machine's known secret values on the way
- * out (artifacts.mjs), and binary ones are withheld when they carry one.
+ * file in its worktree and put it in an artifact the server stores; text
+ * artifacts are scrubbed of the machine's known secret values — and of any
+ * Flowviant credential, by shape — on the way out (artifacts.mjs, env.mjs), and
+ * binary ones are withheld when they carry one.
  * Design still runs a plain `git log` on the CLI's own read-only classifier
  * though no git reader is allowed (measured) — the guard is what refuses its
  * `--output`. And the Agent tool is offered with no allow rule on this CLI:
@@ -274,21 +314,22 @@ const ARTIFACT_WRITE = 'Edit(.flowviant/artifacts/**)';
  *    plane whose every call the CLI refuses. See work.mjs.
  */
 export const PLAN_MODE_PERM = ['--permission-mode', 'plan'];
-export const DESIGN_PERM = [
-  ...READ_GUARD,
-  '--allowedTools',
-  'Read',
-  'Grep',
-  'Glob',
-  'Bash(ls:*)',
-  ARTIFACT_WRITE,
-];
-
-/** A path a permission rule can name: absolute POSIX, and free of the glob and
- *  rule-syntax characters that would change what the rule means. Anything else
- *  gets no rule — `--add-dir` still admits the directory (measured). */
-const ruleSafeAbsolute = (p) =>
-  typeof p === 'string' && p.startsWith('/') && !/[*?[\]{}()\\\n]/.test(p) ? p.replace(/\/+$/, '') : null;
+export function designPermFor(knowledgeDir) {
+  return [
+    ...READ_GUARD,
+    '--allowedTools',
+    ...fencedReads(knowledgeDir),
+    'Bash(ls:*)',
+    ARTIFACT_WRITE,
+    // A mockup is uploaded and runs scripts in a frame that may navigate
+    // itself, so the checkout's own secrets are denied by name too — the same
+    // pair research carries, measured load-bearing there.
+    '--disallowedTools',
+    'Read(./.env*)',
+    'Read(./**/.env*)',
+  ];
+}
+export const DESIGN_PERM = designPermFor(null);
 
 /**
  * RESEARCH, built at spawn — the knowledge library is the one directory
@@ -296,14 +337,10 @@ const ruleSafeAbsolute = (p) =>
  * `//` is the CLI's own spelling for an absolute path in a rule.
  */
 export function researchPerm(knowledgeDir) {
-  const kd = ruleSafeAbsolute(knowledgeDir);
   return [
     ...READ_GUARD,
     '--allowedTools',
-    'Read(./**)',
-    ...(kd ? [`Read(/${kd}/**)`] : []),
-    'Glob(./**)',
-    ...(kd ? [`Glob(/${kd}/**)`] : []),
+    ...fencedReads(knowledgeDir),
     'WebSearch',
     'WebFetch',
     ARTIFACT_WRITE,
@@ -539,6 +576,27 @@ export function handleStreamLine(line, { cwd, emit, onActivity, onToolEvent, app
   }
 }
 
+/**
+ * THE ENVIRONMENT A CLI TURN IS SPAWNED WITH — the daemon's own, plus the
+ * turn's MCP token, MINUS the machine credential (2026-09-24, the audit).
+ *
+ * A turn cannot be handed a curated environment the way `childEnv` builds one
+ * for a deploy: the CLI's own sign-in lives in this environment, and stripping
+ * it signs the CLI out. But on a headless box started as
+ * `FLOWVIANT_MACHINE_TOKEN=… npx flowviant` the MACHINE CREDENTIAL lives here
+ * too, and every turn — and every dev server and script a turn starts, which
+ * inherit it — could read it with one `env`. Nothing a CLI or its children do
+ * needs it: the daemon authenticates to the server itself, and a turn that
+ * needs the project's tools gets its own per-turn token through `mcpEnv` or
+ * the MCP config file. So those two names, and only those, are removed.
+ */
+const MACHINE_CREDENTIAL_ENV = ['FLOWVIANT_MACHINE_TOKEN', 'FLOWVIANT_FLEET'];
+export function cliEnv(mcpEnv) {
+  const env = { ...process.env, ...(mcpEnv ?? {}) };
+  for (const k of MACHINE_CREDENTIAL_ENV) delete env[k];
+  return env;
+}
+
 // One Claude Code turn. Output is captured (for sentinel detection) and streamed
 // through, line-prefixed with the worker label so a fleet stays legible.
 //
@@ -652,10 +710,14 @@ export function runTurn({ prompt, resume, system, cwd, mcpConfig, mcpArgs, mcpEn
       perm: planMode
         ? PLAN_MODE_PERM
         : profile === 'design'
-          ? DESIGN_PERM
+          ? designPermFor(knowledgeDir)
           : profile === 'research'
             ? researchPerm(knowledgeDir)
-            : planPerm ? PLAN_PERM : readOnly ? CONSULT_PERM : wikiPerm ? WIKI_PERM : PERM,
+            : planPerm
+              ? planPermFor(knowledgeDir)
+              : readOnly
+                ? consultPermFor(knowledgeDir)
+                : wikiPerm ? WIKI_PERM : PERM,
       // Handed to the adapter rather than appended here, because WHERE these go
       // is a property of the CLI: Codex reads its prompt as a trailing
       // positional, so a flag after it is a flag in the wrong place.
@@ -706,8 +768,9 @@ export function runTurn({ prompt, resume, system, cwd, mcpConfig, mcpArgs, mcpEn
       detached: true,
       // Only ADDS to the environment (the worker token, for runtimes that read
       // it from there). Never replaces it: the CLI's own credentials live in
-      // this environment, and handing it a curated one signs it out.
-      ...(mcpEnv ? { env: { ...process.env, ...mcpEnv } } : {}),
+      // this environment, and handing it a curated one signs it out. The one
+      // thing it REMOVES is this daemon's machine credential — see `cliEnv`.
+      env: cliEnv(mcpEnv),
     });
     onSpawn?.(child);
     let out = '';
@@ -740,8 +803,15 @@ export function runTurn({ prompt, resume, system, cwd, mcpConfig, mcpArgs, mcpEn
           onActivity?.(ev.activity);
         }
       };
+      // DECODED AS A STREAM, never chunk by chunk (2026-09-24, the audit): a
+      // pipe read can end inside a multi-byte character — the em dash models
+      // write constantly — and `d.toString()` per chunk turned each half into
+      // U+FFFD, which JSON.parse accepts and the reply then carried verbatim.
+      // `setEncoding` holds the partial bytes over to the next chunk.
+      child.stdout.setEncoding('utf8');
+      child.stderr.setEncoding('utf8');
       child.stdout.on('data', (d) => {
-        buf += d.toString();
+        buf += d;
         let nl;
         while ((nl = buf.indexOf('\n')) >= 0) {
           const line = buf.slice(0, nl);
@@ -750,8 +820,7 @@ export function runTurn({ prompt, resume, system, cwd, mcpConfig, mcpArgs, mcpEn
         }
       });
       // stderr is not JSON (warnings/errors) — pass through and keep for sentinels.
-      child.stderr.on('data', (d) => {
-        const s = d.toString();
+      child.stderr.on('data', (s) => {
         out += s;
         emit(s);
       });
@@ -780,11 +849,13 @@ export function runTurn({ prompt, resume, system, cwd, mcpConfig, mcpArgs, mcpEn
       return;
     }
 
-    const onChunk = (d) => {
-      const s = d.toString();
+    const onChunk = (s) => {
       out += s;
       emit(s);
     };
+    // Stream-decoded for the same reason as the line-parsed path above.
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
     child.stdout.on('data', onChunk);
     child.stderr.on('data', onChunk);
     child.on('error', (e) => {

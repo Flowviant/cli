@@ -223,9 +223,41 @@ export const DEPLOY_KEEP_NAMES = [...DEPLOY_KEEP];
  * never leave the box either way; names would, and a name is enough to tell
  * somebody which credential to go looking for.
  */
+/**
+ * …AND THE DAEMON'S OWN CREDENTIALS, REDACTED AND NEVER ADMITTED (2026-09-24,
+ * the audit).
+ *
+ * The list above was written about the deploy lane, and it left out every
+ * credential the DAEMON itself runs on: the machine credential
+ * (`FLOWVIANT_MACHINE_TOKEN`, or its permanent `FLOWVIANT_FLEET` fallback on a
+ * headless box), and whatever signs the operator's CLIs and `gh` in. Those are
+ * the values a CLI turn can most easily reach — a turn inherits this process's
+ * environment, and `env` is one Bash call — and a turn trace, an answer and an
+ * artifact are all posted to the server. Redacting a value we never pass costs
+ * nothing (the `CF_*` argument above), so they join the REDACTION list only;
+ * `DEPLOY_KEEP` is untouched and `childEnv` still hands none of them to anybody.
+ *
+ * The machine credential is ALSO caught by shape in `env.mjs` (`fva_…`),
+ * because the copy that matters most is not in any environment variable at all:
+ * it is every project's `fleetToken` in `~/.flowviant/credentials.json`, plus
+ * the per-turn work/capture tokens the server mints. The names here are belt.
+ */
+const REDACT_ONLY = [
+  'CF_API_TOKEN',
+  'CF_ACCOUNT_ID',
+  'FLOWVIANT_MACHINE_TOKEN',
+  'FLOWVIANT_FLEET',
+  'ANTHROPIC_API_KEY',
+  'ANTHROPIC_AUTH_TOKEN',
+  'CLAUDE_CODE_OAUTH_TOKEN',
+  'OPENAI_API_KEY',
+  'GH_TOKEN',
+  'GITHUB_TOKEN',
+];
+
 export function processEnvSecrets() {
   const out = [];
-  for (const name of [...DEPLOY_KEEP, 'CF_API_TOKEN', 'CF_ACCOUNT_ID']) {
+  for (const name of [...DEPLOY_KEEP, ...REDACT_ONLY]) {
     const value = process.env[name];
     if (typeof value === 'string' && value) out.push({ name, value });
   }

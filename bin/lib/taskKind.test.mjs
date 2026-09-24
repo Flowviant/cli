@@ -173,8 +173,19 @@ test('the postures: research reads the web, design does not, and neither writes 
     // away from a write, and Read covers the rest.
     assert.ok(!perm.some((x) => /^Bash\((git|cat|head|wc)\b/.test(x)), `${name}: no git readers, no cat/head/wc`);
   }
-  // DESIGN, exactly: reads the repo broadly, no web.
-  assert.deepEqual(DESIGN_PERM.slice(2), ['--allowedTools', 'Read', 'Grep', 'Glob', 'Bash(ls:*)', scoped]);
+  // DESIGN, exactly: reads the worktree through the fence (bare Read/Grep/Glob
+  // reach the whole box — measured, 2026-09-24), no web, `.env*` denied.
+  assert.deepEqual(DESIGN_PERM.slice(2), [
+    '--allowedTools',
+    'Read(./**)',
+    'Glob(./**)',
+    'Bash(ls:*)',
+    scoped,
+    '--disallowedTools',
+    'Read(./.env*)',
+    'Read(./**/.env*)',
+  ]);
+  for (const bad of ['Read', 'Grep', 'Glob']) assert.ok(!DESIGN_PERM.includes(bad), `design: no bare ${bad}`);
   assert.ok(!DESIGN_PERM.some((x) => x.startsWith('Web')), 'a design card draws THIS product');
   // RESEARCH, exactly: the web, and reading fenced to the worktree — no Grep,
   // no Bash, `.env*` denied by name (measured load-bearing: without the deny,
@@ -217,9 +228,9 @@ test('runTurn picks the posture by name, ahead of every older branch', () => {
   const body = slice(c, 'export function runTurn(', 'const args = rt.args({');
   assert.match(body, /posture === 'design' \|\| posture === 'research'\s*\?\s*posture\s*:\s*planPerm \? 'plan'/);
   const perm = slice(c, 'const args = rt.args({', '// Handed to the adapter rather than appended here');
-  assert.match(perm, /profile === 'design'\s*\?\s*DESIGN_PERM\s*:\s*profile === 'research'\s*\?\s*researchPerm\(knowledgeDir\)/);
-  // Canary: the untouched arm is still there, so the slice is the real one.
-  assert.match(perm, /planPerm \? PLAN_PERM : readOnly \? CONSULT_PERM : wikiPerm \? WIKI_PERM : PERM/);
+  assert.match(perm, /profile === 'design'\s*\?\s*designPermFor\(knowledgeDir\)\s*:\s*profile === 'research'\s*\?\s*researchPerm\(knowledgeDir\)/);
+  // Canary: the older arms are still there, so the slice is the real one.
+  assert.match(perm, /planPerm\s*\?\s*planPermFor\(knowledgeDir\)\s*:\s*readOnly\s*\?\s*consultPermFor\(knowledgeDir\)\s*:\s*wikiPerm \? WIKI_PERM : PERM/);
 });
 
 test('only Claude declares the two postures, and they need no MCP', () => {

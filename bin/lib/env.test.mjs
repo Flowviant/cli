@@ -742,3 +742,65 @@ test('the env report scans before it gates, and the caller never awaits it', () 
   // than no readout.
   assert.ok(raw.includes('void maybeReportEnv(repoRoot);'), 'fired and forgotten on the loop');
 });
+
+// ── the 2026-09-24 audit ────────────────────────────────────────────────────
+
+/**
+ * A GENERATED PASSWORD IS NOT AN ORDINARY WORD. The plain-identifier exemption
+ * was checked first and alone, so `Tq8vZ2mKp4Lx9RbN` (sixteen characters of
+ * [A-Za-z0-9], the `pwgen -s 16` shape) and a twelve-character `Hx93kPq2Lm7w`
+ * were left in plain text everywhere the daemon posts. A case-and-digit mix is
+ * minted, not written; the words the exemption exists for still survive.
+ */
+test('a case-and-digit mix is redacted even when it looks like an identifier', () => {
+  const dir = checkout({
+    '.env': ['SESSION_SECRET=Tq8vZ2mKp4Lx9RbN', 'DB_PASSWORD=Hx93kPq2Lm7w', 'NODE_ENV=development', 'AWS_REGION=us-east-1', 'APP=flowviant'].join('\n'),
+  });
+  env.scanEnvForScrub(dir, SALT);
+  for (const secret of ['Tq8vZ2mKp4Lx9RbN', 'Hx93kPq2Lm7w']) {
+    const line = env.scrub(`the CLI echoed ${secret} into its log`);
+    assert.ok(!line.includes(secret), `${secret} must be redacted`);
+    assert.ok(env.secretIn(Buffer.from(`xx${secret}xx`)), `${secret} must be found in bytes too`);
+  }
+  const narration = 'development on us-east-1 in the flowviant repo';
+  assert.equal(env.scrub(narration), narration, 'ordinary words still survive');
+});
+
+/**
+ * EVERY FLOWVIANT CREDENTIAL IS REDACTED BY SHAPE. The machine credential sits
+ * in `~/.flowviant/credentials.json` for every project on the box, readable by
+ * any turn, and no value list held it — so a turn that read the store and
+ * wrote it into an artifact, a trace or an answer shipped it verbatim.
+ */
+test('an fva_ token is redacted in text and found in bytes, with no list to feed it', () => {
+  const token = 'fva_' + 'Ab3_-xYz9'.repeat(4) + 'Qq12'; // 40 chars, the nanoid alphabet
+  const out = env.scrub(`{"projects":{"p":{"fleetToken":"${token}"}}}`);
+  assert.ok(!out.includes(token));
+  assert.match(out, /\[REDACTED:FLOWVIANT_TOKEN\]/);
+  assert.equal(env.secretIn(Buffer.concat([Buffer.from([0, 1, 2]), Buffer.from(token), Buffer.from([255])])), 'FLOWVIANT_TOKEN');
+  // The app's own identification prefix (`fva_` + 8) is not a credential.
+  assert.equal(env.scrub('token fva_Ab3xYz9Q (revoked)'), 'token fva_Ab3xYz9Q (revoked)');
+  assert.equal(env.secretIn(Buffer.from('plain bytes, nothing here')), null);
+});
+
+/**
+ * THE BOX'S IDENTITY IS PUBLISHED ONCE. Two first starts racing on a fresh box
+ * each minted a key and the last writer won, so the first kept an identity the
+ * disk no longer held. The mint now links a complete temp file into place, and
+ * a loser reads the winner's key instead of overwriting it.
+ */
+test('the keypair mint lets the first writer win and never leaves a temp file', async () => {
+  const { readdirSync } = await import('node:fs');
+  const dir = mkdtempSync(join(tmpdir(), 'fv-mint-'));
+  const path = join(dir, 'sub', 'env-keypair.json');
+  const first = env.mintKeypairFile(path, JSON.stringify({ pub: 'P1', priv: 'S1' }));
+  assert.deepEqual(first, { pub: 'P1', priv: 'S1' });
+  // A second minter that lost the race gets the WINNER's identity, and the file
+  // is exactly the winner's.
+  const second = env.mintKeypairFile(path, JSON.stringify({ pub: 'P2', priv: 'S2' }));
+  assert.deepEqual(second, { pub: 'P1', priv: 'S1' });
+  assert.deepEqual(JSON.parse(readFileSync(path, 'utf8')), { pub: 'P1', priv: 'S1' });
+  assert.deepEqual(readdirSync(join(dir, 'sub')), ['env-keypair.json'], 'no temp file is left behind');
+  const { statSync } = await import('node:fs');
+  assert.equal(statSync(path).mode & 0o777, 0o600, 'still owner-only');
+});

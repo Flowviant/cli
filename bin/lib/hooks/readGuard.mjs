@@ -38,6 +38,12 @@
  *    into a flag), a newline. A read-only turn runs ONE plain command; every
  *    one of these is a second command or a redirect wearing the first one's
  *    permission.
+ *  · shell syntax that REWRITES A WORD after this guard read it — braces,
+ *    parentheses and glob characters (`{ } ( ) * ? [`). `--outp{u,u}t=x` is
+ *    `--output=x` by the time git sees it, and the substring tests below can
+ *    only judge the word as written. (Quoted or not: the normalisation above
+ *    has already dropped the quotes, so a quoted `*` is refused too — the
+ *    over-refusal the paragraph above accepts.)
  *  · the git arguments above, as substrings (so `--config` covers
  *    `--config-env`, `--output` covers `--output-directory`), plus a bare `-c`
  *    token and any token beginning `-O`.
@@ -75,6 +81,24 @@ const SHELL = [
   ['$', 'an expansion'],
   ['\n', 'a second line'],
   ['\r', 'a second line'],
+  // SHELL SYNTAX THE SUBSTRING TESTS BELOW DO NOT MODEL (2026-09-24, the
+  // audit). The shell rewrites a word AFTER this guard has read it, so a banned
+  // flag can be ASSEMBLED past a substring check: `--outp{u,u}t=x` and
+  // `-{c,c}` brace-expand into `--output=x` and `-c`, and `git log -1
+  // --outp{u,u}t=pwned.txt` wrote the file with this guard returning null
+  // (measured, git 2.55). Globs do the same with a planted file name —
+  // `-?` expands to a file called `-c` — and zsh adds glob QUALIFIERS
+  // (`*(e:…:)`, which evaluate code). None of them is something a single
+  // plain read needs, so the guard refuses the syntax rather than trying to
+  // expand it the way some shell would: over-refusal is the safe direction,
+  // and the Glob tool is the tool-shaped way to match names.
+  ['{', 'brace expansion'],
+  ['}', 'brace expansion'],
+  ['(', 'a subshell or glob qualifier'],
+  [')', 'a subshell or glob qualifier'],
+  ['*', 'a glob'],
+  ['?', 'a glob'],
+  ['[', 'a glob'],
 ];
 
 /**
