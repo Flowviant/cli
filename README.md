@@ -2,9 +2,12 @@
 
 Run your own coding CLIs as build agents for [Flowviant](https://flowviant.com) — [Claude Code](https://claude.com/claude-code), Codex or Antigravity, on your own credentials. This daemon holds your sessions, keeps a worktree per tab, and ships branches on your word. Flowviant never sees your Claude, Codex or GitHub logins.
 
-```bash
-npx flowviant@latest login   # approve the code in Flowviant → connected
+```sh
+curl -fsSL https://api.flowviant.com/install.sh | sh
+~/.flowviant/bin/flowviant   # approve the code in Flowviant → connected
 ```
+
+With Node already installed: `npx flowviant@latest login`.
 
 Login keeps going straight into the daemon — there is no second command to run.
 
@@ -21,19 +24,22 @@ Because it drives the CLIs you're already logged into, **the cost is yours** (yo
 On the machine that runs the daemon:
 
 - **at least one coding CLI** installed and signed in — [Claude Code](https://claude.com/claude-code) (`claude`), Codex (`codex`) or Antigravity (`agy`)
-- **git**, and **Node 20+**
+- **git** (Node 20+ is needed only for the npx/npm install)
 - **[GitHub CLI](https://cli.github.com)** (`gh`) — optional; the daemon offers to fetch an isolated copy, and `flowviant gh-auth` signs it in
 - run it from inside the git repository you want worked
 
 ## Connecting
 
-The easy way — device login, like `gh auth login`:
+Download the standalone binary, then start it in your checkout:
 
-```bash
-npx flowviant@latest login
+```sh
+curl -fsSL https://api.flowviant.com/install.sh | sh
+~/.flowviant/bin/flowviant
 ```
 
-It shows a short code. Open your project's **Workbench** in Flowviant and enter the code where it offers to connect a machine. The credential is stored at `~/.flowviant/credentials.json`, and from then on `npx flowviant@latest` just runs.
+It shows a short code. Open your project's **Workbench** in Flowviant and enter the code where it offers to connect a machine. The credential is stored at `~/.flowviant/credentials.json`, and from then on `flowviant` just runs. The installer prints a PATH hint if needed; `FLOWVIANT_INSTALL_DIR` changes its destination. It verifies SHA-256 and never uses sudo.
+
+With Node already installed: `npx flowviant@latest login`.
 
 Prefer an explicit token? Create a machine credential in the app and pass it directly:
 
@@ -48,9 +54,9 @@ npm i -g flowviant
 flowviant login
 ```
 
-Either way is fine and both stay current on their own (below). npx is the zero-install door; a global install is what you want on a box you keep running, so the daemon, `flowviant login` and `flowviant machines` are ordinary commands.
+The binary, npx and global npm installs all update when idle. The binary fetches the release manifest and verifies the new executable before replacing itself. `flowviant update` updates it on demand.
 
-Launch with `@latest` so each start pulls the newest published version — a bare `npx flowviant` can reuse a stale cache. A running daemon also keeps itself current: from **0.58.0** it restarts itself through `npx flowviant@latest` when a new version ships, so npx launches stay up to date the same way a global install does. (Before 0.58.0 that was only true of a global install — under npx the daemon printed a notice and stayed put, which is how machines ended up sitting several releases back.) It only ever restarts when no turn is running. `FLOWVIANT_NO_UPDATE=1` makes it nag-only; `flowviant update` updates now.
+For npx, launch with `@latest` so each start pulls the newest published version — a bare `npx flowviant` can reuse a stale cache. A running daemon also keeps itself current: from **0.58.0** it restarts itself through `npx flowviant@latest` when a new version ships. It only ever restarts when no turn is running. `FLOWVIANT_NO_UPDATE=1` makes it nag-only; `flowviant update` updates now.
 
 ## Machines on this box
 
