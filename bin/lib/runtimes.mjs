@@ -589,7 +589,7 @@ export const RUNTIMES = {
      * strongest form of it available anywhere: `--append-system-prompt` sits
      * above the conversation rather than inside it.
      */
-    args({ prompt, system, model, effort, resume, streamJson, perm, profile = 'build', mcp = [], resultSchemaArgs = [], adoptResumeId, resumeThreadId, knowledgeDir }) {
+    args({ prompt, system, model, effort, resume, streamJson, perm, profile = 'build', mcp = [], resultSchemaArgs = [], adoptResumeId, resumeThreadId, knowledgeDir, agentTools }) {
       const a = [];
       // THREE ANSWERS TO ONE QUESTION — "what conversation is this?" — and they
       // are mutually exclusive, never combined.
@@ -616,6 +616,13 @@ export const RUNTIMES = {
       else if (resumeThreadId) a.push('--resume', resumeThreadId);
       else if (resume) a.push('--continue');
       a.push('-p', prompt, '--append-system-prompt', system);
+      if (agentTools) {
+        // Keep personal settings, but never load the agent-editable project's
+        // settings, hooks, skills or CLAUDE.md discovery. A resumed agent must
+        // render the CURRENT base snapshot, not the first turn's prompt cache.
+        a.push('--setting-sources', 'user', '--system-prompt-snapshot', 'off');
+        if (agentTools.pluginDir) a.push('--plugin-dir', agentTools.pluginDir);
+      }
       // These fenced postures have no project MCP, even if Claude discovers a
       // .mcp.json in the agent's worktree. Build gets its reviewed base config
       // explicitly from the caller; the plan profile keeps its own principal.
@@ -672,6 +679,11 @@ export const RUNTIMES = {
      * user's repository, which is not a risk worth taking for a slightly
      * stickier instruction.
      *
+     * Agent turns additionally pass reviewed base instructions as a developer
+     * config override when the personal config has no developer instruction;
+     * the prompt always carries them too. Workbench tabs keep their normal
+     * checkout discovery.
+     *
      * `--skip-git-repo-check` is deliberately NOT passed: a task always builds
      * in a git worktree, and if it somehow is not one, failing loudly beats
      * silently editing files nobody can diff.
@@ -682,7 +694,7 @@ export const RUNTIMES = {
      * placed before it. Appending them after the positional is the kind of argv
      * that parses today and stops parsing on some future clap upgrade.
      */
-    args({ prompt, system, model, effort, resume, resumeThreadId, profile = 'build', vaultDir, mcp = [], resultSchemaArgs = [], adoptResumeId }) {
+    args({ prompt, system, model, effort, resume, resumeThreadId, profile = 'build', vaultDir, mcp = [], resultSchemaArgs = [], adoptResumeId, agentTools }) {
       // Adoption resumes a conversation in ITS OWN CLI's store (claude forks,
       // agy moves) — codex has no adoptable store wired yet. Reaching here
       // with an adopt id is a wiring mistake upstream, and it fails loudly on
@@ -699,6 +711,13 @@ export const RUNTIMES = {
       if (resumeThreadId) a.push('resume', resumeThreadId);
       else if (resume) a.push('resume', '--last');
       a.push('--json');
+      if (agentTools) {
+        a.push('-c', 'project_doc_max_bytes=0');
+        // A person's existing developer instructions keep their authority.
+        // The base snapshot is also present in the per-turn prompt preamble.
+        if (!agentTools.personalDeveloperInstructions)
+          a.push('-c', `developer_instructions=${JSON.stringify(agentTools.instructions)}`);
+      }
       if (model) a.push('--model', model);
       // Effort is a config value on Codex rather than a flag.
       if (effort) a.push('-c', `model_reasoning_effort="${effort}"`);

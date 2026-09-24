@@ -607,7 +607,7 @@ export function createWorkAgentTurns({
       try {
         // A turn reads the base ref afresh. Changes the agent has made to its
         // own worktree cannot silently change the next turn's tools.
-        projectTools = prepareAgentTools(readBaseTools(repoRoot, baseRef()), rt);
+        projectTools = prepareAgentTools(readBaseTools(repoRoot, baseRef()), rt, process.env, wt);
         const agentTurnArgs = {
           prompt:
             job.kind === 'task' && job.task
@@ -634,6 +634,8 @@ export function createWorkAgentTurns({
             // land on its page, under the facts row.
             artifacts: getArtifactsAccepted(),
           }) + (projectTools.instructions ? `\n\n${projectTools.instructions}` : ''),
+          agentTools: projectTools,
+          ...(projectTools.codexHome ? { mcpEnv: { CODEX_HOME: projectTools.codexHome } } : {}),
           ...(posture === 'build' && rt === 'claude'
             ? { mcpArgs: ['--strict-mcp-config', '--mcp-config', projectTools.mcpPath] }
             : posture === 'build' && rt === 'codex'

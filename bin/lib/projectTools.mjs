@@ -1,8 +1,8 @@
 /** Repo-owned tool configuration, read from the base ref for every agent turn. */
 import { execFileSync } from 'node:child_process';
-import { accessSync, constants, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { delimiter, isAbsolute, join } from 'node:path';
-import { tmpdir } from 'node:os';
+import { accessSync, constants, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { delimiter, isAbsolute, join, resolve } from 'node:path';
+import { homedir, tmpdir } from 'node:os';
 
 const MAX_TOOLS = 40;
 const MAX_REPORT_TOOLS = 80; // 40 MCP servers plus 40 instruction directories
@@ -83,13 +83,68 @@ export function readBaseTools(root, ref, env = process.env) {
     const reason = missing.length ? `env ${missing.join(', ')} unset` : commandMissing ? `command ${config.command} not on PATH` : unsupported ? 'MCP configuration unsupported' : null;
     return { name, config, state: reason ? 'missing' : 'ready', reason };
   });
-  return { tools, skills, skillFiles, instructions: ['CLAUDE.md', 'AGENTS.md'].map((path) => ({ path, body: show(root, commit, path) })).filter((v) => v.body != null) };
+  // Nested instructions are normally discovered when a CLI enters that path.
+  // Their worktree copies must not regain authority through that discovery.
+  const instructions = [];
+  const paths = execFileSync('git', ['ls-tree', '-r', '--name-only', commit], {
+    cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 1024 * 1024,
+  }).split('\n').filter((path) => /(^|\/)(CLAUDE|AGENTS)\.md$/.test(path)).slice(0, 80);
+  for (const path of paths) {
+    const body = show(root, commit, path);
+    if (body != null) instructions.push({ path, body });
+  }
+  return { tools, skills, skillFiles, instructions };
 }
 
 const expand = (value, env) => String(value).replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_, key) => env[key] ?? '');
 
+/** Keep personal Codex files, but do not copy its project trust grants. An
+ * untrusted worktree's .codex/config.toml is ignored by Codex 0.156.1. */
+function isolatedCodexHome(dir, env, worktree) {
+  const source = resolve(env.CODEX_HOME || join(homedir(), '.codex'));
+  const dest = join(dir, 'codex-home');
+  mkdirSync(dest, { mode: 0o700 });
+  if (existsSync(source)) {
+    for (const name of readdirSync(source)) {
+      if (name === 'config.toml') continue;
+      symlinkSync(join(source, name), join(dest, name));
+    }
+  }
+  const configPath = join(source, 'config.toml');
+  const sourceConfig = existsSync(configPath) ? readFileSync(configPath, 'utf8') : '';
+  const topLevel = sourceConfig.split(/^\s*\[/m, 1)[0];
+  const personalDeveloperInstructions = /^\s*developer_instructions\s*=/m.test(topLevel);
+  // These sections alone grant a checkout permission to supply project
+  // settings. Keep every other personal setting, skill and session store.
+  const lines = sourceConfig.split('\n');
+  let inProject = false;
+  let config = lines.filter((line) => {
+    const header = /^\s*(?:\[\[([^\]]+)\]\]|\[([^\]]+)\])\s*(?:#.*)?$/.exec(line);
+    if (header) {
+      const section = header[1] ?? header[2];
+      inProject = section === 'projects' || section.startsWith('projects.');
+    }
+    return !inProject;
+  }).join('\n');
+  if (worktree) {
+    // Codex discovers these even in an untrusted project. Disable exactly the
+    // worktree skill paths; the person's ~/.codex/skills and config remain.
+    if (/^\s*skills\.config\s*=/m.test(config)) throw new Error('Cannot isolate Codex project skills with inline skills.config');
+    for (const sourceDir of ['.agents/skills', '.codex/skills', '.claude/skills']) {
+      const skillsDir = join(worktree, sourceDir);
+      if (!existsSync(skillsDir)) continue;
+      for (const name of readdirSync(skillsDir)) {
+        const skill = join(skillsDir, name, 'SKILL.md');
+        if (existsSync(skill)) config += `\n[[skills.config]]\npath = ${toml(skill)}\nenabled = false\n`;
+      }
+    }
+  }
+  writeFileSync(join(dest, 'config.toml'), config, { mode: 0o600 });
+  return { path: dest, personalDeveloperInstructions };
+}
+
 /** Temporary per-turn files are removed after the last retry. No personal CLI config is written. */
-export function prepareAgentTools(snapshot, runner, env = process.env) {
+export function prepareAgentTools(snapshot, runner, env = process.env, worktree = null) {
   const dir = mkdtempSync(join(tmpdir(), 'flowviant-agent-tools-'));
   const caps = runnerToolCapabilities(runner);
   const usable = snapshot.tools.filter((t) => t.state === 'ready' && caps.mcp && !(runner === 'codex' && t.config.type === 'sse'));
@@ -126,10 +181,39 @@ export function prepareAgentTools(snapshot, runner, env = process.env) {
     writeFileSync(dest, body, { mode: 0o600 });
     if (!path.startsWith('.claude/skills/') || path.endsWith('/SKILL.md')) pointers.push(`${path}: ${dest}`);
   }
+  const baseInstructions = snapshot.instructions.map(({ path, body }) => `Base ${path}:\n${body}`).join('\n\n');
+  const instructions = [baseInstructions,
+    pointers.length ? `Base-branch instruction and skill copies (read the relevant nested files and skill files before acting):\n${pointers.join('\n')}` : '',
+  ].filter(Boolean).join('\n\n');
+  const pluginDir = runner === 'claude' && snapshot.skillFiles.length ? join(dir, 'reviewed-plugin') : null;
+  if (pluginDir) {
+    mkdirSync(join(pluginDir, '.claude-plugin'), { recursive: true });
+    writeFileSync(join(pluginDir, '.claude-plugin/plugin.json'), JSON.stringify({ name: 'flowviant-reviewed', version: '1.0.0', description: 'Base-branch agent skills' }), { mode: 0o600 });
+    for (const { path, body } of snapshot.skillFiles) {
+      const dest = join(pluginDir, path.replace(/^\.claude\//, ''));
+      mkdirSync(join(dest, '..'), { recursive: true });
+      writeFileSync(dest, body, { mode: 0o600 });
+    }
+  }
+  let codexHome = null;
+  let personalDeveloperInstructions = false;
+  try {
+    if (runner === 'codex') {
+      const isolated = isolatedCodexHome(dir, env, worktree);
+      codexHome = isolated.path;
+      personalDeveloperInstructions = isolated.personalDeveloperInstructions;
+    }
+  } catch (error) {
+    rmSync(dir, { recursive: true, force: true });
+    throw error;
+  }
   return {
     mcpPath,
     codexArgs,
-    instructions: pointers.length ? `Repo instructions and skills from the base branch for this turn:\n${pointers.join('\n')}\nRead the relevant files at these paths before acting.` : '',
+    instructions,
+    pluginDir,
+    codexHome,
+    personalDeveloperInstructions,
     cleanup: () => rmSync(dir, { recursive: true, force: true }),
   };
 }

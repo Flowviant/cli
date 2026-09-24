@@ -622,7 +622,7 @@ export function cliEnv(mcpEnv) {
 // returned string for sentinel detection, and each activity is handed to
 // `onActivity` so the caller can forward progress. Build-agent turns leave it
 // off and keep the raw text passthrough + line sentinels.
-export function runTurn({ prompt, resume, system, cwd, mcpConfig, mcpArgs, mcpEnv, runtime = 'claude', label, onSpawn, streamJson, answerFromResult, onActivity, onToolEvent, onInit, onUsage, onThreadId, onAnswer, wikiPerm, readOnly, planPerm, planMode, posture, vaultDir, knowledgeDir, resultSchemaArgs, model, effort, adoptResumeId, resumeThreadId, resumeConversationId }) {
+export function runTurn({ prompt, resume, system, cwd, mcpConfig, mcpArgs, mcpEnv, agentTools, runtime = 'claude', label, onSpawn, streamJson, answerFromResult, onActivity, onToolEvent, onInit, onUsage, onThreadId, onAnswer, wikiPerm, readOnly, planPerm, planMode, posture, vaultDir, knowledgeDir, resultSchemaArgs, model, effort, adoptResumeId, resumeThreadId, resumeConversationId }) {
   return new Promise((resolve) => {
     const rt = runtimeById(runtime);
     // PLAN MODE IS CLAUDE'S (0.97.0). The other adapters build their argv
@@ -696,6 +696,7 @@ export function runTurn({ prompt, resume, system, cwd, mcpConfig, mcpArgs, mcpEn
       resume,
       streamJson,
       profile,
+      agentTools,
       // Adopting a terminal session (work.mjs): Claude turns it into
       // `--resume <id> --fork-session` (a FORK — the original is untouched);
       // agy turns it into `--conversation <id>` (a MOVE — agy has no fork, the
