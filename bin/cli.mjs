@@ -170,6 +170,8 @@ if (process.argv[2] === 'login') {
 }
 
 if (process.argv[2] === 'status' && process.argv.includes('--json')) {
+  // The tray polls this every 30 s: the fixed per-user bin dirs only, no shell.
+  (await import('./lib/loginPath.mjs')).adoptLoginPath({ shell: false });
   const { desktopStatus, desktopStatusRemote } = await import('./lib/desktopContract.mjs');
   const status = process.argv.includes('--remote') ? await desktopStatusRemote() : desktopStatus();
   process.stdout.write(`${JSON.stringify(status)}\n`);
@@ -178,6 +180,7 @@ if (process.argv[2] === 'status' && process.argv.includes('--json')) {
 
 // `flowviant status` — the same facts, for a person.
 if (process.argv[2] === 'status') {
+  (await import('./lib/loginPath.mjs')).adoptLoginPath();
   const { runStatus } = await import('./lib/views.mjs');
   await runStatus();
   process.exit(0);
@@ -199,6 +202,7 @@ if (process.argv[2] === 'open') {
 
 // `flowviant doctor` — what this computer needs, checked.
 if (process.argv[2] === 'doctor') {
+  (await import('./lib/loginPath.mjs')).adoptLoginPath();
   const { runDoctor } = await import('./lib/views.mjs');
   process.exit((await runDoctor()) > 0 ? 1 : 0);
 }
@@ -560,6 +564,10 @@ if (process.argv[2] && !process.argv[2].startsWith('-')) {
   console.error(unknownCommandMessage(process.argv[2]));
   process.exit(1);
 }
+
+// Find the CLIs where the person's own terminal would: the Windows tray starts
+// this through `wsl.exe --`, which reads no shell startup file (loginPath.mjs).
+(await import('./lib/loginPath.mjs')).adoptLoginPath();
 
 // ── WHICH PROJECT THIS START SERVES — said, asked, or refused; never guessed.
 //
