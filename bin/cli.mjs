@@ -70,6 +70,11 @@
  * env (the box keypair, the uplink scrubber, the env-comparison scan) + vault
  * (the knowledge wiki, not secrets), resources, deploy, shot.
  */
+// The tray app reads `login --json` through a pipe (wsl.exe). A line written
+// just before process.exit() can be dropped there, and then all the tray knows
+// is that the login ended; wait for stdout to drain before exiting.
+const flushStdout = () => new Promise((resolve) => process.stdout.write('', resolve));
+
 // Resolve --dir before config reads the project bound to cwd. A tray process
 // starts outside the checkout; its explicit folder is the daemon's checkout.
 const dirAt = process.argv.indexOf('--dir');
@@ -83,6 +88,7 @@ if (dirAt >= 0 && !noCheckoutCommand.has(process.argv[2])) {
     if (process.argv.includes('--json') && process.argv[2] === 'login')
       process.stdout.write(`${JSON.stringify({ event: 'error', message: `Cannot use directory ${dir ?? ''}: ${e.message}` })}\n`);
     else console.error(`error: cannot use directory ${dir ?? ''}: ${e.message}`);
+    await flushStdout();
     process.exit(1);
   }
 }
@@ -122,6 +128,7 @@ if (process.argv[2] === 'login') {
   // A login the person CANCELLED at the second-project question saved nothing,
   // so there is no credential for the child to serve — starting it would end
   // in "no credential found" over a choice they just made on purpose.
+  if (json) await flushStdout();
   if (!login?.saved) process.exit(1); // refused: the directory already serves another project
   if (noStart) process.exit(0);
   // Re-exec as a plain `flowviant` rather than falling through. config.mjs reads
