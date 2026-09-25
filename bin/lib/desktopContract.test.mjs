@@ -103,7 +103,7 @@ test('login JSONL opens on the host, binds the selected repo, and emits no human
   const result = await child(['login', '--json', '--dir', repo, '--no-start'], { HOME: root, FLOWVIANT_FLEET_URL: `http://127.0.0.1:${port}/api/fleet/agents` });
   assert.equal(result.code, 0, result.stderr);
   assert.deepEqual(result.stdout.trim().split('\n').map(JSON.parse), [
-    { event: 'open_url', url: 'https://app.flowviant.com', code: 'ABCD-EFGH' },
+    { event: 'open_url', url: 'https://app.flowviant.com/connect?code=ABCD-EFGH', code: 'ABCD-EFGH' },
     { event: 'bound', projectId: 'p1', name: 'Project One', dir: repo },
   ]);
   assert.match(readFileSync(join(root, '.flowviant', 'credentials.json'), 'utf8'), /p1/);

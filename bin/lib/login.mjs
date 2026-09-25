@@ -51,10 +51,14 @@ export async function runLogin({ thenStart = false, json = false, dir = process.
   // section deleted 2026-08-17; connecting a machine is offered on the surface
   // you are on when it matters, and for a new operator that is the Workbench —
   // the project's empty state says so before it can show you any sessions.
-  if (json) event({ event: 'open_url', url: APP_URL, code: pretty });
+  // `/connect?code=` (2026-09-25) takes the code, asks which project, and
+  // approves: the code no longer has to be carried by hand into a project's
+  // Connect a machine panel, which is where people got lost.
+  const approveUrl = `${APP_URL}/connect?code=${encodeURIComponent(pretty)}`;
+  if (json) event({ event: 'open_url', url: approveUrl, code: pretty });
   else {
-    console.log(`  1. Open ${c.cyan(APP_URL)} → your project → the ${c.bold('Workbench')} → ${c.bold('Connect a machine')}.`);
-    console.log(`  2. Enter this code:   ${c.bold(c.green(pretty))}\n`);
+    console.log(`  Open ${c.cyan(approveUrl)}`);
+    console.log(`  and approve this computer for your project. Check the code there is ${c.bold(c.green(pretty))}.\n`);
     info('waiting for you to approve…');
   }
 
