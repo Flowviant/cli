@@ -75,10 +75,14 @@
 // is that the login ended; wait for stdout to drain before exiting.
 const flushStdout = () => new Promise((resolve) => process.stdout.write('', resolve));
 
+// `flowviant start` is the spelled-out form of a bare `flowviant`; everything
+// below reads the start path from argv, so the word is simply dropped.
+if (process.argv[2] === 'start' && !process.argv.slice(3).some((arg) => arg === '--help' || arg === '-h')) process.argv.splice(2, 1);
+
 // Resolve --dir before config reads the project bound to cwd. A tray process
 // starts outside the checkout; its explicit folder is the daemon's checkout.
 const dirAt = process.argv.indexOf('--dir');
-const noCheckoutCommand = new Set(['--version', '-v', 'version', 'status', 'stop', 'uninstall', 'machines', 'projects', 'update', 'shot', 'clean', 'gh-auth', 'mcp']);
+const noCheckoutCommand = new Set(['--version', '-v', 'version', 'status', 'stop', 'uninstall', 'machines', 'projects', 'update', 'shot', 'clean', 'gh-auth', 'mcp', 'help', '--help', '-h']);
 if (dirAt >= 0 && !noCheckoutCommand.has(process.argv[2])) {
   const dir = process.argv[dirAt + 1];
   try {
@@ -121,6 +125,22 @@ if (process.argv[2] === '--version' || process.argv[2] === '-v' || process.argv[
   process.exit(0);
 }
 
+// `flowviant help`, `--help`/`-h`, and `<command> --help`. Before any command
+// runs, so asking about one never runs it (bin/lib/help.mjs has the table).
+{
+  const asksHelp = (arg) => arg === '--help' || arg === '-h';
+  const first = process.argv[2];
+  if (first === 'help' || asksHelp(first) || process.argv.slice(3).some(asksHelp)) {
+    const { findCommand, renderCommandHelp, renderHelp, unknownCommandMessage } = await import('./lib/help.mjs');
+    const topic = first === 'help' ? process.argv[3] : asksHelp(first) ? undefined : first?.startsWith('-') ? 'start' : first;
+    if (!topic) { console.log(renderHelp(VERSION)); process.exit(0); }
+    const cmd = findCommand(topic);
+    if (!cmd) { console.error(unknownCommandMessage(topic)); process.exit(1); }
+    console.log(renderCommandHelp(cmd));
+    process.exit(0);
+  }
+}
+
 if (process.argv[2] === 'login') {
   const noStart = process.argv.includes('--no-start');
   const json = process.argv.includes('--json');
@@ -154,6 +174,33 @@ if (process.argv[2] === 'status' && process.argv.includes('--json')) {
   const status = process.argv.includes('--remote') ? await desktopStatusRemote() : desktopStatus();
   process.stdout.write(`${JSON.stringify(status)}\n`);
   process.exit(0);
+}
+
+// `flowviant status` — the same facts, for a person.
+if (process.argv[2] === 'status') {
+  const { runStatus } = await import('./lib/views.mjs');
+  await runStatus();
+  process.exit(0);
+}
+
+// `flowviant logs [-f]` — this repo's daemon log.
+if (process.argv[2] === 'logs') {
+  const { runLogs } = await import('./lib/views.mjs');
+  await runLogs(process.argv);
+  process.exit(0);
+}
+
+// `flowviant open` — this repo's board, in the browser.
+if (process.argv[2] === 'open') {
+  const { runOpen } = await import('./lib/views.mjs');
+  runOpen(process.argv);
+  process.exit(0);
+}
+
+// `flowviant doctor` — what this computer needs, checked.
+if (process.argv[2] === 'doctor') {
+  const { runDoctor } = await import('./lib/views.mjs');
+  process.exit((await runDoctor()) > 0 ? 1 : 0);
 }
 
 // `flowviant update` — install the latest published version now. The daemon also
@@ -503,6 +550,15 @@ if (process.argv[2] === 'mcp') {
   const { runMcpCommand } = await import('./lib/mcp-cli.mjs');
   await runMcpCommand(process.argv.slice(3));
   process.exit(0);
+}
+
+// A WORD THAT IS NOT A COMMAND IS REFUSED, not served. Every word used to fall
+// through to here, so `flowviant hlep` started the daemon. Flags still reach
+// the start path (`--project`, `--dir`, `--json-events`, …).
+if (process.argv[2] && !process.argv[2].startsWith('-')) {
+  const { unknownCommandMessage } = await import('./lib/help.mjs');
+  console.error(unknownCommandMessage(process.argv[2]));
+  process.exit(1);
 }
 
 // ── WHICH PROJECT THIS START SERVES — said, asked, or refused; never guessed.

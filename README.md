@@ -52,6 +52,25 @@ flowviant login
 
 The binary and global npm installs update when idle. The binary fetches the release manifest and verifies the new executable before replacing itself. The global install refreshes from npm before restarting. `flowviant update` checks on demand. `FLOWVIANT_NO_UPDATE=1` makes updates manual.
 
+## Commands
+
+`flowviant help` lists every command, and `flowviant help <command>` (or `<command> --help`) shows one command's options. A word that isn't a command is refused with the nearest match; it never starts the daemon.
+
+| Command | What it does |
+| --- | --- |
+| `flowviant` / `flowviant start` | Serve this repo's project here |
+| `flowviant login` | Connect this repo to a project (approve the link it prints) |
+| `flowviant stop` | Stop every flowviant daemon on this computer |
+| `flowviant status` | Each project connected here: repo, running/serving, live agents |
+| `flowviant logs [-f]` | This repo's daemon log (`-f` follows it) |
+| `flowviant open` | Open this project's board in the browser |
+| `flowviant projects` | Every stored login and the repo it serves |
+| `flowviant machines` | Every computer serving your projects; a menu on a terminal |
+| `flowviant doctor` | Check git, a coding CLI, the connection and the daemon |
+| `flowviant update` | Install the newest version now |
+| `flowviant clean` | Delete kept agent worktrees |
+| `flowviant uninstall` | Remove every copy (`--purge` for logins too) |
+
 ## Uninstall
 
 `flowviant uninstall` stops local daemons and removes installed copies. It keeps logins and local state in `~/.flowviant`, so reinstalling resumes them. Use `flowviant uninstall --purge` to disconnect this box from stored projects and delete that local data too. Add `--yes` to skip confirmation.
