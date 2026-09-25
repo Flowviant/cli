@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { desktopStatus, desktopStatusRemote } from './desktopContract.mjs';
 
 const entry = { projectId: 'p1', name: 'One', repoRoot: '/repo', fleetToken: 'secret' };
-const agent = { id: 'a1', name: 'Build', status: 'working', runtime: 'codex', delivered: 2, total: 3, asks: 1, parked: 0, since: '2026-09-25T10:00:00.000Z' };
+const agent = { id: 'a1', name: 'Build', status: 'working', runtime: 'codex', delivered: 2, total: 3, asks: true, parked: false, since: '2026-09-25T10:00:00.000Z' };
 const boxes = { data: { boxes: [
   { boxId: 'other', boxName: 'server', role: 'serving', daemonVersion: '0.99.0' },
   { boxId: 'mine', boxName: 'laptop', role: 'inactive', daemonVersion: '0.98.0' },
@@ -76,7 +76,7 @@ test('failed boxes keep live agents, and two failures or no credential give null
 });
 
 test('malformed live agent rows are dropped without changing reported words', async () => {
-  const answer = { data: { agents: [agent, { ...agent, id: null }, { ...agent, total: '3' }, { ...agent, name: '' }], pressure: live.data.pressure } };
+  const answer = { data: { agents: [agent, { ...agent, id: null }, { ...agent, total: '3' }, { ...agent, name: '' }, { ...agent, asks: 1 }], pressure: live.data.pressure } };
   const status = await desktopStatusRemote({ ...deps, fetchImpl: fetchFor(response(200, boxes), response(200, answer)) });
   assert.deepEqual(status.projects[0].remote.agents, [agent]);
   assert.deepEqual(status.projects[0].remote.pressure, live.data.pressure);

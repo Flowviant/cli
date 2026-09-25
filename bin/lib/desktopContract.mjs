@@ -116,8 +116,9 @@ async function remoteRead(read, timeoutMs) {
 function liveAgent(row) {
   if (!row || typeof row !== 'object' || typeof row.id !== 'string' || !row.id ||
       typeof row.name !== 'string' || !row.name || typeof row.status !== 'string' ||
-      !['claude', 'codex'].includes(row.runtime) ||
-      !['delivered', 'total', 'asks', 'parked'].every((field) => typeof row[field] === 'number' && Number.isFinite(row[field])) ||
+      typeof row.runtime !== 'string' || !row.runtime ||
+      !['delivered', 'total'].every((field) => Number.isInteger(row[field]) && row[field] >= 0) ||
+      !['asks', 'parked'].every((field) => typeof row[field] === 'boolean') ||
       !(row.since === null || typeof row.since === 'string')) return null;
   const { id, name, status, runtime, delivered, total, asks, parked, since } = row;
   return { id, name, status, runtime, delivered, total, asks, parked, since };
