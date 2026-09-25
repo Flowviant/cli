@@ -44,6 +44,17 @@ function readVersion(fs, path) {
 function files(fs, dir) { try { return fs.readdirSync(dir); } catch { return []; } }
 function regular(fs, path) { try { return fs.statSync(path).isFile(); } catch { return false; } }
 function executable(fs, path) { try { const stat = fs.statSync(path); return stat.isFile() && Boolean(stat.mode & 0o111); } catch { return false; } }
+// A compiled flowviant is an ELF or Mach-O file. A shell wrapper someone named
+// `flowviant` is not a copy of ours and is never removed.
+function compiledExecutable(fs, path) {
+  try {
+    const fd = fs.openSync(path, 'r');
+    const head = Buffer.alloc(4);
+    try { fs.readSync(fd, head, 0, 4, 0); } finally { fs.closeSync(fd); }
+    const magic = head.readUInt32BE(0);
+    return magic === 0x7f454c46 || [0xfeedfacf, 0xcffaedfe, 0xfeedface, 0xcefaedfe, 0xcafebabe].includes(magic);
+  } catch { return false; }
+}
 function exactBlock(dir, rc) {
   const line = basename(rc) === 'flowviant.fish'
     ? `fish_add_path "${dir}"` : `export PATH="${dir}:$PATH"`;
@@ -108,6 +119,10 @@ export async function buildUninstallPlan(options = {}) {
     copies.at(-1).skipReason = alone ? null : 'cache contains other packages or its dependencies could not be read';
   }
 
+  const ownBin = join(o.home, '.flowviant', 'bin');
+  // Trusted: the installer's default directory and any directory an installer
+  // PATH block names. Anything else on PATH must prove itself.
+  const trusted = new Set([real(o.fs, ownBin)]);
   const addBinary = (dir, fromPath = false) => {
     const candidate = join(dir, 'flowviant');
     if (!(fromPath ? executable(o.fs, candidate) : regular(o.fs, candidate))) return;
@@ -124,7 +139,12 @@ export async function buildUninstallPlan(options = {}) {
       }
       return;
     }
+    // Outside the installer's own directory a file must PROVE it is ours:
+    // compiled, and answering `--version` with a version (checked below).
+    const proven = trusted.has(real(o.fs, dir));
+    if (!proven && !compiledExecutable(o.fs, target)) return;
     add('binary', target);
+    if (!proven) copies.at(-1).mustProve = true;
   };
   addBinary(join(o.home, '.flowviant', 'bin'));
   for (const dir of o.path.split(':').filter(Boolean)) addBinary(dir, true);
@@ -139,6 +159,7 @@ export async function buildUninstallPlan(options = {}) {
       const dir = match[1];
       if (match[0] !== exactBlock(dir, path)) continue;
       copies.push({ kind: 'path-line', path, removal: path, block: match[0] });
+      trusted.add(real(o.fs, dir));
       addBinary(dir);
     }
   }
@@ -151,6 +172,10 @@ export async function buildUninstallPlan(options = {}) {
       const version = String(output.stdout).trim();
       if (/^\d+\.\d+\.\d+/.test(version)) copy.version = version;
     } catch { /* A foreign or older binary may not answer. */ }
+  }
+  for (let i = copies.length - 1; i >= 0; i--) {
+    if (copies[i].mustProve && !copies[i].version && !(o.compiled && copies[i].path === own)) copies.splice(i, 1);
+    else delete copies[i].mustProve;
   }
   const daemons = liveDaemons(o);
   for (const copy of copies) {

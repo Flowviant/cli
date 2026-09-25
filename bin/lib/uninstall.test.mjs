@@ -200,3 +200,24 @@ test('npm uninstall failure is reported while other copies are removed', async (
   assert.equal(fs.existsSync(f.binary), false);
   assert.equal(fs.existsSync(join(f.npmRoot, 'flowviant')), true);
 });
+
+test('a wrapper script named flowviant elsewhere on PATH is not ours and is never planned', async (t) => {
+  const f = fixture(t);
+  const script = f.put('mybin/flowviant', '#!/bin/sh\nexec npx flowviant "$@"\n');
+  fs.chmodSync(script, 0o755);
+  const plan = await buildUninstallPlan({ ...f.options, path: join(f.home, 'mybin'),
+    execFile: async (file, args) => (args[0] === 'root' ? { stdout: `${f.npmRoot}\n` } : { stdout: '0.100.0\n' }) });
+  assert.equal(plan.copies.some((c) => c.path === script), false);
+});
+
+test('a compiled binary elsewhere on PATH counts only when it answers --version', async (t) => {
+  const f = fixture(t);
+  const elf = f.put('opt/flowviant', '\x7fELF-not-really');
+  fs.chmodSync(elf, 0o755);
+  const answering = await buildUninstallPlan({ ...f.options, path: join(f.home, 'opt'),
+    execFile: async (file, args) => (args[0] === 'root' ? { stdout: `${f.npmRoot}\n` } : { stdout: '0.99.0\n' }) });
+  assert.equal(answering.copies.find((c) => c.path === elf)?.version, '0.99.0');
+  const silent = await buildUninstallPlan({ ...f.options, path: join(f.home, 'opt'),
+    execFile: async (file, args) => { if (args[0] === 'root') return { stdout: `${f.npmRoot}\n` }; throw new Error('not flowviant'); } });
+  assert.equal(silent.copies.some((c) => c.path === elf), false);
+});
