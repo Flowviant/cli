@@ -73,7 +73,7 @@
 // Resolve --dir before config reads the project bound to cwd. A tray process
 // starts outside the checkout; its explicit folder is the daemon's checkout.
 const dirAt = process.argv.indexOf('--dir');
-const noCheckoutCommand = new Set(['--version', '-v', 'version', 'status', 'stop', 'machines', 'projects', 'update', 'shot', 'clean', 'gh-auth', 'mcp']);
+const noCheckoutCommand = new Set(['--version', '-v', 'version', 'status', 'stop', 'uninstall', 'machines', 'projects', 'update', 'shot', 'clean', 'gh-auth', 'mcp']);
 if (dirAt >= 0 && !noCheckoutCommand.has(process.argv[2])) {
   const dir = process.argv[dirAt + 1];
   try {
@@ -241,6 +241,19 @@ if (process.argv[2] === 'stop') {
   } else result = stopAllDaemons({ log: (m) => console.log(m) });
   const { failed } = result;
   process.exit(failed > 0 ? 1 : 0);
+}
+
+if (process.argv[2] === 'uninstall') {
+  const { runUninstall } = await import('./lib/uninstall.mjs');
+  const { askWithTimeout } = await import('./lib/tty.mjs');
+  const result = await runUninstall({
+    others: process.argv.includes('--others'),
+    purge: process.argv.includes('--purge'),
+    yes: process.argv.includes('--yes'),
+    json: process.argv.includes('--json'),
+    prompt: (query) => askWithTimeout(query, undefined, process.stderr),
+  });
+  process.exit(result.ok ? 0 : 1);
 }
 
 // `flowviant projects` — every project this box has a credential for, which

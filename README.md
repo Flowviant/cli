@@ -52,6 +52,10 @@ flowviant login
 
 The binary and global npm installs update when idle. The binary fetches the release manifest and verifies the new executable before replacing itself. The global install refreshes from npm before restarting. `flowviant update` checks on demand. `FLOWVIANT_NO_UPDATE=1` makes updates manual.
 
+## Uninstall
+
+`flowviant uninstall` stops local daemons and removes installed copies. It keeps logins and local state in `~/.flowviant`, so reinstalling resumes them. Use `flowviant uninstall --purge` to disconnect this box from stored projects and delete that local data too. Add `--yes` to skip confirmation.
+
 ## Machines on this box
 
 One box can serve several projects — one daemon per repository directory, each connected with its own `flowviant login` run inside that repo. `flowviant machines` lists every project connected on this box with the id and date it was connected, and under each one every computer that has polled it (the app's Home lists the same across your whole account). Two projects bound to one repository are named out loud at the foot of the listing, because that is the one shape that reads as "the same project connected twice" and is not — and a directory serves one project, so `flowviant` there refuses to start until one of them goes.

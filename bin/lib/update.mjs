@@ -271,6 +271,13 @@ export async function handleVersionSignal({ latest, min, autoUpdate, safeToUpdat
       note(`flowviant ${cur} → ${target}: downloading binary…`);
       const installed = await installBinaryUpdate({ minimumVersion: target });
       ok('updated — restarting into the new version.');
+      // The replacement is committed; cleanup runs beside the re-exec and
+      // cannot hold the daemon's new version hostage.
+      setImmediate(() => {
+        import('./uninstall.mjs').then(({ runUninstall }) =>
+          runUninstall({ others: true, yes: true, log: (m) => note(m) })
+        ).catch((e) => warn(`older-copy cleanup: ${e?.message ?? e}`));
+      });
       reexec(teardown, { viaBinary: true, target: installed });
       return true;
     } catch (e) {

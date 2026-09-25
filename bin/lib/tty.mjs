@@ -112,7 +112,7 @@ export function boundedTimer(timeoutMs, fire) {
  * answer everywhere (the binding confirm serves unbound; the project picker
  * refuses, exactly as it does headless).
  */
-export async function askWithTimeout(query, timeoutMs) {
+export async function askWithTimeout(query, timeoutMs, output = process.stdout) {
   const noop = () => {};
   // Replacing the DEFAULT disposition is the whole point — an empty handler is
   // enough, and it is what keeps the timer below able to run at all.
@@ -120,7 +120,7 @@ export async function askWithTimeout(query, timeoutMs) {
   process.on('SIGTTOU', noop);
   const rl = (await import('node:readline/promises')).createInterface({
     input: process.stdin,
-    output: process.stdout,
+    output,
   });
   const ac = new AbortController();
   const timer = boundedTimer(timeoutMs, () => ac.abort());
