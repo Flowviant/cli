@@ -91,6 +91,11 @@ const { runFleetDaemon } = await import('./lib/fleet.mjs');
 const { runLogin } = await import('./lib/login.mjs');
 const { launchCommand, terminalCommand } = await import('./lib/launchCommand.mjs');
 
+if (process.argv.includes('--remote') && !(process.argv[2] === 'status' && process.argv.includes('--json'))) {
+  console.error('error: --remote requires status --json');
+  process.exit(1);
+}
+
 // `flowviant login` — device auth (recommended): approve a code in the app, the
 // credential is stored locally, and then we KEEP GOING into the daemon.
 //
@@ -138,8 +143,9 @@ if (process.argv[2] === 'login') {
 }
 
 if (process.argv[2] === 'status' && process.argv.includes('--json')) {
-  const { desktopStatus } = await import('./lib/desktopContract.mjs');
-  process.stdout.write(`${JSON.stringify(desktopStatus())}\n`);
+  const { desktopStatus, desktopStatusRemote } = await import('./lib/desktopContract.mjs');
+  const status = process.argv.includes('--remote') ? await desktopStatusRemote() : desktopStatus();
+  process.stdout.write(`${JSON.stringify(status)}\n`);
   process.exit(0);
 }
 

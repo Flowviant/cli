@@ -340,13 +340,13 @@ export const MACHINES_FLAGS_FOOTER = [
  * probably forget. Two different next moves; collapsing them is how somebody
  * deletes a working credential.
  */
-export async function fetchBoxesFor(entry, { url, envpub, fetchImpl = fetch } = {}) {
+export async function fetchBoxesFor(entry, { url, envpub, fetchImpl = fetch, signal = AbortSignal.timeout(15_000) } = {}) {
   const target = new URL(url);
   if (envpub) target.searchParams.set('envpub', envpub);
   try {
     const res = await fetchImpl(target, {
       headers: { Authorization: `Bearer ${entry.fleetToken}`, 'User-Agent': USER_AGENT },
-      signal: AbortSignal.timeout(15_000),
+      signal,
     });
     if (await credentialRejected(res)) return { rejected: true };
     if (res.status === 401 || res.status === 403) return { error: `HTTP ${res.status} from something in front of the app` };
