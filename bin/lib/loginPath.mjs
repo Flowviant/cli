@@ -17,7 +17,7 @@
  * few seconds once, and nothing is ever removed from PATH.
  */
 
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { existsSync, readdirSync } from 'node:fs';
 import { homedir, platform } from 'node:os';
 import { join } from 'node:path';
@@ -84,4 +84,33 @@ export function adoptLoginPath({ shell = true, env = process.env, ...deps } = {}
   const login = shell ? loginShellPath({ env, ...deps }) : null;
   env.PATH = mergePath(env.PATH, login, userBinDirs(deps));
   return env.PATH;
+}
+
+/**
+ * adoptLoginPath, for THIS process and every child it will start.
+ *
+ * Under Bun (the compiled binary the curl install and the tray ship) child
+ * processes are looked up and started with the environment the process
+ * STARTED with unless a spawn passes `env` — a later `process.env.PATH = …` is
+ * invisible to them (measured 2026-09-25: node found ~/.local/bin/claude after
+ * the change, the compiled binary did not). So when the PATH grew, the
+ * binary restarts itself once with it: a thin proxy, the same shape as the
+ * self-update re-exec, stdio inherited, exit code and signals passed through.
+ * Node needs none of that and adopts in place.
+ */
+export async function adoptLoginPathForProcess(opts = {}) {
+  if (process.env.FLOWVIANT_PATH_ADOPTED === '1') return;
+  const before = process.env.PATH;
+  const after = adoptLoginPath(opts);
+  if (!process.versions.bun || after === before) return;
+  const compiled = process.argv[1]?.startsWith('/$bunfs/');
+  const child = spawn(process.execPath, process.argv.slice(compiled ? 2 : 1), {
+    stdio: 'inherit',
+    env: { ...process.env, FLOWVIANT_PATH_ADOPTED: '1' },
+  });
+  for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+    process.on(signal, () => { try { child.kill(signal); } catch { /* gone */ } });
+  }
+  const code = await new Promise((resolve) => child.on('exit', (status, signal) => resolve(status ?? (signal ? 1 : 0))));
+  process.exit(code);
 }
