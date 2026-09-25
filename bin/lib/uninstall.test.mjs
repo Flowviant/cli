@@ -221,3 +221,14 @@ test('a compiled binary elsewhere on PATH counts only when it answers --version'
     execFile: async (file, args) => { if (args[0] === 'root') return { stdout: `${f.npmRoot}\n` }; throw new Error('not flowviant'); } });
   assert.equal(silent.copies.some((c) => c.path === elf), false);
 });
+
+test('human lines say a PATH line left the rc file, and a fresh install stays quiet about its own copy', async (t) => {
+  const f = fixture(t);
+  const lines = [];
+  await runUninstall({ ...f.options, others: true, log: (m) => lines.push(m) });
+  assert.equal(lines.some((m) => /running copy/.test(m)), false);
+  const all = [];
+  await runUninstall({ ...f.options, log: (m) => all.push(m) });
+  assert.ok(all.includes(`removed the flowviant PATH line from ${f.rc}`));
+  assert.equal(all.includes(`removed ${f.rc}`), false);
+});

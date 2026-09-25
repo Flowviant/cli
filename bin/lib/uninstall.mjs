@@ -259,7 +259,8 @@ export async function runUninstall(options = {}) {
     if (others && c.kind === 'path-line' && plan.copies.some((copy) => copy.kind === 'binary' && copy.current && c.block === exactBlock(dirname(copy.path), c.path))) reason = 'needed by the running binary';
     if (reason) {
       result.skipped.push({ ...item, reason });
-      if (!json) line(`skipped ${c.path}: ${reason}`);
+      // The copy doing the work is not news; every other skip is.
+      if (!json && reason !== 'running copy') line(`skipped ${c.path}: ${reason}`);
       continue;
     }
     try {
@@ -269,7 +270,7 @@ export async function runUninstall(options = {}) {
       else if (c.kind === 'path-line') removePathBlock(o, c.path, c.block);
       else o.fs.rmSync(c.removal, { recursive: c.kind === 'npx-cache', force: true });
       result.removed.push(item);
-      if (!json) line(`removed ${c.path}`);
+      if (!json) line(c.kind === 'path-line' ? `removed the flowviant PATH line from ${c.path}` : `removed ${c.path}`);
     } catch (e) { result.errors.push(`${c.path}: ${errorWords(e)}`); }
   }
   if (purge && !others) {
