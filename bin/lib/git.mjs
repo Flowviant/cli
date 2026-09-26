@@ -250,10 +250,41 @@ export function detectBaseRef(repoRoot) {
     }
   }
   try {
-    return `origin/${git(['rev-parse', '--abbrev-ref', 'HEAD'], repoRoot)}`;
+    return usableBaseRef(repoRoot, `origin/${git(['rev-parse', '--abbrev-ref', 'HEAD'], repoRoot)}`);
   } catch {
     return 'HEAD';
   }
+}
+
+/**
+ * A base ref an agent's worktree can actually be cut from.
+ *
+ * `origin/<branch>` is the right base when the repo HAS an origin. A repo with
+ * no remote (a local-only project — the owner's "Death Note - Roblox",
+ * 2026-09-25) has no `origin/*` refs at all, and cutting a worktree from one
+ * fails; every agent turn then ended "nothing" in a second. So: the ref itself
+ * when it resolves to a commit, else the LOCAL branch of the same name, else
+ * the ref unchanged (and the worktree step says why in git's words).
+ */
+export function usableBaseRef(repoRoot, ref) {
+  const resolves = (r) => {
+    try { git(['rev-parse', '--verify', '--quiet', `${r}^{commit}`], repoRoot); return true; } catch { return false; }
+  };
+  if (resolves(ref)) return ref;
+  const local = String(ref).replace(/^origin\//, '');
+  if (local !== ref && resolves(local)) return local;
+  return ref;
+}
+
+/** True when the repository has at least one commit (HEAD resolves). */
+export function hasCommits(repoRoot) {
+  try { git(['rev-parse', '--verify', '--quiet', 'HEAD^{commit}'], repoRoot); return true; } catch { return false; }
+}
+
+/** The last line git wrote to stderr for a failed call, or its message. */
+export function gitFailure(error) {
+  const stderr = String(error?.stderr ?? '').trim().split('\n').filter(Boolean);
+  return stderr.at(-1) ?? String(error?.message ?? error).split('\n')[0];
 }
 
 /**

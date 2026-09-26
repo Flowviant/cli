@@ -41,19 +41,7 @@ import { projectLabel, safeName, setStoredProjectName } from './credentials.mjs'
 import { credentialRejected } from './authReject.mjs';
 import { handleVersionSignal, cmpVersion } from './update.mjs';
 import { emitMachineEvent, writeDaemonState } from './desktopContract.mjs';
-import {
-  git,
-  gitNetAsync,
-  resetWorktree,
-  repoRootOrDie,
-  detectBaseRef,
-  originSlug,
-  baseBranchName,
-  isValidPrUrl,
-  isValidBranch,
-  isSafePathSegment,
-  excludeInWorktree,
-} from './git.mjs';
+import { git, gitNetAsync, resetWorktree, repoRootOrDie, detectBaseRef, originSlug, baseBranchName, isValidPrUrl, isValidBranch, isSafePathSegment, excludeInWorktree, usableBaseRef } from './git.mjs';
 import { c, info, note, ok, warn, fail } from './ui.mjs';
 import { revertPatch, withPatchLock } from './patch.mjs';
 import {
@@ -2678,7 +2666,7 @@ export async function runFleetDaemon({ afterLock = null } = {}) {
      * thing worse than not offering the choice at all.
      */
     if (typeof roster.baseBranch === 'string' && roster.baseBranch.trim()) {
-      const want = `origin/${baseBranchName(roster.baseBranch.trim())}`;
+      const want = usableBaseRef(repoRoot, `origin/${baseBranchName(roster.baseBranch.trim())}`);
       if (want !== baseRef) {
         note(`base   · ${want} ${c.dim('(set for this project)')}`);
         baseRef = want;

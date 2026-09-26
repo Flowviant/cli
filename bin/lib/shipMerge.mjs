@@ -40,6 +40,34 @@ export function mergeOutward({
       /* not there — fine */
     }
   };
+  const hasOrigin = () => {
+    try { git(['remote', 'get-url', 'origin'], repoRoot); return true; } catch { return false; }
+  };
+  /**
+   * A REPOSITORY WITH NO REMOTE (2026-09-25). There is nowhere to push, so the
+   * merge lands on the local base branch itself. If base is checked out in the
+   * project folder it FAST-FORWARDS there, and only over a tree with no
+   * uncommitted tracked changes (refused in words otherwise: moving a branch
+   * under someone's edits is not a merge anybody approved); if it is not
+   * checked out, the ref moves by compare-and-swap. Either way nothing is
+   * rewritten, and `--no-ff` above kept every receipt's commit.
+   */
+  const landLocally = () => {
+    const base = baseBranchName(baseRef());
+    const merged = String(git(['rev-parse', 'HEAD'], tmpDir)).trim();
+    const before = String(git(['rev-parse', `refs/heads/${base}`], repoRoot)).trim();
+    let current = null;
+    try { current = String(git(['symbolic-ref', '--quiet', '--short', 'HEAD'], repoRoot)).trim(); } catch { /* detached */ }
+    if (current === base) {
+      const dirty = String(git(['status', '--porcelain', '--untracked-files=no'], repoRoot)).trim();
+      if (dirty) {
+        throw new Error(`this repository has no remote, so the merge lands on ${base} in ${repoRoot} itself, and that checkout has uncommitted changes. Commit or stash them, then approve again.`);
+      }
+      git(['merge', '--ff-only', merged], repoRoot);
+    } else {
+      git(['update-ref', `refs/heads/${base}`, merged, before], repoRoot);
+    }
+  };
   const attempt = () => {
     dropTmp();
     git(['worktree', 'add', '--detach', tmpDir, baseRef()], repoRoot);
@@ -47,7 +75,8 @@ export function mergeOutward({
       ['merge', '--no-ff', tip, '-m', `ship(${label}): ${count} commit${count === 1 ? '' : 's'}`],
       tmpDir
     );
-    gitNet(['push', 'origin', `HEAD:${baseBranchName(baseRef())}`], tmpDir, 120_000);
+    if (hasOrigin()) gitNet(['push', 'origin', `HEAD:${baseBranchName(baseRef())}`], tmpDir, 120_000);
+    else landLocally();
   };
   try {
     try {
@@ -132,5 +161,7 @@ export function mergeOutward({
  */
 export function isRaceRejection(e) {
   const d = `${e?.stdout ?? ''}\n${e?.stderr ?? ''}\n${e?.message ?? ''}`;
-  return /non-fast-forward|\[rejected\]|fetch first|stale info/i.test(d);
+  // `but expected` is update-ref's compare-and-swap losing (a repo with no
+  // remote, where the base ref moved between our read and our write).
+  return /non-fast-forward|\[rejected\]|fetch first|stale info|but expected/i.test(d);
 }

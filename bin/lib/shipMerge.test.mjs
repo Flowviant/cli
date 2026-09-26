@@ -218,3 +218,57 @@ test('a ship place that is gone does not stop the merge', () => {
     w.cleanup();
   }
 });
+
+/** A repository with no remote at all: the merge lands on the local base. */
+function localWorld() {
+  const root = mkdtempSync(join(tmpdir(), 'shipmerge-local-'));
+  const mine = join(root, 'mine');
+  G(['init', '-b', 'main', mine], root);
+  writeFileSync(join(mine, 'a.txt'), 'one\n');
+  g(['add', '-A'], mine);
+  g(['commit', '-m', 'base'], mine);
+  return { root, mine, cleanup: () => rmSync(root, { recursive: true, force: true }) };
+}
+const runLocal = (w, over = {}) => run(w, { baseRef: () => 'main', ...over });
+const localLog = (w) => g(['log', 'main', '--format=%s'], w.mine).split('\n').filter(Boolean);
+
+test('with no remote, the merge fast-forwards the checked-out base in the project folder', () => {
+  const w = localWorld();
+  try {
+    const tip = work(w.mine, 'feat', 'b.txt', 'two\n');
+    g(['checkout', 'main'], w.mine);
+    runLocal(w, { tip, branch: 'feat' });
+    assert.ok(localLog(w)[0].startsWith('ship(a tab): 1 commit'), localLog(w).join('|'));
+    assert.equal(existsSync(join(w.mine, 'b.txt')), true, 'the working copy moved with the branch');
+    assert.equal(g(['status', '--porcelain'], w.mine).trim(), '');
+  } finally {
+    w.cleanup();
+  }
+});
+
+test('with no remote, uncommitted work in the checkout is refused in words, and nothing moves', () => {
+  const w = localWorld();
+  try {
+    const tip = work(w.mine, 'feat', 'b.txt', 'two\n');
+    g(['checkout', 'main'], w.mine);
+    writeFileSync(join(w.mine, 'a.txt'), 'edited, not committed\n');
+    const before = g(['rev-parse', 'main'], w.mine).trim();
+    assert.throws(() => runLocal(w, { tip, branch: 'feat' }), /no remote.*uncommitted changes/);
+    assert.equal(g(['rev-parse', 'main'], w.mine).trim(), before);
+  } finally {
+    w.cleanup();
+  }
+});
+
+test('with no remote and base not checked out, the base ref moves and the checkout does not', () => {
+  const w = localWorld();
+  try {
+    const tip = work(w.mine, 'feat', 'b.txt', 'two\n');
+    // Still on `feat`: main is not checked out anywhere.
+    runLocal(w, { tip, branch: 'feat' });
+    assert.ok(localLog(w)[0].startsWith('ship(a tab): 1 commit'));
+    assert.equal(g(['symbolic-ref', '--short', 'HEAD'], w.mine).trim(), 'feat');
+  } finally {
+    w.cleanup();
+  }
+});

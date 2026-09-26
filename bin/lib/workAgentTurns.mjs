@@ -246,7 +246,7 @@ export function createWorkAgentTurns({
     const agentId = String(job.agentId || '');
     const place = String(job.placeId || '');
     if (!isSafePathSegment(place)) {
-      await postAgentTurn({ turnId, outcome: 'nothing' });
+      await postAgentTurn({ turnId, outcome: 'nothing', answer: 'the machine was handed a turn for a place it will not use as a folder name' });
       return;
     }
     /**
@@ -375,9 +375,11 @@ export function createWorkAgentTurns({
       }
       const dir = placeWtFor(place);
       if (!dir) {
-        // No worktree and none could be cut. `nothing` rather than an invented
-        // error: the board says the machine went quiet, which is true.
-        await postAgentTurn({ turnId, outcome: 'nothing' });
+        // No worktree and none could be cut. `nothing`, WITH git's own words:
+        // without them the agent sat in Stuck with no question and no reason
+        // (the owner, 2026-09-25: "it got stuck without saying why").
+        const why = placeWtFor.lastError ?? null;
+        await postAgentTurn({ turnId, outcome: 'nothing', ...(why ? { answer: `This machine could not start the turn: ${why}` } : {}) });
         return;
       }
       const wt = dir.wt;

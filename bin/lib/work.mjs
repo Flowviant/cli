@@ -48,15 +48,7 @@ import {
   DAEMON_INSTANCE,
   MACHINE_HOST,
 } from './config.mjs';
-import {
-  git,
-  gitRaw,
-  gitNet as gitNetIn,
-  gitNetAsync,
-  splitNul,
-  isSafePathSegment,
-  excludeInWorktree,
-} from './git.mjs';
+import { git, gitRaw, gitNet as gitNetIn, gitNetAsync, splitNul, isSafePathSegment, excludeInWorktree, hasCommits, gitFailure } from './git.mjs';
 import {
   publishPushArgs,
   publishFetchArgs,
@@ -1647,7 +1639,12 @@ export function createWorkManager({
         } catch {
           try {
             git(['worktree', 'add', '-b', branch, wt, at], repoRoot);
-          } catch {
+          } catch (e) {
+            // Kept for the caller to SAY: an agent turn that cannot get a
+            // worktree used to end "nothing" with no words at all.
+            placeWtFor.lastError = hasCommits(repoRoot)
+              ? `git could not create the worktree from ${at}: ${gitFailure(e)}`
+              : `the repository ${repoRoot} has no commits yet, so there is nothing to branch from. Make a first commit there, then send the agent any message to try again.`;
             return null;
           }
         }
