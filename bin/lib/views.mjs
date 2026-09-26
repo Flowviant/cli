@@ -194,6 +194,29 @@ export async function runDoctor({ cwd = process.cwd(), fetchImpl = fetch } = {})
     entry ? `Connected to ${projectLabel(entry)}` : 'This repo is not connected to a project',
     'Run `flowviant login` here and approve it in your browser.');
 
+  // EVERY COPY ON THIS BOX, and which one a daemon runs from. An old copy with a
+  // live daemon is the usual reason the app reports a version older than the
+  // one just installed: `uninstall --others` skips a copy a daemon runs from,
+  // and a global npm install that needed sudo cannot update itself.
+  try {
+    const { buildUninstallPlan } = await import('./uninstall.mjs');
+    const plan = await buildUninstallPlan();
+    const copies = plan.copies.filter((copy) => copy.kind !== 'path-line');
+    for (const copy of copies) {
+      const where = copy.kind === 'npm-global' ? 'npm global' : copy.kind === 'npx-cache' ? 'npx cache' : 'binary';
+      const running = copy.runningPid ? `, a daemon runs from it (pid ${copy.runningPid})` : '';
+      const older = copy.version && olderVersion(copy.version, VERSION);
+      const text = `flowviant ${copy.version ?? '(unknown version)'} · ${where} · ${copy.path}${copy.current ? ' (this one)' : ''}${running}`;
+      if (older && copy.runningPid) {
+        add(false, text, `An older daemon is serving. Run \`flowviant stop\`, then \`flowviant uninstall --others\`${copy.kind === 'npm-global' ? ' (if npm refuses, `sudo npm uninstall -g flowviant`)' : ''}, then start flowviant again.`);
+      } else if (older) {
+        add(false, text, `An older copy. Remove it with \`flowviant uninstall --others\`${copy.kind === 'npm-global' ? ' (if npm refuses, `sudo npm uninstall -g flowviant`)' : ''}.`);
+      } else {
+        add(true, text);
+      }
+    }
+  } catch { /* the listing is best-effort */ }
+
   const health = String(FLEET_URL).replace(/\/api\/.*$/, '/health');
   let reach = null;
   try {
