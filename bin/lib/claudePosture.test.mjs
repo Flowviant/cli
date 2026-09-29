@@ -58,6 +58,10 @@ if (mode === 'env') {
   process.env.PATH = `${dir}:${process.env.PATH}`;
 }
 fakeClaude();
+// NOT THE DEVELOPER'S OWN SETTINGS: a fenced turn folds the person's kept
+// Claude settings into its posture's `--settings` (claudePersonal.mjs), so the
+// pins below read an empty config dir, where the posture stands alone.
+process.env.CLAUDE_CONFIG_DIR = mkdtempSync(join(tmpdir(), 'fv-claude-config-'));
 
 const turn = (opts) => runTurn({ prompt: 'p', system: 's', cwd: tmpdir(), streamJson: true, answerFromResult: true, ...opts });
 const argvOf = async (opts) => {

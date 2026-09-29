@@ -19,6 +19,15 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import * as prompts from './prompts.mjs';
 
+/** The text between two anchors, both asserted present first. */
+const slice = (s, from, to) => {
+  const a = s.indexOf(from);
+  assert.ok(a >= 0, `anchor: ${from}`);
+  const b = s.indexOf(to, a);
+  assert.ok(b > a, `anchor after it: ${to}`);
+  return s.slice(a, b);
+};
+
 /** The ```flowviant-ask blocks a contract prints, as the web parser anchors
  *  them (line-start fence, possibly indented in the prompt's own list). */
 const askBlocks = (system) =>
@@ -64,7 +73,7 @@ test('the example the capture chat is shown is itself a valid ask', () => {
 
 test('rule 5 asks only for what shapes the card, and never what the repo answers', () => {
   const s = prompts.SYSTEM_CAPTURE;
-  assert.match(s, /ASK ONLY FOR WHAT SHAPES THE CARD/);
+  assert.match(s, /STAGE FIRST, THEN ASK ONLY FOR WHAT SHAPES THE CARD/);
   for (const subject of ['its KIND', 'its SCOPE', 'JUDGE IT DONE', 'a CONSTRAINT the repository cannot answer']) {
     assert.ok(s.includes(subject), `rule 5 names ${subject}`);
   }
@@ -73,6 +82,60 @@ test('rule 5 asks only for what shapes the card, and never what the repo answers
   assert.match(s, /A clear ask\s+stages without ceremony/);
   // The one-line predecessor is gone, not left beside its replacement.
   assert.ok(!s.includes('CLARIFY BEFORE STAGING'));
+});
+
+/**
+ * STAGE, THEN ASK (2026-09-29). The owner: "it ignored a subsequent ask … but
+ * it worked after i tried again." The follow-up was answered by rule 5 as
+ * written — a question and no card — and a reply that stages nothing reads as
+ * ignored. The order is pinned here: the guess is staged and said FIRST, the
+ * one question follows, the answer moves that row in place.
+ */
+test('a question never stands in for a card: the guess is staged and said first, then asked, then edited in place', () => {
+  const s = prompts.SYSTEM_CAPTURE;
+  const flat = s.replace(/\s+/g, ' ');
+  const rule = slice(s, '5. STAGE FIRST, THEN ASK ONLY FOR WHAT SHAPES THE CARD.', '6. A GOOD CARD');
+  assert.match(rule, /A question never\s+stands in for a card: a message that asks for work ends this turn with\s+that work staged\./);
+  // The order, in the rule's own words: stage, say, ask.
+  const order = ['stage your best guess FIRST', 'say in one line what you guessed', 'THEN ask your'];
+  const at = order.map((p) => rule.replace(/\s+/g, ' ').indexOf(p));
+  assert.ok(at.every((i) => i >= 0), `every step is named: ${at}`);
+  assert.deepEqual([...at].sort((x, y) => x - y), at, 'stage, then say, then ask');
+  // The guess rides the param the server takes; the answer moves the row
+  // through the tool that keeps the person's edits (captureTools.ts).
+  assert.ok(flat.includes('the guessed part named in `assumed` (rule 9)'));
+  assert.ok(flat.includes('change that staged row in place with edit_staged — only the fields the answer moves, and `assumed` as "" once it is settled — never unstage_card and a fresh stage_card.'));
+  // The wait that read as "ignored" is gone.
+  assert.ok(!/then wait for the answer/.test(s));
+  assert.ok(!/Before staging, ask when/.test(s));
+});
+
+test('the chat stays open: a later ask is staged, never answered by reciting the batch', () => {
+  const s = prompts.SYSTEM_CAPTURE;
+  const flat = s.replace(/\s+/g, ' ');
+  assert.ok(
+    flat.includes(
+      '11. THE CHAT STAYS OPEN. Every message is a new ask, however many turns came before it (an answer to your question moves its row instead — rule 5). When they ask for more after a staged batch, stage the new cards; never answer a new ask by restating what is already staged.'
+    )
+  );
+  // It closes the contract: nothing after it.
+  assert.ok(s.trimEnd().endsWith('never\n   answer a new ask by restating what is already staged.'));
+  // Rule 4's dedupe never swallows a new ask, and list_staged is read as this
+  // chat's own rows too — the tool's description says so (captureTools.ts).
+  assert.ok(flat.includes('list_staged (everything waiting to be landed — what you staged earlier in THIS chat included)'));
+  assert.ok(!flat.includes('what earlier chats left'));
+  assert.ok(flat.includes('never take new work for old: an ask for something different gets its own card (rule 11)'));
+});
+
+test('the final reply is always words, and never offers a question in place of a card', () => {
+  const flat = prompts.SYSTEM_CAPTURE.replace(/\s+/g, ' ');
+  assert.ok(
+    flat.includes(
+      'Your FINAL reply is delivered automatically when the turn ends — always end with it, in words, even when it only says what you staged; do not also send it through the tool.'
+    )
+  );
+  assert.ok(!flat.includes('what you need to know'));
+  assert.ok(flat.includes('edit_staged changes a row already staged, in place.'));
 });
 
 test('a guess is SAID through `assumed` on the staging verbs, never buried in the brief', () => {

@@ -174,6 +174,10 @@ function fakeCliOnPath() {
   return join(dir, 'codex-ran');
 }
 const codexRan = fakeCliOnPath();
+// NOT THE DEVELOPER'S OWN SETTINGS: a fenced turn folds the person's kept
+// Claude settings into its posture's `--settings` (claudePersonal.mjs), so the
+// pins below read an empty config dir, where the posture stands alone.
+process.env.CLAUDE_CONFIG_DIR = mkdtempSync(join(tmpdir(), 'fv-claude-config-'));
 
 const argvOf = async (opts) => {
   const out = await runTurn({ prompt: 'p', system: 's', cwd: tmpdir(), streamJson: true, answerFromResult: true, ...opts });

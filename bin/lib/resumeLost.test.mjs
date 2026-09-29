@@ -60,13 +60,31 @@ test('a resumed agent turn whose successful answer mentions a missing session sp
   }
 });
 
-test('a genuinely dead resume retries once fresh; an empty resume too; a fresh turn never', () => {
+test('a genuinely dead resume retries once fresh; an empty resume that found nothing too; a fresh turn never', () => {
   const err = 'No conversation found with session ID: 0f3c2a1b-aaaa-bbbb-cccc-1234567890ab';
   assert.equal(resumeRetriesFresh({ resume: true, out: err, runtime: 'claude', sawInit: false }), true);
-  assert.equal(resumeRetriesFresh({ resume: true, out: '  ', runtime: 'claude', sawInit: true }), true);
+  // Empty with no init measured: the only sign a conversation is gone.
+  assert.equal(resumeRetriesFresh({ resume: true, out: '  ', runtime: 'claude', sawInit: false }), true);
+  assert.equal(resumeRetriesFresh({ resume: true, out: '', runtime: 'claude' }), true);
+  assert.equal(resumeRetriesFresh({ resume: true, out: '', runtime: 'codex' }), true);
+  assert.equal(resumeRetriesFresh({ resume: true, out: '\n', runtime: 'antigravity' }), true);
   assert.equal(resumeRetriesFresh({ resume: true, out: 'thread 0199abc not found', runtime: 'codex' }), true);
   assert.equal(resumeRetriesFresh({ resume: false, out: err, runtime: 'claude', sawInit: false }), false);
   assert.equal(resumeRetriesFresh({ resume: false, out: '', runtime: 'claude', sawInit: false }), false);
+});
+
+/**
+ * AN EMPTY CLAUDE RESUME THAT FOUND ITS CONVERSATION IS AN EMPTY ANSWER
+ * (2026-09-29). Init seen means the conversation was there; running the
+ * message again fresh answered it with no memory of the chat and re-pinned
+ * the tab to the new conversation. It stands, and settles as empty.
+ */
+test('an empty Claude resume that emitted init is not retried fresh', () => {
+  for (const out of ['', '  ', '\n']) {
+    assert.equal(resumeRetriesFresh({ resume: true, out, runtime: 'claude', sawInit: true }), false, JSON.stringify(out));
+  }
+  // Only Claude's init is evidence: a codex caller's `sawInit` changes nothing.
+  assert.equal(resumeRetriesFresh({ resume: true, out: '', runtime: 'codex', sawInit: true }), true);
 });
 
 /**

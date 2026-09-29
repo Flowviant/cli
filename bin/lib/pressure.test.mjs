@@ -450,8 +450,10 @@ test('a deferred SESSION turn is not settled — it is left pending for the next
     'processWorkTurns deferral'
   );
   assert.ok(region.includes('continue;'), 'the deferral must skip the job');
+  // Either name: the lane settles through its own door, `settleTurn`, which
+  // wraps the queue's `settleWorkTurn` (2026-09-29).
   assert.ok(
-    !region.includes('settleWorkTurn'),
+    !/settle(WorkTurn|Turn)\(/.test(region),
     'settling a deferred turn tells the human their message failed over a turn nothing ran'
   );
   // …and it RELAYS, or the tab shows a spinner with no explanation.

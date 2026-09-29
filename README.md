@@ -147,6 +147,15 @@ Two knobs bound the blast radius, and both are worth setting on a shared box:
   its permission engine is machine-wide — which is surfaced in the app rather
   than papered over.
 
+Fenced turns — design, 3D-model, deck and research cards, the pre-review,
+the planner, intake, the wiki and the New task chat — read none of your Claude
+Code settings files: their permissions and hooks are Flowviant's posture
+alone, and of `~/.claude/settings.json` they keep only how Claude signs in
+(`apiKeyHelper`, `env` and the like) and your model defaults. Code agents and
+Terminal tabs still read yours, so your own allow rules and `defaultMode` add
+to `FLOWVIANT_SAFE=1`'s allowlist there. Codex's fenced turns run with
+`--ignore-user-config` the same way.
+
 The posture is reported on every poll and shown in the project's
 Settings → Machine section, so the team can see whether the box runs the
 guarded toolset or full permissions.

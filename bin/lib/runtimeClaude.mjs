@@ -14,6 +14,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { MODEL, USER_AGENT } from './config.mjs';
+import { NO_SETTING_SOURCES, personalClaudeSettings, withPersonalSettings } from './claudePersonal.mjs';
 
 function claudeMcp(token, mcpUrl) {
   const dir = mkdtempSync(join(tmpdir(), 'flowviant-mcp-'));
@@ -72,7 +73,7 @@ export const CLAUDE_RUNTIME = {
    * strongest form of it available anywhere: `--append-system-prompt` sits
    * above the conversation rather than inside it.
    */
-  args({ prompt, system, model, effort, resume, streamJson, perm, profile = 'build', mcp = [], resultSchemaArgs = [], adoptResumeId, resumeThreadId, knowledgeDir, agentTools }) {
+  args({ prompt, system, model, effort, resume, streamJson, perm, profile = 'build', mcp = [], resultSchemaArgs = [], adoptResumeId, resumeThreadId, knowledgeDir, agentTools, personalSettings }) {
     const a = [];
     // THREE ANSWERS TO ONE QUESTION — "what conversation is this?" — and they
     // are mutually exclusive, never combined.
@@ -99,11 +100,38 @@ export const CLAUDE_RUNTIME = {
     else if (resumeThreadId) a.push('--resume', resumeThreadId);
     else if (resume) a.push('--continue');
     a.push('-p', prompt, '--append-system-prompt', system);
+    /**
+     * WHOSE SETTINGS A TURN READS (2026-09-29, claudePersonal.mjs).
+     *
+     * EVERY FENCED POSTURE READS NONE — every profile but `build`: an agent's
+     * design and research cards, the pre-review, the planner, intake, the
+     * wiki and the capture chat. Its permissions and hooks are its posture's
+     * alone; of the person's file it keeps only the login and the model
+     * defaults, folded into the posture's `--settings`. Keyed on `build`
+     * rather than on a list of fenced names, so a posture added later is
+     * fenced unless it is the build.
+     *
+     * THE BUILD POSTURE KEEPS THE PERSON'S OWN, on a code agent and on a
+     * Terminal tab alike. `--dangerously-skip-permissions` already admits
+     * everything, so no personal rule can widen it; what a personal file adds
+     * there is the operator narrowing their own box (a deny rule held a
+     * bypass turn, measured) and their own CLAUDE.md, skills and subagents,
+     * which an empty source list would take away with no flag to keep them.
+     * Codex's build is not hermetic either, for the same reason
+     * (runtimeCodex.mjs). STATED, not closed: under FLOWVIANT_SAFE=1 the
+     * build is a curated list, and the operator's own allow rules or
+     * `defaultMode` can still widen it — two choices of the same operator on
+     * their own box, and a personal allow is the only way a SAFE build runs a
+     * tool its list does not name (`pnpm`, `cargo`, `make`). A code agent names `user` so the agent-editable
+     * worktree's settings and hooks never load; a Terminal tab names nothing
+     * and is the person's Claude Code, project files included. A resumed
+     * agent renders the CURRENT base snapshot, not the first turn's cache.
+     */
+    const fenced = profile !== 'build';
+    if (fenced) a.push(...NO_SETTING_SOURCES);
+    else if (agentTools) a.push('--setting-sources', 'user');
     if (agentTools) {
-      // Keep personal settings, but never load the agent-editable project's
-      // settings, hooks, skills or CLAUDE.md discovery. A resumed agent must
-      // render the CURRENT base snapshot, not the first turn's prompt cache.
-      a.push('--setting-sources', 'user', '--system-prompt-snapshot', 'off');
+      a.push('--system-prompt-snapshot', 'off');
       if (agentTools.pluginDir) a.push('--plugin-dir', agentTools.pluginDir);
     }
     // These fenced postures have no project MCP, even if Claude discovers a
@@ -119,7 +147,9 @@ export const CLAUDE_RUNTIME = {
     // does not refuse the path the prompt just handed it. Before `perm`,
     // because `--allowedTools` is variadic and would swallow the flag.
     if (knowledgeDir) a.push('--add-dir', knowledgeDir);
-    a.push(...perm);
+    // `personalSettings` is the caller's copy when it has one (a test); a
+    // turn reads the person's file here, at spawn, as the CLI would.
+    a.push(...(fenced ? withPersonalSettings(perm, personalSettings ?? personalClaudeSettings()) : perm));
     return a;
   },
   parse: null, // claudeStream.mjs owns its own stream parser (unchanged)

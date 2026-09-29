@@ -28,6 +28,10 @@ const resumed = argv.includes('--continue') || argv.includes('--resume');
 if (process.env.FV_FAKE_MODE === 'dead' && resumed) {
   // A dead --continue: Claude fails before a conversation exists — no init.
   say({ type: 'result', subtype: 'error_during_execution', is_error: true, errors: ['No conversation found with session ID: abc'] });
+} else if (process.env.FV_FAKE_MODE === 'empty' && resumed) {
+  // The conversation WAS found (init), and the result held no words.
+  say({ type: 'system', subtype: 'init', session_id: 'sess-1', skills: [] });
+  say({ type: 'result', subtype: 'success', result: '' });
 } else {
   say({ type: 'system', subtype: 'init', session_id: 'sess-1', skills: [] });
   say({ type: 'result', subtype: 'success', result: resumed
@@ -72,6 +76,24 @@ test('a genuinely dead resume retries once, fresh', async () => {
   assert.ok(!runs[1].includes('--continue') && !runs[1].includes('--resume'), 'the retry is a fresh conversation');
   assert.equal(fresh, 1);
   assert.match(out, /fresh answer/);
+});
+
+/**
+ * THE AGENT LANE TOO (2026-09-29): an empty resume whose Claude emitted init
+ * found the agent's conversation, so it is NOT run again fresh — that run
+ * would work the card with no memory of the ones before it, on top of
+ * whatever the first run already did. The empty turn settles `nothing`
+ * (workAgentTurnOutcome.mjs) and the conversation stays for the next turn.
+ */
+test('an empty resume that found its conversation spawns once', async () => {
+  rmSync(spawns, { force: true });
+  process.env.FV_FAKE_MODE = 'empty';
+  let fresh = 0;
+  const out = await runTurnResumingOnce(runTurn, args(), { resume: true, runtime: 'claude', beforeFresh: () => fresh++ });
+  assert.equal(spawned().length, 1, 'one CLI run');
+  assert.ok(spawned()[0].includes('--continue'), 'canary: it was a resume');
+  assert.equal(String(out).trim(), '');
+  assert.equal(fresh, 0);
 });
 
 test('a fresh turn is never retried, whatever it says', async () => {

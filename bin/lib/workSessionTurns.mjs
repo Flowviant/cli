@@ -59,6 +59,14 @@ import { createCommandAudit } from './workCommandAudit.mjs';
 export const PLAN_TURN_SENTENCE =
   'THIS IS A PLANNING TURN: the person switched this tab to plan mode, so read what you need, decide, and answer with the plan itself as your reply — change nothing (the CLI refuses every write this turn, whatever the mechanics above say about editing, committing or artifacts), and do not try to leave plan mode; they switch it off in the tab when they want the plan carried out.';
 
+/**
+ * HOW LONG, AND HOW MANY, SETTLED TURNS THE LANE REMEMBERS (2026-09-29) — see
+ * `settledHere` below. Ten minutes is far past any roster a poll could still
+ * be holding; the cap keeps a box that answers all day from growing the map.
+ */
+export const SETTLED_HERE_TTL_MS = 10 * 60 * 1000;
+export const SETTLED_HERE_MAX = 500;
+
 export function createWorkSessionTurns({
   repoRoot,
   baseDir,
@@ -91,14 +99,67 @@ export function createWorkSessionTurns({
   // The real CLI driver; injectable only so the lane can be driven in a test
   // without spending a model turn (the wiki runner's shape).
   runTurn = defaultRunTurn,
+  // The clock `settledHere` ages by; injectable only for its bound's test.
+  now = Date.now,
 }) {
   const workAnswering = new Set(); // turn ids currently queued/running here
   const MAX_WORK_TRIES = 3;
+
+  /**
+   * A TURN THIS LANE SETTLED IS NEVER RUN AGAIN (2026-09-29).
+   *
+   * A delivered settle forgets the turn everywhere: the report queue drops it
+   * from `pendingWorkReports` and `workAttempts`, and the turn's `finally`
+   * drops it from `workAnswering`. A roster READ made before that settle
+   * landed still offers it — the poll was in flight while the POST went out —
+   * and nothing was left to say it had run: the turn ran twice, settled
+   * twice, the rerun's reply overwrote the first, and the person's follow-up
+   * waited behind a turn nobody asked for. So every settle this lane makes
+   * goes through `settleTurn`, which remembers the turn id, and a job in the
+   * map is skipped where jobs are picked. Remembered BEFORE the POST: a
+   * settle still in flight is covered by `workAnswering`, one that could not
+   * be delivered by `pendingWorkReports`, and this covers the one that was.
+   */
+  const settledHere = new Map(); // turnId -> when this lane settled it, oldest first
+  const forgetStale = (at) => {
+    for (const [id, when] of settledHere) {
+      if (settledHere.size <= SETTLED_HERE_MAX && at - when < SETTLED_HERE_TTL_MS) break;
+      settledHere.delete(id);
+    }
+  };
+  const settledRecently = (turnId) => {
+    forgetStale(now());
+    return settledHere.has(turnId);
+  };
+  const settleTurn = (turnId, payload) => {
+    const at = now();
+    settledHere.delete(turnId); // re-inserted at the end: the map stays in time order
+    settledHere.set(turnId, at);
+    forgetStale(at);
+    return settleWorkTurn(turnId, payload);
+  };
+
+  /**
+   * A PLACE A TURN OF THIS PROCESS IS STARTING IN (2026-09-29) — the turn
+   * lock's in-process half, keyed by the lock's own path.
+   *
+   * `flowviant-turn.lock` is written at SPAWN, several awaits after it is
+   * read (a credential mint, the attachment fetch), so two turns of one
+   * session offered in one roster both read "unlocked" and both spawned: two
+   * CLIs resuming one conversation at once, the incoherence the lock exists
+   * to prevent. The claim is checked and taken synchronously beside the file
+   * check, so the second turn waits for a later poll like any locked one,
+   * and it is released in the turn's outer `finally`, after its settle.
+   */
+  const startingIn = new Set();
 
   const processWorkTurns = (jobs) => {
     for (const job of jobs ?? []) {
       if (!job || typeof job.id !== 'string' || !job.body || !job.sessionId) continue;
       if (workAnswering.has(job.id)) continue;
+      // Settled by this lane already: a roster read from before the settle
+      // landed. See `settledHere`.
+      if (settledRecently(job.id)) continue;
       // The turn already RAN and its answer sits in the delivery queue — never
       // run it again while the report is merely undelivered.
       if (pendingWorkReports.has(job.id)) continue;
@@ -140,7 +201,7 @@ export function createWorkSessionTurns({
        * tab for the server's whole expiry window.
        */
       if (place !== REPO_PLACE && !isSafePathSegment(place)) {
-        void settleWorkTurn(job.id, {
+        void settleTurn(job.id, {
           ok: false,
           answer:
             'the server named a working directory this machine refuses to use — close and reopen the tab, then send the message again',
@@ -178,12 +239,15 @@ export function createWorkSessionTurns({
          *  out here beside `usage`, and spread wherever it is. Last write wins
          *  across a fresh retry: that spawn is the one that answered. */
         let model = null;
+        /** The `startingIn` key this turn claimed — released in the outer
+         *  `finally`, and only by the turn that took it. */
+        let startClaim = null;
         try {
           const tries = workAttempts.get(job.id) ?? 0;
           if (tries >= MAX_WORK_TRIES) {
             // Out of local tries: SETTLE, don't skip — a silently skipped turn
             // strands the tab for the server's whole 24h expiry window.
-            await settleWorkTurn(job.id, {
+            await settleTurn(job.id, {
               ok: false,
               answer: `the turn failed ${tries} times on this machine — check the daemon log, then send the message again`,
             });
@@ -209,7 +273,7 @@ export function createWorkSessionTurns({
               typeof job.adopt.id !== 'string' ||
               !/^[0-9a-f][0-9a-f-]{6,62}$/i.test(job.adopt.id)
             ) {
-              await settleWorkTurn(job.id, {
+              await settleTurn(job.id, {
                 ok: false,
                 answer: 'that terminal session id is not one this machine can resume',
               });
@@ -223,7 +287,7 @@ export function createWorkSessionTurns({
               srcCwd = null;
             }
             if (!srcCwd) {
-              await settleWorkTurn(job.id, {
+              await settleTurn(job.id, {
                 ok: false,
                 answer: "the terminal session's directory no longer exists on the machine",
               });
@@ -247,14 +311,14 @@ export function createWorkSessionTurns({
               /* keep the literal path */
             }
             if (!under(srcCwd, realRoot)) {
-              await settleWorkTurn(job.id, {
+              await settleTurn(job.id, {
                 ok: false,
                 answer: "the terminal session's directory is outside this project's repository",
               });
               return;
             }
             if (under(srcCwd, realBase)) {
-              await settleWorkTurn(job.id, {
+              await settleTurn(job.id, {
                 ok: false,
                 answer:
                   "that directory is one of the daemon's own worktrees — its session is already a tab, not something to adopt",
@@ -264,7 +328,7 @@ export function createWorkSessionTurns({
             try {
               srcHead = git(['rev-parse', 'HEAD'], srcCwd);
             } catch {
-              await settleWorkTurn(job.id, {
+              await settleTurn(job.id, {
                 ok: false,
                 answer:
                   "the terminal session's directory is not a usable git checkout (no HEAD to branch from)",
@@ -281,7 +345,7 @@ export function createWorkSessionTurns({
                 ? isAgyConversationLive(job.adopt.id)
                 : isTerminalSessionLive(job.adopt.id);
             if (adoptLive) {
-              await settleWorkTurn(job.id, {
+              await settleTurn(job.id, {
                 ok: false,
                 answer:
                   'That terminal session is still open on the machine — close it there first, then adopt.',
@@ -297,7 +361,7 @@ export function createWorkSessionTurns({
           // the session's own id, which is what every tab has always done.
           const dir = placeWtFor(place, adopting ? srcHead : undefined);
           if (!dir) {
-            await settleWorkTurn(job.id, {
+            await settleTurn(job.id, {
               ok: false,
               answer:
                 'the session worktree could not be opened on the machine — check the daemon log',
@@ -308,13 +372,20 @@ export function createWorkSessionTurns({
           // life, most likely; the lock outlives a restart. Leave the job
           // pending and look again next poll; spawning a second CLI would put
           // two Claudes in one held context. Costs no attempt: nothing ran.
+          // …AND ONE OF OURS MAY BE ABOUT TO: `startingIn`, checked and
+          // claimed with no await between, because the file is only written
+          // at spawn. Keyed by the lock's path (the directory, when the git
+          // dir cannot be named) — the file lock's own scope.
           const lockPath = sessionMetaPath(dir.wt, 'flowviant-turn.lock');
-          if (turnLockedByLivePid(lockPath)) {
+          const startKey = lockPath || dir.wt;
+          if (startingIn.has(startKey) || turnLockedByLivePid(lockPath)) {
             warn(
               `a turn is already running in "${job.sessionName || job.sessionId}" — waiting for it to finish`
             );
             return;
           }
+          startingIn.add(startKey);
+          startClaim = startKey;
           // WHICH BRAIN the roster says this tab speaks (null/absent = Claude,
           // which is what every tab ran on until now) — honored by
           // sessionRuntime: on a first turn a named runtime IS the pick, and a
@@ -327,14 +398,14 @@ export function createWorkSessionTurns({
           if (rt.mismatch) {
             // Something upstream changed this tab's identity mid-life. A held
             // context must never be answered by a different brain — say so.
-            await settleWorkTurn(job.id, {
+            await settleTurn(job.id, {
               ok: false,
               answer: `this tab is pinned to ${rt.mismatch.pin} but the server says it is a ${rt.mismatch.runtime} tab — reopen a new tab`,
             });
             return;
           }
           if (rt.missing) {
-            await settleWorkTurn(job.id, {
+            await settleTurn(job.id, {
               ok: false,
               answer: `this session runs on ${rt.missing}, which is no longer installed on the machine — reinstall it, or open a new tab`,
             });
@@ -346,14 +417,14 @@ export function createWorkSessionTurns({
             // tab can run on (Antigravity has no MCP config, and the session's
             // whole control plane rides one). An honest sentence beats the
             // mcpFor throw this used to crash into every turn.
-            await settleWorkTurn(job.id, {
+            await settleTurn(job.id, {
               ok: false,
               answer: `this session runs on ${rt.unsupported}, which cannot drive a Terminal tab on this machine — open a new tab`,
             });
             return;
           }
           if (!rt.id) {
-            await settleWorkTurn(job.id, {
+            await settleTurn(job.id, {
               ok: false,
               answer:
                 'No coding CLI is installed on the machine — install Claude Code (or another supported CLI), then send the message again',
@@ -366,7 +437,7 @@ export function createWorkSessionTurns({
             // (--conversation). Codex has no adoptable store yet, and its
             // args builder backstops this with a loud throw — but a sentence
             // here beats a stack there.
-            await settleWorkTurn(job.id, {
+            await settleTurn(job.id, {
               ok: false,
               answer:
                 'adopting this terminal session needs its own CLI on the machine — install it, then try again',
@@ -383,7 +454,7 @@ export function createWorkSessionTurns({
            */
           const planTurn = job.planMode === true && job.capture !== true;
           if (planTurn && rt.id !== 'claude') {
-            await settleWorkTurn(job.id, {
+            await settleTurn(job.id, {
               ok: false,
               answer: `plan mode runs on Claude Code only, and this tab is ${rt.id} — turn plan off in the tab, then send the message again`,
             });
@@ -409,7 +480,7 @@ export function createWorkSessionTurns({
               return;
             }
             if (mint?.gone) {
-              await settleWorkTurn(job.id, {
+              await settleTurn(job.id, {
                 ok: false,
                 answer:
                   'Flowviant no longer offers this session to this machine — the tab may have been closed or moved',
@@ -417,7 +488,7 @@ export function createWorkSessionTurns({
               return;
             }
             if (!mint?.token) {
-              await settleWorkTurn(job.id, {
+              await settleTurn(job.id, {
                 ok: false,
                 answer:
                   'the machine could not mint a session credential from Flowviant — check its connection, then send the message again',
@@ -765,6 +836,11 @@ export function createWorkSessionTurns({
              * that tab replied identically, with nothing on any surface able
              * to clear it. A tab bricked forever by its own CLI pruning its
              * history, which it does on its own schedule.
+             *
+             * An EMPTY Claude resume that emitted init is not retried
+             * (2026-09-29, resumeLost.mjs): its conversation was found, and a
+             * fresh run would answer with no memory of the chat and re-pin the
+             * tab to that new conversation.
              */
             if (
               !adopting &&
@@ -831,7 +907,7 @@ export function createWorkSessionTurns({
             // transcript is most likely gone (cleaned, expired, deleted). Say
             // exactly that; no sessionRef is recorded, so the server keeps
             // offering the adoption and a retry after the user checks is cheap.
-            await settleWorkTurn(job.id, {
+            await settleTurn(job.id, {
               ok: false,
               answer: "Couldn't resume the terminal session — it may have been removed.",
               // Whatever it DID before coming back empty is exactly the
@@ -862,13 +938,24 @@ export function createWorkSessionTurns({
               }
             }
           }
-          await settleWorkTurn(job.id, {
+          /**
+           * NO WORDS, SAID AS MEASURED (2026-09-29). Claude's init event means
+           * it ran in this conversation — kept, and resumed by the next
+           * message, since an empty resume that found it no longer runs fresh
+           * (resumeLost.mjs) — and its result held no words. "Signed out" is
+           * a guess, left to the case where no init came.
+           */
+          const noWords =
+            rt.id === 'claude' && seenClaudeSession
+              ? 'Claude Code ran in this conversation and returned no words — send the message again'
+              : 'the turn produced no output on the machine — its CLI may be signed out; try again';
+          await settleTurn(job.id, {
             ok: answer.length > 0,
             answer:
               answer.length > 0
                 ? // Scrub: a reply can quote config or env-adjacent code.
                   envScrub(answer).slice(0, 16000)
-                : 'the turn produced no output on the machine — its CLI may be signed out; try again',
+                : noWords,
             // Only a turn that actually SPOKE proves a conversation lives
             // here. Recording the path unconditionally is how a crashed first
             // turn used to brick resume for the session's whole life.
@@ -883,7 +970,7 @@ export function createWorkSessionTurns({
           if (answer.length > 0) ok(`${c.cyan('tab')} ${c.dim('— replied in the session')}`);
           else warn('session turn produced no output — settled as failed');
         } catch (e) {
-          await settleWorkTurn(job.id, {
+          await settleTurn(job.id, {
             ok: false,
             // Scrub, like every string that leaves this machine: an exception
             // routinely quotes command output, and command output can quote a
@@ -899,6 +986,7 @@ export function createWorkSessionTurns({
           warn(`session turn failed: ${e?.message ?? e}`);
         } finally {
           workAnswering.delete(job.id);
+          if (startClaim) startingIn.delete(startClaim);
           // Nothing spawned, or everything already has: releasing twice is the
           // normal case and costs nothing. A reservation that leaked would
           // shrink this machine's ceiling for the life of the process.
@@ -928,5 +1016,5 @@ export function createWorkSessionTurns({
     }
   };
 
-  return { processWorkTurns, workAnswering };
+  return { processWorkTurns, workAnswering, settledHere };
 }

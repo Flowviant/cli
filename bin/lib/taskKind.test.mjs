@@ -55,7 +55,7 @@ test('…but a turn is never SPAWNED on a kind this daemon does not know (2026-0
   assert.equal(kinds.unknownAgentTaskKind('z'.repeat(99)).length, 40);
 });
 
-test('the capture chat reads a kind off the words, and asks when two fit', () => {
+test('the capture chat reads a kind off the words, and when two fit stages the likelier and asks', () => {
   const s = prompts.SYSTEM_CAPTURE;
   assert.match(s, /EVERY CARD HAS A KIND/);
   // The param the staging verbs actually take.
@@ -79,10 +79,14 @@ test('the capture chat reads a kind off the words, and asks when two fit', () =>
   assert.match(rule, /"An illustration", "a hero image", "a photo of", "artwork for"/);
   assert.match(rule, /if stage_card refuses the kind, say so\s+rather than staging another kind in its place\./);
   assert.match(rule, /"research": a write-up[\s\S]*?"Find out", "research", "compare"/);
-  // Two products that fit are a QUESTION, in chips, one option per product.
-  assert.match(rule, /When the words fit two products, ASK before staging — rule 5 — in chips, one\s+option per product that fits, its description its consequence\./);
+  // Two products that fit are a STAGED GUESS, said, then a QUESTION in chips,
+  // one option per product; the answer re-files the row in place
+  // (2026-09-29: a question never stands in for a card — see rule 5).
+  assert.match(rule, /When the words fit two products, STAGE the likelier one, the guess named\s+in `assumed`/);
+  assert.match(rule, /then ask —\s+rule 5 — in chips, one option per product that fits, its description its\s+consequence; the answer re-files the row with edit_staged\./);
   assert.match(rule, /"make a chair for the scene" fits code\s+\(commit the asset\) and model/);
-  assert.match(rule, /Never stage a\s+guessed kind/);
+  assert.match(rule, /Never stage a\s+guessed kind without saying it is a guess\./);
+  assert.ok(!/ASK before staging/.test(s), 'the ask-first order is gone, not left beside its replacement');
   // Rule 5 names the kind as what the card hands back; rule 10 every kept product.
   assert.match(s, /- its KIND — what it hands back — when the words could mean more than one\s+product \(rule 7\);/);
   assert.match(s, /a kept mockup, 3D model,\s+image, deck or write-up/);

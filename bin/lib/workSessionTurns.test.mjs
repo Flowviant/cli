@@ -1,10 +1,16 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createWorkSessionTurns, PLAN_TURN_SENTENCE } from './workSessionTurns.mjs';
+import {
+  createWorkSessionTurns,
+  PLAN_TURN_SENTENCE,
+  SETTLED_HERE_MAX,
+  SETTLED_HERE_TTL_MS,
+} from './workSessionTurns.mjs';
 import { CODEX_RUNTIME } from './runtimeCodex.mjs';
+import { createPlaceLock } from './placeLock.mjs';
 
 /**
  * A WORKBENCH TAB'S TURN, driven directly (split out of work.mjs 2026-09-26,
@@ -267,4 +273,153 @@ test('a tab turn carries the model its CLI named, and none when it named none', 
   silent.processWorkTurns([{ id: 't3', body: 'hi', sessionId: 's3' }]);
   await silent.settle();
   assert.equal('model' in silent.settled[0], false);
+});
+
+/**
+ * A TURN THIS LANE SETTLED IS NEVER RUN AGAIN (2026-09-29). A delivered
+ * settle drops the turn from the report queue and from `workAnswering`, so a
+ * roster read made before the settle landed offered it once more and it ran
+ * a second time — two runs, two settles, the second reply over the first.
+ */
+test('a stale roster offering a turn this lane already settled does not spawn it again', async () => {
+  let spawns = 0;
+  const l = spendingLane(async () => {
+    spawns += 1;
+    return 'the reply';
+  });
+  const job = { id: 't1', body: 'hi', sessionId: 's1' };
+  l.processWorkTurns([job]);
+  await l.settle();
+  assert.equal(spawns, 1, 'canary: the turn ran');
+  assert.equal(l.settled.length, 1);
+  assert.equal(l.workAnswering.size, 0, 'canary: the lane let go of it');
+  // The roster a poll fetched before that settle reached the server.
+  l.processWorkTurns([job]);
+  await l.settle();
+  assert.equal(spawns, 1, 'no second run');
+  assert.equal(l.settled.length, 1, 'no second settle');
+});
+
+test('a turn settled by a refusal is remembered too, and the memory is bounded', async () => {
+  let t = 1_000_000;
+  // No worktree: every turn settles "could not be opened" without a spawn.
+  const l = lane({ now: () => t });
+  const job = { id: 'old', body: 'hi', sessionId: 's1' };
+  l.processWorkTurns([job]);
+  l.processWorkTurns([job]);
+  await l.settle();
+  assert.equal(l.settled.length, 1, 'the refusal settles once');
+  // Past the bound nothing holds it — no roster is ten minutes stale.
+  t += SETTLED_HERE_TTL_MS;
+  l.processWorkTurns([job]);
+  await l.settle();
+  assert.equal(l.settled.length, 2);
+  // And a busy box never grows the map past its cap: the oldest go first.
+  const many = Array.from({ length: SETTLED_HERE_MAX + 20 }, (_, i) => ({ id: `t${i}`, body: 'hi', sessionId: `s${i}` }));
+  l.processWorkTurns(many);
+  await l.settle();
+  assert.equal(l.settledHere.size, SETTLED_HERE_MAX);
+  assert.ok(!l.settledHere.has('old') && !l.settledHere.has('t0'));
+  assert.ok(l.settledHere.has(`t${SETTLED_HERE_MAX + 19}`));
+});
+
+/**
+ * TWO TURNS OF ONE SESSION, ONE ROSTER (2026-09-29). The turn lock is a file
+ * written at SPAWN, several awaits after it is read, so both turns read it
+ * unlocked and both resumed the one conversation at once. The real place lock
+ * runs here (turns are readers — it lets both through, by design); the fake
+ * CLI writes the lock file at spawn as the real one does.
+ */
+test('two turns of one session offered together: one runs, the other waits for the next poll', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'fv-session-start-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const { inPlace } = createPlaceLock();
+  const inFlight = [];
+  const ran = [];
+  let release;
+  const held = new Promise((r) => {
+    release = r;
+  });
+  const l = lane({
+    inPlace: (place, write, fn) => void inFlight.push(inPlace(place, write, fn)),
+    placeWtFor: () => ({ wt: '/tmp/fv-session-wt', fresh: false }),
+    sessionMetaPath: (_wt, name, scope) => join(dir, scope ? `${name}-${scope}` : name),
+    sessionRuntime: () => ({ id: 'claude' }),
+    mintWorkToken: async () => ({ token: 'tok' }),
+    runTurn: async (opts) => {
+      ran.push(opts.prompt.includes('first') ? 'first' : 'second');
+      opts.onSpawn({ pid: process.pid });
+      await held;
+      return 'a reply';
+    },
+  });
+  const drain = async () => {
+    await Promise.allSettled(inFlight.splice(0));
+    await new Promise((r) => setTimeout(r, 5));
+  };
+  l.processWorkTurns([
+    { id: 't1', body: 'the first message', sessionId: 's1' },
+    { id: 't2', body: 'the second message', sessionId: 's1' },
+  ]);
+  await new Promise((r) => setTimeout(r, 20));
+  assert.deepEqual(ran, ['first'], 'one CLI in the conversation');
+  release();
+  await drain();
+  assert.deepEqual(l.settled.map((x) => x.turnId), ['t1'], 'the waiting turn is not settled');
+  assert.equal(l.deps.workAttempts.has('t2'), false, 'and consumed no attempt');
+  assert.equal(l.workAnswering.size, 0);
+  assert.equal(existsSync(join(dir, 'flowviant-turn.lock')), false, 'canary: the file lock was taken and released');
+  // The next poll offers it again, and now it runs.
+  l.processWorkTurns([{ id: 't2', body: 'the second message', sessionId: 's1' }]);
+  await drain();
+  assert.deepEqual(ran, ['first', 'second']);
+  assert.deepEqual(l.settled.map((x) => x.turnId), ['t1', 't2']);
+});
+
+/**
+ * AN EMPTY RESUME THAT FOUND ITS CONVERSATION (2026-09-29). Claude emitted
+ * init — the chat was there — and returned no words; the lane used to run the
+ * message again fresh, answered by a Claude with no memory of the chat, and
+ * re-pinned the tab to that new conversation. Now the empty answer stands,
+ * in words that say what was measured, and the tab keeps its conversation.
+ */
+test('an empty resume whose Claude found the conversation is not re-run fresh, and says what was measured', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'fv-session-empty-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const marker = join(dir, 'flowviant-claude-session-s1');
+  writeFileSync(marker, 'conv-original-0001');
+  const calls = [];
+  const l = lane({
+    placeWtFor: () => ({ wt: '/tmp/fv-session-wt', fresh: false }),
+    sessionMetaPath: (_wt, name, scope) => join(dir, scope ? `${name}-${scope}` : name),
+    sessionRuntime: () => ({ id: 'claude' }),
+    mintWorkToken: async () => ({ token: 'tok' }),
+    runTurn: async (opts) => {
+      calls.push({ resume: opts.resume, id: opts.resumeThreadId ?? null });
+      opts.onInit({ sessionId: opts.resume ? 'conv-original-0001' : 'conv-fresh-0002' });
+      return opts.resume ? '' : 'an answer from a Claude with no memory of the chat';
+    },
+  });
+  l.processWorkTurns([{ id: 't1', body: 'and a phone button too', sessionId: 's1' }]);
+  await l.settle();
+  assert.deepEqual(calls, [{ resume: true, id: 'conv-original-0001' }], 'one run: the resume');
+  assert.equal(l.settled.length, 1);
+  assert.equal(l.settled[0].ok, false);
+  assert.equal(
+    l.settled[0].answer,
+    'Claude Code ran in this conversation and returned no words — send the message again'
+  );
+  assert.equal(readFileSync(marker, 'utf8'), 'conv-original-0001', 'the tab stays pinned to its conversation');
+});
+
+test('an empty turn with no init keeps the old sentence and its fresh retry', async () => {
+  const calls = [];
+  const l = spendingLane(async (opts) => {
+    calls.push(opts.resume);
+    return '';
+  });
+  l.processWorkTurns([{ id: 't1', body: 'hi', sessionId: 's1', sessionRef: '/tmp/fv-session-wt' }]);
+  await l.settle();
+  assert.deepEqual(calls, [true, false], 'no init measured: empty still means the conversation may be gone');
+  assert.equal(l.settled[0].answer, 'the turn produced no output on the machine — its CLI may be signed out; try again');
 });

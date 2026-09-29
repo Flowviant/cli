@@ -80,7 +80,9 @@ test('the tab lane: claude-only refusal in words, plain (no MCP), the sentence a
   const lane = slice(w, 'const planTurn = job.planMode === true', 'streamJson: true,\n              answerFromResult: true,');
   // Canary: this is the tab lane.
   assert.match(lane, /const plainTab = rt\.id === 'antigravity';/);
-  assert.match(lane, /if \(planTurn && rt\.id !== 'claude'\) \{\s*await settleWorkTurn\(job\.id, \{\s*ok: false,/);
+  // Through the lane's own settle door (`settleTurn`, 2026-09-29), which
+  // remembers the turn so a stale roster cannot run it again.
+  assert.match(lane, /if \(planTurn && rt\.id !== 'claude'\) \{\s*await settleTurn\(job\.id, \{\s*ok: false,/);
   assert.match(lane, /plainTab \|\| planTurn\s*\?\s*\{ args: \[\], env: null, dir: null \}/);
   assert.match(lane, /prompt: plainTab \|\| planTurn\s*\?\s*WORK_TURN_KICKOFF_PLAIN/);
   assert.ok(lane.includes("profile: captureTab ? 'plan' : planTurn ? 'plan-mode' : 'build',"));

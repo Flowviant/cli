@@ -78,9 +78,23 @@ export const resumeConversationLost = (text, { runtime, sawInit } = {}) => {
  * is gone. `sawInit` is whether THIS spawn's CLI emitted `system.init` (only
  * Claude's does, and only Claude's is read). A fresh turn is never retried:
  * `resume` false answers false whatever the text says.
+ *
+ * …AND AN EMPTY CLAUDE RESUME THAT FOUND ITS CONVERSATION IS AN EMPTY ANSWER,
+ * NOT A LOST CONVERSATION (2026-09-29). Empty used to retry fresh whatever the
+ * evidence, so a Claude that emitted init — the conversation WAS there — and
+ * then said nothing had the message answered again by a Claude with no memory
+ * of the chat, and that fresh conversation's id re-pinned the tab: the
+ * follow-up read as if the chat had never happened, and so did every one
+ * after it. With init seen, the empty answer stands and settles as what it
+ * is, the conversation kept for the next message. Unmeasured init (`sawInit`
+ * not true) and the other CLIs keep the old reading: empty is the only sign
+ * they give of a conversation that is gone.
  */
-export const resumeRetriesFresh = ({ resume, out, runtime, sawInit }) =>
-  Boolean(resume) && (!String(out || '').trim() || resumeConversationLost(out, { runtime, sawInit }));
+export const resumeRetriesFresh = ({ resume, out, runtime, sawInit }) => {
+  if (!resume) return false;
+  if (!String(out || '').trim()) return !(runtime === 'claude' && sawInit === true);
+  return resumeConversationLost(out, { runtime, sawInit });
+};
 
 /**
  * ONE SPAWN, AND AT MOST ONE FRESH RETRY — the agent lane's whole sequence,
