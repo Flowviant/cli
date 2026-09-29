@@ -1,0 +1,680 @@
+/**
+ * What is LISTENING inside a session's worktree.
+ *
+ * The Workbench preview never starts an app. The driver runs their own dev
+ * server in their own tab, exactly as they would in a terminal, and this file
+ * is how the machine NOTICES — a browser has no `ss -ltnp` to run, so the
+ * daemon runs it. That direction is the whole design: a control that can only
+ * exist once the machine has measured the thing it acts on cannot invent a
+ * state, cannot guess a port, and cannot time out waiting for a cold start.
+ *
+ * A listener is attributed to a session by the CWD OF THE PROCESS HOLDING THE
+ * SOCKET, never by the port number. Ports are global to the box; a worktree is
+ * not. Without that attribution `share_preview(5432)` tunnels Postgres and
+ * `share_preview(<a teammate's port>)` publishes somebody else's worktree — so
+ * this measurement is a security control, not a convenience, and it is why the
+ * MCP tool must not ship before it.
+ *
+ * Deliberately NOT a probe: nothing here connects to the port, sends bytes, or
+ * asks what is on the other end. It reads the kernel's own socket table. A
+ * daemon that spoke to whatever the driver happened to be running would be a
+ * second actor in their session.
+ *
+ * Linux (including WSL2) reads /proc. macOS shells out to lsof twice. Windows
+ * reports NOTHING and says so through the empty array — the same answer
+ * `stillOurs` gives, and the same rule the rest of the product keeps: an
+ * unmeasured thing renders nothing rather than rendering "none".
+ *
+ * CHOSEN vs KERNEL-ASSIGNED, and why this is a measurement rather than a guess.
+ * `wrangler dev` opens NINE listening sockets; exactly one of them is the URL a
+ * person opens. The other eight were opened on port 0 and given whatever the
+ * kernel had free, and nobody will ever type one into a browser. The box itself
+ * says where that range is (`/proc/sys/net/ipv4/ip_local_port_range`, or
+ * `sysctl net.inet.ip.portrange.*`), so "was this port CHOSEN" is a fact we can
+ * read rather than a heuristic about anybody's stack — the same character as
+ * `bind`, and it needs no allowlist, no framework detection and no probe.
+ *
+ * IT IS THE ONE DISCRIMINATOR A PROBE COULD NOT PROVIDE. Connecting to each
+ * port and keeping the ones that answer HTTP is the obvious alternative and it
+ * is WRONG, not merely rude: under `wrangler dev` the app's internal entry
+ * socket returns byte-for-byte what the dev URL returns, because the dev URL
+ * proxies straight to it. A probe promotes the wrong port. The free fact beats
+ * the expensive one on accuracy.
+ *
+ * WHAT THE ROW MAY CARRY, and the line that must not be crossed. `pid` and
+ * `rss` are numbers about a process; the LABEL is still only the basenames of
+ * argv[0] and argv[1], and argv[1] is skipped outright when it starts with `-`.
+ * That is why no row here is ever passed through `envScrub`: it cannot carry a
+ * secret, by construction rather than by filtering. Widening the label to "the
+ * first argument that is not a flag" would break exactly that — it reads a
+ * flag's VALUE, so `node --require hunter2 app.js` would relay `hunter2`. Do
+ * not widen it. Add fields that are numbers; never add argv.
+ */
+
+import { execFileSync } from 'node:child_process';
+import { createConnection } from 'node:net';
+import { readFileSync } from 'node:fs';
+import { platform } from 'node:os';
+import { rssBytes } from './processes.mjs';
+import { insideDir, socketHoldersIn } from './procScan.mjs';
+
+/**
+ * INFRASTRUCTURE CHILDREN ARE NOT LISTENERS. cloudflared opens its own local
+ * metrics socket, and its cwd is inherited from the daemon — inside the
+ * checkout — so a live share put a `cloudflared` row in the repo place's list:
+ * Flowviant's own plumbing offered back to the operator as a thing to share or
+ * stop. Same rule as the `process.pid` exclusion below: a process that IS
+ * Flowviant is not a process Flowviant reports. `preview.mjs` registers each
+ * tunnel child here as it spawns it (that import direction already exists;
+ * the reverse would be a cycle). In-process is enough: a PEER daemon's tunnel
+ * lives in a different checkout, so cwd attribution already excludes it, and
+ * a crashed daemon's orphan is reaped at the next startup.
+ */
+const infraPids = new Set();
+export const noteInfraPid = (pid) => {
+  if (Number.isInteger(pid) && pid > 0) infraPids.add(pid);
+};
+export const forgetInfraPid = (pid) => {
+  infraPids.delete(pid);
+};
+
+/** A process that IS Flowviant is not a process Flowviant reports — see
+ *  `infraPids` above and the daemon's own gate in `scanLinux`. */
+const isFlowviant = (pid) => pid === process.pid || infraPids.has(pid);
+/**
+ * Rows reported per session.
+ *
+ * It was 8, and `wrangler dev` alone opens NINE — so the cap was silently
+ * eating a row on an ordinary stack while the wire carried no flag saying it
+ * had. Both halves of that are fixed: the number is 12, and `measureListeners`
+ * reports the TOTAL so a surface can say it is not showing everything.
+ *
+ * The cap is also no longer allowed to eat the row that matters. Sorting was by
+ * port ascending, which is arbitrary with respect to importance — a dev server
+ * on :8080 beside eight kernel-assigned sockets in the 30000s survives by luck,
+ * and one on :9000 would not. CHOSEN ports sort first now, so the cut falls on
+ * the ephemeral tail, which is the half nobody opens.
+ */
+const MAX_ROWS = 12;
+/** Longest process label we relay. */
+const MAX_LABEL = 40;
+
+// ── /proc/net/tcp parsing (linux) ──────────────────────────────────────────
+
+// local_address is "<hex addr>:<hex port>". The address is little-endian per
+// 4-byte word; the PORT is big-endian. Only the port and the coarse bind scope
+// are worth relaying — a browser cannot reach a loopback bind through a tunnel
+// any differently than an any-bind, but the operator can read the difference.
+function parseLocal(hex) {
+  const [addr, port] = String(hex).split(':');
+  if (!addr || !port) return null;
+  const p = parseInt(port, 16);
+  if (!Number.isInteger(p) || p <= 0 || p > 65535) return null;
+  const zeros = /^0+$/.test(addr);
+  const v4Loopback = addr.toUpperCase() === '0100007F';
+  // ::1 in /proc/net/tcp6 is 24 zeros then 01000000 (little-endian per word).
+  const v6Loopback = addr.toUpperCase() === '00000000000000000000000001000000';
+  return { port: p, bind: zeros ? 'any' : v4Loopback || v6Loopback ? 'loopback' : 'other' };
+}
+
+/** inode -> { port, bind } for every socket in LISTEN state. */
+function listeningByInode() {
+  const out = new Map();
+  for (const f of ['/proc/net/tcp', '/proc/net/tcp6']) {
+    let text;
+    try {
+      text = readFileSync(f, 'utf8');
+    } catch {
+      continue; // no ipv6 stack, or not linux
+    }
+    for (const line of text.split('\n').slice(1)) {
+      const c = line.trim().split(/\s+/);
+      if (c.length < 10) continue;
+      if (c[3] !== '0A') continue; // TCP_LISTEN
+      const local = parseLocal(c[1]);
+      if (!local) continue;
+      const inode = c[9];
+      if (inode && inode !== '0') out.set(inode, local);
+    }
+  }
+  return out;
+}
+
+/**
+ * WHAT TO CALL A LISTENING PROCESS.
+ *
+ * This used to be `basename(argv[0])`, which names the RUNTIME and not the
+ * program — so half the rows in a JavaScript repo read `node` and told the
+ * reader nothing about which of their servers this was. The question that
+ * changed it: "a non developer wouldnt know what node is or workerd."
+ *
+ * THE FIX IS NOT A LOOKUP TABLE. Mapping `workerd` → "Cloudflare Worker" is
+ * the `DEV_ARGV0` shape: a hardcoded list of tools that is wrong for every
+ * stack nobody enumerated, needing a release per ecosystem forever. What is
+ * always available instead is argv[1] — the thing the runtime was asked to
+ * run — so `node …/node_modules/.bin/vite` becomes `node vite` and
+ * `node server.js` becomes `node server.js`. No list, works on every stack.
+ *
+ * A FLAG IS SKIPPED rather than guessed past: `python3 -m http.server` keeps
+ * `python3` instead of claiming to be called `-m`. Only the first two argv
+ * elements are ever read — enough to name the program, far short of the whole
+ * command line, which is the thing this deliberately does not relay.
+ *
+ * And this is still only a MEASUREMENT. The name a person gives a share lives
+ * on `session_previews.label`, is written by a human PATCH, and is what a
+ * teammate actually reads — no amount of argv produces "Storefront".
+ */
+export function labelFromArgv(argv) {
+  const base = (v) => (v || '').split('/').pop() || v || '';
+  const head = base(argv?.[0]);
+  if (!head) return null;
+  // argv[1] only when it NAMES something rather than configuring it. A `-`
+  // prefix is the one universally reliable tell, and skipping is the honest
+  // answer — `python3 -m http.server` keeps `python3` rather than claiming to
+  // be called `-m`.
+  const next = argv?.[1] && !argv[1].startsWith('-') ? base(argv[1]) : '';
+  const label = next && next !== head ? `${head} ${next}` : head;
+  return label.slice(0, MAX_LABEL) || null;
+}
+
+/**
+ * THE KERNEL'S OWN EPHEMERAL PORT RANGE, or null where we cannot read it.
+ *
+ * A socket opened on port 0 is given a port out of this range; a port outside
+ * it was named by a person or their config. That is the whole of the CHOSEN
+ * test, and the reason it is honest: the range is READ FROM THIS BOX, never
+ * assumed. Linux's default is 32768-60999 and macOS's is 49152-65535, and both
+ * are tunable — hardcoding either would turn a measurement into a guess that is
+ * wrong on exactly the machines somebody bothered to tune.
+ *
+ * THREE STATES, as everywhere else here: `undefined` before we look, `null` for
+ * "this box would not say" (which must leave `chosen` OFF every row rather than
+ * defaulting it), and a pair once measured. Cached for the life of the process
+ * because the range does not move under a running kernel.
+ */
+let EPHEMERAL;
+function ephemeralRange() {
+  if (EPHEMERAL !== undefined) return EPHEMERAL;
+  EPHEMERAL = null;
+  try {
+    if (platform() === 'linux') {
+      const [lo, hi] = readFileSync('/proc/sys/net/ipv4/ip_local_port_range', 'utf8')
+        .trim()
+        .split(/\s+/)
+        .map(Number);
+      if (Number.isInteger(lo) && Number.isInteger(hi) && lo > 0 && hi >= lo) EPHEMERAL = [lo, hi];
+    } else if (platform() === 'darwin') {
+      const one = (k) =>
+        Number(
+          execFileSync('sysctl', ['-n', k], {
+            encoding: 'utf8',
+            stdio: ['ignore', 'pipe', 'ignore'],
+            timeout: 3000,
+          }).trim()
+        );
+      const lo = one('net.inet.ip.portrange.first');
+      const hi = one('net.inet.ip.portrange.last');
+      if (Number.isInteger(lo) && Number.isInteger(hi) && lo > 0 && hi >= lo) EPHEMERAL = [lo, hi];
+    }
+  } catch {
+    /* unreadable — stays null, and `chosen` is then absent rather than guessed */
+  }
+  return EPHEMERAL;
+}
+
+/**
+ * True/false once the range is known, `undefined` when it is not — so the
+ * caller can omit the key entirely rather than assert a default.
+ *
+ * Split from the cached reader so the RULE is testable without a kernel: the
+ * three-state answer is the part worth pinning, and it is the part a later
+ * refactor is most likely to flatten into a boolean.
+ */
+export function isChosenPort(port, range) {
+  if (!range) return undefined;
+  return port < range[0] || port > range[1];
+}
+
+function chosenPort(port) {
+  return isChosenPort(port, ephemeralRange());
+}
+
+function labelFor(pid) {
+  try {
+    const raw = readFileSync(`/proc/${pid}/cmdline`, 'utf8');
+    return labelFromArgv(raw.split('\0').filter(Boolean));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The worktree's listening sockets, from the kernel's table and the processes
+ * standing in the worktree — `{ rows, complete }`. The walk of /proc is
+ * `procScan.mjs`'s (bounded on the processes it reads in the worktree, never
+ * on which pids are looked at); `complete: false` means it stopped with pids
+ * unread, and a listener among them is UNMEASURED, not absent.
+ *
+ * Exported with `io` ONLY so the scan-order property can be pinned without a
+ * box that runs four thousand processes. Nothing in the daemon passes it.
+ */
+export function scanLinux(worktree, io) {
+  const inodes = listeningByInode();
+  if (inodes.size === 0) return { rows: [], complete: true };
+
+  // NEVER THE DAEMON ITSELF. `startAuthProxy` binds a loopback port IN THIS
+  // PROCESS to gate a preview, and the daemon's own cwd is inside the
+  // checkout — so the gate was attributed to the repo place and surfaced as
+  // a listener the operator could click Stop on. Stopping it would take down
+  // the door in front of a live share, and it is not a thing anybody
+  // started: it is us. Same rule `processes.mjs` keeps by never reporting the
+  // group leader, for the same reason — a process that IS Flowviant is not a
+  // process Flowviant reports.
+  const scan = socketHoldersIn(worktree, { skip: isFlowviant, io });
+  if (scan === null) return { rows: [], complete: true };
+
+  const found = new Map(); // port -> row
+  for (const { pid, inodes: held } of scan.holders) {
+    for (const inode of held) {
+      const hit = inodes.get(inode);
+      if (!hit) continue;
+      if (found.has(hit.port)) continue;
+      const chosen = chosenPort(hit.port);
+      const rss = rssBytes(pid);
+      found.set(hit.port, {
+        port: hit.port,
+        bind: hit.bind,
+        label: labelFor(pid),
+        // The pid was always in hand here — it is what resolves the cwd — and
+        // was thrown away the moment the row was built. Keeping it is what lets
+        // a surface group nine sockets under the ONE program that opened them,
+        // and it is the only thing a kill could ever be aimed at.
+        pid,
+        ...(rss != null ? { rss } : {}),
+        ...(chosen === undefined ? {} : { chosen }),
+      });
+    }
+  }
+  return { rows: [...found.values()], complete: scan.complete };
+}
+
+// ── macOS ──────────────────────────────────────────────────────────────────
+
+function lsof(args) {
+  try {
+    return execFileSync('lsof', args, {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 5000,
+      maxBuffer: 4 * 1024 * 1024,
+    });
+  } catch {
+    return ''; // lsof absent or nothing matched — both are "no measurement"
+  }
+}
+
+function scanDarwin(worktree) {
+  // Pass 1: every listening socket, as pid → ports.
+  const byPid = new Map();
+  let pid = null;
+  // RSS for every pid on the box, in one call. `lsof` cannot report memory and
+  // a per-pid `ps` would be one fork per row; this is one fork per sweep.
+  const rssByPid = new Map();
+  try {
+    for (const line of execFileSync('ps', ['-axo', 'pid=,rss='], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 5000,
+      maxBuffer: 4 * 1024 * 1024,
+    }).split('\n')) {
+      const m = /^\s*(\d+)\s+(\d+)\s*$/.exec(line);
+      if (m) rssByPid.set(m[1], Number(m[2]) * 1024); // ps reports KB
+    }
+  } catch {
+    /* no memory on this box — rows simply carry no rss */
+  }
+  for (const line of lsof(['-nP', '-iTCP', '-sTCP:LISTEN', '-F', 'pn']).split('\n')) {
+    // The daemon's own preview gate is not something the driver started — see
+    // the linux branch for the whole argument. Nor its cloudflared children.
+    if (line.startsWith('p')) pid = isFlowviant(Number(line.slice(1))) ? null : line.slice(1);
+    else if (line.startsWith('n') && pid) {
+      const m = /:(\d+)$/.exec(line.slice(1));
+      if (!m) continue;
+      const p = Number(m[1]);
+      const bind = /^n\*:/.test(line) ? 'any' : /^n(127\.0\.0\.1|\[::1\])/.test(line) ? 'loopback' : 'other';
+      if (!byPid.has(pid)) byPid.set(pid, []);
+      byPid.get(pid).push({ port: p, bind });
+    }
+  }
+  if (byPid.size === 0) return [];
+
+  const inside = insideDir(worktree);
+  if (!inside) return [];
+
+  // Pass 2: the cwd of exactly those pids, in ONE batched call.
+  const out = new Map();
+  let cur = null;
+  for (const line of lsof(['-a', '-d', 'cwd', '-F', 'pn', '-p', [...byPid.keys()].join(',')]).split('\n')) {
+    if (line.startsWith('p')) cur = line.slice(1);
+    else if (line.startsWith('n') && cur) {
+      if (!inside(line.slice(1))) continue;
+      for (const row of byPid.get(cur) || []) {
+        if (out.has(row.port)) continue;
+        const chosen = chosenPort(row.port);
+        out.set(row.port, {
+          ...row,
+          // Still null on darwin: `lsof -F pn` is asked for name and pid, never
+          // a command, and adding `-F c` would relay a command name we have no
+          // scrub for. The CHOSEN test needs no label, which is the other
+          // reason it is the right discriminator — it is the only one that
+          // works identically on a Mac.
+          label: null,
+          pid: Number(cur),
+          ...(rssByPid.has(cur) ? { rss: rssByPid.get(cur) } : {}),
+          ...(chosen === undefined ? {} : { chosen }),
+        });
+      }
+    }
+  }
+  return [...out.values()];
+}
+
+// ── public ─────────────────────────────────────────────────────────────────
+
+/**
+ * ORDER, and why it is not the port number any more.
+ *
+ * CHOSEN ports first, each group by port ascending. Two reasons, and the second
+ * is the load-bearing one:
+ *
+ *  · A person scanning this list is looking for the URL they are about to open,
+ *    and that is always a port somebody named. The seven sockets `wrangler dev`
+ *    was handed by the kernel are not candidates and should not be read past.
+ *  · The list is CAPPED. Ordering by port number let the cap fall wherever the
+ *    numbers happened to land, so a dev server on a high port could be the row
+ *    that got dropped. Sorting by chosen-ness puts the cut on the tail nobody
+ *    opens.
+ *
+ * Where the range could not be read `chosen` is absent on every row, `Number()`
+ * of undefined is NaN, and the comparison is false both ways — so the order
+ * degrades to the old port sort rather than to something arbitrary.
+ */
+export function byChosenThenPort(a, b) {
+  const ac = a.chosen === true ? 0 : 1;
+  const bc = b.chosen === true ? 0 : 1;
+  return ac !== bc ? ac - bc : a.port - b.port;
+}
+
+/**
+ * Every TCP port in LISTEN held by a process whose cwd is inside `worktree`,
+ * with the TOTAL the cap was applied to.
+ *
+ * The total is the whole point of the pair. A list silently cut at twelve
+ * answers "what is running in here" with a number that is not true, and the
+ * Repository block already settled that trade for branches and worktrees: the
+ * capped list rides beside the count it was cut from. An empty array on an
+ * unsupported platform means "we did not look" — callers must not turn it into
+ * "nothing is running". `incomplete: true` rides along when the /proc walk hit
+ * its work bound (`procScan.mjs`) with pids still unread.
+ *
+ * `incomplete` IS NOT RELAYED, deliberately, for now. The listener reports
+ * (`workPlaceReports.mjs`, `repoState.mjs`) send `rows`/`total` only: a new report field
+ * needs no floor, but it needs a reader on the server and a sentence on the
+ * web, and neither exists — sending it would be a field nobody reads. The cut
+ * needs thousands of processes standing in ONE worktree; the share path, where
+ * the cut would change an answer, says it in words (`originFor`). Relaying it
+ * to the Workbench is a product call, not this module's.
+ *
+ * `io` is the test seam `scanLinux` documents; nothing in the daemon passes it.
+ */
+export function measureListeners(worktree, io) {
+  if (!worktree) return { rows: [], total: 0 };
+  let scan;
+  try {
+    scan =
+      platform() === 'linux'
+        ? scanLinux(worktree, io)
+        : { rows: platform() === 'darwin' ? scanDarwin(worktree) : [], complete: true };
+  } catch {
+    return { rows: [], total: 0 };
+  }
+  const { rows, complete } = scan;
+  return {
+    rows: rows.sort(byChosenThenPort).slice(0, MAX_ROWS),
+    total: rows.length,
+    // SAID ONLY WHEN IT HAPPENED: the walk stopped with pids unread, so the
+    // rows are real and the total is a floor — a listener missing from them
+    // was not looked for, which is not the same fact as "not running".
+    ...(complete ? {} : { incomplete: true }),
+  };
+}
+
+/** The capped rows alone, for callers with nowhere to put a total. */
+export function listenersIn(worktree) {
+  return measureListeners(worktree).rows;
+}
+
+/** Does this platform measure listeners at all? The web must render no preview
+ *  affordance where the answer is no, rather than an empty one. */
+export function listenersSupported() {
+  return platform() === 'linux' || platform() === 'darwin';
+}
+
+/**
+ * Is something accepting connections on this loopback port RIGHT NOW?
+ *
+ * Used at two moments, both of them re-validation rather than discovery: the
+ * daemon re-checks a port the server told it to share, and a live share checks
+ * that its origin has not died under the tunnel. cloudflared happily outlives a
+ * dead dev server and the gate answers a dead origin with 502, so without this
+ * the product would print "live" over a 502 — which is Flowviant asserting a
+ * state it never measured.
+ *
+ * A TCP connect and an immediate close: no bytes sent, nothing read.
+ */
+export function isListening(port, timeoutMs = 1500) {
+  return new Promise((resolve) => {
+    if (!Number.isInteger(port) || port <= 0 || port > 65535) return resolve(false);
+    let done = false;
+    const finish = (v) => {
+      if (done) return;
+      done = true;
+      try {
+        sock.destroy();
+      } catch {
+        /* already gone */
+      }
+      resolve(v);
+    };
+    const sock = createConnection({ port, host: '127.0.0.1' });
+    sock.setTimeout(timeoutMs);
+    sock.once('connect', () => finish(true));
+    sock.once('timeout', () => finish(false));
+    sock.once('error', () => finish(false));
+  });
+}
+
+// ── the address a share dials ────────────────────────────────────────────────
+
+/**
+ * WHICH ADDRESS REACHES THE ATTRIBUTED PROCESS on `port`, or why none does
+ * (audit 2026-09-24).
+ *
+ * Attribution above is keyed on the PORT, and the gate used to dial
+ * `127.0.0.1:<port>` whatever socket had been attributed. Linux and macOS let
+ * two processes hold one port on the two loopback families side by side, so a
+ * dev server in this worktree on `[::1]:5173` and an unrelated process on
+ * `127.0.0.1:5173` passed the attribution check while the tunnel published the
+ * UNRELATED one — the exact thing attribution exists to prevent. And the
+ * ordinary case broke the other way: Vite's default `localhost` bind resolves
+ * to `::1` on a Mac, so the share opened and every request answered 502.
+ *
+ * So the dial address is DERIVED FROM THE ATTRIBUTED SOCKET: a wildcard bind is
+ * reached on its own family's loopback, a specific bind on its own address —
+ * and a candidate is REFUSED when a process outside the worktree holds that
+ * same address (or the same wildcard, via SO_REUSEPORT) on that port, because
+ * the kernel may then hand the connection to either. IPv4 is preferred when
+ * both reach the attributed process, since that is what every dev server's
+ * own printed URL means.
+ *
+ * `{ host }` on success, `{ error }` with a sentence otherwise. A platform this
+ * file cannot measure answers the loopback it always dialled — the same
+ * behaviour as before, never a refusal invented from ignorance.
+ */
+export function originFor(worktree, port, io) {
+  if (!worktree || !Number.isInteger(port) || port <= 0 || port > 65535) {
+    return { error: `nothing is listening on port ${port} in this worktree.` };
+  }
+  let scan;
+  try {
+    scan =
+      platform() === 'linux'
+        ? socketsOnPortLinux(worktree, port, io)
+        : platform() === 'darwin'
+          ? { sockets: socketsOnPortDarwin(worktree, port), complete: true }
+          : null;
+  } catch {
+    scan = null;
+  }
+  if (scan == null) return { host: '127.0.0.1' };
+  const picked = pickOrigin(scan.sockets, port);
+  // A socket on this port whose holder the walk never reached is read as
+  // FOREIGN by the rule — the safe reading for a shadow check — so an
+  // unshadowed socket of ours is shared exactly as a complete walk would share
+  // it. Only when the rule would REFUSE does the cut matter: then "nothing is
+  // listening" (or "another process") may be about a socket the kernel holds
+  // for a process the walk never reached, and that is said instead (F007;
+  // review 2026-09-26: never a refusal built on the cut alone).
+  if (picked.error && !scan.complete && scan.sockets.some((s) => !s.ours)) {
+    return {
+      error: `this machine runs more processes in this worktree than one look reads, so which one holds port ${port} could not be told — it was not shared.`,
+    };
+  }
+  return picked;
+}
+
+/**
+ * The rule alone, over `[{ family: 4|6, addr, ours }]` — split out so it is
+ * testable without two address families on the test box.
+ */
+export function pickOrigin(sockets, port) {
+  const ours = sockets.filter((s) => s.ours);
+  if (!ours.length) return { error: `nothing is listening on port ${port} in this worktree.` };
+  const foreign = sockets.filter((s) => !s.ours);
+  const dialOf = (s) =>
+    s.family === 6 ? (s.addr === '::' ? '::1' : s.addr) : s.addr === '0.0.0.0' ? '127.0.0.1' : s.addr;
+  const rank = (s) => {
+    const d = dialOf(s);
+    return d === '127.0.0.1' ? 0 : d === '::1' ? 1 : s.family === 4 ? 2 : 3;
+  };
+  let contested = false;
+  for (const s of [...ours].sort((a, b) => rank(a) - rank(b))) {
+    const dial = dialOf(s);
+    const shadowed = foreign.some((f) => f.family === s.family && (f.addr === dial || f.addr === s.addr));
+    if (shadowed) {
+      contested = true;
+      continue;
+    }
+    return { host: dial };
+  }
+  return contested
+    ? {
+        error: `another process on this machine, outside this worktree, also listens on port ${port} at the same address, so it was not shared.`,
+      }
+    : { error: `nothing is listening on port ${port} in this worktree.` };
+}
+
+/** /proc/net/tcp{,6} address hex → a printable address. Each 32-bit word is
+ *  stored little-endian. */
+function hexAddr(hex, family) {
+  const words = hex.match(/.{8}/g) || [];
+  const bytes = [];
+  for (const w of words) for (let i = 6; i >= 0; i -= 2) bytes.push(parseInt(w.slice(i, i + 2), 16));
+  if (family === 4) return bytes.join('.');
+  if (bytes.slice(0, 10).every((b) => b === 0) && bytes[10] === 0xff && bytes[11] === 0xff) {
+    return `::ffff:${bytes.slice(12).join('.')}`;
+  }
+  const groups = [];
+  for (let i = 0; i < 16; i += 2) groups.push(((bytes[i] << 8) | bytes[i + 1]).toString(16));
+  // Compress the longest run of zero groups, the way the address is written.
+  let best = [-1, 0];
+  for (let i = 0; i < 8; ) {
+    if (groups[i] !== '0') {
+      i++;
+      continue;
+    }
+    let j = i;
+    while (j < 8 && groups[j] === '0') j++;
+    if (j - i > best[1]) best = [i, j - i];
+    i = j;
+  }
+  if (best[1] < 2) return groups.join(':');
+  const head = groups.slice(0, best[0]).join(':');
+  const tail = groups.slice(best[0] + best[1]).join(':');
+  return `${head}::${tail}`;
+}
+
+/** `{ sockets, complete }` on success, null when /proc cannot be listed.
+ *  `io` is the test seam `scanLinux` documents. */
+export function socketsOnPortLinux(worktree, port, io) {
+  const byInode = new Map(); // inode -> { family, addr }
+  for (const [f, family] of [
+    ['/proc/net/tcp', 4],
+    ['/proc/net/tcp6', 6],
+  ]) {
+    let text;
+    try {
+      text = readFileSync(f, 'utf8');
+    } catch {
+      continue;
+    }
+    for (const line of text.split('\n').slice(1)) {
+      const c = line.trim().split(/\s+/);
+      if (c.length < 10 || c[3] !== '0A') continue;
+      const [a, p] = String(c[1]).split(':');
+      if (parseInt(p, 16) !== port) continue;
+      if (c[9] && c[9] !== '0') byInode.set(c[9], { family, addr: hexAddr(a, family) });
+    }
+  }
+  if (byInode.size === 0) return { sockets: [], complete: true };
+  const scan = socketHoldersIn(worktree, { skip: isFlowviant, io });
+  if (scan === null) return null;
+  const ours = new Set();
+  for (const { inodes } of scan.holders) for (const inode of inodes) if (byInode.has(inode)) ours.add(inode);
+  // A socket whose holder we could not read (another user's process) is
+  // FOREIGN — the safe reading for a refusal check.
+  return {
+    sockets: [...byInode.entries()].map(([inode, s]) => ({ ...s, ours: ours.has(inode) })),
+    complete: scan.complete,
+  };
+}
+
+function socketsOnPortDarwin(worktree, port) {
+  const rows = []; // { pid, family, addr }
+  let pid = null;
+  let family = null;
+  for (const line of lsof(['-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-F', 'ptn']).split('\n')) {
+    if (line.startsWith('p')) pid = line.slice(1);
+    else if (line.startsWith('t')) family = line.slice(1) === 'IPv6' ? 6 : line.slice(1) === 'IPv4' ? 4 : null;
+    else if (line.startsWith('n') && pid && family) {
+      const m = /^n(.*):(\d+)$/.exec(line);
+      if (!m || Number(m[2]) !== port) continue;
+      let addr = m[1].replace(/^\[|\]$/g, '');
+      if (addr === '*') addr = family === 6 ? '::' : '0.0.0.0';
+      rows.push({ pid, family, addr });
+    }
+  }
+  if (!rows.length) return [];
+  const within = insideDir(worktree);
+  if (!within) return [];
+  const inside = new Set();
+  let cur = null;
+  const pids = [...new Set(rows.map((r) => r.pid))];
+  for (const line of lsof(['-a', '-d', 'cwd', '-F', 'pn', '-p', pids.join(',')]).split('\n')) {
+    if (line.startsWith('p')) cur = line.slice(1);
+    else if (line.startsWith('n') && cur) {
+      if (within(line.slice(1)) && !isFlowviant(Number(cur))) inside.add(cur);
+    }
+  }
+  return rows.map((r) => ({ family: r.family, addr: r.addr, ours: inside.has(r.pid) }));
+}

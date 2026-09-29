@@ -1,0 +1,123 @@
+/**
+ * Startup preflight: this tool DRIVES your local CLIs (it never sees their
+ * credentials), so it checks they're present + signed in and tells you exactly
+ * what's missing, rather than failing cryptically mid-run.
+ */
+
+import { execFileSync } from 'node:child_process';
+import { ok, warn, info, c } from './ui.mjs';
+import { addLocalBinToPath, promptYesNo, installClaude, installGh } from './install.mjs';
+import { RUNTIMES, mediatedSafeGap } from './runtimes.mjs';
+import { detectRuntimes } from './runtimeDetection.mjs';
+import { terminalCommand } from './launchCommand.mjs';
+
+function present(cmd) {
+  try {
+    execFileSync(cmd, ['--version'], { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function ghAuthed() {
+  try {
+    execFileSync('gh', ['auth', 'status'], { stdio: 'ignore', timeout: 20_000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Prints a checklist and, when a missing prereq is auto-installable, OFFERS to
+ *  install it (consent-based, never silent). Returns false only if a *fatal*
+ *  prereq (SOME drivable runtime, or git when worktrees are used) is still
+ *  missing after. */
+export async function preflight({ needGit = true } = {}) {
+  addLocalBinToPath(); // find a gh/cloudflared we bundled on a previous run
+  let gh = present('gh');
+  const node18 = Number(process.versions.node.split('.')[0]) >= 18;
+  const git = needGit ? present('git') : true;
+
+  info('checking your setup (this tool drives these — it never sees their logins):');
+
+  // THE RUNTIMES. This used to test one binary — `present('claude')` — and treat
+  // its absence as fatal, which stopped being right the moment a second CLI could
+  // build a task: a machine with Codex and no Claude Code is a working machine,
+  // and it was refused at startup. What is fatal is having NOTHING to build with.
+  //
+  // Reported per runtime rather than as a single verdict, because the three
+  // states a user can be in need three different sentences: not installed
+  // (install it), installed but this daemon cannot drive it here (the live-mode
+  // note, or the registry's own `blocked` reason), and ready.
+  let detected = detectRuntimes({ refresh: true });
+  const shown = detected.filter((r) => r.installed || r.id === 'claude');
+  for (const r of shown) {
+    const rt = RUNTIMES[r.id];
+    if (r.dispatchable) {
+      ok(
+        `${rt.bin} installed ${c.dim(`· ${rt.label} · must be signed in — run \`${rt.login}\` once if you haven’t`)}`
+      );
+    } else if (r.installed) {
+      warn(`${rt.bin} installed but not usable here ${c.dim(`· ${r.blocked ?? 'unsupported'}`)}`);
+    } else if (r.id === 'claude') {
+      // Only Claude gets an install offer: it is the one whose installer we
+      // control and can verify. The others are named, not fetched.
+      warn('claude NOT found.');
+      if (await promptYesNo('Install Claude Code now?', false)) {
+        if (installClaude((m) => info(m))) detected = detectRuntimes({ refresh: true });
+      }
+      if (!detected.find((d) => d.id === 'claude')?.installed) {
+        warn('install Claude Code manually: https://claude.com/claude-code');
+      }
+    }
+  }
+  const drivable = detected.filter((r) => r.dispatchable);
+  // SAFE mode narrows what an agent may do — except on a runtime whose only
+  // permission control is all-or-nothing. Say so at startup rather than letting
+  // an operator believe a setting is in force that isn't.
+  for (const r of drivable) {
+    if (mediatedSafeGap(RUNTIMES[r.id])) {
+      warn(
+        `${RUNTIMES[r.id].bin}: FLOWVIANT_SAFE cannot narrow this runtime — it has no per-invocation permission control, so its builds run unrestricted`
+      );
+    }
+  }
+  // Name the alternatives once, and only when there is nothing to build with —
+  // a working machine does not need a catalogue of the CLIs it is not using.
+  if (drivable.length === 0) {
+    for (const rt of Object.values(RUNTIMES)) {
+      if (!detected.find((d) => d.id === rt.id)?.installed) {
+        info(`${c.dim(`or ${rt.label}: ${rt.install}`)}`);
+      }
+    }
+  }
+
+  // gh — OPTIONAL. The daemon pushes and merges with plain `git`; nothing in
+  // the product opens a pull request any more, so gh is a convenience for the
+  // agent, not a requirement. Hence the offer no longer defaults to yes: an
+  // install nobody asked for, defaulted on, is how a preflight installs
+  // software on a machine whose operator only wanted a status line.
+  if (gh && ghAuthed()) {
+    ok('gh authenticated');
+  } else if (gh) {
+    warn('gh not signed in — run: gh auth login');
+  } else {
+    info('gh not found (optional).');
+    if (await promptYesNo('Install GitHub CLI (gh) now?', false)) {
+      if (await installGh((m) => info(m))) gh = present('gh');
+    }
+    gh
+      ? ok(`gh installed to ~/.flowviant/bin — authenticate with: ${terminalCommand('gh-auth')}`)
+      : info(c.dim('or install it later: https://cli.github.com, then: gh auth login'));
+  }
+
+  if (needGit) (git ? ok('git installed') : warn('git NOT found — install git'));
+  node18 ? ok(`node ${process.versions.node}`) : warn(`node ${process.versions.node} — need 18+`);
+  console.log('');
+
+  if (drivable.length === 0) {
+    warn('No usable coding CLI — install and sign in to one of the above, then restart.');
+  }
+  return drivable.length > 0 && git;
+}

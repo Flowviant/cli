@@ -1,0 +1,1142 @@
+/**
+ * ONE DAEMON PER REPO (and per credential), ARBITRATED at startup — a second
+ * run in the same repo takes the first one's place rather than being turned
+ * away. See "WHAT A SECOND RUN DOES" below for the whole rule.
+ *
+ * WHY THIS EXISTS. Nothing stopped two daemons before, and the server USED to
+ * hand work out by READING, never claiming: `listWorkTurnJobs` selected every
+ * pending turn for the machine credential, `listShipJobs` read a flag. So two
+ * daemons on one credential were offered the SAME turn — and the ProjectRoom
+ * nudges every connected daemon socket at once, so they did not even drift out
+ * of phase.
+ *
+ * That half is fixed on the server now: since 0.53.0 each SESSION is leased to
+ * one daemon INSTANCE nonce — `di`, regenerated every start (config.mjs) and
+ * sent on every poll beside `ws`, the list of sessions this daemon holds a
+ * worktree for — so a turn is handed to the instance holding that session and
+ * to no one else. It does NOT retire this lock. The lease fails OPEN when no
+ * instance is reported (an older daemon cannot name itself), and it arbitrates
+ * only what rides a session: the wiki sweep, env materialization, previews,
+ * deploys and every worktree operation the server never sees are still first
+ * come, first served.
+ *
+ * The per-worktree `flowviant-turn.lock` cannot save it. That lock is written
+ * AFTER the work token is minted and the attachments are fetched — a window
+ * containing a network round trip — so both daemons clear the check and both
+ * spawn a CLI into one held conversation. It was built for a RESTARTED daemon
+ * (its own comment says so, turnLock.mjs), where the holder is already live when
+ * the successor looks; it was never a concurrency primitive.
+ *
+ * What a duplicate run cost before the session lease, all of it invisible in
+ * the tab: two Claudes editing one worktree, two cards from one `file_card` (no
+ * idempotency key), the session write budget spent twice, quota spent twice —
+ * and then exactly ONE answer surviving, because `settleWorkTurn` is atomic.
+ * The side effects landed twice and the transcript showed one turn. Two daemons
+ * in one checkout still cost the un-leased half of that: two `git fetch`, two
+ * worktree sweeps, and the collisions listed under ONE DAEMON PER REPO below.
+ *
+ * KEYED ON THE CREDENTIAL — and, as the next paragraph adds, on the REPO as
+ * well; both checks run, and either one is enough. The credential is stored once, at
+ * ~/.flowviant/credentials.json, so `flowviant` in two DIFFERENT checkouts is
+ * still one project served twice — and that case is strictly worse, because the
+ * two daemons have different worktree roots and the turn lock cannot even see
+ * across them. Keying on the token catches both, and still lets a second
+ * credential run a second project on the same machine.
+ *
+ * ...AND ONE DAEMON PER REPO, which is NOT the same statement. The lock above
+ * is keyed on the credential, and the two coincide only while one credential
+ * serves one project — which is the product's law but not a thing this file can
+ * assume. Two DIFFERENT credentials pointing at one checkout both acquired
+ * happily (measured), giving two daemons in one working tree: two `git fetch`,
+ * two worktree sweeps, `retireWorkSessions` in one removing directories the
+ * other is serving, and a ship in one racing a rebase in the other. No server
+ * lease can arbitrate any of that, because the server never sees a directory.
+ * So the repo is checked too, across every credential's lock.
+ *
+ * WHAT A SECOND RUN DOES, and this is the whole rule:
+ *
+ *   SAME REPO      -> the new run WINS. The holder is asked to stand down and
+ *                     this daemon takes its place. Re-running `flowviant` in a
+ *                     directory you are working in means "serve this repo", and
+ *                     the process already serving it is by definition the one
+ *                     you are replacing. That is a restart, and a restart
+ *                     should not require you to go and find a pid.
+ *
+ *   DIFFERENT REPO -> REFUSED, and nothing is signalled. That daemon is serving
+ *                     other work; killing it because you happened to run this
+ *                     command elsewhere is not a restart, it is collateral.
+ *                     `--takeover` overrides, deliberately explicitly.
+ *
+ * One rule, and it is the invariant stated as behaviour: one daemon per repo.
+ * `--no-takeover` (or FLOWVIANT_NO_TAKEOVER=1) makes even the same-repo case
+ * refuse, for anyone who wants the old ceremony.
+ *
+ * EVERYTHING IN THIS FILE IS ABOUT PROCESSES ON ONE BOX, decided locally against
+ * a lock file. It says nothing about WHICH BOX serves the project — a project
+ * has one machine and the SERVER arbitrates that, because it is the only party
+ * that can see both boxes. A standby daemon here is a perfectly healthy holder
+ * of this repo's lock; the two questions never meet, and no flag in this file
+ * moves the project's machine.
+ *
+ * IT FAILS OPEN. A home directory we cannot write to is not a reason to refuse
+ * to start; it is a reason to say so and carry on unguarded.
+ */
+
+import { execFileSync } from 'node:child_process';
+import {
+  closeSync,
+  mkdirSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+  writeSync,
+} from 'node:fs';
+import { homedir, platform } from 'node:os';
+import { join } from 'node:path';
+import { createHash } from 'node:crypto';
+import { VERSION, PROCESS_STARTED_AT } from './config.mjs';
+import { compareVersions } from './versionOrder.mjs';
+import { samePath } from './repoPath.mjs';
+
+/** Deliberately a HASH: a credential must never become a filename. */
+export function instanceLockPath(fleetToken) {
+  const key = createHash('sha256').update(String(fleetToken || 'anon')).digest('hex').slice(0, 12);
+  return join(homedir(), '.flowviant', `daemon-${key}.lock`);
+}
+
+/** Signal 0 — a liveness probe, not a kill. EPERM means alive and not ours. */
+function alive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return e.code === 'EPERM';
+  }
+}
+
+function readHolder(path) {
+  try {
+    const v = JSON.parse(readFileSync(path, 'utf8'));
+    return v && Number.isInteger(v.pid) && v.pid > 0 ? v : null;
+  } catch {
+    return null; // absent, truncated, or half-written — treat as no holder
+  }
+}
+
+/**
+ * WHAT THE DAEMON HOLDING THIS CREDENTIAL'S LOCK IS FINISHING — the `target →
+ * env` words its draining mark carries (`markLockDraining`), or null. Read-only,
+ * for `status --json` (desktopContract.mjs), so the tray can say the box is
+ * finishing a deploy rather than idle. Null covers no lock, no mark, and an
+ * older daemon that never writes one; the caller asks only of a daemon it has
+ * already measured running.
+ */
+export function drainingFor(fleetToken) {
+  const what = readHolder(instanceLockPath(fleetToken))?.draining?.what;
+  return typeof what === 'string' && what ? what : null;
+}
+
+/** Read-only desktop measurement. No lock is unknown because an unguarded or
+ * older daemon may still run; a stale lock with a dead pid measures empty. */
+export function daemonRunningFor(fleetToken) {
+  const path = instanceLockPath(fleetToken);
+  let raw;
+  try { raw = readFileSync(path, 'utf8'); }
+  catch { return null; }
+  let holder;
+  try { holder = JSON.parse(raw); } catch { return null; }
+  if (!Number.isInteger(holder?.pid) || holder.pid <= 0) return null;
+  if (!alive(holder.pid)) return false;
+  return stillTheHolder(holder);
+}
+
+/**
+ * argv[1] AS IT WAS TYPED, when that differs from the resolved form.
+ *
+ * Node resolves `process.argv[1]` to an absolute path, while `/proc/<pid>/cmdline`
+ * and `ps` show the argv the process was actually given. A daemon started as
+ * `node bin/cli.mjs` (a dev checkout, `npm start`, a Docker CMD with a WORKDIR)
+ * therefore recorded `/abs/bin/cli.mjs` and was matched against `node
+ * bin/cli.mjs`, judged stale WHILE ALIVE — a second start ran beside it and
+ * `flowviant stop` signalled nothing. The raw token is recorded beside `entry`
+ * so both spellings identify the process. Linux only: `ps` joins argv with
+ * spaces, so no token can be recovered from it reliably, and there the absolute
+ * form plus the start-time check stand as before.
+ */
+function rawEntry() {
+  if (platform() !== 'linux') return null;
+  try {
+    const tokens = readFileSync('/proc/self/cmdline', 'utf8').split('\0');
+    const raw = tokens[1 + process.execArgv.length];
+    return raw && raw !== process.argv[1] ? raw : null;
+  } catch {
+    return null;
+  }
+}
+
+const record = (repoRoot) =>
+  JSON.stringify({
+    pid: process.pid,
+    repoRoot,
+    // THE PROCESS'S START, not the moment the lock was written. The start path
+    // can wait on a person at the picker or the binding confirm for as long as
+    // they take (there is no answer time limit), and a lock line written three
+    // minutes after the process began put a LIVE daemon outside the 120s window
+    // startedAroundLockWrite brackets — so a second start cleared its "stale"
+    // lock and ran beside it, and stop and disconnect skipped it. The window now
+    // measures clock granularity only, whatever a prompt cost.
+    startedAt: PROCESS_STARTED_AT,
+    // The script we were started from, and what we are. A takeover matches the
+    // live command line against `entry` before signalling anything — a lock
+    // records a PID, and a crashed daemon's PID can be reused by anything.
+    // Locks written before this field existed (0.51.2 through 0.53.0) are
+    // matched on the holder's process START TIME instead; stillTheHolder says
+    // why that is the weaker of the two claims and still strong enough.
+    entry: process.argv[1] || '',
+    ...(rawEntry() ? { entryRaw: rawEntry() } : {}),
+    version: VERSION,
+  });
+
+/** Up to this many parents are walked looking for the daemon we re-exec'd from.
+ *  `npx -y flowviant@latest` puts `npm exec` (and a `sh -c`) between the old
+ *  daemon and the new one; eight is several times that chain. */
+const ANCESTOR_DEPTH = 8;
+
+/** The parent pid of `pid`, or null where it cannot be read. */
+function parentOf(pid) {
+  try {
+    if (platform() === 'linux') {
+      const raw = readFileSync(`/proc/${pid}/stat`, 'utf8');
+      const close = raw.lastIndexOf(')');
+      if (close < 0) return null;
+      const ppid = Number.parseInt(raw.slice(close + 1).trim().split(/\s+/)[1], 10);
+      return Number.isInteger(ppid) && ppid > 0 ? ppid : null;
+    }
+    if (platform() === 'darwin') {
+      const out = execFileSync('ps', ['-o', 'ppid=', '-p', String(pid)], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        timeout: 3000,
+      });
+      const ppid = Number.parseInt(out.trim(), 10);
+      return Number.isInteger(ppid) && ppid > 0 ? ppid : null;
+    }
+  } catch {
+    /* unreadable — ancestry unknown */
+  }
+  return null;
+}
+
+/**
+ * IS THIS HOLDER THE DAEMON THAT RE-EXEC'D US? — the self-update case.
+ *
+ * The direct parent is the global-install path: update.mjs spawns
+ * `process.execPath` itself, so the successor's ppid IS the holder. Under npx
+ * — the documented launch — the successor is spawned by `npm exec`, which the
+ * old daemon spawned, so the holder is a GRANDPARENT and a ppid check read it
+ * as a rival: the new daemon SIGTERMed its own proxy, the foreground process
+ * exited 143 while the successor ran on detached (or, with --no-takeover, both
+ * exited and the machine went dark after every update). So update.mjs names
+ * the pid it re-exec'd from, and that pid is adopted only when it really is an
+ * ANCESTOR of this process: the env var alone is inherited by anything the
+ * daemon spawns and proves nothing on its own. Ancestry that cannot be read
+ * adopts nothing — the pre-existing takeover rules then apply.
+ */
+function isOurReexecParent(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  if (pid === process.ppid) return true;
+  if (process.env.FLOWVIANT_REEXEC_FROM !== String(pid)) return false;
+  let p = process.ppid;
+  for (let i = 0; i < ANCESTOR_DEPTH && p && p > 1; i++) {
+    const up = parentOf(p);
+    if (up === pid) return true;
+    p = up;
+  }
+  return false;
+}
+
+/**
+ * A LIVE daemon in this same checkout, under a DIFFERENT credential.
+ *
+ * The lock above cannot see one: it is keyed on the credential, so a second
+ * token in the same directory opens its own file and takes it. Every other
+ * lock file on this machine is ours to read, so read them.
+ *
+ * Returns the holder, or null. A stale file never blocks — it is cleared by
+ * whichever acquire owns it, and blocking on a corpse would be worse than the
+ * thing this prevents.
+ */
+/** Which lock file a neighbour holder was read from — takeOverFrom waits on it. */
+const NEIGHBOUR_PATHS = new WeakMap();
+function neighbourLockPath(holder, fallback) {
+  return NEIGHBOUR_PATHS.get(holder) ?? fallback;
+}
+
+/** Every daemon lock file on this machine, absolute, sorted for a stable read.
+ *  ONE scan, because two callers walk this directory for opposite reasons —
+ *  daemonInSameRepo looking for a neighbour to refuse or replace, stopAllDaemons
+ *  sweeping the lot — and the FILENAME PATTERN is the thing that must not drift
+ *  between them: it is what separates our locks from anything else living in
+ *  ~/.flowviant. An unreadable (or absent) directory is not an error here, it is
+ *  an empty machine. */
+function lockFiles() {
+  try {
+    return readdirSync(join(homedir(), '.flowviant'))
+      .filter((f) => /^daemon-[0-9a-f]{12}\.lock$/.test(f))
+      .sort()
+      .map((f) => join(homedir(), '.flowviant', f));
+  } catch {
+    return [];
+  }
+}
+
+export function daemonInSameRepo(repoRoot, ownPath) {
+  for (const path of lockFiles()) {
+    if (path === ownPath) continue; // our own credential — the lock above owns that question
+    const holder = readHolder(path);
+    if (!holder || !alive(holder.pid)) continue;
+    if (isOurReexecParent(holder.pid)) continue; // ourselves mid self-update re-exec
+    if (samePath(holder.repoRoot, repoRoot)) {
+      NEIGHBOUR_PATHS.set(holder, path);
+      return holder;
+    }
+  }
+  return null;
+}
+
+/** How far a holder's actual start may sit BEFORE the `startedAt` line it wrote
+ *  and still be the same process. Measured on this exact path: node boot to the
+ *  first line of JS is 20ms, and the whole way through importing this module,
+ *  `git rev-parse --show-toplevel` and base-ref detection to record() is 29-32ms.
+ *  The worst realistic run is a start that had to take over a NEIGHBOUR's lock
+ *  first (a 20s grace, then 600ms) and then its own (another 20s), which lands
+ *  around 41s. 120s is ~3x that worst path and ~4000x the typical one, and it is
+ *  still short enough that pid reuse cannot reach into it: reuse means cycling
+ *  the entire pid space (4194304 by default), which no machine does inside two
+ *  minutes. (Since the lock records the PROCESS start rather than the moment it
+ *  was written, a lock from this version sits a few milliseconds from its
+ *  process whatever the start path cost; the window's width is for locks older
+ *  daemons wrote, which still stamp the write.) */
+const TAKEOVER_START_WINDOW_MS = 120_000;
+
+/** ...and how far the OTHER way, which is a unit problem rather than a real
+ *  possibility. `starttime` is quantised to clock ticks and `ps -o etime=` to
+ *  whole seconds, so a process that genuinely started a moment before its own
+ *  lock line can compute a hair after it. 5s covers that granularity and
+ *  nothing else. The window is deliberately asymmetric and BACKWARD-looking: it
+ *  brackets the daemon's own startup, not "recently", so a freshly forked
+ *  impostor that inherited a recycled pid lands on this side and is refused. */
+const TAKEOVER_START_SLACK_MS = 5_000;
+
+/** USER_HZ — the unit `/proc` publishes `starttime` in. NOT the kernel's internal
+ *  CONFIG_HZ (250/300/1000): the kernel converts before writing, and USER_HZ is a
+ *  fixed ABI constant, 100 on every architecture that matters. So the fallback
+ *  below is the ABI and not a guess, and `getconf` is only belt and braces.
+ *
+ *  A wrong value here fails SAFE in BOTH directions, which is why it is allowed
+ *  to be a guess at all: too low and the process computes as far older than its
+ *  lock (refused by the 120s window), too high and it computes as newer than a
+ *  lock it supposedly wrote (refused by the 5s slack). */
+function userHz() {
+  try {
+    const n = Number.parseInt(
+      execFileSync('getconf', ['CLK_TCK'], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        timeout: 3000,
+      }).trim(),
+      10,
+    );
+    if (Number.isInteger(n) && n > 0 && n <= 1_000_000) return n;
+  } catch {
+    /* no getconf — the constant below IS the ABI */
+  }
+  return 100;
+}
+
+/**
+ * Wall-clock milliseconds at which `pid` started, or null.
+ *
+ * NULL IS NOT "UNKNOWN, PROBABLY FINE". Every caller must read it as refuse —
+ * this feeds a check that gates a SIGTERM and then a SIGKILL, and there is no
+ * such thing as a harmless guess about which process to kill.
+ */
+function processStartedAt(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  try {
+    if (platform() === 'linux') {
+      // FIELD 22 OF /proc/<pid>/stat, and the parse is the whole trap. Field 2
+      // is `comm`, which the kernel wraps in parens and which may contain BOTH
+      // spaces and parens — it is the first 15 bytes of the executable's name,
+      // and a name is not a token. A naive split on whitespace taking $22 then
+      // lands on `nice` for any such process, and `nice` is a small integer, so
+      // the answer is not a parse error but a plausible-looking "started at
+      // boot" that sails past any isFinite guard. Measured: a binary named
+      // `ev (i l) x` read 28308s too old that way.
+      //
+      // Every field after `comm` is a number or a single-character state, so no
+      // ')' can appear later: the LAST ')' in the line is always the kernel's
+      // own closing paren, even when comm itself ends in one.
+      const raw = readFileSync(`/proc/${pid}/stat`, 'utf8');
+      const close = raw.lastIndexOf(')');
+      if (close < 0) return null;
+      const fields = raw.slice(close + 1).trim().split(/\s+/); // fields[0] IS field 3
+      const ticks = Number.parseInt(fields[19], 10); // field 22 => 22 - 3
+      if (!Number.isFinite(ticks) || ticks < 0) return null;
+      // `/proc/uptime` rather than `/proc/stat`'s btime, and not for precision
+      // alone (measured 6ms out against 162ms). Date.now() and uptime are read
+      // at the same instant, so a realtime clock stepped since boot cancels
+      // out of the subtraction; btime bakes in a boot-realtime estimate that a
+      // later NTP step silently invalidates. `starttime` is in ticks either
+      // way — uptime gives seconds-since-boot, so the division by USER_HZ is
+      // not optional.
+      const up = Number.parseFloat(readFileSync('/proc/uptime', 'utf8').split(/\s+/)[0]);
+      if (!Number.isFinite(up) || up < 0) return null;
+      const ageMs = (up - ticks / userHz()) * 1000;
+      if (!Number.isFinite(ageMs) || ageMs < 0) return null;
+      return Date.now() - ageMs;
+    }
+    if (platform() === 'darwin') {
+      // `etime`, not `lstart`. A DURATION has no locale, no timezone, and no
+      // ambiguous repeated hour at the DST fall-back — where `lstart` is an
+      // hour out and would refuse a genuine holder twice a year. It also dodges
+      // Date.parse being LENIENT rather than strict: a localized `lstart` can
+      // parse to a wrong-but-finite instant instead of failing honestly.
+      // (`etimes`, the seconds-only form, is procps-only and not a BSD keyword.)
+      // Both derive from the same kinfo_proc.p_starttime, so 1s resolution
+      // against a 120s window costs nothing. LC_ALL is pinned anyway, since a
+      // localized number format would be a wrong answer rather than no answer.
+      const out = execFileSync('ps', ['-o', 'etime=', '-p', String(pid)], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        timeout: 3000,
+        env: { ...process.env, LC_ALL: 'C', LC_TIME: 'C' },
+      });
+      const m = /^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$/.exec(out.trim()); // [[dd-]hh:]mm:ss
+      if (!m) return null;
+      const age =
+        Number(m[1] || 0) * 86400 + Number(m[2] || 0) * 3600 + Number(m[3]) * 60 + Number(m[4]);
+      if (!Number.isFinite(age) || age < 0) return null;
+      return Date.now() - age * 1000;
+    }
+    return null; // win32, and anything else — never signalled rather than guessed at
+  } catch {
+    return null; // no /proc (hidepid=2, a pid namespace, a stripped container), no ps
+  }
+}
+
+/**
+ * THE FALLBACK, for a lock that carries no `entry`.
+ *
+ * `entry` arrived after the lock did. Every daemon from 0.51.2 through 0.53.0
+ * wrote `{pid, repoRoot, startedAt}` and nothing else, and stillTheHolder used
+ * to refuse those outright. Refusing was right in spirit and useless in fact:
+ * it made takeover impossible on precisely the locks takeover exists for, since
+ * the daemon you are replacing is by definition the OLD one. `--takeover` did
+ * nothing, and re-running `flowviant` in the repo you were working in printed a
+ * refusal and sent you hunting for a pid — the exact ceremony the same-repo rule
+ * was written to abolish. (Those locks carry no `version` either, so a legacy
+ * takeover also skips takeOverFrom's downgrade guard, which short-circuits on
+ * `holder.version &&`. Separate hole, not this function's to close.)
+ *
+ * WHY START TIME PROVES IDENTITY, which is the only question worth asking here,
+ * because what this gates is a SIGTERM and then a SIGKILL. A pid alone proves
+ * nothing: pids are recycled, and a crashed daemon's number goes to whatever
+ * forks next. The PAIR (pid, start time) is the standard POSIX process
+ * identity — pidfd, systemd and procps all key on it — because the kernel
+ * stamps a start time at fork and it is immutable for the life of the process,
+ * unforgeable by anything that started later. And `startedAt` was written BY
+ * the process being identified, measured 29-32ms after its own fork, so the
+ * lock is that process's own witness to when it began.
+ *
+ * It is a WEAKER statement than `entry`, which says what the process IS rather
+ * than when it started, and that is why `entry` stays the primary path. What
+ * makes this one acceptable anyway is that a false positive needs two things at
+ * once that are close to mutually exclusive: the pid space must have wrapped
+ * back to this exact number, AND the new occupant must have started inside a
+ * 2-minute window that ENDS at the lock write. Wrapping takes millions of
+ * forks; the window ends before the impostor could have been born.
+ *
+ * EVERY ERROR MODE HERE PUSHES TOWARD REFUSAL, never toward signalling — an
+ * unreadable /proc, a pid namespace, a kernel before 5.5 whose starttime drifts
+ * across suspend, a realtime clock stepped in either direction, a locale that
+ * mangles `ps`, Windows. All of them return false, and false costs a person a
+ * manual kill. The other direction costs somebody else's process.
+ */
+function startedAroundLockWrite(holder) {
+  try {
+    const written = Date.parse(holder?.startedAt ?? '');
+    if (!Number.isFinite(written)) return null; // no witness — nothing was measured
+    const started = processStartedAt(holder.pid);
+    if (started === null) return null; // could not measure — see the tri-state note
+    const delta = written - started; // >0: the process predates its own lock line, as it must
+    return delta >= -TAKEOVER_START_SLACK_MS && delta <= TAKEOVER_START_WINDOW_MS;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * IS THIS PID STILL THE DAEMON THAT TOOK THE LOCK?
+ *
+ * `process.kill(pid, 0)` says "a process exists", which is not the same claim,
+ * and the difference matters the moment we are about to signal it. Matched on
+ * the holder's own recorded ENTRYPOINT, never on the word "flowviant": a
+ * command line merely CONTAINING it matches a shell, an editor, or a test
+ * runner living under a `…-flowviant/` directory. That last one is not
+ * hypothetical — a looser version of this check SIGTERMed one.
+ *
+ * A lock with no `entry` is no longer refused outright. Those locks are real
+ * and current — every daemon 0.51.2 through 0.53.0 wrote one — so refusing
+ * them meant takeover never worked on the upgrade it was built for. They fall
+ * back to the holder's PROCESS START TIME, which is the same claim made a
+ * weaker way; startedAroundLockWrite above argues why that is a proof rather
+ * than a guess, and why every way it can go wrong ends in a refusal.
+ *
+ * TRI-STATE, and the third value is the point: `true` identified, `false`
+ * measured-and-it-is-someone-else, `null` COULD NOT MEASURE. Both `false` and
+ * `null` refuse — that never changes — but they are not the same sentence, and
+ * collapsing them made the refusal assert a fact nobody had established: on a
+ * `hidepid=2` host (ordinary Debian/Ubuntu hardening) the daemon told the user
+ * their live holder "is no longer the daemon that took this lock", i.e. that
+ * the lock was stale. Acting on that — deleting the lock, or taking the
+ * ALLOW_MULTI escape printed underneath it — lands them in two daemons in one
+ * working tree, which this module's header says no server lease can arbitrate.
+ * Ignorance is not a state this product renders as fact.
+ */
+function stillTheHolder(holder) {
+  const want = typeof holder?.entry === 'string' ? holder.entry : null;
+  // An `entry` of '' is a field with nothing in it — record() writes
+  // `process.argv[1] || ''` — and matching on '' would match every process
+  // alive, so it takes the same road as a missing one.
+  if (!want) return startedAroundLockWrite(holder);
+  let cmdline;
+  let tokens;
+  try {
+    if (platform() === 'linux') {
+      const raw = readFileSync(`/proc/${holder.pid}/cmdline`, 'utf8');
+      tokens = raw.split('\0');
+      cmdline = raw.replace(/\0/g, ' ');
+    } else {
+      cmdline = execFileSync('ps', ['-o', 'command=', '-p', String(holder.pid)], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        timeout: 3000,
+      });
+      tokens = cmdline.trim().split(/\s+/);
+    }
+  } catch {
+    // NOT `false`. takeOverFrom already returned early if the pid were gone, so
+    // reaching here means the process is alive and we could not READ it —
+    // hidepid=2, a pid namespace, a stripped image with no `ps`. Saying `false`
+    // here is what made the refusal claim the pid belonged to somebody else.
+    return null;
+  }
+  // The typed spelling is matched as a whole TOKEN, never a substring: a
+  // relative `bin/cli.mjs` is a fragment of countless command lines.
+  const raw = typeof holder.entryRaw === 'string' && holder.entryRaw ? holder.entryRaw : null;
+  if (!cmdline.includes(want) && !(raw && tokens.includes(raw))) return false;
+  // AN ENTRY MATCH ALONE IS NOT IDENTITY. Every daemon on the box shares one
+  // entry path under a global install, so "cmdline contains this cli.mjs"
+  // proves "is SOME flowviant daemon", not "is the daemon that wrote THIS
+  // lock" — and a crashed daemon's pid recycled to a SIBLING project's live
+  // daemon passed it, which let a same-repo takeover SIGTERM a different
+  // project's machine. Every 0.54.0+ lock also carries `startedAt`, the
+  // process's own witness to when it began, so when it is present the start
+  // time must agree too. `null` (could not measure — hidepid, no ps, a lock
+  // with no startedAt) falls back to the entry match alone, exactly the
+  // pre-check behaviour: refusing on ignorance here would re-brick takeover
+  // on the hosts that hide /proc.
+  const around = startedAroundLockWrite(holder);
+  return around === false ? false : true;
+}
+
+/**
+ * Unlink a lock file ONLY while it still names the pid the caller decided
+ * about (or nothing readable). Every rmSync of a lock outside the ppid-adopt
+ * path goes through this: between "I proved pid N is dead/stale" and the
+ * unlink, a concurrently starting daemon can clear the file itself and
+ * wx-create its own — and an unconditional rm then deletes a LIVE daemon's
+ * lock, leaving it running unguarded, which is the one condition this module
+ * exists to prevent. The read-then-rm gap that remains is microseconds against
+ * the seconds-wide window it closes.
+ *
+ * Returns false when the file now names a DIFFERENT pid — a handover the
+ * caller must treat as "not mine to clear" — true otherwise (removed, already
+ * gone, or best-effort failed into acquire's next pass).
+ */
+function rmLockIfStill(path, pid) {
+  const cur = readHolder(path);
+  if (cur && cur.pid !== pid) return false;
+  try {
+    rmSync(path, { force: true });
+  } catch {
+    /* best-effort; a stale file is cleared by the next acquire */
+  }
+  return true;
+}
+
+/** Blocking, because this runs before there is an event loop worth yielding to
+ *  and the caller cannot proceed until it knows whether the holder is gone. */
+const sleep = (ms) => {
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  } catch {
+    /* no SharedArrayBuffer — check again immediately */
+  }
+};
+
+/** How long the outgoing daemon gets to stand down cleanly. Its SIGTERM handler
+ *  kills the CLI children it spawned and stops its preview tunnels; both are
+ *  why we ask before we insist. */
+const TAKEOVER_GRACE_MS = 20_000;
+
+/**
+ * THE STAND-DOWN, and it is deliberately ONE copy of this.
+ *
+ * Two callers perform this identical ritual for different reasons — a takeover
+ * (a second run in the same repo replacing the daemon serving it) and
+ * `flowviant stop` (a person who does not know what is running clearing the
+ * box). What they share is a SIGTERM followed by a SIGKILL, and two hand-copies
+ * of a SIGKILL are two places to get the grace period, the zombie trap or the
+ * mid-update handover subtly wrong. The IDENTITY gate is NOT in here: this
+ * function signals whatever it is handed, so every caller must have proved what
+ * the pid is before it calls (see stillTheHolder, and read its tri-state note).
+ *
+ * SIGTERM FIRST, and not out of politeness: the daemon's handler runs its
+ * teardown — it kills the CLI children it spawned and stops its preview
+ * tunnels, which are DETACHED and would otherwise keep a public hostname
+ * serving a worktree until the box reboots.
+ *
+ * WAIT ON THE LOCK FILE, not the pid. A departing daemon's release() removes it
+ * on exit, so the file changing IS the handover. `kill(pid, 0)` cannot see it:
+ * a process that exited but has not been reaped is a ZOMBIE and answers signal
+ * 0 exactly like a living one — measured, a peer that exited cleanly still read
+ * as alive for the full grace window.
+ *
+ * And "gone" is NOT "the file stopped naming our pid". It can stop naming it
+ * because the holder SELF-UPDATED: update.mjs re-execs and the successor adopts
+ * this same lock through the ppid branch. Treating that as free steals a live
+ * daemon's lock and leaves it running unguarded — measured doing exactly that.
+ *
+ * A DRAINING HOLDER IS NEVER SIGNALLED (ruling 2026-09-26, "a stand-down lets
+ * a deploy finish and report"). It is already standing down and leaves by
+ * itself once its deploy's outcome is posted, and a signal can only cost that
+ * outcome. So the mark is read BEFORE the SIGTERM, and again on every look
+ * after it (the holder writes it the moment our SIGTERM finds a deploy in
+ * flight). What happens then is the caller's: `flowviant stop` is told so and
+ * returns (`draining`), a takeover waits for the lock to clear
+ * (`waitOutDrain`) — one line said once, no deadline, and Ctrl+C on the
+ * waiting process abandons only the wait (no handler is installed yet, so the
+ * default action ends the process; the draining daemon is untouched).
+ *
+ * Returns null when the holder is stopped and its lock file is cleared, or
+ * `{ failed }` with a sentence the caller can print as-is.
+ */
+function standDown(holder, path, log, { waitOutDrain = false } = {}) {
+  // NEVER SIGNAL OURSELVES, and this is not a theoretical guard — it was
+  // reproduced end to end. A 0.54.0+ lock records `entry` = the daemon's
+  // argv[1], i.e. `…/bin/cli.mjs`. Run `flowviant stop` and OUR cmdline is
+  // `node …/bin/cli.mjs stop`, which CONTAINS that string. So if a stale lock's
+  // pid has been recycled to us — ordinary on a host with pid_max 32768, and
+  // stale locks are deliberately left on disk — stillTheHolder answers `true`
+  // ABOUT THE SWEEPER and this function SIGTERMs the process running it. The
+  // command then dies mid-line, every later lock goes unexamined, and the real
+  // daemons it was asked to stop keep running. It is the signal-the-wrong-
+  // process bug arriving through a POSITIVE identification, which is why the
+  // identity check cannot catch it and the guard belongs here, at the one place
+  // that signals, rather than in each caller.
+  if (holder.pid === process.pid) return { failed: 'refusing to signal this very process' };
+  const standing = () => {
+    const now = readHolder(path);
+    if (!now || !alive(now.pid)) return null;
+    return now;
+  };
+  const before = standing();
+  if (!(before?.pid === holder.pid && before.draining)) {
+    log?.(`asking daemon pid ${holder.pid} to stand down…`);
+    try {
+      process.kill(holder.pid, 'SIGTERM');
+    } catch {
+      return { failed: `could not signal pid ${holder.pid}` };
+    }
+  }
+
+  const deadline = Date.now() + TAKEOVER_GRACE_MS;
+  let saidWaiting = false;
+  for (;;) {
+    const now = standing();
+    if (!now) break;
+    if (now.pid !== holder.pid) {
+      return {
+        failed: `the daemon handed over to pid ${now.pid}${now.version ? ` (${now.version})` : ''} while we waited — it is mid-update, so try again in a moment`,
+      };
+    }
+    /**
+     * IT IS FINISHING A DEPLOY — never forced (see above). The lock's mark
+     * (`markLockDraining`) says it has stopped taking work and leaves by
+     * itself once the outcome is posted; a SIGKILL here would lose exactly
+     * that outcome, so the server would hand the same irreversible job out
+     * again.
+     */
+    if (now.draining) {
+      const what = typeof now.draining.what === 'string' && now.draining.what ? ` (${now.draining.what})` : '';
+      if (!waitOutDrain) {
+        return {
+          draining: true,
+          failed: `pid ${holder.pid} is finishing a deploy${what} and stops by itself once its outcome is reported — it was not forced`,
+        };
+      }
+      if (!saidWaiting) {
+        saidWaiting = true;
+        log?.(`pid ${holder.pid} is finishing a deploy${what} — waiting…`);
+      }
+      sleep(1000);
+      continue;
+    }
+    if (Date.now() >= deadline) {
+      log?.(`pid ${holder.pid} did not stand down within ${TAKEOVER_GRACE_MS / 1000}s — forcing it.`);
+      try {
+        process.kill(holder.pid, 'SIGKILL');
+      } catch {
+        /* exited in the gap */
+      }
+      sleep(600);
+      const after = standing();
+      if (after && after.pid !== holder.pid) {
+        return { failed: `the daemon handed over to pid ${after.pid} — try again in a moment` };
+      }
+      if (after) return { failed: `pid ${holder.pid} would not stop` };
+      break;
+    }
+    sleep(400);
+  }
+
+  // A SIGKILLed daemon never ran its release(), so clear what it left — but
+  // only if the file still names the pid we stood down: in the gap since the
+  // last read a fresh daemon may have cleared it and taken the lock itself.
+  if (!rmLockIfStill(path, holder.pid)) {
+    return { failed: 'another daemon took the lock while it was being cleared — try again in a moment' };
+  }
+  return null;
+}
+
+/**
+ * Ask the holder to stand down, then take its place.
+ *
+ * WHAT THIS FUNCTION IS, now that the choreography lives in standDown above: the
+ * IDENTITY GATE. Nothing below signals anything until the pid has been proved to
+ * be the process that wrote this lock — a lock records a PID, pids are recycled,
+ * and a crashed daemon's number goes to whatever forks next. `stillTheHolder` is
+ * tri-state and both of its refusing values are reported, separately, because
+ * "it is someone else" and "we could not look" are different sentences and
+ * collapsing them once had the daemon telling people a live holder was stale.
+ */
+function takeOverFrom(holder, path, log, { allowDowngrade = false } = {}) {
+  if (!holder?.pid || !alive(holder.pid)) return null; // already gone
+  const identified = stillTheHolder(holder);
+  if (identified === null) {
+    // We know nothing about this pid, and said so. The remedy is a human
+    // stopping it, NOT running a second daemon alongside it.
+    return {
+      failed:
+        `cannot confirm what pid ${holder.pid} is on this host — no readable /proc or ps — ` +
+        `so it will not be signalled. Stop that process yourself and start this one again.`,
+      unidentified: true,
+    };
+  }
+  if (identified === false) {
+    // MEASURED: the lock's writer is gone and the pid now belongs to something
+    // else. That is a STALE LOCK, not an unremovable holder — refusing here
+    // used to brick every start after an OOM-kill or reboot recycled the pid
+    // to any live process, until a human deleted ~/.flowviant/daemon-*.lock by
+    // hand. Nothing is signalled (the process is a stranger); the caller
+    // clears the corpse the same way it clears a dead pid's.
+    return { stale: true };
+  }
+  /**
+   * THE DOWNGRADE GUARD refuses only a MEASURED downgrade. A holder version
+   * this daemon cannot read (versionOrder.mjs answers unknown) gates nothing,
+   * the same as before the one comparator existed: ignorance never refuses
+   * (CLAUDE.md, "What Flowviant is"). The old comment here claimed the
+   * opposite while its code let the takeover through; the code was the rule.
+   * A lock with NO version (an older daemon wrote it) is not compared either.
+   */
+  if (!allowDowngrade && holder.version && compareVersions(VERSION, holder.version) === -1) {
+    return {
+      failed: `the running daemon is ${holder.version} and this one is ${VERSION} — refusing to replace a newer daemon with an older one (--takeover-downgrade if you mean it)`,
+    };
+  }
+
+  // A takeover WAITS OUT a drain (ruling 2026-09-26): the new start is what
+  // was asked for, and it arrives once the deploy has reported.
+  const bad = standDown(holder, path, log, { waitOutDrain: true });
+  if (bad) return bad;
+  log?.(`daemon pid ${holder.pid} stopped — taking over.`);
+  return null;
+}
+
+/**
+ * Take the lock, or report who holds it.
+ *
+ * Returns `{ ok: true, release }` — call `release()` to drop it, and it is
+ * already wired to process exit — or `{ ok: false, holder }` with the other
+ * daemon's pid and repo so the caller can say something useful.
+ *
+ * `wx` is the whole guarantee: create-exclusive is one atomic syscall, which is
+ * the property the turn lock's check-then-write does not have.
+ */
+export function acquireInstanceLock(fleetToken, repoRoot, opts = {}) {
+  const { takeover: force = false, noTakeover = false, allowDowngrade = false, log } = opts;
+  if (process.env.FLOWVIANT_ALLOW_MULTI === '1') return { ok: true, release: () => {} };
+  const path = instanceLockPath(fleetToken);
+  try {
+    mkdirSync(join(homedir(), '.flowviant'), { recursive: true });
+  } catch {
+    return { ok: true, release: () => {}, unguarded: true };
+  }
+
+  // ONE DAEMON PER REPO, checked across every credential — see the header. This
+  // runs BEFORE we take our own lock, so a refusal leaves nothing behind.
+  const neighbour = daemonInSameRepo(repoRoot, path);
+  if (neighbour) {
+    // Same working tree, another credential. Under "one daemon per repo" the
+    // new run wins here too — but it is signalling a process that belongs to a
+    // DIFFERENT project, so it is worth saying out loud rather than doing
+    // quietly.
+    if (noTakeover) return { ok: false, holder: neighbour, sameRepo: true };
+    log?.(`another project's daemon is serving this repo (pid ${neighbour.pid}).`);
+    // The OPTIONS ride along — this call used to drop them, so a deliberate
+    // `flowviant --takeover-downgrade` against a newer neighbour printed
+    // "--takeover-downgrade if you mean it" at somebody who had already
+    // typed it.
+    const bad = takeOverFrom(neighbour, neighbourLockPath(neighbour, path), log, { allowDowngrade });
+    if (bad?.stale) {
+      // The neighbour's lock is a corpse wearing a recycled pid — clear it (if
+      // it still names that pid) and carry on to our own lock.
+      log?.(`pid ${neighbour.pid} is no longer a daemon — clearing its stale lock.`);
+      rmLockIfStill(neighbourLockPath(neighbour, path), neighbour.pid);
+    } else if (bad) {
+      return { ok: false, holder: neighbour, sameRepo: true, takeoverFailed: bad.failed, unidentified: bad.unidentified };
+    }
+  }
+
+  // Two passes at most: one to clear a stale holder, one to take the lock. A
+  // loop here would spin against a peer that keeps re-taking it.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let fd;
+    try {
+      fd = openSync(path, 'wx');
+    } catch (e) {
+      if (e.code !== 'EEXIST') return { ok: true, release: () => {}, unguarded: true };
+      const holder = readHolder(path);
+      if (!holder || !alive(holder.pid)) {
+        // A crashed daemon's leftover. Clear it and take it on the next pass —
+        // ownership-verified, because a concurrent start may have cleared and
+        // re-created it in the gap since our read.
+        if (holder) rmLockIfStill(path, holder.pid);
+        else {
+          // Unreadable content: re-read before clearing, so a half-written
+          // record a peer is writing RIGHT NOW is not deleted mid-write.
+          const again = readHolder(path);
+          if (again && alive(again.pid)) continue; // it finished writing — a real holder now
+          try {
+            rmSync(path, { force: true });
+          } catch {
+            return { ok: true, release: () => {}, unguarded: true };
+          }
+        }
+        continue;
+      }
+      // OUR OWN PARENT, which is not a second daemon — it is this one, mid
+      // re-exec. The SELF-UPDATE is the case: a live daemon holding this lock
+      // installs a new version, spawns it, and stays alive as a proxy awaiting
+      // it (update.mjs), so the successor's ppid IS the holder. Refusing there
+      // would brick every auto-update. Adopt instead; the parent's release is
+      // ownership-checked, so it will not delete the lock it handed over.
+      // (`flowviant login` also proxies a child, but that parent never reached
+      // the daemon and holds nothing — the child simply acquires.)
+      if (isOurReexecParent(holder.pid)) {
+        try {
+          writeFileSync(path, record(repoRoot));
+        } catch {
+          return { ok: true, release: () => {}, unguarded: true };
+        }
+        return { ok: true, release: makeRelease(path) };
+      }
+      // THE RULE. Same repo -> this run replaces it; different repo -> refuse
+      // and signal nothing, unless --takeover says otherwise. See the header.
+      const here = samePath(holder.repoRoot, repoRoot);
+      const wanted = force || (here && !noTakeover);
+      if (wanted) {
+        const bad = takeOverFrom(holder, path, log, { allowDowngrade });
+        if (bad?.stale) {
+          // Measured: the lock's writer is gone and its pid was recycled to a
+          // stranger. A corpse is cleared, never "refused" — refusing bricked
+          // every start after a reboot handed the pid to any live process.
+          log?.(`pid ${holder.pid} is no longer a daemon — clearing its stale lock.`);
+          rmLockIfStill(path, holder.pid);
+          continue;
+        }
+        if (bad)
+          return { ok: false, holder, takeoverFailed: bad.failed, sameRepo: here, unidentified: bad.unidentified };
+        continue; // the file is gone — the next pass takes it
+      }
+      // Before refusing on a different-repo holder, make sure it IS one: a
+      // stale lock whose pid was recycled to any live process would otherwise
+      // refuse this credential's start forever, naming a "daemon" that is a
+      // stranger. Only the MEASURED verdict clears; null (could not look)
+      // still refuses, because ignorance must not delete a lock.
+      if (stillTheHolder(holder) === false) {
+        log?.(`pid ${holder.pid} is no longer a daemon — clearing its stale lock.`);
+        rmLockIfStill(path, holder.pid);
+        continue;
+      }
+      return { ok: false, holder, sameRepo: here };
+    }
+    try {
+      writeSync(fd, record(repoRoot));
+    } finally {
+      closeSync(fd);
+    }
+    return { ok: true, release: makeRelease(path) };
+  }
+  // Both passes lost to something re-creating the file — assume a peer.
+  return { ok: false, holder: readHolder(path) };
+}
+
+/**
+ * MARK THIS PROCESS'S LOCK AS DRAINING — it is standing down and waits only
+ * for its in-flight deploys to report (ruling 2026-09-26; standDownExit.mjs).
+ * The lock stays held, so `status --json` still shows the daemon running and
+ * busy until the outcome lands; the mark is what tells a takeover (which then
+ * waits) or a `flowviant stop` (which then says so) never to signal it
+ * (see standDown).
+ *
+ * Written only while the lock still names this pid, and by rename, so a
+ * reader never sees half a record. Returns whether it was written; an
+ * unguarded daemon (no lock) has nothing to mark.
+ */
+export function markLockDraining(fleetToken, what) {
+  const path = instanceLockPath(fleetToken);
+  const holder = readHolder(path);
+  if (!holder || holder.pid !== process.pid) return false;
+  const tmp = `${path}.${process.pid}.tmp`;
+  try {
+    writeFileSync(tmp, JSON.stringify({ ...holder, draining: { what: String(what ?? ''), since: new Date().toISOString() } }));
+    renameSync(tmp, path);
+    return true;
+  } catch {
+    try {
+      rmSync(tmp, { force: true });
+    } catch {
+      /* best-effort */
+    }
+    return false;
+  }
+}
+
+/** Release ONLY what we still own: a successor that adopted the lock (see the
+ *  ppid branch) must not have it deleted out from under it when we exit. */
+function makeRelease(path) {
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    const holder = readHolder(path);
+    if (holder && holder.pid !== process.pid) return; // handed over — leave it
+    try {
+      rmSync(path, { force: true });
+    } catch {
+      /* best-effort; a stale file is cleared by the next acquire */
+    }
+  };
+  // 'exit' covers the SIGINT/SIGTERM handlers too — both leave through
+  // standDownExit.mjs's `leave`, which ends in process.exit().
+  process.on('exit', release);
+  return release;
+}
+
+/**
+ * ONE LOCK FILE, EXAMINED AND — IF IT NAMES A LIVE DAEMON WE CAN IDENTIFY —
+ * STOPPED. The per-file half of `stopAllDaemons`, split out (0.95.0) so that
+ * `stopDaemonFor` can run the identical ritual on ONE credential's lock: the
+ * `machines` command's disconnect stops the daemon serving the project being
+ * disconnected and must not touch the daemons serving anything else on the
+ * box, which a sweep of every lock cannot promise. Same tri-state, same
+ * sentences, same refusal to guess — there is one copy of this on purpose,
+ * for the reason `standDown` gives about SIGKILLs.
+ *
+ * `tally` is mutated in place: `running` counts locks naming a process we
+ * believe is, or might be, a daemon; `draining` counts the ones that were
+ * obeyed but are still alive, finishing a deploy (also counted `stopped`); the
+ * rest are what the caller reports.
+ */
+function stopLock(path, log, tally) {
+  const holder = readHolder(path);
+  if (!holder) return; // absent, truncated, half-written — no claim to answer
+  const where = holder.repoRoot ? ` in ${holder.repoRoot}` : '';
+  const what = holder.version ? ` ${holder.version}` : '';
+
+  if (!alive(holder.pid)) {
+    log(`pid ${holder.pid}${where} is already gone — nothing to stop.`);
+    return;
+  }
+  // Us. standDown refuses this too, but reaching it would print a stand-down
+  // line and then a failure for the one pid we are certain is not a daemon.
+  if (holder.pid === process.pid) return;
+
+  const identified = stillTheHolder(holder);
+  if (identified === false) {
+    // A live pid, but measured NOT to be the process that wrote this lock. The
+    // daemon is gone; the number was handed to something else. Not counted as
+    // running, and deliberately not counted as a failure either.
+    log(`pid ${holder.pid} is no longer the daemon that took this lock — nothing signalled.`);
+    return;
+  }
+  tally.running++;
+  if (identified === null) {
+    tally.unconfirmed++;
+    tally.failed++;
+    // NAMES BOTH CAUSES, because null has two and we did not measure which:
+    // the lock may carry no witness to match against (neither `entry` nor
+    // `startedAt` — a hand-edited or half-written file), or this host may hide
+    // the process from us (hidepid=2, a pid namespace, an image with no `ps`).
+    // "no readable /proc" alone is what takeover says, and said HERE it would
+    // assert a diagnosis nobody established — over a live process we are about
+    // to tell someone to kill.
+    // `kill` is not a command on Windows, where platform() is 'win32' and
+    // processStartedAt has no implementation at all — so EVERY lock lands in
+    // this branch and the whole command is a no-op that exits 1. Say that
+    // once, in the platform's own vocabulary, rather than handing someone a
+    // remedy their shell does not have.
+    const byHand =
+      platform() === 'win32'
+        ? `taskkill /PID ${holder.pid} /F`
+        : `kill ${holder.pid}`;
+    log(
+      `could not confirm that pid ${holder.pid} is still a flowviant daemon — its lock carries ` +
+        `nothing to match it against, or this host hides the process from us` +
+        `${platform() === 'win32' ? ' (identifying a process is not implemented on Windows)' : ''}` +
+        ` — so it was NOT signalled. Stop it by hand: ${byHand}`
+    );
+    return;
+  }
+
+  const bad = standDown(holder, path, log);
+  if (bad?.draining) {
+    // Asked, heard, and leaving once its deploy reports: the stop was obeyed,
+    // so this is not a failure — and nothing is forced (see standDown). It is
+    // counted apart too, because it is still ALIVE: a disconnect must not go
+    // on to leave and forget under it (machineDisconnect.mjs).
+    tally.stopped++;
+    tally.draining++;
+    log(`daemon pid ${holder.pid}${where}: ${bad.failed}.`);
+    return;
+  }
+  if (bad) {
+    tally.failed++;
+    log(`could not stop daemon pid ${holder.pid}${where}: ${bad.failed}`);
+    return;
+  }
+  tally.stopped++;
+  log(`stopped daemon${what} pid ${holder.pid}${where}.`);
+}
+
+/**
+ * STOP THE DAEMON SERVING ONE CREDENTIAL — `flowviant machines` disconnecting
+ * this box from one project (0.95.0).
+ *
+ * `stopAllDaemons` is the right shape for a person who does not know what is
+ * running; this is for a person who has just NAMED a project in a menu and
+ * expects exactly that project's daemon to stop. The lock is keyed on the
+ * credential (`instanceLockPath`), so the file to examine is known without a
+ * sweep, and a daemon serving a sibling project in another directory is never
+ * examined, let alone signalled.
+ *
+ * NO LOCK IS NOT AN ERROR: a project connected here but not currently running
+ * is the ordinary case for a disconnect, and the caller says "nothing was
+ * running" rather than failing. Returns the same tally `stopAllDaemons` does.
+ */
+export function stopDaemonFor(fleetToken, { log = (m) => console.log(m) } = {}) {
+  const tally = { stopped: 0, unconfirmed: 0, failed: 0, running: 0, draining: 0 };
+  stopLock(instanceLockPath(fleetToken), log, tally);
+  return tally;
+}
+
+/**
+ * STOP EVERY FLOWVIANT DAEMON ON THIS MACHINE — `flowviant stop`.
+ *
+ * WHY IT IS "EVERY" AND NOT "THIS REPO'S". The friction this exists to remove is
+ * not knowing what is running. Somebody who could NAME the daemon they meant
+ * would not need this command — they would already have the pid. What actually
+ * happens is that they run `flowviant`, hit a refusal naming a pid and a
+ * directory they do not recognise, and go hunting through `ps`. So this takes no
+ * argument, asks no question, and sweeps every credential's lock file rather
+ * than the one this checkout happens to key to: a stop command with a scope is a
+ * stop command you have to be sure about before you can use it.
+ *
+ * IT IDENTIFIES BEFORE IT SIGNALS, exactly as takeover does and for the same
+ * reason — a lock records a PID, pids are recycled, and there is no such thing
+ * as a harmless guess about which process to kill. The tri-state from
+ * stillTheHolder is reported as three DIFFERENT sentences and never collapsed:
+ *
+ *   true   -> stopped, through the same standDown the takeover path uses.
+ *   false  -> measured, and that pid is somebody else now. Nothing is signalled
+ *             and it is NOT a failure: the daemon that wrote the lock is gone,
+ *             which is the answer the asker wanted.
+ *   null   -> COULD NOT CONFIRM — either the lock carries no witness to match
+ *             against, or the host hides the process (hidepid=2, a pid
+ *             namespace, an image with no `ps`); the line below names BOTH,
+ *             since we did not measure which. Said out loud WITH THE PID,
+ *             because we have just declined to touch a live process and the
+ *             remedy is a human running `kill`.
+ *             That one counts as a failure — something is alive and we did not
+ *             stop it — which is the ONLY thing that makes this command exit
+ *             non-zero.
+ *
+ * A STALE LOCK IS LEFT ON DISK. Unlinking one looks tidy and races a daemon that
+ * is starting RIGHT NOW: acquire clears a dead holder's file and then re-creates
+ * it with `wx`, so a sweep landing between those two steps deletes a LIVE
+ * daemon's lock and leaves it running unguarded — the one condition this whole
+ * module exists to prevent. Clearing stale files is acquire's job, it already
+ * does it, and it does it without the race.
+ *
+ * FINDING NOTHING IS THE FEATURE, not an error: "no flowviant daemon is running
+ * on this machine." is the sentence the person who did not know came for, and it
+ * exits 0. Reported through `log` line by line as the sweep goes — a person
+ * watching a SIGTERM wants to see which pid it went to while it is happening,
+ * not in a summary afterwards.
+ *
+ * Returns `{ stopped, unconfirmed, failed }`; the caller turns `failed` into the
+ * exit code.
+ */
+export function stopAllDaemons({ log = (m) => console.log(m) } = {}) {
+  const tally = { stopped: 0, unconfirmed: 0, failed: 0, running: 0, draining: 0 };
+  for (const path of lockFiles()) stopLock(path, log, tally);
+  const { stopped, unconfirmed, failed, running } = tally;
+
+  // WHAT WE ACTUALLY MEASURED IS LOCKS, so that is what this says. The old
+  // sentence — "no flowviant daemon is running on this machine" — was asserted
+  // from lock files alone, and there are several ways to run a daemon that
+  // holds no readable lock: FLOWVIANT_ALLOW_MULTI=1 returns before the
+  // filesystem is touched (and fleetStartup.mjs PRINTS that flag as the way out
+  // of an "already running" refusal, so a stuck user is steered onto it), an
+  // unwritable ~/.flowviant runs `unguarded`, and every daemon before 0.51.2
+  // predates the lock entirely. Telling somebody "nothing is running" while
+  // something is, is this product's cardinal sin: it turns ignorance into a
+  // state. So the claim is scoped to what was looked at, and the ways past it
+  // are named rather than left for them to discover.
+  if (!running) {
+    log('no flowviant daemon holds a lock on this machine.');
+    log(
+      '(a daemon started with FLOWVIANT_ALLOW_MULTI=1, or one older than 0.51.2, holds no lock — ' +
+        'this cannot see those. `pgrep -af flowviant` will.)'
+    );
+  }
+  return { stopped, unconfirmed, failed };
+}

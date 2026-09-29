@@ -1,0 +1,146 @@
+# RELEASE: a `v*` tag runs the tests, builds the four standalone binaries with
+# scripts/build-binaries.sh (linux-x64/arm64, darwin-x64/arm64), attests them,
+# and attaches them and dist/manifest.json to a GitHub Release. Uploading them
+# to the Flowviant download host (R2, what `curl … install.sh | sh` and the
+# self-update read) is a separate job, off until the owner turns it on.
+#
+#   test ─► build ─► github-release ─► publish-r2 (optional)
+#
+# The Windows tray (Flowviant/desktop) bundles the linux-x64 binary from the
+# GitHub Release made here and checks its attestation before it does.
+#
+# SECRETS (repository → Settings → Secrets and variables → Actions):
+#   APP_DEPLOY_KEY   the private half of a READ-ONLY deploy key on the private
+#                    app repository (Flowviant/flowviant), for the release gate
+#                    below. Nothing from that checkout goes into a binary.
+# In the `r2` environment, only for publish-r2:
+#   CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID
+# VARIABLES:
+#   PUBLISH_R2 = 'true'  turns publish-r2 on
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+env:
+  BUN_VERSION: 1.3.13
+  APP_REPO: Flowviant/flowviant
+
+jobs:
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write      # build provenance attestations
+      attestations: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: The tag is the package's version
+        id: version
+        run: |
+          version=$(node -p 'require("./package.json").version')
+          [ "$GITHUB_REF_NAME" = "v$version" ] || { echo "::error::tag $GITHUB_REF_NAME is not v$version (package.json)"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - run: bun install --frozen-lockfile
+
+      # THE RELEASE GATE (scripts/check-app-parity.mjs, run by build-binaries.sh):
+      # the daemon's copies of server rules must match the app it talks to, and
+      # the app's source is private. The gate only compares; it adds nothing to
+      # the binaries.
+      - name: The app checkout for the release gate is configured
+        env:
+          APP_DEPLOY_KEY: ${{ secrets.APP_DEPLOY_KEY }}
+        run: '[ -n "$APP_DEPLOY_KEY" ] || { echo "::error::the APP_DEPLOY_KEY secret is not set (a read-only deploy key on $APP_REPO)"; exit 1; }'
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.APP_REPO }}
+          ssh-key: ${{ secrets.APP_DEPLOY_KEY }}
+          path: app
+          persist-credentials: false
+      - name: Install the app's workspace (the gate imports its TypeScript)
+        working-directory: app
+        run: bun install --frozen-lockfile --ignore-scripts
+
+      - name: Build the binaries
+        env:
+          FLOWVIANT_APP_DIR: ${{ github.workspace }}/app
+        run: sh scripts/build-binaries.sh
+
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            dist/flowviant-${{ steps.version.outputs.version }}-*
+            dist/manifest.json
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: |
+            dist/flowviant-${{ steps.version.outputs.version }}-*
+            dist/manifest.json
+          if-no-files-found: error
+
+  github-release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          (cd dist && sha256sum flowviant-* > SHA256SUMS)
+          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "flowviant $VERSION" \
+            --notes "Standalone binaries (Bun, no Node needed) for Linux and macOS, their manifest.json and SHA256SUMS. Verify one with: gh attestation verify <file> --repo $GITHUB_REPOSITORY. Built by this workflow run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
+  # Off until the repository variable PUBLISH_R2 is 'true'. The same upload as
+  # by hand (scripts/upload-binaries.sh): every binary, then the versioned
+  # manifest, then latest.json LAST, so no client sees a manifest before its
+  # binaries. Put the Cloudflare secrets in the `r2` environment and add a
+  # required reviewer there to approve each publish.
+  publish-r2:
+    needs: [build, github-release]
+    if: vars.PUBLISH_R2 == 'true'
+    runs-on: ubuntu-latest
+    environment: r2
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist
+      - name: Upload to the Flowviant download host
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: sh scripts/upload-binaries.sh

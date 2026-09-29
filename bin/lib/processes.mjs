@@ -1,0 +1,248 @@
+/**
+ * WHAT YOUR CLAUDE IS ACTUALLY RUNNING — the processes it started, still alive.
+ *
+ * The Workbench could say what a tab had CHANGED (the diffstat) and what was
+ * LISTENING in it (`listeners.mjs`), and nothing about what it was RUNNING. A
+ * backgrounded watcher — `rbxtsc -w`, `tsc --watch`, `cargo watch` — holds no
+ * socket and touches no file for minutes at a time, so it was invisible from a
+ * browser in a way it never is in a terminal, where you can just look.
+ *
+ * ATTRIBUTED BY PROCESS GROUP, not by working directory, and that choice is the
+ * whole design. Two candidates were weighed:
+ *
+ *   · BY CWD, the rule `listeners.mjs` uses. It answers "what is running in
+ *     this directory", which is the wrong question here — under a shared place
+ *     it sweeps in a teammate's processes and their command lines, and this
+ *     product's standing rule is that a teammate's activity is never surfaced.
+ *   · BY DESCENDANCY, walking ppid. It answers the right question and then
+ *     loses exactly the processes worth showing: `nohup` and `setsid` reparent
+ *     to init, so the long-running watcher drops off the chain the moment it
+ *     becomes long-running.
+ *
+ * A process GROUP survives reparenting. The daemon spawns each turn's CLI
+ * `detached`, which makes it a group leader, and every process the agent starts
+ * inherits that pgid however it is backgrounded. So the group IS "started by
+ * the AI instructed through Flowviant", precisely, and it keeps being that
+ * after the turn ends and the CLI exits — which is when it matters.
+ *
+ * THE GROUP LEADER IS NEVER REPORTED, and this is not tidiness. The CLI is
+ * spawned as `-p <prompt> --append-system-prompt <system>`, so its own argv
+ * holds the driver's entire message and the whole operating contract. Reporting
+ * it would push several kilobytes of prompt through the wire and into a browser
+ * on every sweep. The leader is also not something the agent STARTED — it is
+ * the agent. `pid === pgid` identifies it for free.
+ *
+ * Command lines are SCRUBBED with the project's own secret values before they
+ * leave, the same treatment the activity line and the command audit get, and
+ * capped. Scrubbing catches materialized env secrets; it cannot catch a token
+ * somebody types inline, and nothing here pretends otherwise.
+ *
+ * Linux (including WSL2) reads /proc. macOS shells out to `ps`. Windows reports
+ * NOTHING and says so by returning null — the same three-state rule the rest of
+ * this product keeps, where "looked and found none" is `[]` and "cannot look"
+ * is not the same answer.
+ */
+
+import { execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
+import { platform } from 'node:os';
+import { procPids, scanProcs } from './procScan.mjs';
+
+// THE WALK'S BOUND is `procScan.mjs`'s: matched rows collected before the walk
+// stops early — a bound on the WORK done for one pathological group, never on
+// which part of /proc is looked at. It used to cut the pid LIST before
+// filtering, and readdir answers in string order, so a busy box kept '1',
+// '10', '100'… and dropped a tab's watcher at pid 912345 while `liveGroups`
+// (which has no cap) still called its group alive: the tab read "looked,
+// found none" and a Stop on it answered not_found. The listener scans made
+// the same mistake after this one was fixed, which is why the rule moved.
+/** Rows reported per session. A watcher, a dev server and its child is three;
+ *  twenty is somebody's compose stack and the extra rows say nothing. */
+export const MAX_PROCS = 12;
+/** Longest command line relayed. Long enough for `node x.js --flag value`,
+ *  short enough that a pathological argv cannot become the report. */
+const MAX_CMD = 200;
+
+export function processesSupported() {
+  return platform() === 'linux' || platform() === 'darwin';
+}
+
+/**
+ * `pid (comm) state ppid pgrp …` — comm is arbitrary text and CAN contain a
+ * `)`, so the fields are read after the LAST one rather than by splitting the
+ * whole line. A process named `foo) bar` is not hypothetical; it is what
+ * anything that sets its own title can produce.
+ */
+function pgrpOf(pid) {
+  let stat;
+  try {
+    stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+  } catch {
+    return null; // gone between readdir and read — ordinary
+  }
+  const close = stat.lastIndexOf(')');
+  if (close < 0) return null;
+  const rest = stat.slice(close + 1).trim().split(/\s+/);
+  const pgrp = Number(rest[2]);
+  return Number.isInteger(pgrp) && pgrp > 0 ? pgrp : null;
+}
+
+/**
+ * Resident set size in BYTES for one pid, or null.
+ *
+ * Read from `VmRSS` in /proc/<pid>/status rather than from `statm`, whose
+ * second field is resident PAGES and would need a page size we would have to
+ * assume. 4096 is not universal — arm64 boxes run 16K pages — and a memory
+ * readout that is silently four times wrong on somebody's machine is worse than
+ * no readout at all. `status` states its own unit.
+ *
+ * Lives here rather than in `listeners.mjs` because it is a fact about a
+ * PROCESS; both scanners import it, so there is one implementation of the unit
+ * question and not two that can drift.
+ */
+export function rssBytes(pid) {
+  try {
+    const m = /^VmRSS:\s+(\d+)\s+kB$/m.exec(readFileSync(`/proc/${pid}/status`, 'utf8'));
+    return m ? Number(m[1]) * 1024 : null;
+  } catch {
+    return null; // gone between the scan and the read — ordinary
+  }
+}
+
+function cmdlineOf(pid) {
+  try {
+    const raw = readFileSync(`/proc/${pid}/cmdline`, 'utf8');
+    const parts = raw.split('\0').filter(Boolean);
+    if (!parts.length) return null; // a kernel thread — no argv at all
+    return parts.join(' ');
+  } catch {
+    return null;
+  }
+}
+
+/** Exported with its readers injectable ONLY so the scan-order property can be
+ *  pinned without a box that runs four thousand processes. Nothing in the
+ *  daemon passes `io`. */
+export function scanLinux(pgids, io = {}) {
+  const pgrpFor = io.pgrpOf ?? pgrpOf;
+  const cmdFor = io.cmdlineOf ?? cmdlineOf;
+  const rssFor = io.rssBytes ?? rssBytes;
+  const pids = procPids(io.list);
+  if (pids === null) return [];
+  return scanProcs(
+    pids,
+    (raw) => {
+      const pid = Number(raw);
+      const pgrp = pgrpFor(raw);
+      if (pgrp === null || !pgids.has(pgrp)) return null;
+      // The CLI itself — its argv is the prompt. See the header.
+      if (pid === pgrp) return null;
+      const cmd = cmdFor(raw);
+      if (!cmd) return null;
+      const rss = rssFor(raw);
+      return { pid, pgid: pgrp, cmd, ...(rss != null ? { rss } : {}) };
+    },
+    io.bound
+  ).rows;
+}
+
+function scanDarwin(pgids) {
+  let text;
+  try {
+    text = execFileSync('ps', ['-axo', 'pid=,pgid=,rss=,command='], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 5000,
+      maxBuffer: 4 * 1024 * 1024,
+    });
+  } catch {
+    return [];
+  }
+  const out = [];
+  for (const line of text.split('\n')) {
+    const m = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(.*)$/.exec(line);
+    if (!m) continue;
+    const pid = Number(m[1]);
+    const pgid = Number(m[2]);
+    if (!pgids.has(pgid) || pid === pgid) continue;
+    const cmd = m[4].trim();
+    if (cmd) out.push({ pid, pgid, cmd, rss: Number(m[3]) * 1024 }); // ps reports KB
+  }
+  return out;
+}
+
+/**
+ * Live processes in any of `pgids`.
+ *
+ * Returns null where the platform cannot answer — never `[]`, which means
+ * "looked, found none" and is a different fact a surface renders differently.
+ */
+export function processesInGroups(pgids, { scrub } = {}) {
+  const m = measureProcesses(pgids, { scrub });
+  return m === null ? null : m.rows;
+}
+
+/**
+ * …and the TOTAL the cap was applied to.
+ *
+ * The rows alone are a lie about scale the moment a group has more than twelve
+ * members: a dashboard summing them states an incomplete figure as a complete
+ * one. Same rule the listener list and the Repository block's worktree counts
+ * keep — the capped list rides beside the count it was cut from, or it answers
+ * "how much is in here" with a number that is not true.
+ */
+export function measureProcesses(pgids, { scrub } = {}) {
+  if (!processesSupported()) return null;
+  const want = pgids instanceof Set ? pgids : new Set(pgids ?? []);
+  if (want.size === 0) return { rows: [], total: 0 };
+  const rows = platform() === 'darwin' ? scanDarwin(want) : scanLinux(want);
+  // Oldest first: a pid is monotonic, so the long-running watcher you started
+  // an hour ago sorts above the `sh -c` spawned two seconds ago. Cutting from
+  // the END keeps the durable processes and drops the churn.
+  rows.sort((a, b) => a.pid - b.pid);
+  const capped = rows.slice(0, MAX_PROCS).map((r) => ({
+    pid: r.pid,
+    cmd: String(scrub ? scrub(r.cmd) : r.cmd).slice(0, MAX_CMD),
+    // Absent rather than zero where it could not be read: a watcher using no
+    // memory is not a thing, so a 0 here would only ever mean "we failed".
+    ...(r.rss != null ? { rss: r.rss } : {}),
+  }));
+  return { rows: capped, total: rows.length };
+}
+
+/**
+ * Which of `pgids` still has anything alive in it.
+ *
+ * The caller remembers a pgid per session so a backgrounded process outlives
+ * the turn that started it. That set must be pruned or it grows for the life of
+ * the daemon — and a recycled pgid would eventually attribute a stranger's
+ * process to a tab.
+ */
+export function liveGroups(pgids) {
+  if (!processesSupported()) return new Set(pgids ?? []);
+  const want = pgids instanceof Set ? pgids : new Set(pgids ?? []);
+  if (want.size === 0) return new Set();
+  const alive = new Set();
+  if (platform() === 'darwin') {
+    for (const r of scanDarwin(want)) alive.add(r.pgid);
+    // A group whose only member is its leader is still alive; scanDarwin drops
+    // leaders, so ask the kernel directly for the rest.
+    for (const g of want) {
+      if (alive.has(g)) continue;
+      try {
+        process.kill(g, 0);
+        alive.add(g);
+      } catch {
+        /* gone */
+      }
+    }
+    return alive;
+  }
+  const pids = procPids();
+  if (pids === null) return want; // cannot tell — keep what we had rather than forget a live tab
+  for (const raw of pids) {
+    const pgrp = pgrpOf(raw);
+    if (pgrp !== null && want.has(pgrp)) alive.add(pgrp);
+  }
+  return alive;
+}

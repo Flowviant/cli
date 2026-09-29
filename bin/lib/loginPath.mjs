@@ -1,0 +1,114 @@
+/**
+ * THE PATH A PERSON'S TERMINAL HAS, for a daemon nobody started from one.
+ *
+ * Every CLI is found by name on PATH (`claude --version`, `codex`, `agy`,
+ * `gh`). A terminal's PATH comes from the shell's startup files; the Windows
+ * tray starts the daemon with `wsl.exe -d <distro> -- <binary>`, which reads
+ * none of them. That PATH is the distro's bare default, and it misses exactly
+ * where the CLIs usually live: `~/.local/bin` (Claude Code's own installer,
+ * put on PATH by ~/.profile) and version managers set up in ~/.bashrc (nvm,
+ * volta, bun). So a machine whose `claude` works in the owner's WSL terminal
+ * measured "not installed" under the tray (2026-09-25).
+ *
+ * So the daemon asks the person's login shell for its PATH once, and keeps
+ * every entry it already had FIRST (a terminal start is unchanged) with the
+ * shell's additions after it; then the usual per-user bin directories that
+ * exist. Best-effort and bounded: a shell that hangs or prints nothing costs a
+ * few seconds once, and nothing is ever removed from PATH.
+ */
+
+import { execFileSync, spawn } from 'node:child_process';
+import { existsSync, readdirSync } from 'node:fs';
+import { homedir, platform } from 'node:os';
+import { join } from 'node:path';
+import { compareVersions } from './versionOrder.mjs';
+
+const MARK = '__FLOWVIANT_PATH__=';
+
+/** The PATH an interactive login shell ends up with, or null. */
+export function loginShellPath({ env = process.env, exec = execFileSync, timeoutMs = 4000 } = {}) {
+  const shell = env.SHELL && env.SHELL.startsWith('/') ? env.SHELL : '/bin/bash';
+  try {
+    // -i so ~/.bashrc runs (nvm lives there, behind the "not interactive?
+    // return" guard); -l so ~/.profile runs (~/.local/bin lives there). The
+    // marker line survives whatever a startup file prints.
+    const out = String(exec(shell, ['-ilc', `printf '\\n${MARK}%s\\n' "$PATH"`], {
+      env: { ...env, TERM: 'dumb' },
+      timeout: timeoutMs,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }));
+    const line = out.split('\n').reverse().find((l) => l.startsWith(MARK));
+    const value = line?.slice(MARK.length).trim();
+    return value ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Per-user bin directories CLIs install into, that exist on this box. */
+export function userBinDirs({ home = homedir(), exists = existsSync, list = readdirSync } = {}) {
+  const dirs = ['.local/bin', '.npm-global/bin', '.bun/bin', '.volta/bin', '.cargo/bin'].map((d) => join(home, d));
+  // nvm: the newest installed node's bin (nvm's own "default" needs its shell
+  // function to resolve; the newest is the usual answer and only a fallback).
+  try {
+    const versions = list(join(home, '.nvm/versions/node'))
+      .filter((v) => /^v\d+\.\d+\.\d+$/.test(v))
+      // Newest first. Every name passed the filter, so none is unknown.
+      .sort((a, b) => compareVersions(b, a));
+    if (versions[0]) dirs.push(join(home, '.nvm/versions/node', versions[0], 'bin'));
+  } catch { /* no nvm */ }
+  return dirs.filter((d) => exists(d));
+}
+
+/** Current entries first, then any the others add. Order-preserving, deduped. */
+export function mergePath(current, ...more) {
+  const seen = new Set();
+  const out = [];
+  for (const part of [current, ...more].flatMap((p) => (Array.isArray(p) ? p : String(p ?? '').split(':')))) {
+    if (!part || seen.has(part)) continue;
+    seen.add(part);
+    out.push(part);
+  }
+  return out.join(':');
+}
+
+/**
+ * Widen process.env.PATH in place. `shell: false` skips the login shell and
+ * only adds the fixed per-user directories (for the tray's frequent status
+ * polls, where a shell start every 30 s is not worth it).
+ */
+export function adoptLoginPath({ shell = true, env = process.env, ...deps } = {}) {
+  if (platform() === 'win32' || env.FLOWVIANT_KEEP_PATH === '1') return env.PATH;
+  const login = shell ? loginShellPath({ env, ...deps }) : null;
+  env.PATH = mergePath(env.PATH, login, userBinDirs(deps));
+  return env.PATH;
+}
+
+/**
+ * adoptLoginPath, for THIS process and every child it will start.
+ *
+ * Under Bun (the compiled binary the curl install and the tray ship) child
+ * processes are looked up and started with the environment the process
+ * STARTED with unless a spawn passes `env` — a later `process.env.PATH = …` is
+ * invisible to them (measured 2026-09-25: node found ~/.local/bin/claude after
+ * the change, the compiled binary did not). So when the PATH grew, the
+ * binary restarts itself once with it: a thin proxy, the same shape as the
+ * self-update re-exec, stdio inherited, exit code and signals passed through.
+ * Node needs none of that and adopts in place.
+ */
+export async function adoptLoginPathForProcess(opts = {}) {
+  if (process.env.FLOWVIANT_PATH_ADOPTED === '1') return;
+  const before = process.env.PATH;
+  const after = adoptLoginPath(opts);
+  if (!process.versions.bun || after === before) return;
+  const compiled = process.argv[1]?.startsWith('/$bunfs/');
+  const child = spawn(process.execPath, process.argv.slice(compiled ? 2 : 1), {
+    stdio: 'inherit',
+    env: { ...process.env, FLOWVIANT_PATH_ADOPTED: '1' },
+  });
+  for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+    process.on(signal, () => { try { child.kill(signal); } catch { /* gone */ } });
+  }
+  const code = await new Promise((resolve) => child.on('exit', (status, signal) => resolve(status ?? (signal ? 1 : 0))));
+  process.exit(code);
+}
