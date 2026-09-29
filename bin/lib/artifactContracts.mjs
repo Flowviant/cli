@@ -60,6 +60,25 @@ or, if you are stopping to ask:
 past tense, plain sentences, no card ids.`;
 
 /**
+ * NOBODY IS AT THIS SCREEN (2026-09-29, the owner: Chrome "kept opening on my
+ * desktop … but me as the user didnt click anything"). A board agent looking
+ * at the page it made started Chrome itself, and a Chrome started on the
+ * default profile hands its window to the person's own running Chrome. The
+ * turn's environment now closes those roads (noWindowEnv.mjs); these words
+ * are for what an environment cannot close — an agent reaching for a window
+ * on purpose — and say how to look without one: headless, a profile of its
+ * own, a screenshot it reads back. `flowviant shot` is not named because
+ * nothing puts `flowviant` on a turn's PATH (an npx or tray-bundled daemon
+ * has none there). Every file-handing kind that draws a page renders
+ * `LOOK_HEADLESS` in its rule 2; the image card renders `NO_WINDOW`.
+ */
+export const NO_WINDOW = `Never open a browser window or any desktop application: this is somebody's
+   own screen, and nobody is at it.`;
+export const LOOK_HEADLESS = `${NO_WINDOW} To look at your page, screenshot it
+   headless with a profile of its own and read the PNG:
+     google-chrome --headless=new --user-data-dir="$(mktemp -d)" --virtual-time-budget=5000 --screenshot=/tmp/<name>.png file://<the page's absolute path>`;
+
+/**
  * THE 3D-MODEL CARD (rewritten 0.107.0, the owner, 2026-09-27: "yeah just
  * glb"). The product is ONE .glb a person downloads and imports; the card
  * hands back ONE three.js page that builds the model in code and shows it —
@@ -133,6 +152,8 @@ WHAT TO DO:
 
    Keep the page under 2 MB.
 
+   ${LOOK_HEADLESS}
+
 ${ARTIFACT_CONTRACT_TAIL({
   ask: `If you cannot model it without a DECISION only a person can make — which of
    two directions, what size or style, which asset it stands beside — STOP AND
@@ -170,6 +191,8 @@ WHAT TO DO:
    says which slide of how many is showing. Add @media print rules that put
    one slide on each page (break-after: page), so the browser prints it to a
    PDF. Keep it under 2 MB.
+
+   ${LOOK_HEADLESS}
 
 ${ARTIFACT_CONTRACT_TAIL({
   ask: `If you cannot write it without a DECISION only a person can make — who the
@@ -233,6 +256,9 @@ WHAT TO DO:
    WebP file — one file per image, and nothing else in that directory: no page,
    no notes, no scripts, no discarded variants. Keep each file under
    ${IMAGE_CAP_WORDS}; if one is larger, save it as WebP or at a smaller size.
+
+   ${NO_WINDOW} Look at a picture through your own tools,
+   never an image viewer.
 
 ${ARTIFACT_CONTRACT_TAIL({
   ask: `If you cannot make it without a DECISION only a person can make — what it

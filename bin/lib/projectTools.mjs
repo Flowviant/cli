@@ -99,8 +99,16 @@ export function readBaseTools(root, ref, env = process.env) {
 
 const expand = (value, env) => String(value).replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_, key) => env[key] ?? '');
 
-/** Temporary per-turn files are removed after the last retry. No personal CLI config is written. */
-export function prepareAgentTools(snapshot, runner, env = process.env, worktree = null) {
+/**
+ * Temporary per-turn files are removed after the last retry. No personal CLI config is written.
+ *
+ * `codexHome` is the AGENT'S OWN CODEX_HOME, kept between its turns
+ * (2026-09-29): a place the caller owns, refreshed here each turn and never
+ * removed by `cleanup`, because Codex indexes a thread under the home it ran
+ * in and the next card resumes that thread. Absent, a Codex turn gets a home
+ * that dies with it.
+ */
+export function prepareAgentTools(snapshot, runner, env = process.env, worktree = null, { codexHome: keptCodexHome = null } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'flowviant-agent-tools-'));
   const usable = snapshot.tools.filter((t) => t.state === 'ready' && mcpRefusal(runner, t.config) == null);
   const mcpServers = {};
@@ -142,7 +150,7 @@ export function prepareAgentTools(snapshot, runner, env = process.env, worktree 
   ].filter(Boolean).join('\n\n');
   let prepared;
   try {
-    prepared = prepareForRunner(runner, dir, snapshot, env, worktree);
+    prepared = prepareForRunner(runner, dir, snapshot, env, worktree, { codexHome: keptCodexHome });
   } catch (error) {
     rmSync(dir, { recursive: true, force: true });
     throw error;

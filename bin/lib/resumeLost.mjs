@@ -32,6 +32,12 @@ const RESUME_LOST = [
   /session .{0,80}not found/i,
   /conversation .{0,80}not found/i,
   /thread .{0,80}not found/i,
+  // Codex 0.156's words for a pinned thread whose rollout file is gone
+  // (2026-09-29): "Error: thread/resume: thread/resume failed: no rollout
+  // found for thread id <id> (code -32600)" on stderr, exit 1, no event on
+  // stdout. Every agent thread filed under a deleted per-turn /tmp home says
+  // exactly this, and none of the phrases above matched it.
+  /no rollout found/i,
   /trajectory not found/i,
 ];
 /**

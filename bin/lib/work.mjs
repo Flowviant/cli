@@ -330,6 +330,8 @@ export function createWorkManager({
     postBestEffort,
     workChildren,
     groupKillChildren,
+    // Only to find the agent's browser profile (noWindowEnv.mjs).
+    sessionMetaPath,
   });
   const { runPrecheck } = createWorkAgentPrecheck({
     baseRef,

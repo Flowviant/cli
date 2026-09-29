@@ -243,9 +243,10 @@ export const CODEX_RUNTIME = {
       // one under `$CODEX_HOME/generated_images/…` and says the path (the
       // binary's own words: "Generated images are saved to … by default. If
       // you need to use a generated image at another path, copy it"). An agent
-      // turn's CODEX_HOME is its isolated per-turn home (projectToolRuntimes);
-      // `:root` reads admit it, so the agent copies what it keeps into the one
-      // writable directory, where the artifact scan finds it.
+      // turn's CODEX_HOME is the agent's own isolated home (projectToolRuntimes,
+      // kept per agent since 2026-09-29); `:root` reads admit it, so the agent
+      // copies what it keeps into the one writable directory, where the
+      // artifact scan finds it.
       //
       // IMAGE GENERATION IS SWITCHED ON HERE AND ONLY HERE — a decision. This
       // is the one turn whose card asks for pictures, so it must not depend

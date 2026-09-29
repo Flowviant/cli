@@ -15,24 +15,51 @@
  * projectTools.mjs. projectTools.test.mjs pins every transport word to here.
  */
 
-import { existsSync, mkdirSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 
 export const toml = (value) => JSON.stringify(String(value));
 
-/** Keep personal Codex files, but do not copy its project trust grants. An
- * untrusted worktree's .codex/config.toml is ignored by Codex 0.156.1. */
-function isolatedCodexHome(dir, env, worktree) {
-  const source = resolve(env.CODEX_HOME || join(homedir(), '.codex'));
-  const dest = join(dir, 'codex-home');
-  mkdirSync(dest, { mode: 0o700 });
-  if (existsSync(source)) {
-    for (const name of readdirSync(source)) {
-      if (name === 'config.toml') continue;
-      symlinkSync(join(source, name), join(dest, name));
-    }
+/**
+ * ONE LINK PER PERSONAL ENTRY, MADE OR MENDED IN PLACE (2026-09-29). A home
+ * that outlives its turn is refreshed rather than rebuilt, so it must end up
+ * exactly what a fresh build would link: a link already right stays, a link
+ * pointing anywhere else is re-pointed, and a real file or directory standing
+ * where a personal entry belongs — Codex rewrote a link by rename, or made its
+ * own before the person's existed — gives way to the link, because the
+ * personal copy is the one login and the one store (one login per CLI). A
+ * racing refresh that made the same link first is not an error.
+ */
+function linkPersonalEntry(target, link) {
+  let st = null;
+  try { st = lstatSync(link); } catch { /* absent: link it */ }
+  if (st?.isSymbolicLink() && readlinkSync(link) === target) return;
+  if (st) rmSync(link, { recursive: true, force: true }); // never follows a link
+  try {
+    symlinkSync(target, link);
+  } catch (error) {
+    if (error?.code !== 'EEXIST' || readlinkSync(link) !== target) throw error;
   }
+}
+
+/**
+ * Keep personal Codex files, but do not copy its project trust grants. An
+ * untrusted worktree's .codex/config.toml is ignored by Codex 0.156.1.
+ *
+ * `dest` IS REFRESHED IN PLACE, NEVER ASSUMED EMPTY (2026-09-29). An agent's
+ * home is kept between its turns (prepareAgentTools' `codexHome`), because
+ * Codex's shared thread index (`state_5.sqlite`, reached through the link)
+ * records each rollout under the CODEX_HOME in force, unresolved: a home that
+ * died with its turn left the agent's pinned thread pointing into a deleted
+ * directory, and the next card's `resume <id>` failed "no rollout found".
+ * So every personal entry is (re)linked, every link whose entry left the
+ * personal home is dropped, config.toml is rewritten whole each turn (the
+ * worktree's skills can change between turns), and what Codex made here
+ * itself under a name the person has not got is kept.
+ */
+function isolatedCodexHome(dest, env, worktree) {
+  const source = resolve(env.CODEX_HOME || join(homedir(), '.codex'));
   const configPath = join(source, 'config.toml');
   const sourceConfig = existsSync(configPath) ? readFileSync(configPath, 'utf8') : '';
   const topLevel = sourceConfig.split(/^\s*\[/m, 1)[0];
@@ -65,7 +92,33 @@ function isolatedCodexHome(dir, env, worktree) {
       throw new Error('Cannot isolate Codex project skills with inline skills.config');
     for (const skill of worktreeSkills) config += `\n[[skills.config]]\npath = ${toml(skill)}\nenabled = false\n`;
   }
-  writeFileSync(join(dest, 'config.toml'), config, { mode: 0o600 });
+
+  // The home itself, only once the config is decided: a refused turn touches
+  // nothing here. A home that is not a real directory is not ours to write
+  // through — a link standing here would carry what follows somewhere else.
+  try { if (!lstatSync(dest).isDirectory()) rmSync(dest, { force: true }); } catch { /* absent */ }
+  mkdirSync(dest, { recursive: true, mode: 0o700 });
+  chmodSync(dest, 0o700);
+  const personal = existsSync(source) ? readdirSync(source).filter((name) => name !== 'config.toml') : [];
+  for (const name of personal) linkPersonalEntry(join(source, name), join(dest, name));
+  const linked = new Set(personal);
+  for (const name of readdirSync(dest)) {
+    if (linked.has(name) || name === 'config.toml') continue;
+    // Only a LINK is ours to drop: a real entry under a name the person has
+    // not got is Codex's own (its sessions, on a box whose personal home had
+    // none yet), and this agent's threads live in it.
+    try { if (lstatSync(join(dest, name)).isSymbolicLink()) rmSync(join(dest, name), { force: true }); } catch { /* gone */ }
+  }
+  // Written beside and RENAMED over, so a config.toml that is somehow a link
+  // is replaced as an entry and never written through: the personal
+  // config.toml is the one file this home must never reach.
+  const staged = join(dest, `.config.toml.${process.pid}.${Date.now()}`);
+  try {
+    writeFileSync(staged, config, { mode: 0o600, flag: 'wx' });
+    renameSync(staged, join(dest, 'config.toml'));
+  } finally {
+    rmSync(staged, { force: true });
+  }
   return { path: dest, personalDeveloperInstructions };
 }
 
@@ -85,8 +138,9 @@ function reviewedClaudePlugin(dir, snapshot) {
 
 /**
  * The table. `refuseMcp(config)` names why this runtime cannot take one MCP
- * configuration it otherwise could; `prepare(dir, snapshot, env, worktree)`
- * returns the runner-specific part of prepareAgentTools' result.
+ * configuration it otherwise could; `prepare(dir, snapshot, env, worktree,
+ * kept)` returns the runner-specific part of prepareAgentTools' result — under
+ * `dir`, which dies with the turn, except what `kept` names a lasting place for.
  */
 const TOOL_RUNTIMES = {
   claude: {
@@ -99,8 +153,11 @@ const TOOL_RUNTIMES = {
     mcp: true,
     skills: true,
     refuseMcp: (config) => (config.type === 'sse' ? 'Codex cannot take SSE MCP' : null),
-    prepare: (dir, _snapshot, env, worktree) => {
-      const isolated = isolatedCodexHome(dir, env, worktree);
+    // The agent's own lasting home when the caller has one (2026-09-29: its
+    // threads are indexed under it — see isolatedCodexHome), else one that
+    // dies with the turn, as every home did before.
+    prepare: (dir, _snapshot, env, worktree, kept) => {
+      const isolated = isolatedCodexHome(kept?.codexHome ?? join(dir, 'codex-home'), env, worktree);
       return { codexHome: isolated.path, personalDeveloperInstructions: isolated.personalDeveloperInstructions };
     },
   },
@@ -132,7 +189,8 @@ export function skillsRefusal(runner) {
   return runner === 'none' ? 'no installed CLI can take instructions' : `${runner} cannot take instructions`;
 }
 
-/** The runner-specific files a turn needs, written under `dir`. */
-export function prepareForRunner(runner, dir, snapshot, env, worktree) {
-  return { pluginDir: null, codexHome: null, personalDeveloperInstructions: false, ...(rowFor(runner).prepare?.(dir, snapshot, env, worktree) ?? {}) };
+/** The runner-specific files a turn needs, written under `dir` — or, for what
+ *  `kept` names, where the caller keeps it between turns. */
+export function prepareForRunner(runner, dir, snapshot, env, worktree, kept = {}) {
+  return { pluginDir: null, codexHome: null, personalDeveloperInstructions: false, ...(rowFor(runner).prepare?.(dir, snapshot, env, worktree, kept) ?? {}) };
 }

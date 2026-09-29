@@ -20,7 +20,7 @@
 import { agentTaskKindOf } from './agentTaskKinds.mjs';
 // A card's type (0.106.0) likewise: the table holds the words, this file prints them.
 import { AGENT_TASK_TYPES, agentTaskTypeFor, agentTaskTypeOf } from './agentTaskTypes.mjs';
-import { ARTIFACT_CONTRACT_TAIL, SYSTEM_AGENT_DECK, SYSTEM_AGENT_IMAGE, SYSTEM_AGENT_MODEL } from './artifactContracts.mjs';
+import { ARTIFACT_CONTRACT_TAIL, LOOK_HEADLESS, SYSTEM_AGENT_DECK, SYSTEM_AGENT_IMAGE, SYSTEM_AGENT_MODEL } from './artifactContracts.mjs';
 import { isLibraryReference } from './knowledgeLibrary.mjs';
 import { readCardThread } from './cardThread.mjs';
 import { AGENT_FILE_LINE_MAX, AGENT_FILES_PER_MESSAGE_MAX, CARD_FILES_PER_TURN_MAX } from './agentFiles.mjs';
@@ -1021,6 +1021,8 @@ WHAT TO DO:
    else; nothing else may load from the network and nothing can be sent, so
    images are data: URIs or inline SVG. Several pages asked for in one card
    go in the ONE file (sections, or tabs you script). Keep it under 2 MB.
+
+   ${LOOK_HEADLESS}
 
 ${ARTIFACT_CONTRACT_TAIL({
   ask: `If you cannot draw it without a DECISION only a person can make — which of

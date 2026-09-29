@@ -20,6 +20,7 @@ import { removeProbeTranscript } from './runtimeCapabilities.mjs';
 import { taskIdsFromMessage } from './worktreeDiff.mjs';
 import { limitLine } from './cliLimit.mjs';
 import { fleetEndpoint } from './fleetWire.mjs';
+import { agentBrowserHome } from './noWindowEnv.mjs';
 
 export function createWorkAgentPrecheck({ baseRef, admit, sessionMetaPath, workChildren }) {
   const AGENT_PRECHECK_URL = fleetEndpoint('agent-precheck', FLEET_URL);
@@ -257,6 +258,9 @@ export function createWorkAgentPrecheck({ baseRef, admit, sessionMetaPath, workC
         profile: 'consult',
         cwd: wt,
         runtime: rt,
+        // The agent's own browser profile, in the worktree this reader stands
+        // in; no display either way (noWindowEnv.mjs, 2026-09-29).
+        browserHome: agentBrowserHome(sessionMetaPath, wt, agentId),
         // NO `resume`, AND THAT IS THE FEATURE. A resumed turn would be the
         // agent grading its own homework out of its own context; this is a
         // stranger reading a diff.

@@ -69,6 +69,43 @@ test('a genuinely dead resume retries once fresh; an empty resume too; a fresh t
   assert.equal(resumeRetriesFresh({ resume: false, out: '', runtime: 'claude', sawInit: false }), false);
 });
 
+/**
+ * CODEX 0.156'S LOST THREAD, AS IT REACHES THE RULE (2026-09-29). A resume
+ * whose rollout file is gone exits 1 with no event on stdout, so the text is
+ * the CLI's stderr alone — measured through runTurn: the PATH-alias warning a
+ * home under the temp dir earns, then the error, or the error line alone. The
+ * owner's agent went to Stuck on exactly this, because no phrase matched it.
+ */
+const CODEX_LOST_LINE =
+  'Error: thread/resume: thread/resume failed: no rollout found for thread id 01a0edf2-f1ae-7d70-b0e1-0cd101d1c873 (code -32600)\n';
+const CODEX_LOST =
+  'WARNING: proceeding, even though we could not create PATH aliases: Refusing to create helper binaries under temporary dir "/tmp" (codex_home: AbsolutePathBuf("/tmp/flowviant-agent-tools-BEpCig/codex-home"))\n' +
+  CODEX_LOST_LINE;
+
+test("Codex's own lost-thread error, whole or as its one line, is a lost conversation — and only when it is the reply", () => {
+  assert.ok(CODEX_LOST.length <= RESUME_LOST_MAX_CHARS, 'canary: the measured shape fits the one-line bound');
+  for (const out of [CODEX_LOST, CODEX_LOST_LINE]) {
+    assert.equal(resumeConversationLost(out, { runtime: 'codex' }), true, out);
+    assert.equal(resumeRetriesFresh({ resume: true, out, runtime: 'codex' }), true, out);
+    // A fresh turn is never retried, whatever it says.
+    assert.equal(resumeRetriesFresh({ resume: false, out, runtime: 'codex' }), false, out);
+  }
+  // …and only when it IS the reply: an answer that merely mentions a missing
+  // rollout is an answer.
+  const long = `Fixed the replay tool: when no rollout found for thread id matches, it now says so instead of crashing. ${'More detail about the fix. '.repeat(20)}`;
+  assert.ok(long.length > RESUME_LOST_MAX_CHARS);
+  assert.equal(resumeConversationLost(long, { runtime: 'codex' }), false);
+  assert.equal(resumeRetriesFresh({ resume: true, out: long, runtime: 'codex' }), false);
+  // Claude's evidence is its init event, whatever the words: seen, or never
+  // measured, authorises nothing.
+  for (const out of [CODEX_LOST, CODEX_LOST_LINE]) {
+    assert.equal(resumeConversationLost(out, { runtime: 'claude', sawInit: true }), false);
+    assert.equal(resumeConversationLost(out, { runtime: 'claude' }), false);
+    assert.equal(resumeRetriesFresh({ resume: true, out, runtime: 'claude', sawInit: true }), false);
+    assert.equal(resumeRetriesFresh({ resume: true, out, runtime: 'claude' }), false);
+  }
+});
+
 /** CODE ONLY — comments quote the shapes they replaced. */
 const code = (file) =>
   readFileSync(new URL(`./${file}`, import.meta.url), 'utf8')

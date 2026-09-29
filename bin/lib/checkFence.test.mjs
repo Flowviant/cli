@@ -86,5 +86,8 @@ test('the check clears the directory first and runs under checkEnv', () => {
   const clearAt = body.indexOf('clearNonArtifacts(wt)');
   const spawnAt = body.indexOf('child = spawn(cmd, {');
   assert.ok(clearAt > -1 && spawnAt > -1 && clearAt < spawnAt, 'cleared before the command starts');
-  assert.ok(body.includes('env: checkEnv(),'), 'never the daemon’s own environment with its credential');
+  assert.ok(body.includes('env: checkEnv(process.env, browser.dir),'), 'never the daemon’s own environment with its credential');
+  // …nor a way to a window, and the agent's own browser profile (2026-09-29).
+  assert.ok(body.includes('const browser = openBrowserHome(agentBrowserHome(sessionMetaPath, wt, agentId));'));
+  assert.ok(body.indexOf('browser.cleanup();') > body.indexOf('child = spawn(cmd, {'), 'a check\'s own browser home goes after it');
 });

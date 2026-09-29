@@ -1,10 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, readlinkSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, sep } from 'node:path';
 import { prepareAgentTools, readBaseTools, toolReadout } from './projectTools.mjs';
 import { mcpRefusal, runnerToolCapabilities, skillsRefusal } from './projectToolRuntimes.mjs';
 import { RUNTIMES } from './runtimes.mjs';
@@ -177,6 +177,165 @@ test('an unmergeable personal skill list fails closed when the worktree has skil
     writeFileSync(join(worktree, '.agents/skills/evil/SKILL.md'), 'unreviewed');
     const snapshot = { tools: [], skills: [], skillFiles: [], instructions: [] };
     assert.throws(() => prepareAgentTools(snapshot, 'codex', { CODEX_HOME: personal }, worktree), /Cannot isolate Codex project skills/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+/**
+ * AN AGENT'S CODEX HOME OUTLIVES ITS TURN (2026-09-29). Codex files each
+ * thread in its shared index under the CODEX_HOME the turn ran with, as that
+ * path; a home that died with its turn sent the agent's next `resume <id>` to
+ * "no rollout found" and the agent to Stuck. So the kept home is the SAME
+ * place every turn, not under the temp dir, untouched by the turn's cleanup,
+ * and refreshed in place: config rewritten (the worktree's skills and the
+ * person's settings move), new personal entries linked, a link pointing
+ * elsewhere or a real file where a personal entry belongs mended, a link to
+ * an entry the person no longer has dropped, and what Codex made itself kept.
+ * The old per-turn home fails the first assertion.
+ */
+test("an agent's Codex home is one kept place, refreshed in place by every turn and never removed by a turn's cleanup", () => {
+  const root = mkdtempSync(join(tmpdir(), 'flowviant-kept-home-'));
+  const savedTmp = process.env.TMPDIR;
+  const git = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+  try {
+    const personal = join(root, 'personal');
+    mkdirSync(join(personal, 'sessions'), { recursive: true });
+    writeFileSync(join(personal, 'auth.json'), 'PERSONAL_LOGIN');
+    const personalConfig = `model_reasoning_effort = "low"\n[projects."${root}"]\ntrust_level = "trusted"\n`;
+    writeFileSync(join(personal, 'config.toml'), personalConfig);
+    const repo = join(root, 'repo');
+    mkdirSync(repo);
+    git(['init', '-q', '-b', 'main'], repo);
+    git(['-c', 'user.email=t@t.t', '-c', 'user.name=T', 'commit', '-q', '--allow-empty', '-m', 'base'], repo);
+    const wt = join(root, 'a-ag1');
+    git(['worktree', 'add', '-q', '-b', 'session/a-ag1', wt, 'main'], repo);
+    // Where the agent lane keeps it: the worktree's private git dir.
+    const kept = join(git(['rev-parse', '--absolute-git-dir'], wt), 'flowviant-agent-codex-home-ag1');
+    // The per-turn files go to a temp dir of their own, so "not under the
+    // temp dir" is a claim about the home and not about where the repo is.
+    process.env.TMPDIR = join(root, 'turn-tmp');
+    mkdirSync(process.env.TMPDIR);
+    const snapshot = { tools: [], skills: [], skillFiles: [], instructions: [] };
+    const env = { CODEX_HOME: personal };
+
+    const first = prepareAgentTools(snapshot, 'codex', env, wt, { codexHome: kept });
+    assert.equal(first.codexHome, kept, 'the home is the one the agent keeps');
+    assert.ok(!first.codexHome.startsWith(tmpdir() + sep), 'never under the temp dir');
+    assert.equal(statSync(kept).mode & 0o777, 0o700);
+    assert.equal(statSync(join(kept, 'config.toml')).mode & 0o777, 0o600);
+    assert.doesNotMatch(readFileSync(join(kept, 'config.toml'), 'utf8'), /projects|trust_level/);
+    assert.equal(readlinkSync(join(kept, 'sessions')), join(personal, 'sessions'));
+    // What Codex files through the link lands in the person's store, under
+    // the path the index will hand back to the next resume.
+    writeFileSync(join(kept, 'sessions', 'rollout-t1.jsonl'), '{}');
+    first.cleanup();
+    assert.ok(!existsSync(first.mcpPath), "the turn's own files go");
+    assert.ok(existsSync(join(kept, 'config.toml')), 'the home stays');
+
+    // Between turns: the person's home and the worktree move, and the home
+    // is found in every state a refresh has to mend.
+    writeFileSync(join(personal, 'new-entry.json'), '{}');
+    writeFileSync(join(personal, 'config.toml'), personalConfig.replace('"low"', '"high"'));
+    mkdirSync(join(wt, '.agents/skills/late'), { recursive: true });
+    writeFileSync(join(wt, '.agents/skills/late/SKILL.md'), 'unreviewed');
+    rmSync(join(kept, 'auth.json'));
+    writeFileSync(join(kept, 'auth.json'), 'A STALE COPY'); // a link Codex replaced by rename
+    mkdirSync(join(root, 'elsewhere'));
+    writeFileSync(join(root, 'elsewhere', 'keep.txt'), 'not ours');
+    rmSync(join(kept, 'sessions'));
+    symlinkSync(join(root, 'elsewhere'), join(kept, 'sessions')); // a link pointing elsewhere
+    symlinkSync(join(personal, 'gone'), join(kept, 'gone')); // an entry the person no longer has
+    mkdirSync(join(kept, 'generated_images'));
+    writeFileSync(join(kept, 'generated_images', 'a.png'), 'png'); // Codex's own
+    rmSync(join(kept, 'config.toml'));
+    symlinkSync(join(personal, 'config.toml'), join(kept, 'config.toml')); // must never be written through
+
+    const second = prepareAgentTools(snapshot, 'codex', env, wt, { codexHome: kept });
+    try {
+      assert.equal(second.codexHome, first.codexHome, 'the same place, turn after turn');
+      const config = readFileSync(join(kept, 'config.toml'), 'utf8');
+      assert.ok(lstatSync(join(kept, 'config.toml')).isFile(), 'config.toml is a file of its own');
+      assert.equal(statSync(join(kept, 'config.toml')).mode & 0o777, 0o600);
+      assert.match(config, /model_reasoning_effort = "high"/, 'rewritten from the person\'s current config');
+      assert.doesNotMatch(config, /projects|trust_level/, 'still without their trust grants');
+      assert.ok(config.includes(`path = ${JSON.stringify(join(wt, '.agents/skills/late/SKILL.md'))}\nenabled = false`), "the worktree's new skill is disabled");
+      assert.equal(readFileSync(join(personal, 'config.toml'), 'utf8'), personalConfig.replace('"low"', '"high"'), 'the personal config is untouched');
+      assert.equal(readlinkSync(join(kept, 'new-entry.json')), join(personal, 'new-entry.json'), 'a new personal entry is linked');
+      assert.equal(readlinkSync(join(kept, 'auth.json')), join(personal, 'auth.json'), 'the one login, not a stale copy');
+      assert.equal(readlinkSync(join(kept, 'sessions')), join(personal, 'sessions'), 'a link elsewhere is re-pointed');
+      assert.equal(readFileSync(join(root, 'elsewhere', 'keep.txt'), 'utf8'), 'not ours', 're-pointing never follows the old link');
+      assert.ok(!existsSync(join(kept, 'gone')) && !readdirSync(kept).includes('gone'), 'a link to nothing the person has is dropped');
+      assert.ok(existsSync(join(kept, 'generated_images', 'a.png')), "Codex's own entry is kept");
+      assert.equal(readFileSync(join(kept, 'sessions', 'rollout-t1.jsonl'), 'utf8'), '{}', 'the first turn\'s rollout is where the index says');
+      assert.deepEqual(readdirSync(kept).filter((n) => n.startsWith('.config.toml.')), [], 'no staged config left behind');
+    } finally { second.cleanup(); }
+    assert.ok(existsSync(join(kept, 'config.toml')));
+
+    // Claude turns are unchanged: no Codex home, kept or otherwise.
+    const claudeKept = join(root, 'claude-kept');
+    const claude = prepareAgentTools(snapshot, 'claude', env, wt, { codexHome: claudeKept });
+    try {
+      assert.equal(claude.codexHome, null);
+      assert.ok(!existsSync(claudeKept));
+    } finally { claude.cleanup(); }
+  } finally {
+    if (savedTmp === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = savedTmp;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a refused preparation leaves the kept home as the last turn left it', () => {
+  const root = mkdtempSync(join(tmpdir(), 'flowviant-kept-refused-'));
+  try {
+    const personal = join(root, 'personal');
+    const worktree = join(root, 'worktree');
+    const kept = join(root, 'kept');
+    mkdirSync(personal);
+    mkdirSync(worktree);
+    writeFileSync(join(personal, 'config.toml'), 'skills.config = []\n');
+    const snapshot = { tools: [], skills: [], skillFiles: [], instructions: [] };
+    prepareAgentTools(snapshot, 'codex', { CODEX_HOME: personal }, worktree, { codexHome: kept }).cleanup();
+    const before = readFileSync(join(kept, 'config.toml'), 'utf8');
+    // The next turn cannot be isolated: an inline skills list beside a
+    // worktree skill. It is refused before the home is touched.
+    mkdirSync(join(worktree, '.agents/skills/evil'), { recursive: true });
+    writeFileSync(join(worktree, '.agents/skills/evil/SKILL.md'), 'unreviewed');
+    writeFileSync(join(personal, 'auth.json'), '{}');
+    assert.throws(() => prepareAgentTools(snapshot, 'codex', { CODEX_HOME: personal }, worktree, { codexHome: kept }), /Cannot isolate Codex project skills/);
+    assert.equal(readFileSync(join(kept, 'config.toml'), 'utf8'), before);
+    assert.ok(!readdirSync(kept).includes('auth.json'), 'nothing was linked for a turn that cannot run');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a kept home refreshed after the worktree grows a skill still hides it from Codex', (t) => {
+  if (spawnSync('codex', ['--version'], { encoding: 'utf8' }).status !== 0) return t.skip('Codex is not installed');
+  const root = mkdtempSync(join(tmpdir(), 'flowviant-kept-discovery-'));
+  const personal = join(root, 'personal');
+  const repo = join(root, 'repo');
+  const kept = join(root, 'kept');
+  mkdirSync(join(personal, 'skills/personal'), { recursive: true });
+  mkdirSync(repo);
+  try {
+    assert.equal(spawnSync('git', ['init', '-q'], { cwd: repo }).status, 0);
+    writeFileSync(join(personal, 'skills/personal/SKILL.md'), '---\nname: personal\ndescription: PERSONAL_SKILL_SENTINEL\n---\nbody');
+    writeFileSync(join(personal, 'config.toml'), `[projects."${repo}"]\ntrust_level = "trusted"\n`);
+    const snapshot = { tools: [], skills: [], skillFiles: [], instructions: [{ path: 'AGENTS.md', body: 'BASE_DOC_SENTINEL' }] };
+    prepareAgentTools(snapshot, 'codex', { CODEX_HOME: personal }, repo, { codexHome: kept }).cleanup();
+    // The second turn's worktree has a skill the first turn's did not.
+    mkdirSync(join(repo, '.agents/skills/late'), { recursive: true });
+    writeFileSync(join(repo, '.agents/skills/late/SKILL.md'), '---\nname: late\ndescription: LATE_WORKTREE_SKILL_SENTINEL\n---\nbody');
+    writeFileSync(join(repo, 'AGENTS.md'), 'WORKTREE_DOC_SENTINEL');
+    const prepared = prepareAgentTools(snapshot, 'codex', { CODEX_HOME: personal }, repo, { codexHome: kept });
+    try {
+      assert.equal(prepared.codexHome, kept, 'canary: this is the refreshed kept home');
+      const args = RUNTIMES.codex.args({ prompt: 'probe', system: prepared.instructions, agentTools: prepared });
+      const configArgs = args.flatMap((a, i) => a === '-c' ? ['-c', args[i + 1]] : []);
+      const scoped = spawnSync('codex', ['debug', 'prompt-input', ...configArgs, 'probe'], {
+        cwd: repo, env: { ...process.env, CODEX_HOME: prepared.codexHome }, encoding: 'utf8', timeout: 10000,
+      }).stdout;
+      assert.match(scoped, /BASE_DOC_SENTINEL/);
+      assert.match(scoped, /PERSONAL_SKILL_SENTINEL/);
+      assert.doesNotMatch(scoped, /LATE_WORKTREE_SKILL_SENTINEL|WORKTREE_DOC_SENTINEL/);
+    } finally { prepared.cleanup(); }
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 

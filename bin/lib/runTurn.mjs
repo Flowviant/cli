@@ -13,6 +13,7 @@
 import { spawn } from 'node:child_process';
 import { runtimeById } from './runtimes.mjs';
 import { withoutMachineCredentials } from './machineEnv.mjs';
+import { openBrowserHome, withoutWindows } from './noWindowEnv.mjs';
 import { resolveTurnProfile } from './turnProfile.mjs';
 import { claudePermFor } from './claudePosture.mjs';
 import { handleStreamLine } from './claudeStream.mjs';
@@ -38,9 +39,18 @@ const CODEX_MODEL_READ_MS = 1_500;
  * the MCP config file. So those two names, and only those, are removed —
  * by the one rule in machineEnv.mjs, which the project check obeys too.
  */
-export function cliEnv(mcpEnv) {
+/**
+ * …AND, UNLESS A PERSON IS AT THE KEYBOARD, NO WAY TO A WINDOW (2026-09-29).
+ * `display: true` is the Terminal tab's alone: a person typing there may ask
+ * for a window and gets their own environment. Every other turn — an agent's,
+ * its pre-review, the planner, the wiki, intake, the capture chat, and any
+ * lane added later that does not say otherwise — runs under
+ * `withoutWindows` (noWindowEnv.mjs), its browsers in `browserHome`.
+ */
+export function cliEnv(mcpEnv, { display = false, browserHome = null } = {}) {
   // After the merge, so an mcpEnv can never smuggle one back in.
-  return withoutMachineCredentials({ ...process.env, ...(mcpEnv ?? {}) });
+  const env = withoutMachineCredentials({ ...process.env, ...(mcpEnv ?? {}) });
+  return display === true ? env : withoutWindows(env, browserHome);
 }
 
 // One Claude Code turn. Output is captured (for sentinel detection) and streamed
@@ -53,7 +63,7 @@ export function cliEnv(mcpEnv) {
 // `onActivity` so the caller can forward progress. Build-agent turns leave it
 // off and keep the raw text passthrough + line sentinels.
 export function runTurn(opts) {
-  const { prompt, resume, system, cwd, mcpConfig, mcpArgs, mcpEnv, agentTools, runtime = 'claude', label, onSpawn, streamJson, answerFromResult, onActivity, onToolEvent, onInit, onUsage, onRateLimit, onModel, onThreadId, onAnswer, vaultDir, knowledgeDir, resultSchemaArgs, model, effort, adoptResumeId, resumeThreadId, resumeConversationId } = opts;
+  const { prompt, resume, system, cwd, mcpConfig, mcpArgs, mcpEnv, agentTools, runtime = 'claude', label, onSpawn, streamJson, answerFromResult, onActivity, onToolEvent, onInit, onUsage, onRateLimit, onModel, onThreadId, onAnswer, vaultDir, knowledgeDir, resultSchemaArgs, model, effort, adoptResumeId, resumeThreadId, resumeConversationId, display, browserHome } = opts;
   /**
    * AFTER THE TEARDOWN, NO TURN STARTS AND NO TURN ENDS (standDownGate.mjs).
    * A stand-down that drains a deploy keeps this process alive; without this
@@ -195,6 +205,11 @@ export function runTurn(opts) {
     // Which credential is correct, and whether an account may be shared, is
     // between the operator and the vendor. Flowviant does not detect it and does
     // not enforce it; it runs the CLI the ordinary way and relays what happens.
+    //
+    // A turn nobody is sitting at keeps its browsers in a home of its own —
+    // the lane's kept one (an agent's), else this spawn's, removed when the
+    // CLI closes. See `cliEnv`.
+    const browser = display === true ? null : openBrowserHome(browserHome);
     const child = spawn(rt.bin, args, {
       cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -219,10 +234,15 @@ export function runTurn(opts) {
       detached: true,
       // Only ADDS to the environment (the worker token, for runtimes that read
       // it from there). Never replaces it: the CLI's own credentials live in
-      // this environment, and handing it a curated one signs it out. The one
-      // thing it REMOVES is this daemon's machine credential — see `cliEnv`.
-      env: cliEnv(mcpEnv),
+      // this environment, and handing it a curated one signs it out. What it
+      // REMOVES is this daemon's machine credential and, for a turn nobody is
+      // sitting at, every way to a window — see `cliEnv`.
+      env: cliEnv(mcpEnv, { display: display === true, browserHome: browser?.dir }),
     });
+    if (browser) {
+      child.once('close', browser.cleanup);
+      child.once('error', browser.cleanup);
+    }
     onSpawn?.(child);
     // When this turn began, for the Codex rollout read: a `turn_context` older
     // than this is a previous turn's (turnModel.mjs).

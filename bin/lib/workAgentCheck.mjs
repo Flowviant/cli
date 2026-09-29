@@ -17,6 +17,7 @@ import { warn } from './ui.mjs';
 import { ARTIFACT_DIR, artifactTypeFor } from './artifacts.mjs';
 import { scrub as envScrub } from './uplinkScrub.mjs';
 import { withoutMachineCredentials } from './machineEnv.mjs';
+import { agentBrowserHome, openBrowserHome, withoutWindows } from './noWindowEnv.mjs';
 import { fleetEndpoint } from './fleetWire.mjs';
 import { workLanesStopped } from './standDownGate.mjs';
 
@@ -85,11 +86,14 @@ export function clearNonArtifacts(wt) {
  * authenticates with; everything else is what the agent's own turn saw when it
  * ran the same tests.
  */
-export function checkEnv(env = process.env) {
-  return withoutMachineCredentials(env);
+export function checkEnv(env = process.env, browserHome = null) {
+  // …and, like that turn since 2026-09-29, no way to a window: a test run
+  // nobody is watching that opens a headed browser or an HTML report opens it
+  // on nobody's behalf (noWindowEnv.mjs). The agent's own browser profile.
+  return withoutWindows(withoutMachineCredentials(env), browserHome);
 }
 
-export function createWorkAgentCheck({ repoRoot, postBestEffort, workChildren, groupKillChildren }) {
+export function createWorkAgentCheck({ repoRoot, postBestEffort, workChildren, groupKillChildren, sessionMetaPath }) {
   const AGENT_CHECK_DONE_URL = fleetEndpoint('agent-check-done', FLEET_URL);
 
   // ── THE PROJECT'S OWN CHECK, and the MERGE ─────────────────────────────────
@@ -142,6 +146,7 @@ export function createWorkAgentCheck({ repoRoot, postBestEffort, workChildren, g
       warn(
         `agent ${agentId}: removed ${cleared.length} non-artifact file(s) from ${ARTIFACT_DIR} before the check — ${cleared.slice(0, 5).join(', ')}`
       );
+    const browser = openBrowserHome(agentBrowserHome(sessionMetaPath, wt, agentId));
     const out = await new Promise((resolve) => {
       let text = '';
       let done = false;
@@ -178,7 +183,7 @@ export function createWorkAgentCheck({ repoRoot, postBestEffort, workChildren, g
           shell: true,
           detached: true,
           stdio: ['ignore', 'pipe', 'pipe'],
-          env: checkEnv(),
+          env: checkEnv(process.env, browser.dir),
         });
         /**
          * …AND IT IS TRACKED, so a stop or a takeover takes it with them.
@@ -266,6 +271,7 @@ export function createWorkAgentCheck({ repoRoot, postBestEffort, workChildren, g
         finish(code === 0 ? 'passed' : 'failed');
       });
     });
+    browser.cleanup();
     await postCheck({
       agentId,
       status: out.status,

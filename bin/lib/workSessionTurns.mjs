@@ -694,6 +694,11 @@ export function createWorkSessionTurns({
               cwd: dir.wt,
               mcpArgs: mcp.args,
               mcpEnv: mcp.env,
+              // A PERSON AT THE KEYBOARD MAY ASK FOR A WINDOW (2026-09-29): a
+              // Terminal tab keeps its environment's display. The capture chat
+              // does not — it only reads and stages cards, and the person
+              // talking to it may be on a phone (noWindowEnv.mjs).
+              display: !captureTab,
               runtime: rt.id,
               label: c.cyan('[tab]'),
               // Only codex announces one (thread.started); held here so the id

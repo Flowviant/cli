@@ -38,6 +38,7 @@ import { brainFor } from './workBrain.mjs';
 import { begunTurnRefusal } from './workAgentTurnBegun.mjs';
 import { agentTurnSettlement } from './workAgentTurnOutcome.mjs';
 import { ensureArtifactDir } from './artifacts.mjs';
+import { agentBrowserHome } from './noWindowEnv.mjs';
 
 export function createAgentTurnExecution({
   baseRef,
@@ -286,6 +287,23 @@ export function createAgentTurnExecution({
       rt === 'codex'
         ? Boolean(codexResumeId)
         : rt === 'claude' && Boolean(ranMarker && existsSync(ranMarker));
+    /**
+     * …AND THE HOME THAT THREAD IS FILED UNDER, KEPT PER AGENT (2026-09-29).
+     *
+     * Codex's thread index records each rollout under the CODEX_HOME the turn
+     * ran with, as that path — not the personal store the link leads to — so
+     * the per-turn home in /tmp every turn used to get died with its turn and
+     * took the pinned thread with it: the next card's `resume` failed "no
+     * rollout found" and the agent went to Stuck. Beside the thread marker,
+     * in the worktree's private git dir: outside the working tree (never
+     * committed, never seen by `git add -A`), refreshed by every turn and
+     * removed only with the worktree, when the agent retires and its threads
+     * stop mattering. One agent runs one turn at a time (its place's writer
+     * lock), so no two turns refresh it at once. Null (no git dir to hold it)
+     * is the per-turn home again, and a lost resume then runs once fresh.
+     */
+    const codexAgentHome =
+      rt === 'codex' ? sessionMetaPath(wt, 'flowviant-agent-codex-home', agentId) : null;
 
     /**
      * THE TURN'S FILES, ON DISK BEFORE THE PROMPT NAMES THEM (0.112.0) — the
@@ -377,6 +395,15 @@ export function createAgentTurnExecution({
     let out = '';
     let child = null;
     /**
+     * EVERY CHILD THIS TURN SPAWNED, not only the last (2026-09-29). A lost
+     * resume runs once more fresh (runTurnResumingOnce), so a turn can own two
+     * CLIs, and `child` names only the second: the first stayed in
+     * `workChildren` for the life of the daemon — one phantom live turn per
+     * retry, held against the machine's ceiling, and `workBusy()` true for
+     * ever, which holds the self-update and the tray's install for ever.
+     */
+    const spawnedChildren = new Set();
+    /**
      * WHAT THIS TURN SPENT, AS THE CLI COUNTED IT (2026-09-19).
      *
      * Held across the whole turn so every settle below can carry it — a turn
@@ -409,7 +436,7 @@ export function createAgentTurnExecution({
     try {
       // A turn reads the base ref afresh. Changes the agent has made to its
       // own worktree cannot silently change the next turn's tools.
-      projectTools = prepareAgentTools(readBaseTools(repoRoot, baseRef()), rt, process.env, wt);
+      projectTools = prepareAgentTools(readBaseTools(repoRoot, baseRef()), rt, process.env, wt, { codexHome: codexAgentHome });
       const agentTurnArgs = {
         prompt:
           job.kind === 'task' && job.task
@@ -450,6 +477,11 @@ export function createAgentTurnExecution({
         }) + (projectTools.instructions ? `\n\n${projectTools.instructions}` : ''),
         agentTools: projectTools,
         ...(projectTools.codexHome ? { mcpEnv: { CODEX_HOME: projectTools.codexHome } } : {}),
+        // NOBODY IS AT THIS SCREEN (2026-09-29): no display, BROWSER=none, and
+        // a browser profile of the agent's own, kept beside its Codex home —
+        // so a Chrome it starts to look at its page never reaches the
+        // person's (noWindowEnv.mjs).
+        browserHome: agentBrowserHome(sessionMetaPath, wt, agentId),
         ...(posture === 'build' && rt === 'claude'
           ? { mcpArgs: ['--strict-mcp-config', '--mcp-config', projectTools.mcpPath] }
           : posture === 'build' && rt === 'codex'
@@ -531,6 +563,7 @@ export function createAgentTurnExecution({
         },
         onSpawn: (ch) => {
           child = ch;
+          spawnedChildren.add(ch);
           // The AGENT it serves — what the machine snapshot charges this
           // child's memory to.
           workChildren.set(ch, agentId);
@@ -585,7 +618,7 @@ export function createAgentTurnExecution({
        */
       trace.stop();
       await trace.flush(TRACE_FINAL_FLUSH_MS);
-      if (child) workChildren.delete(child);
+      for (const ch of spawnedChildren) workChildren.delete(ch);
       if (agentChildren.get(place) === child) agentChildren.delete(place);
       if (ranMarker && rt === 'claude') {
         try {

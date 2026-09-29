@@ -269,11 +269,15 @@ test('design draws one self-contained page and commits nothing; research cites a
  * final JSON of every file-handing contract are `ARTIFACT_CONTRACT_TAIL`'s;
  * the design and research contracts render it too, and their bytes are pinned
  * to what 0.104.0 sent (sha256 of the whole string), so moving the tail
- * changed nothing an agent reads.
+ * changed nothing an agent reads. The design contract has since said one
+ * thing more (2026-09-29, `LOOK_HEADLESS`, its own paragraph closing rule 2);
+ * without that paragraph it is still 0.104.0's, byte for byte.
  */
 test('every file-handing contract renders the one tail, and design and research are byte-for-byte 0.104.0', () => {
   const sha = (s) => createHash('sha256').update(s).digest('hex');
-  assert.equal(sha(prompts.SYSTEM_AGENT_DESIGN), 'c6bb3a485f9edae9418872f5f23b3ce0cd2c49ab8b13ba2ae653ab77390dc24f');
+  const look = `\n\n   ${contracts.LOOK_HEADLESS}`;
+  assert.ok(prompts.SYSTEM_AGENT_DESIGN.includes(`Keep it under 2 MB.${look}\n\n3. CHANGE NO`), 'canary: rule 2 closes on it');
+  assert.equal(sha(prompts.SYSTEM_AGENT_DESIGN.replace(look, '')), 'c6bb3a485f9edae9418872f5f23b3ce0cd2c49ab8b13ba2ae653ab77390dc24f');
   assert.equal(sha(prompts.SYSTEM_AGENT_RESEARCH), 'a6615314e5face775e23677c133ce86f8c1e4027f5d5b6ca0a9d069bd4fecc96');
   const strip = (s) => s.replace(/\/\*[\s\S]*?\*\//g, '');
   // Canary: the home spells rule 3.
@@ -359,6 +363,37 @@ test('the model and deck contracts commit nothing and end the way the design con
   assert.match(k, /a counter\s+says which slide/);
   assert.match(k, /@media print rules that put\s+one slide on each page \(break-after: page\)/);
   assert.match(k, /Keep it under 2 MB\./);
+});
+
+/**
+ * NOBODY IS AT THIS SCREEN (2026-09-29). A board agent looking at its page
+ * started Chrome itself, and the window landed on the owner's desktop. Every
+ * kind that draws a page says, in rule 2, never to open a window and how to
+ * look without one — headless, a profile of its own, a screenshot read back;
+ * the image card says the first half. Research draws nothing and says
+ * neither; a code card's contract is not a file-handing one.
+ */
+test('every page-drawing contract says never to open a window, and how to look headless', () => {
+  assert.match(contracts.NO_WINDOW, /^Never open a browser window or any desktop application: this is somebody's\s+own screen, and nobody is at it\.$/);
+  assert.ok(contracts.LOOK_HEADLESS.startsWith(contracts.NO_WINDOW));
+  for (const flag of ['--headless=new', '--user-data-dir="$(mktemp -d)"', '--screenshot=']) {
+    assert.ok(contracts.LOOK_HEADLESS.includes(flag), flag);
+  }
+  assert.match(contracts.LOOK_HEADLESS, /read the PNG/);
+  for (const [name, c] of [
+    ['design', prompts.SYSTEM_AGENT_DESIGN],
+    ['model', contracts.SYSTEM_AGENT_MODEL],
+    ['deck', contracts.SYSTEM_AGENT_DECK],
+  ]) {
+    const at = c.indexOf(contracts.LOOK_HEADLESS);
+    assert.ok(at > -1, `${name}: says it`);
+    assert.ok(at < c.indexOf('3. CHANGE NO REPOSITORY FILE'), `${name}: inside rule 2, before the tail`);
+    assert.equal(c.split(contracts.NO_WINDOW).length - 1, 1, `${name}: once`);
+  }
+  const image = contracts.SYSTEM_AGENT_IMAGE;
+  assert.ok(image.includes(`${contracts.NO_WINDOW} Look at a picture through your own tools,\n   never an image viewer.`));
+  assert.ok(!image.includes('google-chrome'), 'the image card draws no page to screenshot');
+  assert.ok(!prompts.SYSTEM_AGENT_RESEARCH.includes(contracts.NO_WINDOW), 'research is 0.104.0, byte for byte');
 });
 
 test('the kickoff names the 3D-model and presentation products and never asks for a commit', () => {
