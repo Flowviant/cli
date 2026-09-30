@@ -79,10 +79,16 @@ test('who may run what: plan mode is Claude\'s, the kind postures need a runtime
   const codex = RUNTIMES.codex;
   assert.equal(resolveTurnProfile({ profile: 'plan-mode' }).onlyOn(claude), null);
   assert.equal(resolveTurnProfile({ profile: 'plan-mode' }).onlyOn(codex), `plan mode runs on Claude Code only — not '${codex.label}'`);
-  for (const name of ['design', 'research']) {
-    assert.equal(resolveTurnProfile({ profile: name }).onlyOn(claude), null);
-    assert.equal(resolveTurnProfile({ profile: name }).onlyOn(codex), `a ${name} card runs on Claude Code only — not '${codex.label}'`);
-  }
+  // RESEARCH IS CLAUDE'S; DESIGN IS CLAUDE'S AND CODEX'S (0.115.0), and the
+  // refusal names both.
+  assert.equal(resolveTurnProfile({ profile: 'research' }).onlyOn(claude), null);
+  assert.equal(resolveTurnProfile({ profile: 'research' }).onlyOn(codex), `a research card runs on Claude Code only — not '${codex.label}'`);
+  assert.equal(resolveTurnProfile({ profile: 'design' }).onlyOn(claude), null);
+  assert.equal(resolveTurnProfile({ profile: 'design' }).onlyOn(codex), null);
+  assert.equal(
+    resolveTurnProfile({ profile: 'design' }).onlyOn(RUNTIMES.antigravity),
+    "a design card runs on Claude Code or Codex only — not 'Antigravity'"
+  );
   // THE IMAGE POSTURE IS CODEX'S (0.114.0), and the sentence names the CLI
   // that declares it rather than assuming Claude.
   assert.equal(resolveTurnProfile({ profile: 'image' }).onlyOn(codex), null);

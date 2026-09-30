@@ -30,15 +30,23 @@ test('every kind has a contract, a posture some runtime declares, and a delivery
       assert.deepEqual(Object.keys(k.artifact).sort(), ['match', 'missing'], `${name}: one file proves it`);
       assert.match(k.artifact.missing, /under \.flowviant\/artifacts\/$/);
       assert.equal(typeof AGENT_HANDS_BACK[name], 'string', `${name}: a kickoff clause`);
-      // Each non-code kind runs on exactly ONE CLI, and its off-runtime
-      // sentence names that CLI.
-      assert.equal(runners.length, 1, `${name}: one CLI runs it`);
+      // Each non-code kind's off-runtime sentence names exactly the CLIs
+      // that declare its posture (2026-09-29: the design posture is Claude's
+      // and Codex's, research Claude's, image Codex's) — read off the
+      // registry, so a sentence cannot name a CLI that would refuse it.
+      const words = { claude: 'Claude', codex: 'Codex', antigravity: 'Antigravity' };
       assert.equal(
         k.offRuntime('x'),
-        runners[0] === 'claude'
-          ? 'mockup, 3D model, presentation and write-up cards run on Claude on this machine'
-          : 'image cards run on Codex on this machine',
+        {
+          design: 'mockup, 3D model and presentation cards run on Claude or Codex on this machine',
+          research: 'write-up cards run on Claude on this machine',
+          image: 'image cards run on Codex on this machine',
+        }[k.posture],
         name
+      );
+      assert.ok(
+        k.offRuntime('x').includes(` run on ${runners.map((id) => words[id]).join(' or ')} on this machine`),
+        `${name}: the sentence names ${runners.join(', ')}`
       );
     }
   }
@@ -53,17 +61,21 @@ test('every kind has a contract, a posture some runtime declares, and a delivery
 /**
  * THE IMAGE KIND IS CODEX'S (0.114.0): the pictures come from Codex's own
  * image tool, so Codex alone declares its posture and Claude — which draws no
- * raster image — is refused before spawn. And Codex declares NEITHER of
- * Claude's kind postures: a mockup on Codex is still refused.
+ * raster image — is refused before spawn. THE DESIGN POSTURE IS CLAUDE'S AND
+ * CODEX'S (0.115.0, measured — runtimeCodexDesign.test.mjs), so a mockup,
+ * 3D model or deck runs on either; RESEARCH stays Claude's alone, and
+ * Antigravity declares none of the three.
  */
-test('the image posture is declared by Codex only, and Claude’s by Claude only', () => {
+test('image is Codex’s, design is Claude’s and Codex’s, research is Claude’s', () => {
   assert.equal(canRun(RUNTIMES.codex, 'image'), true);
   assert.equal(canRun(RUNTIMES.claude, 'image'), false);
   assert.equal(canRun(RUNTIMES.antigravity, 'image'), false);
-  for (const p of ['design', 'research']) {
-    assert.equal(canRun(RUNTIMES.claude, p), true, p);
-    assert.equal(canRun(RUNTIMES.codex, p), false, p);
-  }
+  assert.equal(canRun(RUNTIMES.claude, 'design'), true);
+  assert.equal(canRun(RUNTIMES.codex, 'design'), true);
+  assert.equal(canRun(RUNTIMES.antigravity, 'design'), false);
+  assert.equal(canRun(RUNTIMES.claude, 'research'), true);
+  assert.equal(canRun(RUNTIMES.codex, 'research'), false);
+  assert.equal(canRun(RUNTIMES.antigravity, 'research'), false);
   assert.equal(AGENT_TASK_KINDS.image.offRuntime('claude'), 'image cards run on Codex on this machine');
 });
 

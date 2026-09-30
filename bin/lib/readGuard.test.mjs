@@ -219,12 +219,12 @@ test('research is handed the knowledge dir it was spawned with, as a rule beside
   assert.deepEqual(argv.slice(argv.indexOf('--disallowedTools') + 1), ['Read(./.env*)', 'Read(./**/.env*)', 'Bash']);
 });
 
-test('runTurn refuses a design or research posture on a runtime that does not declare it', async () => {
-  for (const posture of ['design', 'research']) {
-    const out = await runTurn({ prompt: 'p', system: 's', cwd: tmpdir(), runtime: 'codex', profile: posture });
-    assert.equal(out, '', `${posture} on codex: the turn fails`);
-    assert.ok(!existsSync(codexRan), `${posture} on codex: never spawned as a codex build`);
-  }
+test('runTurn refuses a research posture on a runtime that does not declare it', async () => {
+  // Codex declares design since 0.115.0 (its own fence, runtimeCodexDesign
+  // .test.mjs); research stays Claude's alone.
+  const out = await runTurn({ prompt: 'p', system: 's', cwd: tmpdir(), runtime: 'codex', profile: 'research' });
+  assert.equal(out, '', 'research on codex: the turn fails');
+  assert.ok(!existsSync(codexRan), 'research on codex: never spawned as a codex build');
   // Canary: the fake codex IS spawned when nothing refuses, so the absence
   // above is the belt and not a missing binary.
   await runTurn({ prompt: 'p', system: 's', cwd: tmpdir(), runtime: 'codex' });

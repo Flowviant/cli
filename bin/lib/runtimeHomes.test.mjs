@@ -185,7 +185,9 @@ test('pickRuntimeFor joins the registry with the measured rows: Claude first, el
   assert.equal(pickRuntimeFor('wiki', { detected: rows(['codex']) }), 'codex');
   // Antigravity cannot plan (the profile is absent on purpose), so it is never picked for one.
   assert.equal(pickRuntimeFor('plan', { detected: rows(['antigravity']) }), null);
-  assert.equal(pickRuntimeFor('design', { detected: rows(['codex', 'antigravity']) }), null);
+  // Codex declares the design fence since 0.115.0; research is Claude's alone.
+  assert.equal(pickRuntimeFor('design', { detected: rows(['codex', 'antigravity']) }), 'codex');
+  assert.equal(pickRuntimeFor('research', { detected: rows(['codex', 'antigravity']) }), null);
   assert.equal(pickRuntimeFor('consult', { detected: rows([]) }), null);
 });
 

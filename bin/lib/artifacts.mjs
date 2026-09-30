@@ -74,7 +74,7 @@
  * that cannot show an artifact must not have the CLI told it will.
  */
 
-import { constants, closeSync, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readSync } from 'node:fs';
+import { constants, closeSync, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readSync, rmSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { cutKeepingExtension } from './safeFileName.mjs';
@@ -136,6 +136,48 @@ export function ensureArtifactDir(placeDir) {
     return false;
   }
   return real(parent) === true && real(dir) === true;
+}
+
+/**
+ * A FENCED TURN'S OWN SCRATCH — `<place>/.flowviant/tmp`, beside the artifacts
+ * directory, under the `.flowviant/` git already ignores (0.115.0, 2026-09-29).
+ *
+ * MEASURED on codex-cli 0.156.1: under an artifacts-only profile `/tmp` is
+ * read-only, and a shell here-document needs a temp file (zsh writes it under
+ * `$TMPPREFIX`, bash and `mktemp` under `$TMPDIR`) — so `cat > page.html
+ * <<EOF` failed "can't create temp file for here document: read-only file
+ * system", left an empty page, and the turn stopped to ask why the artifacts
+ * directory was read-only. Codex's design fence grants this directory and
+ * points both variables at it (runtimeCodex.mjs `codexDesignFence`), so the
+ * shell works like a shell; nothing here is uploaded, committed or read back.
+ *
+ * Made EMPTY before each turn (a previous turn's scratch is nobody's), and
+ * only as a real directory under a real `.flowviant` — the artifacts
+ * directory's rule, for its reason: a fence grant on a path through a
+ * committed symlink is a write grant on its target. False creates nothing
+ * that matters, and the caller refuses the turn in words.
+ */
+export const FENCE_TMP_DIR = '.flowviant/tmp';
+export function ensureFenceScratch(placeDir) {
+  const parent = join(placeDir, '.flowviant');
+  const dir = join(placeDir, FENCE_TMP_DIR);
+  const kind = (p) => {
+    try {
+      const st = lstatSync(p);
+      return st.isDirectory() && !st.isSymbolicLink() ? 'dir' : 'other';
+    } catch (e) {
+      return e?.code === 'ENOENT' ? 'none' : 'other';
+    }
+  };
+  if (kind(parent) !== 'dir' || kind(dir) === 'other') return false;
+  try {
+    // A real directory (checked above): its contents go, never through a link.
+    if (kind(dir) === 'dir') rmSync(dir, { recursive: true, force: true });
+    mkdirSync(dir);
+  } catch {
+    return false;
+  }
+  return kind(parent) === 'dir' && kind(dir) === 'dir';
 }
 
 export function artifactTypeFor(name) {

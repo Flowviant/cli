@@ -423,3 +423,93 @@ test('an empty turn with no init keeps the old sentence and its fresh retry', as
   assert.deepEqual(calls, [true, false], 'no init measured: empty still means the conversation may be gone');
   assert.equal(l.settled[0].answer, 'the turn produced no output on the machine — its CLI may be signed out; try again');
 });
+
+/**
+ * A CODEX TURN SAYS WHAT ITS OWN WORDS MEASURED (2026-09-29, codexRelay.mjs).
+ * The owner's Codex New task chat answered with Codex's retry log — "Reading
+ * additional input from stdin... unexpected status 401 Unauthorized: Missing
+ * bearer or basic authentication in header …" — settled as the chat's REPLY;
+ * and a chat whose staging calls Codex refused for want of an approval said
+ * nothing of it. The strings below are the ones codex-cli 0.156.1 printed.
+ */
+const NO_LOGIN_LOG = [
+  'Reading additional input from stdin...',
+  '2026-09-29T23:06:29.770260Z ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 401 Unauthorized, url: wss://api.openai.com/v1/responses',
+  'Reconnecting... 2/5 (unexpected status 401 Unauthorized: Missing bearer or basic authentication in header, url: wss://api.openai.com/v1/responses)',
+  'unexpected status 401 Unauthorized: Missing bearer or basic authentication in header, url: https://api.openai.com/v1/responses, request id: req_1',
+].join('\n');
+const BAD_KEY_LOG = 'unexpected status 401 Unauthorized: Incorrect API key provided: sk-fvtes*-bad. You can find your API key at https://platform.openai.com/account/api-keys., url: https://api.openai.com/v1/responses';
+function codexLane(runTurn, runtime = 'codex') {
+  return lane({
+    placeWtFor: () => ({ wt: '/tmp/fv-capture-wt', fresh: true }),
+    sessionRuntime: () => ({ id: runtime }),
+    mintWorkToken: async () => ({ token: 'capture-token' }),
+    runTurn,
+  });
+}
+
+test('a Codex turn that never spoke and was refused for want of a login fails in words, its log kept under them', async () => {
+  const l = codexLane(async () => NO_LOGIN_LOG);
+  l.processWorkTurns([{ id: 't1', body: 'add a card', sessionId: 's1', capture: true, runtime: 'codex' }]);
+  await l.settle();
+  assert.equal(l.settled.length, 1);
+  assert.equal(l.settled[0].ok, false, 'a 401 is not a reply');
+  const [sentence, ...rest] = l.settled[0].answer.split('\n\n');
+  assert.equal(
+    sentence,
+    "Codex isn't signed in for this chat on the machine — it sent the request with no login, and the provider refused it (401 Unauthorized). Run `codex login` there, then send the message again."
+  );
+  assert.equal(rest.join('\n\n'), NO_LOGIN_LOG, "Codex's own words stay under the sentence");
+  assert.equal('sessionRef' in l.settled[0], false, 'nothing spoke, so no conversation is recorded here');
+
+  const refused = codexLane(async () => BAD_KEY_LOG);
+  refused.processWorkTurns([{ id: 't2', body: 'hi', sessionId: 's2', runtime: 'codex' }]);
+  await refused.settle();
+  assert.equal(refused.settled[0].ok, false);
+  assert.match(refused.settled[0].answer, /^Codex's login on the machine was refused for this chat \(401 Unauthorized\) — run `codex login` there/);
+
+  // …while a 401 in what the agent SAID is its words, and a Claude turn is
+  // never read as Codex.
+  const words = 'Your app answers "unexpected status 401 Unauthorized: Missing bearer or basic authentication" when the cookie is gone.';
+  const spoke = codexLane(async (opts) => {
+    opts.onAnswer?.(words);
+    return words;
+  });
+  spoke.processWorkTurns([{ id: 't1', body: 'why 401?', sessionId: 's1', runtime: 'codex' }]);
+  await spoke.settle();
+  assert.equal(spoke.settled[0].ok, true);
+  assert.equal(spoke.settled[0].answer, words);
+
+  const claude = codexLane(async () => NO_LOGIN_LOG, 'claude');
+  claude.processWorkTurns([{ id: 't2', body: 'hi', sessionId: 's2' }]);
+  await claude.settle();
+  assert.equal(claude.settled[0].ok, true, 'canary: the old reading of a Claude turn');
+  assert.equal(claude.settled[0].answer, NO_LOGIN_LOG);
+});
+
+test('tool calls Codex refused for want of an approval are named above what the agent said', async () => {
+  const refusal = 'MCP tool call requires approval, but approval policy is never';
+  const l = codexLane(async (opts) => {
+    opts.onActivity({ kind: 'tool', label: 'flowviant.stage_card', error: refusal });
+    opts.onActivity({ kind: 'tool', label: 'flowviant.stage_card', error: refusal });
+    opts.onActivity({ kind: 'tool', label: 'flowviant.list_staged' }); // ran
+    opts.onAnswer?.('Nothing staged — the tool calls were rejected.');
+    return 'Nothing staged — the tool calls were rejected.';
+  });
+  l.processWorkTurns([{ id: 't1', body: 'add a card', sessionId: 's1', capture: true, runtime: 'codex' }]);
+  await l.settle();
+  assert.equal(l.settled[0].ok, true, 'the turn spoke');
+  assert.equal(
+    l.settled[0].answer,
+    'Codex on the machine refused 2 tool calls in this turn (flowviant.stage_card) — "MCP tool call requires approval, but approval policy is never" — so nothing they would have done was done.\n\nNothing staged — the tool calls were rejected.'
+  );
+  // A turn whose calls all ran reads as it always did.
+  const fine = codexLane(async (opts) => {
+    opts.onActivity({ kind: 'tool', label: 'flowviant.stage_card' });
+    opts.onAnswer?.('Staged one card.');
+    return 'Staged one card.';
+  });
+  fine.processWorkTurns([{ id: 't2', body: 'add a card', sessionId: 's2', capture: true, runtime: 'codex' }]);
+  await fine.settle();
+  assert.equal(fine.settled[0].answer, 'Staged one card.');
+});

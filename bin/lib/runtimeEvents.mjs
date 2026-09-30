@@ -277,8 +277,15 @@ function humanizeCodexItem(item = {}, cwd = '') {
       const verb = first.kind === 'add' ? '+' : first.kind === 'delete' ? '-' : '~';
       return { kind: 'write', path: p, label: `${verb} ${tail || 'file'}` };
     }
-    case 'mcp_tool_call':
-      return { kind: 'tool', label: `${item.server ?? 'mcp'}.${item.tool ?? ''}` };
+    case 'mcp_tool_call': {
+      // A FAILED CALL KEEPS ITS OWN WORDS (2026-09-29), beside a label that is
+      // unchanged: codex-cli 0.156.1 closes a call it would not run as
+      // `status: "failed"`, `error.message` "MCP tool call requires approval,
+      // but approval policy is never" (measured), and the tab lane says so
+      // in words (codexRelay.mjs) instead of leaving a chat that staged nothing.
+      const error = String(item.error?.message ?? '');
+      return { kind: 'tool', label: `${item.server ?? 'mcp'}.${item.tool ?? ''}`, ...(error ? { error } : {}) };
+    }
     case 'web_search':
       return { kind: 'search', label: `search ${oneLine(item.query, 60)}` };
     default:

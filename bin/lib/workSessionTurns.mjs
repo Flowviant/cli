@@ -42,6 +42,7 @@ import { REPO_PLACE } from './workPlaces.mjs';
 import { CODEX_THREAD_RE, AGY_CONV_RE } from './workSessionRuntime.mjs';
 import { createToolLog } from './workToolLog.mjs';
 import { createCommandAudit } from './workCommandAudit.mjs';
+import { APPROVAL_REFUSED, codexApprovalSentence, codexLoginFailure, codexLoginSentence, withRelay } from './codexRelay.mjs';
 
 /**
  * THE ONE SENTENCE A PLAN TURN'S SYSTEM PROMPT GAINS (0.97.0), composed here
@@ -625,6 +626,11 @@ export function createWorkSessionTurns({
           let out;
           let seenThreadId = null; // codex's conversation id, off thread.started
           let seenClaudeSession = null; // claude's own conversation id, off system.init
+          // What a Codex turn's own events say went wrong (codexRelay.mjs):
+          // whether the agent said anything at all, and each tool call Codex
+          // refused for want of an approval, by `server.tool`.
+          let codexSpoke = false;
+          const approvalRefused = [];
           const spawned = []; // this turn's children, for the teardown registry
           // THE TURN'S TOOL LOG — see workToolLog.mjs for its shape rules.
           const turnLog = createToolLog(dir.wt);
@@ -733,6 +739,12 @@ export function createWorkSessionTurns({
               onActivity: (a) => {
                 narrator.line(a?.label);
                 auditCommand(a);
+                if (a?.kind === 'tool' && APPROVAL_REFUSED.test(a.error ?? '')) approvalRefused.push(a.label);
+              },
+              // One Codex agent MESSAGE (runtimeEvents.mjs `answer`): the turn
+              // spoke, so a 401 in its words is its words, not its failure.
+              onAnswer: (a) => {
+                if (String(a ?? '').trim()) codexSpoke = true;
               },
               // The structured twin of the line above — see toolLog.
               onToolEvent: pushToolEvent,
@@ -949,17 +961,31 @@ export function createWorkSessionTurns({
             rt.id === 'claude' && seenClaudeSession
               ? 'Claude Code ran in this conversation and returned no words — send the message again'
               : 'the turn produced no output on the machine — its CLI may be signed out; try again';
+          /**
+           * A CODEX TURN SAYS WHAT ITS OWN WORDS MEASURED (2026-09-29,
+           * codexRelay.mjs). A turn that never spoke and whose output is a
+           * 401 was not answered: it fails, its sentence first and Codex's
+           * retry log kept under it — it used to settle as the chat's REPLY.
+           * Tool calls Codex refused for want of an approval are named above
+           * whatever the agent said, so a chat that staged nothing says why.
+           */
+          const loginFailure = rt.id === 'codex' && !codexSpoke ? codexLoginFailure(answer) : null;
+          const refusedLine = rt.id === 'codex' ? codexApprovalSentence(approvalRefused) : null;
+          const spoke = answer.length > 0 && !loginFailure;
           await settleTurn(job.id, {
-            ok: answer.length > 0,
-            answer:
-              answer.length > 0
-                ? // Scrub: a reply can quote config or env-adjacent code.
-                  envScrub(answer).slice(0, 16000)
-                : noWords,
+            ok: spoke,
+            answer: loginFailure
+              ? withRelay(codexLoginSentence(loginFailure), answer)
+              : answer.length > 0
+                ? refusedLine
+                  ? withRelay(refusedLine, answer)
+                  : // Scrub: a reply can quote config or env-adjacent code.
+                    envScrub(answer).slice(0, 16000)
+                : (refusedLine ?? noWords),
             // Only a turn that actually SPOKE proves a conversation lives
             // here. Recording the path unconditionally is how a crashed first
             // turn used to brick resume for the session's whole life.
-            ...(answer.length > 0 ? { sessionRef: dir.wt } : {}),
+            ...(spoke ? { sessionRef: dir.wt } : {}),
             // The turn's tool log, in final form — the durable copy that lands
             // on the settled message (the live copy on the record is cleared
             // at settle). Already scrubbed at collection.
@@ -967,7 +993,8 @@ export function createWorkSessionTurns({
             ...(usage ? { usage } : {}),
             ...(model ? { model } : {}),
           });
-          if (answer.length > 0) ok(`${c.cyan('tab')} ${c.dim('— replied in the session')}`);
+          if (spoke) ok(`${c.cyan('tab')} ${c.dim('— replied in the session')}`);
+          else if (loginFailure) warn('codex answered 401 for this session turn — settled as failed, in words');
           else warn('session turn produced no output — settled as failed');
         } catch (e) {
           await settleTurn(job.id, {

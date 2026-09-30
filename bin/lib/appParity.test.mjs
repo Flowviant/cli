@@ -55,11 +55,14 @@ test('every runtime declares an effort ladder, and the release gate reads it and
   // …and the turn model's shape (2026-09-29), its cap and its pattern.
   assert.match(src, /join\(shared, 'turnModel\.ts'\)/);
   assert.match(src, /TURN_MODEL_RE\?\.source/);
-  // …and (0.114.0) the CLI each non-code kind runs on — the server's
-  // KIND_RUNTIME against the runtimes that declare the kind's posture — and
-  // every extension the server keeps a library item under.
-  assert.match(src, /const \{ KIND_RUNTIME \} = await import\(pathToFileURL\(join\(shared, 'taskKind\.ts'\)\)\.href\);/);
-  assert.match(src, /JSON\.stringify\(declared\) !== JSON\.stringify\(\[want\]\)/);
+  // …and (0.114.0; a set since 0.115.0) the CLIs each non-code kind runs on
+  // — the server's KIND_RUNTIMES against the runtimes that declare the kind's
+  // posture, its default among them, a missing table a failure — and every
+  // extension the server keeps a library item under.
+  assert.match(src, /const \{ KIND_RUNTIMES \} = await import\(pathToFileURL\(join\(shared, 'taskKind\.ts'\)\)\.href\);/);
+  assert.match(src, /if \(!KIND_RUNTIMES\) failures\.push\(/);
+  assert.match(src, /JSON\.stringify\(declared\) !== JSON\.stringify\(want\)/);
+  assert.match(src, /if \(!declared\.includes\(row\.default\)\)/);
   assert.match(src, /const accepted = DAEMON_LIBRARY_KINDS\[kind\]\?\.ext \?\? \[\];/);
   assert.match(readFileSync(join(cliRoot, 'scripts/build-binaries.sh'), 'utf8'), /bun scripts\/check-app-parity\.mjs/);
   assert.equal(JSON.parse(readFileSync(join(cliRoot, 'package.json'), 'utf8')).scripts.prepublishOnly, 'bun scripts/check-app-parity.mjs');

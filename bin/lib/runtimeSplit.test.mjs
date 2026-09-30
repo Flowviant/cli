@@ -132,3 +132,14 @@ test('the agent prompt names no CLI and points at both instruction files', () =>
   assert.ok(!/own Claude/.test(SYSTEM_AGENT));
   assert.ok(SYSTEM_AGENT.includes('CLAUDE.md') && SYSTEM_AGENT.includes('AGENTS.md'));
 });
+
+test("a failed Codex MCP call keeps its own words beside an unchanged label", () => {
+  const failed = parse({
+    type: 'item.completed',
+    item: { id: 'i', type: 'mcp_tool_call', server: 'flowviant', tool: 'stage_card', arguments: {}, result: null, error: { message: 'MCP tool call requires approval, but approval policy is never' }, status: 'failed' },
+  });
+  assert.deepEqual(failed.activity, { kind: 'tool', label: 'flowviant.stage_card', error: 'MCP tool call requires approval, but approval policy is never' });
+  assert.equal(failed.text, '', 'a tool call is never the agent speaking');
+  const ran = parse({ type: 'item.completed', item: { id: 'i', type: 'mcp_tool_call', server: 'flowviant', tool: 'stage_card', result: { content: [] }, error: null, status: 'completed' } });
+  assert.deepEqual(ran.activity, { kind: 'tool', label: 'flowviant.stage_card' });
+});

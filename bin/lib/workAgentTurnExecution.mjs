@@ -37,7 +37,7 @@ import { CODEX_THREAD_RE } from './workSessionRuntime.mjs';
 import { brainFor } from './workBrain.mjs';
 import { begunTurnRefusal } from './workAgentTurnBegun.mjs';
 import { agentTurnSettlement } from './workAgentTurnOutcome.mjs';
-import { ensureArtifactDir } from './artifacts.mjs';
+import { ensureArtifactDir, ensureFenceScratch } from './artifacts.mjs';
 import { agentBrowserHome } from './noWindowEnv.mjs';
 
 export function createAgentTurnExecution({
@@ -176,7 +176,8 @@ export function createAgentTurnExecution({
      * posture, which can write ONLY `.flowviant/artifacts/` (claudePosture.mjs).
      *
      * A RUNTIME THAT CANNOT EXPRESS THE POSTURE IS REFUSED, NOT IMPROVISED.
-     * Codex and antigravity declare neither (runtimeCodex.mjs,
+     * Antigravity declares none of them and Codex declares `design` (since
+     * 0.115.0) and `image` but not `research` (runtimeCodex.mjs,
      * runtimeAntigravity.mjs), and the only
      * alternative to refusing is running the card as a BUILD turn with
      * permissions skipped — an agent writing code for an ask that was a
@@ -243,6 +244,23 @@ export function createAgentTurnExecution({
         turnId,
         outcome: 'nothing',
         answer: "this worktree's .flowviant/artifacts is not a real directory, so there is nowhere to write what the card hands back",
+        branch,
+        worktree: wt,
+      });
+      return;
+    }
+    /**
+     * …AND ITS SCRATCH BESIDE IT, EMPTY (0.115.0): a fenced shell's temp files
+     * (a here-document, `mktemp`) go under `.flowviant/tmp`, which Codex's
+     * design fence grants because `/tmp` is read-only in there
+     * (`ensureFenceScratch`). Made for every file kind — one rule, no kind
+     * named — and refused in words where it cannot stand as a real directory.
+     */
+    if (kind.artifact && !ensureFenceScratch(wt)) {
+      await postAgentTurn({
+        turnId,
+        outcome: 'nothing',
+        answer: "this worktree's .flowviant/tmp is not a real directory, so the fenced turn has no scratch to work in",
         branch,
         worktree: wt,
       });
@@ -469,7 +487,9 @@ export function createAgentTurnExecution({
         // The knowledge paragraph, when this box holds a library — the same
         // composer the tabs use, so an agent and a tab can never be told two
         // different things about the same directory.
-        system: withProjectContext(SYSTEM_AGENT_FOR(taskKind), {
+        // Spoken to the CLI that runs it (0.115.0): a mockup on Codex is
+        // told it is Codex, never Claude.
+        system: withProjectContext(SYSTEM_AGENT_FOR(taskKind, RUNTIMES[rt]?.label), {
           knowledgeDir: knowledgeDirFor(repoRoot),
           // ARTIFACTS (0.94.0), while the server can show one — an agent's
           // land on its page, under the facts row.

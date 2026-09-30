@@ -32,7 +32,7 @@ test('the image profile fences writes to the worktree’s artifacts directory, b
   assert.equal(a[0], 'exec');
   assert.ok(a.includes('--json'));
   assert.ok(c.includes('permissions.flowviantimage.extends=":read-only"'));
-  assert.ok(c.includes(`permissions.flowviantimage.filesystem={"${WT}/.flowviant/artifacts"="write"}`), c.join('\n'));
+  assert.ok(c.includes(`permissions.flowviantimage.filesystem={"${WT}/.flowviant/artifacts"="write","${WT}/.flowviant/tmp"="write"}`), c.join('\n'));
   assert.ok(c.includes('default_permissions="flowviantimage"'));
   assert.ok(c.includes('approval_policy="never"'));
   // Never the spellings codex exec (or exec resume) refuses on 0.156.1.
@@ -62,7 +62,7 @@ test('a resumed image turn keeps the fence, and a path is quoted as a TOML strin
   assert.deepEqual(a.slice(0, 3), ['exec', 'resume', '0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b']);
   assert.ok(configs(a).includes('default_permissions="flowviantimage"'));
   const odd = argvFor({ cwd: '/tmp/a "quoted" dir' });
-  assert.ok(configs(odd).includes('permissions.flowviantimage.filesystem={"/tmp/a \\"quoted\\" dir/.flowviant/artifacts"="write"}'));
+  assert.ok(configs(odd).includes('permissions.flowviantimage.filesystem={"/tmp/a \\"quoted\\" dir/.flowviant/artifacts"="write","/tmp/a \\"quoted\\" dir/.flowviant/tmp"="write"}'));
 });
 
 test('an image turn with no absolute worktree is refused loudly, never run unfenced', () => {
@@ -129,7 +129,7 @@ test('runTurn hands the codex adapter the turn’s cwd, and an image turn on Cla
       mkdirSync(join(wt, ARTIFACT_DIR), { recursive: true });
       const out = await runTurn({ prompt: 'p', system: 's', cwd: wt, runtime: 'codex', profile: 'image' });
       const argv = JSON.parse(out.trim().split('\n').at(-1));
-      assert.ok(argv.includes(`permissions.flowviantimage.filesystem={"${wt}/.flowviant/artifacts"="write"}`), argv.join(' '));
+      assert.ok(argv.includes(`permissions.flowviantimage.filesystem={"${wt}/.flowviant/artifacts"="write","${wt}/.flowviant/tmp"="write"}`), argv.join(' '));
       assert.ok(argv.includes('image_generation'));
       rmSync(ran, { force: true });
       const refused = await runTurn({ prompt: 'p', system: 's', cwd: wt, runtime: 'claude', profile: 'image', streamJson: true, answerFromResult: true });

@@ -123,6 +123,23 @@ export function runTurn(opts) {
       resolve('');
       return;
     }
+    /**
+     * THE PERSON'S LOGIN, FOR A POSTURE THAT READS NONE OF THEIR CONFIG
+     * (2026-09-29, codexPersonal.mjs). Asked of the runtime that has one
+     * (Codex; Claude reads its own inside its adapter), with the environment
+     * this turn's CLI will run in — its CODEX_HOME is the agent's own when the
+     * lane keeps one — so the file read is the file the CLI would have read.
+     * Its `args` go to the adapter; its `env`, the literal secrets those name,
+     * to the child below and never to argv.
+     */
+    const personal =
+      rt.personal?.({
+        profile: turnProfile.adapterProfile,
+        vaultDir,
+        model,
+        effort,
+        env: { ...process.env, ...(mcpEnv ?? {}) },
+      }) ?? null;
     // Pin the model — never inherit the user's global default (which for Claude
     // may be a 1M/long-context tier their subscription can't bill autonomous
     // work on). A per-task override (chosen in the app, validated server-side
@@ -139,6 +156,7 @@ export function runTurn(opts) {
     // which posture a turn is running under. There is no precedence chain left
     // to get wrong: the caller named one profile (turnProfile.mjs).
     const args = rt.args({
+      personal,
       prompt,
       system,
       model,
@@ -237,7 +255,12 @@ export function runTurn(opts) {
       // this environment, and handing it a curated one signs it out. What it
       // REMOVES is this daemon's machine credential and, for a turn nobody is
       // sitting at, every way to a window — see `cliEnv`.
-      env: cliEnv(mcpEnv, { display: display === true, browserHome: browser?.dir }),
+      // The login's literal secrets first, so nothing of the lane's (its MCP
+      // token, its CODEX_HOME) can be overwritten by one.
+      env: cliEnv(personal?.env ? { ...personal.env, ...(mcpEnv ?? {}) } : mcpEnv, {
+        display: display === true,
+        browserHome: browser?.dir,
+      }),
     });
     if (browser) {
       child.once('close', browser.cleanup);

@@ -52,11 +52,14 @@ export const CLAUDE_RUNTIME = {
    * "consult" and "plan" currently mean. That is a statement about where the
    * contract was written, not a claim that only Claude could ever satisfy it.
    */
-  // `design` and `research` (0.97.0) are Claude's alone: each is an
-  // `--allowedTools` list with a PATH-SCOPED write (claudePosture.mjs), and neither
-  // codex's sandbox modes nor agy's flags were measured to express "write
-  // only this directory". A runtime that does not declare them is refused
-  // such a card before spawn, in words — never handed a build turn instead.
+  // `design` and `research` (0.97.0): each is an `--allowedTools` list with a
+  // PATH-SCOPED write (claudePosture.mjs). `research` is Claude's alone;
+  // `design` is Codex's too since 0.115.0 (2026-09-29), whose permission
+  // profile was measured to write only the artifacts directory
+  // (runtimeCodex.mjs `codexDesignFence`). agy's flags cannot express "write
+  // only this directory" (runtimeAntigravity.mjs). A runtime that does not
+  // declare a posture is refused such a card before spawn, in words — never
+  // handed a build turn instead.
   profiles: ['build', 'wiki', 'consult', 'plan', 'design', 'research'],
   /**
    * THE EFFORTS THIS CLI SPELLS — the daemon's copy of the server's

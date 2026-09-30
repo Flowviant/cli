@@ -504,14 +504,13 @@ test('runTurn takes ONE profile by name, and Claude\'s list is looked up by that
   assert.ok(call.includes('perm: claudePermFor(turnProfile.name, knowledgeDir),'));
 });
 
-test('only Claude declares the two postures, and they need no MCP', () => {
+test('Claude declares both postures, Codex design alone (0.115.0), and they need no MCP', () => {
   assert.ok(canRun(RUNTIMES.claude, 'design'));
   assert.ok(canRun(RUNTIMES.claude, 'research'));
-  for (const id of ['codex', 'antigravity']) {
-    if (!RUNTIMES[id]) continue;
-    assert.ok(!canRun(RUNTIMES[id], 'design'), `${id} cannot run a design card`);
-    assert.ok(!canRun(RUNTIMES[id], 'research'), `${id} cannot run a research card`);
-  }
+  assert.ok(canRun(RUNTIMES.codex, 'design'), 'codex runs a design card under its own fence');
+  assert.ok(!canRun(RUNTIMES.codex, 'research'), 'codex cannot run a research card');
+  assert.ok(!canRun(RUNTIMES.antigravity, 'design'), 'antigravity cannot run a design card');
+  assert.ok(!canRun(RUNTIMES.antigravity, 'research'), 'antigravity cannot run a research card');
 });
 
 test('the agent turn: contract and posture from the kind, refusal off Claude, artifact before delivered', () => {
@@ -530,9 +529,10 @@ test('the agent turn: contract and posture from the kind, refusal off Claude, ar
   assert.match(turn, /const kind = AGENT_TASK_KINDS\[taskKind\];\s*const posture = kind\.posture;/);
   assert.match(turn, /if \(!canRun\(RUNTIMES\[rt\], posture\)\)/);
   assert.ok(turn.includes('answer: kind.offRuntime(rt),'));
-  for (const k of ['design', 'model', 'deck', 'research']) {
-    assert.equal(kinds.AGENT_TASK_KINDS[k].offRuntime('codex'), 'mockup, 3D model, presentation and write-up cards run on Claude on this machine', k);
+  for (const k of ['design', 'model', 'deck']) {
+    assert.equal(kinds.AGENT_TASK_KINDS[k].offRuntime('antigravity'), 'mockup, 3D model and presentation cards run on Claude or Codex on this machine', k);
   }
+  assert.equal(kinds.AGENT_TASK_KINDS.research.offRuntime('codex'), 'write-up cards run on Claude on this machine');
   assert.equal(kinds.AGENT_TASK_KINDS.code.offRuntime('agy'), 'this machine cannot run agy');
   assert.equal(kinds.AGENT_TASK_KINDS.image.offRuntime('claude'), 'image cards run on Codex on this machine');
   // THE ARTIFACTS DIRECTORY STANDS BEFORE A NON-CODE CARD'S CLI SPAWNS
@@ -546,7 +546,7 @@ test('the agent turn: contract and posture from the kind, refusal off Claude, ar
   const standAt = turn.indexOf('if (kind.artifact && !ensureArtifactDir(wt))');
   const spawnAt = turn.indexOf('runTurnResumingOnce(runTurn, agentTurnArgs');
   assert.ok(refuseAt > -1 && standAt > refuseAt && spawnAt > standAt, 'refuse the runtime, make the directory, then spawn');
-  assert.match(turn, /system: withProjectContext\(SYSTEM_AGENT_FOR\(taskKind\),/);
+  assert.match(turn, /system: withProjectContext\(SYSTEM_AGENT_FOR\(taskKind, RUNTIMES\[rt\]\?\.label\),/);
   assert.ok(turn.includes('profile: posture,'), 'the kind\'s posture is the one turn profile');
   // The measured check — the snapshot taken before the spawn, the scan after —
   // is the settlement decision's (workAgentTurnOutcome.mjs, SOLID F036).

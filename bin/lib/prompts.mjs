@@ -1111,8 +1111,22 @@ ${ARTIFACT_CONTRACT_TAIL({
  * WHICH CONTRACT A TURN RUNS UNDER, by the card's kind. Absent or unknown is
  * code, and code is `SYSTEM_AGENT` — the same object, so a code turn's system
  * prompt is byte-for-byte what it was before kinds existed.
+ *
+ * …AND WHO IT IS SPOKEN TO (0.115.0, 2026-09-29). The mockup, 3D-model and
+ * deck contracts open "You are the human's own Claude" because Claude ran them
+ * alone; Codex runs them now (`codexDesignFence`), and a contract that calls
+ * Codex Claude is the prompt telling the agent something false about itself.
+ * `runtimeLabel` is the CLI's own name ("Codex"); absent, or Claude's, the
+ * contract is the pinned string itself, byte for byte. Only that opening
+ * names a CLI — nothing else in these contracts is Claude's (no tool names,
+ * no flags), so nothing else changes.
  */
-export const SYSTEM_AGENT_FOR = (taskKind) => AGENT_CONTRACTS[agentTaskKindOf(taskKind)];
+const CLAUDE_OPENING = "You are the human's own Claude,";
+export const SYSTEM_AGENT_FOR = (taskKind, runtimeLabel = null) => {
+  const contract = AGENT_CONTRACTS[agentTaskKindOf(taskKind)];
+  if (!runtimeLabel || /^claude\b/i.test(runtimeLabel) || !contract.startsWith(CLAUDE_OPENING)) return contract;
+  return `You are the human's own ${runtimeLabel},${contract.slice(CLAUDE_OPENING.length)}`;
+};
 
 /**
  * THE STRINGS EACH KIND IS HANDED, keyed by the kinds in agentTaskKinds.mjs —

@@ -59,13 +59,17 @@
  *      (`turnModel.ts`): the server re-applies them to a settle's `model`, so
  *      a looser copy here has the model dropped at the boundary and a tighter
  *      one withholds a model the app would have named.
- *  13. the CLI each card kind runs on (2026-09-29, 0.114.0) — the server
- *      resolves an accepted agent's CLI from its cards' kinds
- *      (`KIND_RUNTIME`: images on Codex, the other non-code kinds on Claude),
- *      and the daemon runs a kind only on a runtime that DECLARES its posture
+ *  13. the CLIs each card kind runs on (2026-09-29, 0.114.0; a set since
+ *      0.115.0) — the server accepts a container only on a CLI that runs
+ *      every card in it (`KIND_RUNTIMES[kind].runs`: images on Codex,
+ *      write-ups on Claude, mockups, 3D models and decks on Claude or Codex)
+ *      and resolves an unpicked one to the kind's `default`, and the daemon
+ *      runs a kind only on a runtime that DECLARES its posture
  *      (`RUNTIMES[id].profiles`). Each non-code kind's posture must be
- *      declared by exactly the server's CLI: otherwise every turn of that
- *      kind is refused into Stuck on the CLI the server chose.
+ *      declared by exactly the server's set, and the default must be one of
+ *      them: a CLI the server allows that the daemon does not declare is a
+ *      container refused into Stuck on its first turn, and one the daemon
+ *      declares that the server does not is a posture nobody can pick.
  *  14. the kept library's file types (2026-09-29, 0.114.0) — every extension
  *      the server may keep an item under (its kind's `mimes`/`mime`, through
  *      the artifact allowlist) must be one the daemon's `LIBRARY_KINDS[kind]
@@ -221,17 +225,23 @@ const daemonTurnModel = await import(pathToFileURL(join(cliRoot, 'bin/lib/turnMo
   if (server !== daemon) failures.push(`bin/lib/turnModel.mjs TURN_MODEL_MAX/TURN_MODEL_RE are ${daemon}; the server's are ${server}.`);
 }
 
-// 13. Which CLI runs each non-code kind: the server's pick, the daemon's
-// declaration. Code is the project's code default (null), declared by build.
+// 13. Which CLIs run each non-code kind: the server's set and default, the
+// daemon's declarations. Code runs anywhere (null), declared by build. An app
+// with no set (older than 0.115.0's) is a failure, never a skip.
 {
-  const { KIND_RUNTIME } = await import(pathToFileURL(join(shared, 'taskKind.ts')).href);
-  for (const kind of [...TASK_KINDS]) {
-    const want = KIND_RUNTIME?.[kind] ?? null;
+  const { KIND_RUNTIMES } = await import(pathToFileURL(join(shared, 'taskKind.ts')).href);
+  if (!KIND_RUNTIMES) failures.push("the server's taskKind.ts exports no KIND_RUNTIMES (the CLIs each kind runs on).");
+  for (const kind of KIND_RUNTIMES ? [...TASK_KINDS] : []) {
+    const row = KIND_RUNTIMES[kind];
     const posture = AGENT_TASK_KINDS[kind]?.posture;
-    if (want === null || !posture) continue;
-    const declared = Object.keys(RUNTIMES).filter((id) => (RUNTIMES[id].profiles ?? []).includes(posture));
-    if (JSON.stringify(declared) !== JSON.stringify([want])) {
-      failures.push(`a ${kind} card's posture '${posture}' is declared by ${JSON.stringify(declared)} here; the server runs it on ${JSON.stringify(want)} (KIND_RUNTIME).`);
+    if (!row || row.runs === null || !posture) continue;
+    const declared = Object.keys(RUNTIMES).filter((id) => (RUNTIMES[id].profiles ?? []).includes(posture)).sort();
+    const want = [...row.runs].sort();
+    if (JSON.stringify(declared) !== JSON.stringify(want)) {
+      failures.push(`a ${kind} card's posture '${posture}' is declared by ${JSON.stringify(declared)} here; the server runs it on ${JSON.stringify(want)} (KIND_RUNTIMES).`);
+    }
+    if (!declared.includes(row.default)) {
+      failures.push(`a ${kind} card defaults to ${JSON.stringify(row.default)} on the server, which does not declare its posture '${posture}' here.`);
     }
   }
 }

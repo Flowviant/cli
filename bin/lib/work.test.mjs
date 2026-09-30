@@ -1791,8 +1791,9 @@ test('the agent turn takes its kind from the job before the card', () => {
 
 /**
  * …AND AT RUNTIME: a card-less human turn carrying `taskKind: 'design'` is
- * judged under the design posture — which only Claude declares, so on another
- * runtime it is refused in the design sentence BEFORE anything spawns. The
+ * judged under the design posture — which Claude and Codex declare (Codex
+ * since 0.115.0), so on Antigravity it is refused in the design sentence
+ * BEFORE anything spawns. The
  * canary is the same job with no kind on an unknown runtime: that is a build
  * turn, refused in the build sentence — so the words, not the refusal, are what
  * prove the job's key was read.
@@ -1801,13 +1802,15 @@ test('a card-less send-back on a design agent runs under the design posture', as
   const { m } = managerIn(t);
   const { calls } = stubFetch(t);
   m.processAgentTurnJobs([
-    { id: 'at-k1', agentId: 'ag-k1', placeId: 'a-ag-k1', kind: 'human', body: 'make the hero bigger', runtime: 'codex', taskKind: 'design' },
+    // Antigravity declares no kind posture (Codex declares design since
+    // 0.115.0, so it no longer proves the refusal).
+    { id: 'at-k1', agentId: 'ag-k1', placeId: 'a-ag-k1', kind: 'human', body: 'make the hero bigger', runtime: 'antigravity', taskKind: 'design' },
     { id: 'at-k2', agentId: 'ag-k2', placeId: 'a-ag-k2', kind: 'human', body: 'make the hero bigger', runtime: 'no-such-cli' },
   ]);
   await until(() => calls.filter((c) => c.url.includes('agent-turn-done')).length >= 2);
   const settle = (id) => calls.find((c) => c.url.includes('agent-turn-done') && c.body.turnId === id).body;
   assert.equal(settle('at-k1').outcome, 'nothing');
-  assert.equal(settle('at-k1').answer, 'mockup, 3D model, presentation and write-up cards run on Claude on this machine');
+  assert.equal(settle('at-k1').answer, 'mockup, 3D model and presentation cards run on Claude or Codex on this machine');
   assert.equal(settle('at-k2').answer, 'this machine cannot run no-such-cli');
   await until(() => !m.workBusy());
 });

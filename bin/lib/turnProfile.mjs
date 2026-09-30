@@ -22,8 +22,9 @@
  *  - design / research / image — a non-code card's posture
  *                (agentTaskKinds.mjs), refused on any runtime that does not
  *                DECLARE it, because every other adapter's fallback is its
- *                build branch. design and research are Claude Code's; image
- *                (0.114.0) is Codex's.
+ *                build branch. research is Claude Code's; design is
+ *                Claude Code's and, since 0.115.0, Codex's; image (0.114.0)
+ *                is Codex's.
  *
  * Claude's permission list for each name lives beside the lists themselves
  * (`claudePermFor`, claudePosture.mjs); this module owns the vocabulary and the
