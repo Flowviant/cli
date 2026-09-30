@@ -7,8 +7,8 @@
  * turn's `usage`, tagged with the CLI that counted it (the agent lane's wire
  * shape). A report with nothing spent carries no key.
  *
- * `runTurn` and `pickRuntimeFor` are injected (a test must not spend a model
- * turn); the claim is the server's answer, so `fetch` is stubbed to grant it.
+ * `runTurn`, `detectRuntimes` and `pickRuntimeFor` are injected (a test must
+ * not spend a model turn); `fetch` is stubbed to grant the server's claim.
  *
  * Run: node --test bin/lib/workAgentPlans.test.mjs
  */
@@ -24,6 +24,7 @@ process.env.FLOWVIANT_FLEET_URL = 'http://127.0.0.1:9/api/fleet/agents';
 process.env.FLOWVIANT_FLEET = 'fva_plans_test';
 
 const { createWorkAgentPlans } = await import('./workAgentPlans.mjs');
+const { RUNTIMES } = await import('./runtimes.mjs');
 
 // The claim is granted; narration lines are swallowed. Nothing leaves the box.
 const realFetch = globalThis.fetch;
@@ -36,8 +37,12 @@ test.after(() => {
   globalThis.fetch = realFetch;
 });
 
-function planLane(runTurn) {
+function planLane(runTurn = async () => PROPOSAL, {
+  pickRuntimeFor = () => 'claude',
+  detectRuntimes = () => [{ id: 'claude', installed: true }, { id: 'codex', installed: true }],
+} = {}) {
   const posted = [];
+  const turns = [];
   const lane = createWorkAgentPlans({
     postBestEffort: async (url, body) => {
       posted.push({ url, body });
@@ -49,20 +54,97 @@ function planLane(runTurn) {
     admit: Object.assign(() => null, { reserve: () => () => {} }),
     placeLocks: new Map(),
     workChildren: new Map(),
-    runTurn,
-    pickRuntimeFor: () => 'claude',
+    runTurn: (opts) => {
+      turns.push(opts);
+      return runTurn(opts);
+    },
+    pickRuntimeFor,
+    detectRuntimes,
   });
-  const run = async (id) => {
-    lane.processAgentPlanJobs([{ id, tasks: [{ id: 'c1', title: 'Fix login' }], liveAgents: [] }]);
+  const run = async (id, job = {}) => {
+    lane.processAgentPlanJobs([{ id, tasks: [{ id: 'c1', title: 'Fix login' }], liveAgents: [], ...job }]);
     for (let i = 0; i < 300 && !posted.length; i++) await new Promise((r) => setTimeout(r, 5));
     assert.equal(posted.length, 1, 'one report per press');
     assert.match(posted[0].url, /\/agent-plan-done$/);
     return posted[0].body;
   };
-  return { run };
+  return { run, turns };
 }
 
 const SPENT = { input: 12, output: 340, cacheCreate: 900, cacheRead: 15000 };
+const PROPOSAL = JSON.stringify({ agents: [{ tempId: 'a1', name: 'auth', taskIds: ['c1'] }] });
+
+test('a job naming installed Codex runs on Codex ahead of the picker', async () => {
+  const lane = planLane(async (opts) => {
+    opts.onUsage(SPENT);
+    return PROPOSAL;
+  }, { pickRuntimeFor: () => assert.fail('a named CLI must not take the picker') });
+  const body = await lane.run('picked', { runtime: 'codex' });
+  assert.ok(body.proposal);
+  assert.equal(lane.turns.length, 1);
+  assert.equal(lane.turns[0].runtime, 'codex');
+  assert.equal(lane.turns[0].profile, 'consult');
+  assert.equal('mcpArgs' in lane.turns[0], false);
+  assert.deepEqual(body.usage, { ...SPENT, runtime: 'codex' });
+});
+
+test('a job naming an uninstalled CLI settles in words and spawns nothing', async () => {
+  const lane = planLane(undefined, {
+    detectRuntimes: () => [{ id: 'claude', installed: true }, { id: 'codex', installed: false }],
+    pickRuntimeFor: () => assert.fail('a missing pick must not fall back'),
+  });
+  const body = await lane.run('missing', { runtime: 'codex' });
+  assert.equal(body.id, 'missing');
+  assert.equal(body.error, 'Codex is not installed on this machine');
+  assert.equal(lane.turns.length, 0);
+  assert.equal('usage' in body, false);
+});
+
+test('an installed CLI without consult support settles in words and spawns nothing', async (t) => {
+  const profiles = RUNTIMES.codex.profiles;
+  t.after(() => { RUNTIMES.codex.profiles = profiles; });
+  RUNTIMES.codex.profiles = profiles.filter((profile) => profile !== 'consult');
+  const lane = planLane(undefined, {
+    pickRuntimeFor: () => assert.fail('an unsupported pick must not fall back'),
+  });
+  const body = await lane.run('unsupported', { runtime: 'codex' });
+  assert.equal(body.error, "Codex can't run a read-only turn on this machine");
+  assert.equal(lane.turns.length, 0);
+});
+
+for (const runtime of ['future-cli', 'toString', '__proto__']) {
+  test(`an unknown runtime ${runtime} settles in words and spawns nothing`, async () => {
+    const lane = planLane(undefined, {
+      detectRuntimes: () => assert.fail('an unknown CLI must not be probed'),
+      pickRuntimeFor: () => assert.fail('an unknown pick must not fall back'),
+    });
+    const body = await lane.run('unknown', { runtime });
+    assert.equal(body.error, `${runtime} is not a CLI this machine knows`);
+    assert.equal(lane.turns.length, 0);
+  });
+}
+
+test('a job without a runtime takes the consult picker and leaves knobs absent', async () => {
+  const profiles = [];
+  const lane = planLane(undefined, {
+    pickRuntimeFor: (profile) => { profiles.push(profile); return 'codex'; },
+    detectRuntimes: () => assert.fail('the fallback picker handles detection'),
+  });
+  assert.ok((await lane.run('fallback')).proposal);
+  assert.deepEqual(profiles, ['consult']);
+  assert.equal(lane.turns.length, 1);
+  assert.equal(lane.turns[0].runtime, 'codex');
+  assert.equal('model' in lane.turns[0], false);
+  assert.equal('effort' in lane.turns[0], false);
+});
+
+test('the picked model and effort reach the read-only planning turn', async () => {
+  const lane = planLane();
+  assert.ok((await lane.run('brain', { runtime: 'codex', model: 'gpt-5.4', effort: 'xhigh' })).proposal);
+  assert.equal(lane.turns.length, 1);
+  assert.equal(lane.turns[0].model, 'gpt-5.4');
+  assert.equal(lane.turns[0].effort, 'xhigh');
+});
 
 test('a proposal carries what the planning turn spent, tagged with its CLI', async () => {
   const body = await planLane(async (opts) => {
