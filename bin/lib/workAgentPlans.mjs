@@ -228,12 +228,16 @@ export function createWorkAgentPlans({
     /**
      * WHICH CLI PLANS. The person's pick comes first; a named CLI must be
      * installed and able to run the read-only profile, or the press says why.
-     * With no pick, `pickRuntimeFor('consult')` is the fallback — Claude when
-     * it is here, otherwise whatever can express the profile.
+     * A model or effort pin without a named CLI is a Claude pick. With no pick
+     * or pin, `pickRuntimeFor('consult')` is the fallback — Claude when it is
+     * here, otherwise whatever can express the profile.
      */
     let rt;
-    if (typeof job.runtime === 'string' && job.runtime.length > 0) {
-      rt = job.runtime;
+    const pickedRuntime = typeof job.runtime === 'string' && job.runtime.length > 0
+      ? job.runtime
+      : job.model != null || job.effort != null ? 'claude' : null;
+    if (pickedRuntime) {
+      rt = pickedRuntime;
       if (!Object.hasOwn(RUNTIMES, rt)) {
         await postAgentPlan({ id, error: `${rt} is not a CLI this machine knows` });
         return;

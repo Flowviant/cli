@@ -138,6 +138,46 @@ test('a job without a runtime takes the consult picker and leaves knobs absent',
   assert.equal('effort' in lane.turns[0], false);
 });
 
+for (const pin of [{ model: 'opus' }, { effort: 'max' }, { model: 'opus', effort: 'max' }]) {
+  const name = JSON.stringify(pin);
+  test(`a pin without a runtime ${name} settles in words when Claude is missing`, async () => {
+    const lane = planLane(undefined, {
+      detectRuntimes: () => [{ id: 'claude', installed: false }, { id: 'codex', installed: true }],
+      pickRuntimeFor: () => 'codex',
+    });
+    const body = await lane.run('missing-claude', pin);
+    assert.equal(body.id, 'missing-claude');
+    assert.equal(body.error, 'Claude Code is not installed on this machine');
+    assert.equal(lane.turns.length, 0);
+    assert.equal('usage' in body, false);
+  });
+
+  test(`a pin without a runtime ${name} runs on installed Claude with its pin`, async () => {
+    const lane = planLane(undefined, { pickRuntimeFor: () => 'codex' });
+    assert.ok((await lane.run('pinned-claude', pin)).proposal);
+    assert.equal(lane.turns.length, 1);
+    assert.equal(lane.turns[0].runtime, 'claude');
+    assert.equal(lane.turns[0].profile, 'consult');
+    assert.equal('mcpArgs' in lane.turns[0], false);
+    for (const key of ['model', 'effort']) {
+      assert.equal(lane.turns[0][key], pin[key]);
+      assert.equal(key in lane.turns[0], key in pin);
+    }
+  });
+}
+
+test('null model and effort without a runtime keep the consult picker', async () => {
+  const lane = planLane(undefined, {
+    pickRuntimeFor: () => 'codex',
+    detectRuntimes: () => assert.fail('the fallback picker handles detection'),
+  });
+  assert.ok((await lane.run('null-brain', { model: null, effort: null })).proposal);
+  assert.equal(lane.turns.length, 1);
+  assert.equal(lane.turns[0].runtime, 'codex');
+  assert.equal('model' in lane.turns[0], false);
+  assert.equal('effort' in lane.turns[0], false);
+});
+
 test('the picked model and effort reach the read-only planning turn', async () => {
   const lane = planLane();
   assert.ok((await lane.run('brain', { runtime: 'codex', model: 'gpt-5.4', effort: 'xhigh' })).proposal);
