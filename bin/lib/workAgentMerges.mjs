@@ -12,6 +12,18 @@ import { warn } from './ui.mjs';
 import { scrub as envScrub } from './uplinkScrub.mjs';
 import { fleetEndpoint } from './fleetWire.mjs';
 
+/** Git puts merge conflicts on stdout, while refusals usually use stderr.
+ * Keep both before the command wrapper, scrub before bounding, and put Git's
+ * reason first so the server's shorter mergeError cap keeps the useful part.
+ * A genuine conflict stays in the worktree for the merge_resolve turn. */
+export function agentMergeFailureDetail(error) {
+  const output = [error?.stdout, error?.stderr]
+    .map((value) => String(value ?? '').trim())
+    .filter(Boolean)
+    .join('\n');
+  return envScrub(output || String(error?.message || error)).slice(0, 2000);
+}
+
 export function createWorkAgentMerges({
   repoRoot,
   inPlace,
@@ -154,7 +166,7 @@ export function createWorkAgentMerges({
           await report({
             agentId,
             ok: false,
-            detail: envScrub(String(e?.message || e)).slice(0, 2000),
+            detail: agentMergeFailureDetail(e),
           });
           return;
         }
@@ -354,7 +366,7 @@ export function createWorkAgentMerges({
           // resolve turn on the server. A conflict says nothing, and the
           // agent resolves it in its worktree as before.
           ...(e?.fix === 'person' ? { fix: 'person' } : {}),
-          detail: envScrub(String(e?.message || e)).slice(0, 2000),
+          detail: agentMergeFailureDetail(e),
         });
         return;
       }
@@ -362,6 +374,12 @@ export function createWorkAgentMerges({
       onRepoChanged();
       landed.observe();
       });
+    } catch (e) {
+      // Unexpected Git failures must retain their diagnostics too. The belt
+      // below remains for paths which exit without an error or a report.
+      if (!reported) {
+        await report({ agentId, ok: false, detail: agentMergeFailureDetail(e) });
+      }
     } finally {
       if (!reported) {
         // Belt over braces. A merge this daemon claimed and cannot account for
