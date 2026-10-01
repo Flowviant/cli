@@ -8,8 +8,9 @@ import { c, note } from './ui.mjs';
 import { runTurn as defaultRunTurn } from './runTurn.mjs';
 import { SYSTEM_PLAN, AGENT_PLAN_KICKOFF } from './prompts.mjs';
 import { scrub as envScrub } from './uplinkScrub.mjs';
-import { RUNTIMES } from './runtimes.mjs';
-import { pickRuntimeFor as defaultPickRuntimeFor } from './runtimeDetection.mjs';
+import { RUNTIMES, canRun } from './runtimes.mjs';
+import { detectRuntimes as defaultDetectRuntimes, pickRuntimeFor as defaultPickRuntimeFor } from './runtimeDetection.mjs';
+import { brainFor } from './workBrain.mjs';
 import { removeProbeTranscript } from './runtimeCapabilities.mjs';
 import { fleetEndpoint } from './fleetWire.mjs';
 import { REPO_PLACE } from './workPlaces.mjs';
@@ -24,10 +25,11 @@ export function createWorkAgentPlans({
   admit,
   placeLocks,
   workChildren,
-  // The real CLI driver and picker; injectable only so the lane can be driven
+  // The real CLI driver, detector and picker; injectable so the lane can be driven
   // in a test without spending a model turn (the wiki runner's shape).
   runTurn = defaultRunTurn,
   pickRuntimeFor = defaultPickRuntimeFor,
+  detectRuntimes = defaultDetectRuntimes,
 }) {
   const AGENT_PLAN_DONE_URL = fleetEndpoint('agent-plan-done', FLEET_URL);
   const AGENT_PLAN_ACTIVITY_URL = fleetEndpoint('agent-plan-activity', FLEET_URL);
@@ -224,15 +226,34 @@ export function createWorkAgentPlans({
     }
 
     /**
-     * WHICH CLI PLANS. `pickRuntimeFor('consult')`, the same picker every other
-     * turn nobody @mentioned already uses — Claude when it is here (the prompts
-     * were written against it), otherwise whatever can express the profile.
-     *
-     * Deliberately NOT the project's runtime order: that order is about AGENTS,
-     * which hold a conversation across many turns and whose value is that held
-     * context. A planner runs once and reads; it takes what the machine has.
+     * WHICH CLI PLANS. The person's pick comes first; a named CLI must be
+     * installed and able to run the read-only profile, or the press says why.
+     * A model or effort pin without a named CLI is a Claude pick. With no pick
+     * or pin, `pickRuntimeFor('consult')` is the fallback — Claude when it is
+     * here, otherwise whatever can express the profile.
      */
-    const rt = pickRuntimeFor('consult');
+    let rt;
+    const pickedRuntime = typeof job.runtime === 'string' && job.runtime.length > 0
+      ? job.runtime
+      : job.model != null || job.effort != null ? 'claude' : null;
+    if (pickedRuntime) {
+      rt = pickedRuntime;
+      if (!Object.hasOwn(RUNTIMES, rt)) {
+        await postAgentPlan({ id, error: `${rt} is not a CLI this machine knows` });
+        return;
+      }
+      const label = RUNTIMES[rt].label;
+      if (!detectRuntimes().find((r) => r.id === rt)?.installed) {
+        await postAgentPlan({ id, error: `${label} is not installed on this machine` });
+        return;
+      }
+      if (!canRun(RUNTIMES[rt], 'consult')) {
+        await postAgentPlan({ id, error: `${label} can't run a read-only turn on this machine` });
+        return;
+      }
+    } else {
+      rt = pickRuntimeFor('consult');
+    }
     if (!rt) {
       await postAgentPlan({ id, error: 'no CLI on this machine can run a read-only turn' });
       return;
@@ -342,6 +363,7 @@ export function createWorkAgentPlans({
           profile: 'consult',
           cwd: repoRoot,
           runtime: rt,
+          ...brainFor(job, rt),
           streamJson: true,
           answerFromResult: true,
           label: c.cyan('[plan]'),
