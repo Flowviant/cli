@@ -11,6 +11,7 @@ import { gitMergeIn } from './gitMergeIdentity.mjs';
 import { warn } from './ui.mjs';
 import { scrub as envScrub } from './uplinkScrub.mjs';
 import { fleetEndpoint } from './fleetWire.mjs';
+import { gitReportedConflict } from './agentMergeResolution.mjs';
 
 /** Git puts merge conflicts on stdout, while refusals usually use stderr.
  * Keep both before the command wrapper, scrub before bounding, and put Git's
@@ -167,6 +168,7 @@ export function createWorkAgentMerges({
             agentId,
             ok: false,
             detail: agentMergeFailureDetail(e),
+            conflict: gitReportedConflict(e),
           });
           return;
         }
@@ -367,6 +369,7 @@ export function createWorkAgentMerges({
           // agent resolves it in its worktree as before.
           ...(e?.fix === 'person' ? { fix: 'person' } : {}),
           detail: agentMergeFailureDetail(e),
+          conflict: gitReportedConflict(e),
         });
         return;
       }

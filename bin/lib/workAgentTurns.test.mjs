@@ -29,6 +29,10 @@ writeFileSync(
 const fs = require('node:fs');
 const { execFileSync } = require('node:child_process');
 fs.appendFileSync(${JSON.stringify(spawns)}, process.cwd() + '\\n');
+try {
+  execFileSync('git', ['rev-parse', '--verify', 'MERGE_HEAD'], { stdio: 'ignore' });
+  fs.writeFileSync('a.txt', 'resolved agent and base\\n');
+} catch { /* ordinary task */ }
 fs.writeFileSync('work-' + Date.now() + '-' + Math.random().toString(36).slice(2) + '.txt', 'x');
 execFileSync('git', ['add', '-A'], { stdio: 'ignore' });
 execFileSync('git', ['commit', '-qm', 'agent work'], { stdio: 'ignore' });
@@ -41,6 +45,7 @@ say({ type: 'result', subtype: 'success', usage: { input_tokens: 10, output_toke
 chmodSync(join(bin, 'claude'), 0o755);
 process.env.PATH = `${bin}:${process.env.PATH}`;
 const { createWorkAgentTurns } = await import('./workAgentTurns.mjs');
+const { createWorkAgentMerges } = await import('./workAgentMerges.mjs');
 
 const git = (args, cwd) =>
   execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
@@ -112,6 +117,48 @@ const until = async (cond, ms = 15_000) => {
   }
 };
 const job = { id: 'at-1', agentId: 'ag-1', placeId: 'a-ag-1', kind: 'human', body: 'go', runtime: 'claude' };
+
+test('conflict → real resolve turn → retry lands the committed resolution', async (t) => {
+  const { m, repoRoot, baseDir } = lane(t);
+  const { calls, state } = stubFetch(t);
+  state.reply = { claimed: true };
+  const wt = join(baseDir, 'sessions', job.placeId);
+  git(['worktree', 'add', '-q', '-b', `session/${job.placeId}`, wt, 'main'], repoRoot);
+  const change = (cwd, text) => {
+    writeFileSync(join(cwd, 'a.txt'), text);
+    git(['add', '.'], cwd);
+    git(['commit', '-qm', 'change'], cwd);
+  };
+  change(wt, 'agent changed\\n');
+  change(repoRoot, 'base changed\\n');
+  let checks = 0;
+  const merges = createWorkAgentMerges({
+    repoRoot, baseDir, baseRef: () => 'main',
+    inPlace: async (_p, _w, fn) => fn(), gitNet: (args) => git(args, repoRoot),
+    runReviewEntry: async () => { checks++; }, onRepoChanged: () => {},
+    landed: { observe() {} }, agentRemoteAt: new Map(), agentPublished: new Map(),
+  });
+  const mergeJob = { agentId: job.agentId, placeId: job.placeId, stale: true };
+  const mergeReports = () => calls.filter((c) => c.url.includes('agent-merge-done'));
+  // One person's approval; subsequent work is the server's resolve/retry jobs.
+  merges.processAgentMergeJobs([mergeJob]);
+  await until(() => mergeReports().length === 1 && merges.agentMerges.size === 0);
+  assert.equal(mergeReports()[0].body.conflict, true);
+  assert.match(mergeReports()[0].body.detail, /CONFLICT.*a\.txt/);
+  m.processAgentTurnJobs([{ ...job, kind: 'merge_resolve', body: 'Resolve and commit the conflict.' }]);
+  await until(() => settles(calls).length === 1 && m.agentTurns.size === 0);
+  const resolved = settles(calls)[0].body;
+  assert.equal(resolved.outcome, 'delivered');
+  assert.equal(resolved.mergeResolved, true, 'the real turn wire carries committed resolution evidence');
+  assert.equal(resolved.commits, undefined, 'the resolution merge is not a card receipt');
+  const tip = git(['rev-parse', 'HEAD'], wt);
+  // The API test verifies this handout is queued without a second approval.
+  merges.processAgentMergeJobs([mergeJob]);
+  await until(() => mergeReports().length === 2 && merges.agentMerges.size === 0);
+  assert.equal(mergeReports()[1].body.ok, true);
+  assert.equal(checks, 1, 'the resolved tree is checked before landing');
+  git(['merge-base', '--is-ancestor', tip, 'main'], repoRoot);
+});
 
 test('a run that throws after the CLI committed settles nothing once, and a re-offer re-POSTs — never re-runs', async (t) => {
   const { m, baseDir } = lane(t, {

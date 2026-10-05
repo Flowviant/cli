@@ -39,6 +39,7 @@ import { begunTurnRefusal } from './workAgentTurnBegun.mjs';
 import { agentTurnSettlement } from './workAgentTurnOutcome.mjs';
 import { ensureArtifactDir, ensureFenceScratch } from './artifacts.mjs';
 import { agentBrowserHome } from './noWindowEnv.mjs';
+import { committedMergeResolution } from './agentMergeResolution.mjs';
 
 export function createAgentTurnExecution({
   baseRef,
@@ -706,6 +707,9 @@ export function createAgentTurnExecution({
       // limit is no reason to stop the Claude agents. The turn itself is
       // reported as `nothing` — it did not deliver and it did not ask.
       await postAgentParked(limit, rt);
+    }
+    if (job.kind === 'merge_resolve' && body.outcome === 'delivered') {
+      body.mergeResolved = committedMergeResolution(wt, before, baseRef());
     }
     const reply = await postAgentTurn(body);
     // The queue just emptied. Run the project's own check and the AI

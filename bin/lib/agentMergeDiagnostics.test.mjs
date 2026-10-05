@@ -6,6 +6,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { agentMergeFailureDetail, createWorkAgentMerges } from './workAgentMerges.mjs';
+import { committedMergeResolution, gitReportedConflict } from './agentMergeResolution.mjs';
 
 const git = (args, cwd) => execFileSync('git', args, {
   cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
@@ -69,6 +70,7 @@ test('conflict diagnostics survive the stale fold; retry only succeeds after a c
   git(['push', '-q', 'origin', 'main'], repo);
   const first = await approve();
   assert.equal(first.ok, false);
+  assert.equal(first.conflict, true);
   assert.equal(first.fix, undefined); // server must still queue merge_resolve
   assert.equal(checks(), 0);
   assert.equal(git(['diff', '--name-only', '--diff-filter=U'], wt), 'shared.txt');
@@ -78,8 +80,21 @@ test('conflict diagnostics survive the stale fold; retry only succeeds after a c
   const unchanged = await approve();
   assert.equal(unchanged.ok, false);
   assert.match(unchanged.detail, /unmerged|resolve your current index|not possible/i);
-  commit(wt, 'agent and base resolved\n');
+  const before = git(['rev-parse', 'HEAD'], wt);
+  assert.equal(committedMergeResolution(wt, before, 'origin/main'), false);
+  writeFileSync(join(wt, 'shared.txt'), 'agent and base resolved\n');
+  git(['add', '.'], wt);
+  // A staged resolution is not yet a committed resolution.
+  assert.equal(committedMergeResolution(wt, before, 'origin/main'), false);
+  git(['commit', '-qm', 'resolve conflict'], wt);
   const resolvedTip = git(['rev-parse', 'HEAD'], wt);
+  assert.equal(git(['log', '--format=%H', '--no-merges', `${before}..HEAD`, '--not', 'origin/main'], wt), '');
+  assert.equal(committedMergeResolution(wt, before, 'origin/main'), true);
+  assert.equal(committedMergeResolution(wt, resolvedTip, 'origin/main'), false);
+  assert.equal(committedMergeResolution(wt, before, 'missing-base'), false);
+  writeFileSync(join(wt, 'shared.txt'), 'dirty again\n');
+  assert.equal(committedMergeResolution(wt, before, 'origin/main'), false);
+  git(['restore', 'shared.txt'], wt);
   const retried = await approve();
   assert.equal(retried.ok, true);
   assert.equal(checks(), 1);
@@ -94,6 +109,7 @@ test('a stale fold refused over uncommitted edits names the file and preserves t
   writeFileSync(join(wt, 'shared.txt'), 'uncommitted\n');
   const refused = await approve();
   assert.equal(refused.ok, false);
+  assert.equal(refused.conflict, false);
   assert.match(refused.detail, /local changes.*overwritten/s);
   assert.match(refused.detail, /shared\.txt/);
   assert.equal(git(['diff', '--name-only'], wt), 'shared.txt');
@@ -101,6 +117,8 @@ test('a stale fold refused over uncommitted edits names the file and preserves t
 
 
 test('diagnostics preserve both streams and bounded non-Git fallbacks', () => {
+  assert.equal(gitReportedConflict({ message: 'CONFLICT (content): user text' }), false);
+  assert.equal(gitReportedConflict({ stderr: 'fatal: unable to access remote' }), false);
   assert.equal(agentMergeFailureDetail({ stdout: Buffer.from('CONFLICT in file\n'), stderr: 'fatal: unfinished merge\n', message: 'Command failed' }),
     'CONFLICT in file\nfatal: unfinished merge');
   assert.equal(agentMergeFailureDetail(new Error('worktree unavailable')), 'worktree unavailable');
